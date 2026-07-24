@@ -300,6 +300,7 @@ fn build_svc_params<'a>(binary: &'a str, cname: &'a str, ctx: &'a ForgeContext<'
         container_name: cname,
         env_name: &ctx.config.metadata.name,
         config_dir: &ctx.config_dir,
+        state_dir: &ctx.state_dir,
     }
 }
 

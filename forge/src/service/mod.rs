@@ -51,6 +51,8 @@ pub struct ServiceParams<'a> {
     pub env_name: &'a str,
     /// Directory containing the configuration file.
     pub config_dir: &'a Path,
+    /// Forge state directory (for resolving `.forge/` volume sources).
+    pub state_dir: &'a Path,
 }
 
 // -------------------------------------------------------------
@@ -128,13 +130,7 @@ pub fn start_service(
         let rm = rm_spec(params.binary, params.container_name);
         check_success(&runner.run(&rm)?, "rm")?;
     }
-    let spec = run_spec(
-        params.binary,
-        params.container_name,
-        service,
-        params.env_name,
-        params.config_dir,
-    );
+    let spec = run_spec(params, service);
     let output = runner.run(&spec)?;
     check_success(&output, "run")
 }
@@ -299,16 +295,16 @@ fn missing_label(name: &str, key: &str) -> ForgeError {
 // -------------------------------------------------------------
 
 /// Build a `docker run` command spec with all configured options.
-fn run_spec(binary: &str, name: &str, service: &ServiceSpec, env_name: &str, config_dir: &Path) -> CommandSpec {
-    let mut args = base_run_args(name, env_name, &service.name);
+fn run_spec(params: &ServiceParams<'_>, service: &ServiceSpec) -> CommandSpec {
+    let mut args = base_run_args(params.container_name, params.env_name, &service.name);
     let mut redact = Vec::new();
-    append_network_args(&mut args, &service.network, env_name);
+    append_network_args(&mut args, &service.network, params.env_name);
     append_port_args(&mut args, &service.ports);
-    append_volume_args(&mut args, &service.volumes, config_dir);
+    append_volume_args(&mut args, &service.volumes, params.config_dir, params.state_dir);
     append_env_args(&mut args, &mut redact, &service.env);
     append_restart_arg(&mut args, &service.restart);
     append_image_and_cmd(&mut args, &service.image, &service.args);
-    build_spec_with_redactions(binary, args, redact)
+    build_spec_with_redactions(params.binary, args, redact)
 }
 
 /// Build the base `run -d --name ... --label ...` argument list.
@@ -351,10 +347,10 @@ fn append_port_args(args: &mut Vec<OsString>, ports: &[PortMapping]) {
 }
 
 /// Append `-v` volume mount arguments.
-fn append_volume_args(args: &mut Vec<OsString>, volumes: &[VolumeMount], config_dir: &Path) {
+fn append_volume_args(args: &mut Vec<OsString>, volumes: &[VolumeMount], config_dir: &Path, state_dir: &Path) {
     for vol in volumes {
         args.push("-v".into());
-        args.push(format_volume_arg(vol, config_dir).into());
+        args.push(format_volume_arg(vol, config_dir, state_dir).into());
     }
 }
 
@@ -466,20 +462,33 @@ fn format_port_mapping(port: &PortMapping) -> String {
 }
 
 /// Format a volume mount as `source:target[:ro]`.
-fn format_volume_arg(vol: &VolumeMount, config_dir: &Path) -> String {
-    let source = resolve_source(&vol.source, config_dir);
+fn format_volume_arg(vol: &VolumeMount, config_dir: &Path, state_dir: &Path) -> String {
+    let source = resolve_source(&vol.source, config_dir, state_dir);
     let base = format!("{}:{}", source.display(), vol.target);
     if vol.read_only { format!("{base}:ro") } else { base }
 }
 
-/// Resolve a volume source path against the config directory.
-fn resolve_source(source: &str, config_dir: &Path) -> std::path::PathBuf {
+/// State directory prefix for volume source paths.
+const STATE_DIR_PREFIX: &str = ".forge/";
+
+/// Resolve a volume source path.
+///
+/// Sources starting with `.forge/` are resolved against `state_dir`
+/// (the Forge state directory) so services can mount runtime outputs
+/// like kubeconfigs and overlay files.  All other relative sources
+/// resolve against `config_dir` (the directory containing forge.yaml).
+fn resolve_source(source: &str, config_dir: &Path, state_dir: &Path) -> std::path::PathBuf {
     let path = Path::new(source);
     if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        config_dir.join(source)
+        return path.to_path_buf();
     }
+    if let Some(suffix) = source.strip_prefix(STATE_DIR_PREFIX) {
+        let canonical = std::fs::canonicalize(state_dir).unwrap_or_else(|_| {
+            std::env::current_dir().map_or_else(|_| state_dir.to_path_buf(), |cwd| cwd.join(state_dir))
+        });
+        return canonical.join(suffix);
+    }
+    config_dir.join(source)
 }
 
 /// Parse JSON labels from `docker inspect --format` output.
@@ -560,6 +569,7 @@ fn handle_start(ctx: &ForgeContext<'_>, name: &str, writer: &mut dyn Write) -> R
         container_name: &cname,
         env_name,
         config_dir: &ctx.config_dir,
+        state_dir: &ctx.state_dir,
     };
     if ctx.dry_run {
         return report_text_or_json(writer, &format!("would start service '{name}'"), &ctx.format);
@@ -583,6 +593,7 @@ fn handle_stop(ctx: &ForgeContext<'_>, name: &str, writer: &mut dyn Write) -> Re
         container_name: &cname,
         env_name,
         config_dir: &ctx.config_dir,
+        state_dir: &ctx.state_dir,
     };
     if ctx.dry_run {
         return report_text_or_json(writer, &format!("would stop service '{name}'"), &ctx.format);
@@ -758,6 +769,7 @@ mod tests {
             container_name: "test-env-test-svc",
             env_name: "test-env",
             config_dir: Path::new("/tmp/config"),
+            state_dir: Path::new("/tmp/config/.forge"),
         }
     }
 
@@ -930,10 +942,27 @@ mod tests {
     // Run spec tests
     // ---------------------------------------------------------
 
+    /// Build `ServiceParams` for `run_spec` tests.
+    fn spec_params<'a>(
+        name: &'a str,
+        env_name: &'a str,
+        config_dir: &'a Path,
+        state_dir: &'a Path,
+    ) -> ServiceParams<'a> {
+        ServiceParams {
+            binary: "docker",
+            container_name: name,
+            env_name,
+            config_dir,
+            state_dir,
+        }
+    }
+
     #[test]
     fn run_spec_includes_labels() {
         let svc = minimal_service();
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/tmp"));
+        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(
             display.contains("forge.managed=true"),
@@ -953,7 +982,8 @@ mod tests {
     fn run_spec_network_environment() {
         let mut svc = minimal_service();
         svc.network = NetworkMode::Environment;
-        let spec = run_spec("docker", "env-svc", &svc, "myenv", Path::new("/tmp"));
+        let p = spec_params("env-svc", "myenv", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(display.contains("--network"), "should include --network: {display}");
         assert!(display.contains("myenv-net"), "should use env network: {display}");
@@ -963,7 +993,8 @@ mod tests {
     fn run_spec_network_host() {
         let mut svc = minimal_service();
         svc.network = NetworkMode::Host;
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/tmp"));
+        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(display.contains("--network"), "should include --network: {display}");
         assert!(display.contains("host"), "should use host network: {display}");
@@ -972,7 +1003,8 @@ mod tests {
     #[test]
     fn run_spec_network_none() {
         let svc = minimal_service();
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/tmp"));
+        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(
             !display.contains("--network"),
@@ -989,7 +1021,8 @@ mod tests {
             container: 80,
             protocol: "tcp".to_owned(),
         });
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/tmp"));
+        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(
             display.contains("127.0.0.1:8080:80/tcp"),
@@ -1005,7 +1038,8 @@ mod tests {
             target: "/mnt/data".to_owned(),
             read_only: true,
         });
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/cfg"));
+        let p = spec_params("env-svc", "env", Path::new("/cfg"), Path::new("/cfg/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(
             display.contains("/cfg/data:/mnt/data:ro"),
@@ -1017,7 +1051,8 @@ mod tests {
     fn run_spec_env_vars() {
         let mut svc = minimal_service();
         svc.env.insert("MY_VAR".to_owned(), "my_value".to_owned());
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/tmp"));
+        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(display.contains("-e"), "should include -e flag: {display}");
         assert!(
@@ -1038,7 +1073,8 @@ mod tests {
     fn run_spec_restart_policy() {
         let mut svc = minimal_service();
         svc.restart = RestartPolicy::UnlessStopped;
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/tmp"));
+        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(display.contains("--restart"), "should include --restart: {display}");
         assert!(display.contains("unless-stopped"), "should include policy: {display}");
@@ -1047,11 +1083,64 @@ mod tests {
     #[test]
     fn run_spec_no_privileged() {
         let svc = minimal_service();
-        let spec = run_spec("docker", "env-svc", &svc, "env", Path::new("/tmp"));
+        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&p, &svc);
         let display = format!("{spec}");
         assert!(
             !display.contains("--privileged"),
             "should not include --privileged: {display}"
+        );
+    }
+
+    // ---------------------------------------------------------
+    // Volume source resolution
+    // ---------------------------------------------------------
+
+    #[test]
+    fn resolve_source_relative_uses_config_dir() {
+        let resolved = resolve_source("configs/app", Path::new("/env"), Path::new("/state"));
+        assert_eq!(resolved, Path::new("/env/configs/app"));
+    }
+
+    #[test]
+    fn resolve_source_absolute_unchanged() {
+        let resolved = resolve_source("/abs/path", Path::new("/env"), Path::new("/state"));
+        assert_eq!(resolved, Path::new("/abs/path"));
+    }
+
+    #[test]
+    fn resolve_source_dotforge_uses_state_dir() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let resolved = resolve_source(".forge/runtime/edge", Path::new("/env"), &state);
+        let canonical = std::fs::canonicalize(&state).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(resolved, canonical.join("runtime/edge"));
+    }
+
+    #[test]
+    fn run_spec_dotforge_volume_resolves_to_state_dir() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let mut svc = minimal_service();
+        svc.volumes.push(VolumeMount {
+            source: ".forge/runtime/edge-us-east".to_owned(),
+            target: "/etc/grid".to_owned(),
+            read_only: true,
+        });
+        let p = spec_params("env-svc", "env", Path::new("/cfg"), &state);
+        let spec = run_spec(&p, &svc);
+        let display = format!("{spec}");
+        let canonical = std::fs::canonicalize(&state).unwrap_or_else(|_| std::process::abort());
+        let expected = format!(
+            "{}:{}",
+            canonical.join("runtime/edge-us-east").display(),
+            "/etc/grid:ro"
+        );
+        assert!(
+            display.contains(&expected),
+            "should resolve .forge/ against state_dir: {display}"
         );
     }
 

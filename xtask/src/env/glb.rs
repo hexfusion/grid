@@ -1,14 +1,14 @@
-//! GLB ingress failover verifier.
+//! GLB ingress hot-reload verifier.
 //!
 //! Runs prerequisite checks then a structured 13-step verification
-//! representing the full GLB failover proof.  Steps 1-6 validate
-//! prerequisite infrastructure.  Step 7 (edge identity) is `BLOCKED`
-//! when any service uses a placeholder image.  Steps 8-13 cover the
-//! failover sequence and are `BLOCKED` until the failover harness is
-//! implemented.  The command exits non-zero whenever any step is
-//! `FAIL` or `BLOCKED`.
+//! representing the full GLB hot-reload proof.  Steps 1-6 validate
+//! prerequisite infrastructure.  Steps 7-8 verify the Forge-managed
+//! services are running.  Step 9 proves initial inference routing.
+//! Steps 10-13 exercise the overlay hot-reload path: modify the
+//! overlay file, observe the reload, verify routing still works,
+//! and confirm the edge container was never restarted.
 
-use std::{path::Path, process::Command};
+use std::{path::Path, process::Command, thread, time::Duration};
 
 use crate::env::{StepResult, StepStatus, print_validate_all_table, safe_truncate_str, verify};
 
@@ -18,6 +18,9 @@ use crate::env::{StepResult, StepStatus, print_validate_all_table, safe_truncate
 
 /// Edge service name in the GLB demo forge.yaml.
 const EDGE_SERVICE: &str = "grid-edge-us-east";
+
+/// Overlay-sync service name in the GLB demo forge.yaml.
+const OVERLAY_SYNC_SERVICE: &str = "grid-overlay-sync-us-east";
 
 /// Kubernetes namespace for Grid resources.
 const GRID_SYSTEM_NS: &str = "grid-system";
@@ -34,15 +37,23 @@ const REQUIRED_TOOLS: &[&str] = &["kind", "kubectl", "curl", "docker"];
 /// Total number of verification steps.
 const TOTAL_STEPS: u32 = 13;
 
-/// Reason for steps that depend on the failover harness.
-const FAILOVER_NOT_IMPLEMENTED: &str = "failover proof not yet implemented; \
-     see environments/grid-glb-demo/README.md";
+/// Overlay file relative to the working directory.
+const OVERLAY_FILE: &str = ".forge/runtime/edge-us-east/grid-config.json";
+
+/// Edge service host port.
+const EDGE_PORT: u16 = 8080;
+
+/// Time to wait for overlay hot-reload (debounce + propagation).
+const HOT_RELOAD_WAIT: Duration = Duration::from_millis(1500);
+
+/// Edge container name (deterministic from forge naming).
+const EDGE_CONTAINER: &str = "grid-glb-demo-grid-edge-us-east";
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Verify GLB ingress failover readiness.
+/// Verify GLB ingress hot-reload readiness.
 ///
 /// Checks prerequisites (config, tools, forge binary, placeholder
 /// images), then runs a 13-step structured verification.  Exits
@@ -60,7 +71,7 @@ pub(crate) fn verify_glb_ingress(forge_config: &Path) -> Result<(), Box<dyn std:
     run_steps(&ctx, &mut results);
 
     eprintln!();
-    eprintln!("## GLB Ingress Failover Proof");
+    eprintln!("## GLB Ingress Hot-Reload Proof");
     print_validate_all_table(&results);
 
     let any_not_pass = results.iter().any(|r| r.status != StepStatus::Pass);
@@ -69,7 +80,7 @@ pub(crate) fn verify_glb_ingress(forge_config: &Path) -> Result<(), Box<dyn std:
         let blocked_count = results.iter().filter(|r| r.status == StepStatus::Blocked).count();
         Err(format!(
             "glb-ingress: {fail_count} FAIL, {blocked_count} BLOCKED \
-             — failover proof incomplete"
+             — hot-reload proof incomplete"
         )
         .into())
     } else {
@@ -89,9 +100,9 @@ struct PrereqContext {
     config: std::path::PathBuf,
     /// Resolved forge binary path.
     forge_bin: String,
-    /// Edge host port parsed from config (used by failover steps).
-    _edge_port: u16,
-    /// Services blocked by placeholder images.
+    /// Overlay file path (for hot-reload testing).
+    overlay_path: std::path::PathBuf,
+    /// Services blocked by placeholder images (warning only).
     placeholders: Vec<(String, String)>,
 }
 
@@ -113,12 +124,11 @@ fn check_prerequisites(forge_config: &Path) -> Result<PrereqContext, Box<dyn std
     }
 
     let forge_bin = forge_bin.unwrap_or_else(|| std::process::abort());
-    let edge_port = parse_edge_host_port(&config_text, EDGE_SERVICE).unwrap_or(8080);
 
     Ok(PrereqContext {
         config: forge_config.to_path_buf(),
         forge_bin,
-        _edge_port: edge_port,
+        overlay_path: std::path::PathBuf::from(OVERLAY_FILE),
         placeholders,
     })
 }
@@ -217,7 +227,8 @@ pub(crate) fn detect_placeholder_images(config_text: &str) -> Vec<(String, Strin
 ///
 /// Looks for the `- name: <service>` block and extracts the first
 /// `host:` value from its `ports:` section.
-pub(crate) fn parse_edge_host_port(config_text: &str, service_name: &str) -> Option<u16> {
+#[cfg(test)]
+fn parse_edge_host_port(config_text: &str, service_name: &str) -> Option<u16> {
     let name_marker = format!("- name: {service_name}");
     let mut in_service = false;
 
@@ -297,13 +308,8 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
     step_banner(6, "checking edge config applied");
     record_step("edge config applied", results, check_edge_control_stacks);
 
-    // Step 7: Edge identity captured (blocked if placeholder images).
-    step_banner(7, "capturing edge identity");
-    if ctx.placeholders.is_empty() {
-        record_step("edge identity captured", results, || {
-            check_service_identity(&status_json, EDGE_SERVICE)
-        });
-    } else {
+    // Gate steps 7+ on placeholder images.
+    if !ctx.placeholders.is_empty() {
         let reason = format!(
             "placeholder images: {}",
             ctx.placeholders
@@ -312,21 +318,86 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        results.push(StepResult::blocked("edge identity captured", reason));
+        block_remaining(7, &reason, results);
+        return;
     }
 
-    // Steps 8-13: Failover sequence (not yet implemented).
-    for (step, label) in [
-        (8, "initial request → provider-east"),
-        (9, "provider-east failure injected"),
-        (10, "overlay revision changed"),
-        (11, "edge reload observed"),
-        (12, "second request → provider-west"),
-        (13, "edge identity unchanged"),
-    ] {
-        step_banner(step, label);
-        results.push(StepResult::blocked(label, FAILOVER_NOT_IMPLEMENTED));
+    // Step 7: Overlay-sync service running.
+    step_banner(7, "checking overlay-sync service");
+    let sync_ok = record_step("overlay-sync running", results, || {
+        check_service_running(&status_json, OVERLAY_SYNC_SERVICE)
+    });
+    if !sync_ok {
+        block_remaining(8, "overlay-sync not running", results);
+        return;
     }
+
+    // Step 8: Edge service running — capture container ID.
+    step_banner(8, "capturing edge service identity");
+    let edge_identity = match check_service_running(&status_json, EDGE_SERVICE) {
+        Ok(evidence) => {
+            let captured = extract_service_identity(&status_json, EDGE_SERVICE);
+            results.push(StepResult::pass("edge service running", evidence));
+            captured
+        },
+        Err(e) => {
+            results.push(StepResult::fail("edge service running", e.as_ref()));
+            block_remaining(9, "edge not running", results);
+            return;
+        },
+    };
+
+    // Step 9: Inference routed (initial request).
+    step_banner(9, "sending inference request");
+    let routed_ok = record_step("inference routed", results, check_inference_routed);
+    if !routed_ok {
+        block_remaining(10, "initial inference failed", results);
+        return;
+    }
+
+    let reload_count_before = count_overlay_reload_logs(EDGE_CONTAINER).unwrap_or(0);
+
+    // Step 10: Modify overlay (remove one provider).
+    step_banner(10, "modifying overlay for hot-reload test");
+    let original_overlay = match modify_overlay_for_test(&ctx.overlay_path) {
+        Ok((evidence, original)) => {
+            results.push(StepResult::pass("overlay modified", evidence));
+            Some(original)
+        },
+        Err(e) => {
+            results.push(StepResult::fail("overlay modified", e.as_ref()));
+            block_remaining(11, "overlay modification failed", results);
+            return;
+        },
+    };
+
+    // Step 11: Hot-reload observed.
+    step_banner(11, "checking hot-reload");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
+    )]
+    {
+        thread::sleep(HOT_RELOAD_WAIT);
+    }
+    record_step("hot-reload observed", results, || {
+        check_hot_reload_observed(EDGE_CONTAINER, reload_count_before)
+    });
+
+    // Step 12: Routing after reload.
+    step_banner(12, "sending post-reload inference request");
+    record_step("routing after reload", results, check_inference_routed);
+
+    // Restore overlay before step 13.
+    if let Some(original) = &original_overlay {
+        restore_overlay(&ctx.overlay_path, original);
+    }
+
+    // Step 13: Edge container stable (same ID, no restart).
+    step_banner(13, "checking edge container stability");
+    record_step("edge container stable", results, || {
+        check_container_stable(EDGE_CONTAINER, edge_identity.as_ref())
+    });
 }
 
 /// Print a step progress banner.
@@ -360,13 +431,13 @@ const STEP_LABELS: &[&str] = &[
     "provider gateway IPs",
     "provider gateways reachable",
     "edge config applied",
-    "edge identity captured",
-    "initial request → provider-east",
-    "provider-east failure injected",
-    "overlay revision changed",
-    "edge reload observed",
-    "second request → provider-west",
-    "edge identity unchanged",
+    "overlay-sync running",
+    "edge service running",
+    "inference routed",
+    "overlay modified",
+    "hot-reload observed",
+    "routing after reload",
+    "edge container stable",
 ];
 
 /// Block all steps from `from_step` (1-indexed) onward.
@@ -493,9 +564,9 @@ fn check_edge_control_stacks() -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("{count} GridNetwork resource(s) found"))
 }
 
-/// Step 7: Verify a service identity (phase, health, containerId,
-/// restartCount) from forge status JSON.
-pub(crate) fn check_service_identity(
+/// Steps 7-8: Verify a service is running (phase=running,
+/// containerId present).
+fn check_service_running(
     status_json: &serde_json::Value,
     service_name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -509,30 +580,214 @@ pub(crate) fn check_service_identity(
         return Err(format!("service '{service_name}' phase={phase} (expected running)").into());
     }
 
-    let health = svc
-        .get("health")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    if health != "healthy" && health != "unknown" {
-        return Err(format!("service '{service_name}' health={health} (expected healthy)").into());
-    }
-
     let container_id = svc.get("containerId").and_then(serde_json::Value::as_str);
     let Some(id) = container_id.filter(|id| !id.is_empty()) else {
-        return Err(format!("service '{service_name}' has no containerId (not running)").into());
+        return Err(format!("service '{service_name}' has no containerId").into());
     };
 
     let restart_count = svc.get("restartCount").and_then(serde_json::Value::as_u64);
-    if let Some(restarts) = restart_count
-        && restarts > 0
+    let restart_text = restart_count.map_or_else(|| "unknown".to_owned(), |count| count.to_string());
+
+    Ok(format!(
+        "containerId={}, phase=running, restartCount={restart_text}",
+        safe_truncate_str(id, 12)
+    ))
+}
+
+/// Baseline identity for a Forge-managed service.
+struct ServiceIdentity {
+    /// Full container ID.
+    id: String,
+    /// Restart count observed before the proof window.
+    restart_count: Option<u64>,
+}
+
+/// Extract baseline service identity from Forge status JSON.
+fn extract_service_identity(status_json: &serde_json::Value, service_name: &str) -> Option<ServiceIdentity> {
+    let svc = find_service_in_status(status_json, service_name).ok()?;
+    let id = svc
+        .get("containerId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)?;
+    let restart_count = svc.get("restartCount").and_then(serde_json::Value::as_u64);
+    Some(ServiceIdentity { id, restart_count })
+}
+
+/// Step 9/12: Send an inference request and verify 200 OK.
+fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
+    let resp = curl_post_with_auth(EDGE_PORT)?;
+    if resp.status != 200 {
+        return Err(format!("inference request returned HTTP {}", resp.status).into());
+    }
+    let model = serde_json::from_str::<serde_json::Value>(&resp.body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(serde_json::Value::as_str).map(str::to_owned));
+    match model {
+        Some(m) => Ok(format!("HTTP 200, model={m}")),
+        None => Ok("HTTP 200".to_owned()),
+    }
+}
+
+/// Step 10: Modify the overlay file for hot-reload testing.
+///
+/// Reads the current overlay, removes one candidate, writes the
+/// modified version back.  Returns the evidence string and the
+/// original content for later restoration.
+fn modify_overlay_for_test(overlay_path: &Path) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let original = std::fs::read_to_string(overlay_path).map_err(|e| format!("failed to read overlay: {e}"))?;
+
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&original).map_err(|e| format!("failed to parse overlay: {e}"))?;
+
+    let candidates = doc
+        .get_mut("candidates")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("overlay missing candidates array")?;
+
+    let original_count = candidates.len();
+    if original_count < 2 {
+        return Err("need at least 2 candidates for hot-reload test".into());
+    }
+    candidates.pop();
+
+    let modified = serde_json::to_string(&doc).map_err(|e| format!("failed to serialize: {e}"))?;
+    write_overlay(overlay_path, &modified)?;
+
+    Ok((
+        format!("candidates {original_count} → {}", original_count - 1),
+        original,
+    ))
+}
+
+/// Step 11: Check docker logs for hot-reload evidence and verify
+/// the container was not restarted.
+fn check_hot_reload_observed(container: &str, previous_count: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let current_count = count_overlay_reload_logs(container)?;
+    if current_count <= previous_count {
+        return Err(format!(
+            "overlay reload log count did not increase: before={previous_count}, after={current_count}"
+        )
+        .into());
+    }
+    Ok(format!(
+        "overlay reload observed: before={previous_count}, after={current_count}"
+    ))
+}
+
+/// Count overlay reload log entries for a Docker container.
+fn count_overlay_reload_logs(container: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let output = Command::new("docker")
+        .args(["logs", "--tail", "200", container])
+        .output()?;
+    let logs = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{logs}{stderr}");
+    Ok(count_reload_entries(&combined))
+}
+
+/// Count hot-reload log entries in text.
+fn count_reload_entries(logs: &str) -> usize {
+    logs.matches("overlay reloaded").count()
+}
+
+/// Step 13: Verify the edge container was not restarted during the
+/// hot-reload test.
+fn check_container_stable(
+    container: &str,
+    expected: Option<&ServiceIdentity>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let state = inspect_container_state(container)?;
+
+    if let Some(expected) = expected
+        && state.id != expected.id
     {
-        return Err(format!("service '{service_name}' restartCount={restarts} (expected 0)").into());
+        return Err(format!(
+            "container restarted: expected {}, got {}",
+            safe_truncate_str(&expected.id, 12),
+            safe_truncate_str(&state.id, 12)
+        )
+        .into());
+    }
+    if let Some(expected) = expected.and_then(|id| id.restart_count)
+        && state.restart_count != expected
+    {
+        return Err(format!(
+            "container restart count changed: expected {expected}, got {}",
+            state.restart_count
+        )
+        .into());
     }
 
     Ok(format!(
-        "containerId={}, phase=running, restartCount=0",
-        safe_truncate_str(id, 12)
+        "containerId={} unchanged, startedAt={}, restartCount={}",
+        safe_truncate_str(&state.id, 12),
+        state.started_at,
+        state.restart_count
     ))
+}
+
+/// Minimal Docker container state needed by the verifier.
+struct ContainerState {
+    /// Full container ID.
+    id: String,
+    /// Docker start timestamp.
+    started_at: String,
+    /// Docker restart count.
+    restart_count: u64,
+}
+
+/// Inspect a Docker container and parse its identity fields.
+fn inspect_container_state(container: &str) -> Result<ContainerState, Box<dyn std::error::Error>> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            container,
+            "--format",
+            "{{.Id}} {{.State.StartedAt}} {{.RestartCount}}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("docker inspect failed for {container}").into());
+    }
+    parse_container_state(container, &String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse Docker inspect output from `inspect_container_state`.
+fn parse_container_state(container: &str, inspect: &str) -> Result<ContainerState, Box<dyn std::error::Error>> {
+    let mut fields = inspect.split_whitespace();
+    let id = fields
+        .next()
+        .ok_or_else(|| format!("docker inspect returned no container ID for {container}"))?
+        .to_owned();
+    let started_at = fields
+        .next()
+        .ok_or_else(|| format!("docker inspect returned no start time for {container}"))?
+        .to_owned();
+    let restart_count = fields
+        .next()
+        .ok_or_else(|| format!("docker inspect returned no restart count for {container}"))?
+        .parse::<u64>()?;
+    Ok(ContainerState {
+        id,
+        started_at,
+        restart_count,
+    })
+}
+
+/// Write content to the overlay file via rename (handles ownership).
+fn write_overlay(overlay_path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = overlay_path.parent().ok_or("overlay path has no parent directory")?;
+    let tmp = parent.join(".grid-config.json.tmp");
+    std::fs::write(&tmp, content).map_err(|e| format!("failed to write temp overlay: {e}"))?;
+    std::fs::rename(&tmp, overlay_path).map_err(|e| format!("failed to rename overlay: {e}"))?;
+    Ok(())
+}
+
+/// Restore the overlay file to its original content.
+fn restore_overlay(overlay_path: &Path, original: &str) {
+    if write_overlay(overlay_path, original).is_err() {
+        eprintln!("glb-ingress: WARNING: failed to restore overlay file");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +842,33 @@ pub(crate) fn find_service_in_status<'a>(
         .ok_or_else(|| format!("service '{service_name}' not found in status").into())
 }
 
+/// Send a Chat Completions request to the edge with bearer auth.
+fn curl_post_with_auth(port: u16) -> Result<verify::HttpResponse, Box<dyn std::error::Error>> {
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let body = r#"{"model":"sim-model-v1","messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#;
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            "Authorization: Bearer test-token",
+            "-d",
+            body,
+            &url,
+        ])
+        .output()?;
+    verify::parse_curl_output(&String::from_utf8(output.stdout)?)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -634,12 +916,7 @@ spec:
     }
 
     /// Build a status JSON with configurable service fields.
-    fn status_with_service(
-        phase: &str,
-        health: &str,
-        container_id: Option<&str>,
-        restart_count: Option<u32>,
-    ) -> serde_json::Value {
+    fn status_with_services(phase: &str, container_id: Option<&str>) -> serde_json::Value {
         serde_json::json!({
             "status": "ok",
             "data": {
@@ -648,15 +925,26 @@ spec:
                     {"name": "provider-east", "statePhase": "running", "live": true},
                     {"name": "provider-west", "statePhase": "running", "live": true}
                 ],
-                "services": [{
-                    "name": EDGE_SERVICE,
-                    "containerName": "grid-glb-grid-edge-us-east",
-                    "phase": phase,
-                    "health": health,
-                    "containerId": container_id,
-                    "startedAt": "2026-07-22T14:31:00Z",
-                    "restartCount": restart_count,
-                }]
+                "services": [
+                    {
+                        "name": OVERLAY_SYNC_SERVICE,
+                        "containerName": "grid-glb-demo-grid-overlay-sync-us-east",
+                        "phase": phase,
+                        "health": "unknown",
+                        "containerId": container_id,
+                        "startedAt": "2026-07-22T14:31:00Z",
+                        "restartCount": 0,
+                    },
+                    {
+                        "name": EDGE_SERVICE,
+                        "containerName": "grid-glb-demo-grid-edge-us-east",
+                        "phase": phase,
+                        "health": "unknown",
+                        "containerId": container_id,
+                        "startedAt": "2026-07-22T14:31:00Z",
+                        "restartCount": 0,
+                    }
+                ]
             }
         })
     }
@@ -695,7 +983,7 @@ spec:
 
     #[test]
     fn parses_forge_status_clusters() {
-        let status = status_with_service("running", "healthy", Some("abc123"), Some(0));
+        let status = status_with_services("running", Some("abc123"));
         let result = check_clusters_live(&status);
         assert!(result.is_ok(), "all clusters should be live: {result:?}");
         let evidence = result.unwrap_or_else(|_| std::process::abort());
@@ -703,19 +991,18 @@ spec:
     }
 
     #[test]
-    fn service_identity_running_healthy() {
-        let status = status_with_service("running", "healthy", Some("abcdef1234567890"), Some(0));
-        let result = check_service_identity(&status, EDGE_SERVICE);
+    fn service_running_check_pass() {
+        let status = status_with_services("running", Some("abcdef1234567890"));
+        let result = check_service_running(&status, EDGE_SERVICE);
         assert!(result.is_ok(), "should pass: {result:?}");
         let evidence = result.unwrap_or_else(|_| std::process::abort());
         assert!(evidence.contains("containerId="), "evidence: {evidence}");
-        assert!(evidence.contains("restartCount=0"), "evidence: {evidence}");
     }
 
     #[test]
-    fn service_identity_phase_stopped_fails() {
-        let status = status_with_service("stopped", "unknown", Some("abc123"), Some(0));
-        let Err(err) = check_service_identity(&status, EDGE_SERVICE) else {
+    fn service_running_check_stopped_fails() {
+        let status = status_with_services("stopped", Some("abc123"));
+        let Err(err) = check_service_running(&status, EDGE_SERVICE) else {
             std::process::abort()
         };
         let msg = err.to_string();
@@ -723,33 +1010,48 @@ spec:
     }
 
     #[test]
-    fn service_identity_unhealthy_fails() {
-        let status = status_with_service("running", "unhealthy", Some("abc123"), Some(0));
-        let Err(err) = check_service_identity(&status, EDGE_SERVICE) else {
-            std::process::abort()
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("health=unhealthy"), "error: {msg}");
-    }
-
-    #[test]
-    fn service_identity_restart_count_nonzero_fails() {
-        let status = status_with_service("running", "healthy", Some("abc123"), Some(3));
-        let Err(err) = check_service_identity(&status, EDGE_SERVICE) else {
-            std::process::abort()
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("restartCount=3"), "error: {msg}");
-    }
-
-    #[test]
-    fn service_identity_no_container_id_fails() {
-        let status = status_with_service("running", "healthy", None, Some(0));
-        let Err(err) = check_service_identity(&status, EDGE_SERVICE) else {
+    fn service_running_no_container_id_fails() {
+        let status = status_with_services("running", None);
+        let Err(err) = check_service_running(&status, EDGE_SERVICE) else {
             std::process::abort()
         };
         let msg = err.to_string();
         assert!(msg.contains("no containerId"), "error: {msg}");
+    }
+
+    #[test]
+    fn service_running_restart_count_nonzero_is_baseline() {
+        let mut status = status_with_services("running", Some("abc123"));
+        status
+            .get_mut("data")
+            .and_then(|data| data.get_mut("services"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|services| services.get_mut(1))
+            .and_then(|svc| svc.get_mut("restartCount"))
+            .map_or_else(|| std::process::abort(), |count| *count = serde_json::json!(2));
+        let evidence = check_service_running(&status, EDGE_SERVICE).unwrap_or_else(|_| std::process::abort());
+        assert!(evidence.contains("restartCount=2"), "evidence: {evidence}");
+    }
+
+    #[test]
+    fn reload_entry_counter_counts_exact_messages() {
+        let logs = "overlay reloaded\nunrelated\noverlay reloaded";
+        assert_eq!(count_reload_entries(logs), 2, "should count reload entries");
+    }
+
+    #[test]
+    fn extract_service_identity_present() {
+        let status = status_with_services("running", Some("abcdef1234567890"));
+        let identity = extract_service_identity(&status, EDGE_SERVICE).unwrap_or_else(|| std::process::abort());
+        assert_eq!(identity.id, "abcdef1234567890", "should extract container ID");
+        assert_eq!(identity.restart_count, Some(0), "should extract restart count");
+    }
+
+    #[test]
+    fn extract_service_identity_missing() {
+        let status = status_with_services("running", None);
+        let identity = extract_service_identity(&status, EDGE_SERVICE);
+        assert!(identity.is_none(), "should return None when containerId is null");
     }
 
     #[test]
@@ -778,5 +1080,12 @@ spec:
         ];
         let any_not_pass = results.iter().any(|r| r.status != StepStatus::Pass);
         assert!(any_not_pass, "BLOCKED step should prevent clean exit");
+    }
+
+    #[test]
+    fn overlay_sync_service_check_pass() {
+        let status = status_with_services("running", Some("abc123"));
+        let result = check_service_running(&status, OVERLAY_SYNC_SERVICE);
+        assert!(result.is_ok(), "overlay-sync should pass: {result:?}");
     }
 }

@@ -532,6 +532,7 @@ fn step_type_label(step: &crate::config::StepSpec) -> &'static str {
         crate::config::StepSpec::CoreDnsForward { .. } => "core-dns-forward",
         crate::config::StepSpec::Capture { .. } => "capture",
         crate::config::StepSpec::TemplateManifest { .. } => "template-manifest",
+        crate::config::StepSpec::TemplateFile { .. } => "template-file",
     }
 }
 
@@ -553,6 +554,7 @@ fn step_description(step: &crate::config::StepSpec) -> String {
         crate::config::StepSpec::CoreDnsForward { zone, .. } => format!("coredns forward {zone}"),
         crate::config::StepSpec::Capture { key, resource, .. } => format!("capture {key} from {resource}"),
         crate::config::StepSpec::TemplateManifest { path } => format!("template-apply {path}"),
+        crate::config::StepSpec::TemplateFile { source, target } => format!("template-file {source} -> {target}"),
     }
 }
 

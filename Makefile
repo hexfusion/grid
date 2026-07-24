@@ -4,6 +4,7 @@
 
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 V                ?=
+NIGHTLY_RUSTFMT   ?= nightly-2026-03-28
 KIND_CLUSTER_NAME ?= praxis-grid
 PROJECT_IMAGE    ?= praxis-grid:dev
 KUBECTL          ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
@@ -13,7 +14,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test lint fmt doc audit \
+	test test-unit lint fmt doc audit \
 	coverage coverage-check \
 	require-container-engine \
 	images container operator-image overlay-sync-image kind-up kind-down \
@@ -47,7 +48,9 @@ clean:
 # Test
 # -------------------------------------------------------------------
 
-test:
+test: test-unit
+
+test-unit:
 	cargo test --workspace $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
@@ -56,11 +59,11 @@ test:
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo +nightly fmt --all -- --check
+	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
 	cargo machete
 
 fmt:
-	cargo +nightly fmt --all
+	cargo +$(NIGHTLY_RUSTFMT) fmt --all
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
@@ -70,10 +73,16 @@ audit:
 	cargo deny check
 
 coverage:
-	cargo llvm-cov --workspace --html --output-dir target/coverage
+	cargo llvm-cov --workspace --html --output-dir target/coverage \
+		--exclude xtask \
+		--ignore-filename-regex '(target/|tests/)'
 
 coverage-check:
-	cargo llvm-cov --workspace --fail-under-lines 80
+	cargo llvm-cov --workspace --json \
+		--exclude xtask \
+		--ignore-filename-regex '(target/|tests/)' \
+		--fail-under-lines 80 \
+		--output-path coverage.json
 
 # -------------------------------------------------------------------
 # Container

@@ -1,8 +1,29 @@
-listener:
-  address: "0.0.0.0:8080"
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
 
-grid:
-  configPath: /etc/grid/grid-config.json
+filter_chains:
+  - name: main
+    filters:
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: grid_route
+        overlay_file: /etc/grid/grid-config.json
+        model_header: X-Model
+        reload:
+          enabled: true
+          debounce_ms: 500
+      - filter: load_balancer
+        clusters:
+          - name: provider-east
+            endpoints:
+              - "{{ captures.provider-east.provider-gateway-ip }}:8080"
+          - name: provider-west
+            endpoints:
+              - "{{ captures.provider-west.provider-gateway-ip }}:8080"
 
-logging:
-  level: info
+admin:
+  address: "127.0.0.1:9901"

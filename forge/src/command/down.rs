@@ -155,6 +155,7 @@ fn stop_one_svc(
         container_name: &cname,
         env_name: &ctx.config.metadata.name,
         config_dir: &ctx.config_dir,
+        state_dir: &ctx.state_dir,
     };
     service::stop_service(ctx.runner, &params)?;
     mark_svc_gone(state, &svc.name);

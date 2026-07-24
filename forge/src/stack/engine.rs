@@ -77,6 +77,8 @@ pub struct StepContext {
     pub kube_context: String,
     /// Directory for resolving relative paths.
     pub config_dir: std::path::PathBuf,
+    /// Forge state directory for runtime output paths.
+    pub state_dir: std::path::PathBuf,
     /// Container runtime binary (for `MetalLB` network inspection).
     pub runtime_binary: String,
     /// Forge-owned environment network, if configured.
@@ -173,6 +175,7 @@ fn build_step_context(
     Ok(StepContext {
         kube_context: kube_ctx,
         config_dir: ctx.config_dir.clone(),
+        state_dir: ctx.state_dir.clone(),
         runtime_binary: resolved.binary,
         network_name,
         cluster_pool: network.and_then(|n| n.cluster_pool.map(ToOwned::to_owned)),
@@ -257,6 +260,7 @@ fn execute_step(
         StepSpec::CoreDnsForward { .. } => execute_coredns_forward(runner, step, sc).map(|()| 1),
         StepSpec::Capture { .. } => execute_capture(runner, step, sc).map(|()| 1),
         StepSpec::TemplateManifest { path } => execute_template_manifest(runner, path, tpl, sc).map(|()| 1),
+        StepSpec::TemplateFile { source, target } => execute_template_file(source, target, tpl, sc).map(|()| 1),
     }
 }
 
@@ -425,6 +429,42 @@ fn execute_template_manifest(
     steps::check_success(&output, "kubectl apply")
 }
 
+/// Render a local template file to a local output path.
+fn execute_template_file(
+    source: &str,
+    target: &str,
+    tpl: &TemplateContext,
+    sc: &StepContext,
+) -> Result<(), ForgeError> {
+    let resolved_source = resolve_path(&sc.config_dir, source)?;
+    let content = std::fs::read_to_string(&resolved_source)
+        .map_err(|e| ForgeError::Config(format!("cannot read template file '{source}': {e}")))?;
+    let rendered = template::render_with_limit(&content, tpl, steps::MAX_REMOTE_MANIFEST_BYTES)?;
+    let resolved_target = resolve_output_path(&sc.config_dir, &sc.state_dir, target)?;
+    write_rendered_file(&resolved_target, rendered.as_bytes())
+}
+
+/// Write a rendered local file through temp-file-and-rename.
+fn write_rendered_file(path: &Path, bytes: &[u8]) -> Result<(), ForgeError> {
+    let Some(parent) = path.parent() else {
+        return Err(ForgeError::Config(format!(
+            "target path '{}' has no parent",
+            path.display()
+        )));
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|e| ForgeError::Config(format!("cannot create output directory '{}': {e}", parent.display())))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| ForgeError::Config(format!("invalid target filename '{}'", path.display())))?;
+    let tmp = parent.join(format!(".{file_name}.tmp"));
+    std::fs::write(&tmp, bytes)
+        .map_err(|e| ForgeError::Config(format!("cannot write temporary file '{}': {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| ForgeError::Config(format!("cannot move rendered file to '{}': {e}", path.display())))
+}
+
 /// Expand a for-each loop over a cluster property array.
 fn execute_foreach(
     runner: &dyn CommandRunner,
@@ -576,6 +616,10 @@ fn render_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, Forge
         StepSpec::Manifest { path } => render_path(path, tpl).map(|p| StepSpec::Manifest { path: p }),
         StepSpec::Kustomize { path } => render_path(path, tpl).map(|p| StepSpec::Kustomize { path: p }),
         StepSpec::TemplateManifest { path } => render_path(path, tpl).map(|p| StepSpec::TemplateManifest { path: p }),
+        StepSpec::TemplateFile { source, target } => Ok(StepSpec::TemplateFile {
+            source: render_path(source, tpl)?,
+            target: render_path(target, tpl)?,
+        }),
         StepSpec::MetallbAutoPool { name } => render_path(name, tpl).map(|n| StepSpec::MetallbAutoPool { name: n }),
         StepSpec::Helm { .. } => render_helm_step(step, tpl),
         StepSpec::Deployment { .. } => render_deployment_step(step, tpl),
@@ -803,6 +847,26 @@ fn resolve_path(config_dir: &Path, path: &str) -> Result<String, ForgeError> {
     Ok(config_dir.join(path).to_string_lossy().into_owned())
 }
 
+/// Runtime output prefix resolved against the Forge state directory.
+const STATE_DIR_PREFIX: &str = ".forge/";
+
+/// Resolve a local output path.
+///
+/// Ordinary relative paths resolve under `config_dir`. Paths under `.forge/`
+/// resolve under the configured Forge state directory so stack steps can
+/// prepare runtime files for host services.
+fn resolve_output_path(config_dir: &Path, state_dir: &Path, path: &str) -> Result<std::path::PathBuf, ForgeError> {
+    if path.trim().is_empty() || Path::new(path).is_absolute() || path.split('/').any(|part| part == "..") {
+        return Err(ForgeError::Config(format!(
+            "stack output path '{path}' must be relative and must not escape the config root"
+        )));
+    }
+    if let Some(suffix) = path.strip_prefix(STATE_DIR_PREFIX) {
+        return Ok(state_dir.join(suffix));
+    }
+    Ok(config_dir.join(path))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -829,6 +893,7 @@ mod tests {
         StepContext {
             kube_context: "kind-test-hub".to_owned(),
             config_dir: std::path::PathBuf::from("/tmp"),
+            state_dir: std::path::PathBuf::from("/tmp/.forge"),
             runtime_binary: "docker".to_owned(),
             network_name: Some("test-net".to_owned()),
             cluster_pool: None,
@@ -1330,5 +1395,46 @@ mod tests {
             stdin_text, "ip: 172.18.255.200:8080",
             "should render captures in manifest content"
         );
+    }
+
+    #[test]
+    fn template_file_renders_to_state_dir() {
+        let config_dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state_dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let template_path = config_dir.path().join("edge.yaml");
+        std::fs::write(&template_path, "endpoint: {{ captures.provider-east.gw-ip }}:8080")
+            .unwrap_or_else(|_| std::process::abort());
+
+        let mut tpl = make_template_context();
+        tpl.captures = BTreeMap::from([(
+            "provider-east".to_owned(),
+            BTreeMap::from([("gw-ip".to_owned(), "172.18.255.200".to_owned())]),
+        )]);
+        let mut sc = make_step_context();
+        sc.config_dir = config_dir.path().to_path_buf();
+        sc.state_dir = state_dir.path().to_path_buf();
+
+        execute_template_file("edge.yaml", ".forge/runtime/edge-us-east/praxis/praxis.yaml", &tpl, &sc)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let rendered = std::fs::read_to_string(state_dir.path().join("runtime/edge-us-east/praxis/praxis.yaml"))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            rendered, "endpoint: 172.18.255.200:8080",
+            "should render captures into state-dir runtime output"
+        );
+    }
+
+    #[test]
+    fn template_file_rejects_escaping_target() {
+        let config_dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let template_path = config_dir.path().join("edge.yaml");
+        std::fs::write(&template_path, "endpoint: static").unwrap_or_else(|_| std::process::abort());
+        let tpl = make_template_context();
+        let mut sc = make_step_context();
+        sc.config_dir = config_dir.path().to_path_buf();
+
+        let result = execute_template_file("edge.yaml", "../runtime/praxis.yaml", &tpl, &sc);
+        assert!(result.is_err(), "escaping target path should be rejected");
     }
 }

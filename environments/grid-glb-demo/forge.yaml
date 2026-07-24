@@ -37,10 +37,6 @@ spec:
       image: "grid-overlay-sync:latest"
       autoStart: false
       network: environment
-      # TODO(forge): volumes referencing .forge/runtime/ resolve against
-      # config_dir (this directory) but .forge/ lives at the grid root.
-      # Blocked on forge state_dir expansion in volume sources.
-      # Workaround: start manually with docker run using absolute paths.
       volumes:
         - source: configs/overlay-sync
           target: /etc/overlay-sync
@@ -52,13 +48,14 @@ spec:
           readOnly: true
       env:
         KUBECONFIG: /kube/config
+        RUST_LOG: info
       args:
         - "--config"
         - "/etc/overlay-sync/sync.yaml"
       restart: on-failure
 
     - name: grid-edge-us-east
-      image: "ghcr.io/praxis-proxy/praxis-ai:sha-PLACEHOLDER"
+      image: "praxis-ai:hot-reload-grid-route"
       autoStart: false
       network: environment
       dependsOn:
@@ -69,7 +66,7 @@ spec:
           container: 8080
           protocol: tcp
       volumes:
-        - source: configs/edge-us-east
+        - source: .forge/runtime/edge-us-east/praxis
           target: /etc/praxis
           readOnly: true
         - source: .forge/runtime/edge-us-east
@@ -121,6 +118,9 @@ spec:
       steps:
         - type: template-manifest
           path: resources/gridnetwork.yaml
+        - type: template-file
+          source: configs/edge-us-east/praxis.yaml
+          target: .forge/runtime/edge-us-east/praxis/praxis.yaml
         - type: manifest
           path: resources/edge-site.yaml
         - type: manifest

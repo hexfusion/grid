@@ -576,7 +576,14 @@ fn check_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
         StepSpec::MetallbAutoPool { name } => check_named_resource_step(stack_name, "metallb pool", name, None),
         StepSpec::CoreDnsForward { zone, upstreams } => check_coredns_forward_step(stack_name, zone, upstreams),
         StepSpec::Capture { .. } => check_capture_step(stack_name, step),
+        StepSpec::TemplateFile { source, target } => check_template_file_step(stack_name, source, target),
     }
+}
+
+/// Validate a template-file step.
+fn check_template_file_step(stack_name: &str, source: &str, target: &str) -> Result<(), ForgeError> {
+    check_relative_path(source, &format!("stack {stack_name:?}: template-file source"))?;
+    check_relative_path(target, &format!("stack {stack_name:?}: template-file target"))
 }
 
 /// Validate a capture step.

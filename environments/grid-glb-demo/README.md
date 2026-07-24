@@ -1,10 +1,10 @@
 # Grid GLB Demo Environment
 
-Multi-cluster Grid environment demonstrating external ingress with
-GLB-style failover. Three Kind clusters simulate a realistic topology:
-one edge-control plane running Praxis AI as the external entry point,
-and two provider clusters hosting simulated inference backends exposed
-via MetalLB LoadBalancer Services.
+Multi-cluster Grid environment demonstrating external ingress and
+file-based Grid overlay hot-reload. Three Kind clusters simulate a
+realistic topology: one edge-control plane running Praxis AI as the
+external entry point, and two provider clusters hosting simulated
+inference backends exposed via MetalLB LoadBalancer Services.
 
 ## Architecture
 
@@ -41,9 +41,12 @@ Two host services complete the data path:
 - **grid-overlay-sync-us-east** watches the operator-generated routing
   overlay ConfigMap (`grid-overlay-glb-demo-consumer-gateway`) on
   edge-control and writes its `grid-config.json` key to a
-  shared runtime directory (`environments/grid-glb-demo/.forge/runtime/edge-us-east/`).
+  shared runtime directory (`.forge/runtime/edge-us-east/` when run
+  from the repository root).
 - **grid-edge-us-east** runs Praxis AI with file-based Grid config,
-  reading from the same runtime directory. It listens on
+  reading from the same runtime directory. Forge renders its
+  `praxis.yaml` into `.forge/runtime/edge-us-east/praxis/` after the
+  provider gateway IPs have been captured. It listens on
   `127.0.0.1:8080` for local client requests.
 
 ## Current Status
@@ -61,22 +64,17 @@ Two host services complete the data path:
 - Container-reachable kubeconfig export for host services
 - Config validation passes with full service definitions
 
-### Blocked on Runtime Configuration
+### Current Development Limits
 
-- **grid-overlay-sync image** (`sha-PLACEHOLDER`): the overlay-sync
-  binary is implemented in the `overlay-sync/` crate and can be
-  built locally with `make overlay-sync-image`. The container
-  expects `KUBECONFIG=/kube/config`, mounted from
-  `.forge/runtime/kubeconfig/edge-control/config`. `praxis-forge up`
-  exports that kubeconfig with the Kind API server rewritten to the
-  control-plane container DNS name reachable from the Docker network.
-  Replace the placeholder tag in `forge.yaml` after building the image.
-- **Praxis AI hot-reload image** (`sha-PLACEHOLDER`): the edge
-  service requires a Praxis AI build with file-based Grid config
-  hot-reload support. No published image exists yet.
-- **Transport** between edge and providers is set to `plaintext` for
+- The demo uses local development images:
+  - `grid-overlay-sync:latest`
+  - `praxis-ai:hot-reload-grid-route`
+- Transport between edge and providers is set to `plaintext` for
   initial development. Production requires `mutual_tls` with proper
   SNI and certificate references.
+- Geo/load-aware routing, session affinity, and semantic routing are
+  planned follow-up capabilities. This demo proves the external ingress
+  data path and hot-reload behavior, not those policy layers.
 
 ## Prerequisites
 
@@ -101,8 +99,9 @@ praxis-forge up --config environments/grid-glb-demo/forge.yaml
 
 This creates three Kind clusters (`edge-control`, `provider-east`,
 `provider-west`) with a shared Docker network (`grid-glb-demo-net`).
-The host edge services are marked `autoStart: false` until their
-placeholder images are replaced, so `up` will not try to start them.
+The host edge services are marked `autoStart: false`, so `up` creates
+the clusters, networking, stacks, and runtime files without starting
+the local edge containers.
 
 ### 3. Apply provider stacks
 
@@ -127,8 +126,10 @@ praxis-forge stack apply edge-control --config environments/grid-glb-demo/forge.
 ```
 
 The `edge-demo` stack uses `template-manifest` to render
-`gridnetwork.yaml` with the captured provider gateway IPs. No manual
-YAML editing is required.
+`gridnetwork.yaml` with the captured provider gateway IPs. It also
+renders the edge Praxis config to
+`.forge/runtime/edge-us-east/praxis/praxis.yaml`. No manual YAML
+editing is required.
 
 ### 5. Verify cluster status
 
@@ -150,11 +151,14 @@ curl -s http://<west-ip>:8080/health
 
 Both should return `ok` from the mock-inference health endpoint.
 
-### 7. Start host services (blocked on images)
+### 7. Start host services
 
-The two host services are defined in `forge.yaml` with `autoStart:
-false` and placeholder image tags (`sha-PLACEHOLDER`). Once real images
-are published, replace the tags and start the services:
+Build the local images and start the two host services:
+
+```console
+make overlay-sync-image
+# Build praxis-ai:hot-reload-grid-route from the AI hot-reload branch.
+```
 
 ```console
 praxis-forge service start grid-overlay-sync-us-east --config environments/grid-glb-demo/forge.yaml
@@ -162,19 +166,11 @@ praxis-forge service start grid-edge-us-east --config environments/grid-glb-demo
 ```
 
 The overlay-sync service writes `grid-config.json` to
-`environments/grid-glb-demo/.forge/runtime/edge-us-east/`. The edge service mounts that directory
+`.forge/runtime/edge-us-east/`. The edge service mounts that directory
 read-only at `/etc/grid` and begins accepting requests on
 `127.0.0.1:8080`.
 
-**Remaining blockers:**
-
-- Overlay-sync image must be built locally (`make overlay-sync-image`)
-  and the placeholder tag in `forge.yaml` replaced with
-  `grid-overlay-sync:latest`.
-- `ghcr.io/praxis-proxy/praxis-ai` image must be published with
-  file-based Grid config hot-reload support
-
-### 8. Send a test request (blocked on step 7)
+### 8. Send a test request
 
 Once both services are running:
 
@@ -189,11 +185,12 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 Both host services share a runtime directory on the Docker host:
 
 ```
-environments/grid-glb-demo/.forge/runtime/edge-us-east/
+.forge/runtime/edge-us-east/
   grid-config.json    # written by overlay-sync, read by edge
+  praxis/praxis.yaml  # rendered by Forge from captured provider IPs
   tls/                # reserved for future mTLS certificates
 
-environments/grid-glb-demo/.forge/runtime/kubeconfig/edge-control/
+.forge/runtime/kubeconfig/edge-control/
   config              # rewritten kubeconfig mounted into overlay-sync
 ```
 
@@ -201,16 +198,20 @@ The runtime directories are created by `praxis-forge up` and service
 startup. They are gitignored (`.forge/` in root `.gitignore`) and must
 not be committed.
 
-## Automated Proof (Not Yet Implemented)
+## Automated Proof
 
-The GLB ingress verifier will assert:
+The GLB ingress verifier asserts:
 
-1. The edge service `containerId` remains stable across a simulated
-   provider failover (provider-east cycled while provider-west absorbs
-   traffic).
-2. `restartCount == 0` for the edge service throughout the proof window.
-3. Inference requests continue to succeed during failover (routed to the
-   surviving provider via Grid overlay).
+```console
+cargo xtask env verify-grid-glb-ingress \
+  --forge-config environments/grid-glb-demo/forge.yaml
+```
+
+The proof checks the running Forge environment, verifies provider
+gateway reachability, sends an inference request through the edge,
+edits the local overlay file to remove one provider, observes a new
+`overlay reloaded` log entry, sends a second inference request, and
+confirms the edge container ID and restart count remain stable.
 
 ## Teardown
 

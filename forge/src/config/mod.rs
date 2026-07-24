@@ -4,6 +4,13 @@
 //! structs use `#[serde(deny_unknown_fields)]` to reject typos and
 //! forward-incompatible additions at parse time.
 
+// JsonSchema derives for large nested enums generate schema-builder functions
+// with stack frames above the repository's server-oriented default threshold.
+#![allow(
+    clippy::large_stack_frames,
+    reason = "JsonSchema derives for nested Forge config enums generate large schema-builder stack frames"
+)]
+
 pub mod schema;
 pub mod validate;
 
@@ -462,6 +469,14 @@ pub enum StepSpec {
     TemplateManifest {
         /// Path relative to the config root.
         path: String,
+    },
+    /// Render a local template file to a local output path.
+    TemplateFile {
+        /// Source template path relative to the config root.
+        source: String,
+        /// Target path relative to the config root, or under `.forge/` for
+        /// runtime output.
+        target: String,
     },
 }
 
