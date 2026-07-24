@@ -569,6 +569,7 @@ fn check_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
             resource,
             condition,
             timeout,
+            ..
         } => check_wait_step(stack_name, resource, condition, timeout),
         StepSpec::Exec { command } => check_exec_step(stack_name, command),
         StepSpec::ForEach { property, steps } => check_for_each_step(stack_name, property, steps),
@@ -1288,6 +1289,7 @@ spec:
                     resource: "deployment/web".to_owned(),
                     condition: "available".to_owned(),
                     timeout: "soon".to_owned(),
+                    namespace: None,
                 }],
             },
         );

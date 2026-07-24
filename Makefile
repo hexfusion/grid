@@ -15,7 +15,7 @@ endif
 .PHONY: all build release check clean \
 	test test-unit lint fmt doc audit \
 	coverage coverage-check \
-	images container operator-image kind-up kind-down \
+	images container operator-image overlay-sync-image kind-up kind-down \
 	dev-env dev-push dev-integration \
 	help
 
@@ -93,6 +93,10 @@ operator-image:
 	podman build -f deploy/operator/Containerfile -t grid-operator:latest . || \
 	docker build -f deploy/operator/Containerfile -t grid-operator:latest .
 
+overlay-sync-image:
+	podman build -f deploy/overlay-sync/Containerfile -t grid-overlay-sync:latest . || \
+	docker build -f deploy/overlay-sync/Containerfile -t grid-overlay-sync:latest .
+
 images:
 	docker build -t $(PROJECT_IMAGE) -f Containerfile .
 
@@ -157,7 +161,8 @@ help:
 	@echo "  coverage-check   fail if line coverage < 80%%"
 	@echo ""
 	@echo "Operator:"
-	@echo "  operator-image   build operator container image"
+	@echo "  operator-image       build operator container image"
+	@echo "  overlay-sync-image   build overlay-sync container image"
 	@echo ""
 	@echo "KIND:"
 	@echo "  kind-up          create cluster + deploy"

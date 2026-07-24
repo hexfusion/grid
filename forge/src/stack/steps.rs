@@ -168,17 +168,28 @@ fn helm_values_stdin(
 }
 
 /// Build a `kubectl wait` command spec.
-pub fn kubectl_wait_spec(context: &str, resource: &str, condition: &str, timeout: &str) -> CommandSpec {
+pub fn kubectl_wait_spec(
+    context: &str,
+    resource: &str,
+    condition: &str,
+    timeout: &str,
+    namespace: Option<&str>,
+) -> CommandSpec {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--context".into(),
+        context.into(),
+        "wait".into(),
+        resource.into(),
+        format!("--for=condition={condition}").into(),
+        format!("--timeout={timeout}").into(),
+    ];
+    if let Some(ns) = namespace {
+        args.push("-n".into());
+        args.push(ns.into());
+    }
     CommandSpec {
         program: "kubectl".into(),
-        args: vec![
-            "--context".into(),
-            context.into(),
-            "wait".into(),
-            resource.into(),
-            format!("--for=condition={condition}").into(),
-            format!("--timeout={timeout}").into(),
-        ],
+        args,
         env: BTreeMap::default(),
         stdin: None,
         redact: Vec::new(),
@@ -728,7 +739,7 @@ mod tests {
 
     #[test]
     fn wait_step_builds_kubectl_wait() {
-        let spec = kubectl_wait_spec("kind-forge-hub", "deployment/controller", "available", "120s");
+        let spec = kubectl_wait_spec("kind-forge-hub", "deployment/controller", "available", "120s", None);
         let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(
@@ -740,6 +751,14 @@ mod tests {
             "should have condition: {joined}"
         );
         assert!(joined.contains("--timeout=120s"), "should have timeout: {joined}");
+    }
+
+    #[test]
+    fn wait_step_includes_namespace() {
+        let spec = kubectl_wait_spec("ctx", "deployment/web", "available", "60s", Some("my-ns"));
+        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined = args.join(" ");
+        assert!(joined.contains("-n my-ns"), "should have namespace: {joined}");
     }
 
     #[test]

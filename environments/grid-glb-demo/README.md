@@ -38,8 +38,9 @@ requests across the cross-cluster Docker network.
 
 Two host services complete the data path:
 
-- **grid-overlay-sync-us-east** watches the operator-generated
-  ConfigMap on edge-control and writes `grid-config.json` to a
+- **grid-overlay-sync-us-east** watches the operator-generated routing
+  overlay ConfigMap (`grid-overlay-glb-demo-consumer-gateway`) on
+  edge-control and writes its `grid-config.json` key to a
   shared runtime directory (`environments/grid-glb-demo/.forge/runtime/edge-us-east/`).
 - **grid-edge-us-east** runs Praxis AI with file-based Grid config,
   reading from the same runtime directory. It listens on
@@ -57,14 +58,19 @@ Two host services complete the data path:
 - Provider gateway LoadBalancer Services exposed via MetalLB
 - Automatic capture of provider gateway IPs into Forge state
 - Template-manifest rendering of GridNetwork with captured IPs
+- Container-reachable kubeconfig export for host services
 - Config validation passes with full service definitions
 
-### Blocked on Upstream Packaging
+### Blocked on Runtime Configuration
 
 - **grid-overlay-sync image** (`sha-PLACEHOLDER`): the overlay-sync
-  service requires a packaged watcher that reads the
-  operator-generated ConfigMap and writes `grid-config.json`. No
-  published image exists yet.
+  binary is implemented in the `overlay-sync/` crate and can be
+  built locally with `make overlay-sync-image`. The container
+  expects `KUBECONFIG=/kube/config`, mounted from
+  `.forge/runtime/kubeconfig/edge-control/config`. `praxis-forge up`
+  exports that kubeconfig with the Kind API server rewritten to the
+  control-plane container DNS name reachable from the Docker network.
+  Replace the placeholder tag in `forge.yaml` after building the image.
 - **Praxis AI hot-reload image** (`sha-PLACEHOLDER`): the edge
   service requires a Praxis AI build with file-based Grid config
   hot-reload support. No published image exists yet.
@@ -162,8 +168,9 @@ read-only at `/etc/grid` and begins accepting requests on
 
 **Remaining blockers:**
 
-- `ghcr.io/praxis-proxy/grid-overlay-sync` image must be published
-  with a ConfigMap watcher that writes `grid-config.json`
+- Overlay-sync image must be built locally (`make overlay-sync-image`)
+  and the placeholder tag in `forge.yaml` replaced with
+  `grid-overlay-sync:latest`.
 - `ghcr.io/praxis-proxy/praxis-ai` image must be published with
   file-based Grid config hot-reload support
 
@@ -185,10 +192,14 @@ Both host services share a runtime directory on the Docker host:
 environments/grid-glb-demo/.forge/runtime/edge-us-east/
   grid-config.json    # written by overlay-sync, read by edge
   tls/                # reserved for future mTLS certificates
+
+environments/grid-glb-demo/.forge/runtime/kubeconfig/edge-control/
+  config              # rewritten kubeconfig mounted into overlay-sync
 ```
 
-This directory is created at service start time. It is gitignored
-(`.forge/` in root `.gitignore`) and must not be committed.
+The runtime directories are created by `praxis-forge up` and service
+startup. They are gitignored (`.forge/` in root `.gitignore`) and must
+not be committed.
 
 ## Automated Proof (Not Yet Implemented)
 

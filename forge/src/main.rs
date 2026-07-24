@@ -90,9 +90,14 @@ fn build_context<'a>(
 }
 
 /// Derive the config directory from the config file path.
+///
+/// Canonicalizes the result so that Docker volume bind-mounts
+/// receive absolute paths instead of relative ones.
 fn config_dir_from_path(path: &std::path::Path) -> std::path::PathBuf {
-    path.parent()
-        .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
+    let parent = path
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf);
+    std::fs::canonicalize(&parent).unwrap_or(parent)
 }
 
 /// Dispatch the `up` command.

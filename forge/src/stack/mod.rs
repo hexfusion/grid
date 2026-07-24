@@ -585,6 +585,7 @@ mod tests {
                     resource: "deployment/controller".to_owned(),
                     condition: "available".to_owned(),
                     timeout: "60s".to_owned(),
+                    namespace: None,
                 },
             ],
         }

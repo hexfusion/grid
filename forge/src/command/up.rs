@@ -6,7 +6,7 @@
 use std::io::Write;
 
 use crate::{
-    cluster::kind as kind_ops,
+    cluster::{kind as kind_ops, kubeconfig},
     config::ClusterSpec,
     context::ForgeContext,
     error::ForgeError,
@@ -32,6 +32,7 @@ pub fn run(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeEr
     state.runtime = Some(resolved.binary.clone());
     let net_result = ensure_network(ctx, &resolved.binary, &mut state)?;
     let results = create_clusters(ctx, &mut state)?;
+    export_kubeconfigs(ctx, &state)?;
     let svc_results = start_services(ctx, &resolved.binary, &mut state)?;
     update_digest(ctx, &mut state)?;
     record_operation(&mut state, "up", true);
@@ -198,6 +199,28 @@ fn ensure_state_entry(state: &mut state::ForgeState, name: &str, kind_name: &str
         context: kind_ops::kubectl_context(kind_name),
         phase,
     });
+}
+
+// ---------------------------------------------------------------
+// Kubeconfig export
+// ---------------------------------------------------------------
+
+/// Export container-reachable kubeconfigs for all running clusters.
+///
+/// Skipped during dry-run. On a real run, exports a kubeconfig for
+/// each cluster in state so services on the Docker network can
+/// reach cluster API servers by DNS name.
+fn export_kubeconfigs(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Result<(), ForgeError> {
+    if ctx.dry_run || ctx.config.spec.services.is_empty() {
+        return Ok(());
+    }
+    for cluster in &state.clusters {
+        if cluster.phase != ClusterPhase::Running {
+            continue;
+        }
+        kubeconfig::export_kubeconfig(ctx.runner, &cluster.kind_name, &cluster.name, &ctx.state_dir)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------
@@ -525,6 +548,32 @@ spec:
         }
     }
 
+    /// Build a minimal kubeconfig YAML with the given server URL.
+    fn sample_kubeconfig(server_url: &str) -> String {
+        format!(
+            "\
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: dGVzdC1jYQ==
+    server: {server_url}
+  name: kind-test
+contexts:
+- context:
+    cluster: kind-test
+    user: kind-test
+  name: kind-test
+current-context: kind-test
+users:
+- name: kind-test
+  user:
+    client-certificate-data: dGVzdC1jZXJ0
+    client-key-data: dGVzdC1rZXk=
+"
+        )
+    }
+
     /// Create a temp dir for test state.
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap_or_else(|_| {
@@ -584,6 +633,7 @@ spec:
                 stderr: String::new(),
             },
         );
+        runner.respond("kind", empty_ok());
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -643,6 +693,34 @@ spec:
         })
     }
 
+    /// Build a config with one cluster and one non-auto-start service.
+    fn test_config_with_cluster_and_service() -> crate::config::ForgeConfig {
+        let yaml = "\
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+metadata:
+  name: test
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: forge
+  clusters:
+    - name: hub
+  services:
+    - name: placeholder
+      image: example/placeholder:v1
+      autoStart: false
+  stacks: {}
+";
+        serde_yaml::from_str(yaml).unwrap_or_else(|_| {
+            std::process::abort();
+            #[expect(unreachable_code, reason = "abort prevents reaching this")]
+            {
+                unreachable!()
+            }
+        })
+    }
+
     #[test]
     fn up_skips_services_with_auto_start_false() {
         let config = test_config_with_disabled_service();
@@ -664,6 +742,71 @@ spec:
         assert!(
             !text.contains("placeholder"),
             "skipped service should not appear as started: {text}"
+        );
+    }
+
+    #[test]
+    fn up_exports_kubeconfig_when_services_are_configured() {
+        let config = test_config_with_cluster_and_service();
+        let dir = test_dir();
+        let runner = mock_for_service_kubeconfig_export();
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+
+        let _text = run_up(&ctx);
+
+        assert!(
+            runner.was_called("kind get kubeconfig --name forge-hub"),
+            "service-bearing environments should export a container-reachable kubeconfig"
+        );
+        assert!(
+            dir.path().join("runtime/kubeconfig/hub/config").exists(),
+            "rewritten kubeconfig should be written under runtime"
+        );
+    }
+
+    /// Mock a successful `forge up` for an environment with services.
+    fn mock_for_service_kubeconfig_export() -> MockRunner {
+        let mut runner = MockRunner::new();
+        runner.respond("docker version", docker_ok());
+        runner.respond("kind get clusters", empty_ok());
+        runner.respond("kind", empty_ok());
+        runner.respond(
+            "kind get kubeconfig --name forge-hub",
+            CommandOutput {
+                status: 0,
+                stdout: sample_kubeconfig("https://127.0.0.1:42789"),
+                stderr: String::new(),
+            },
+        );
+        runner
+    }
+
+    #[test]
+    fn up_does_not_export_kubeconfig_without_services() {
+        let dir = test_dir();
+        let config = test_config();
+        let runner = mock_for_create();
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+
+        let _text = run_up(&ctx);
+
+        assert!(
+            !runner.was_called("kind get kubeconfig"),
+            "service-free environments should not write kubeconfigs containing client key material"
         );
     }
 

@@ -414,6 +414,9 @@ pub enum StepSpec {
         condition: String,
         /// Timeout (e.g. `120s`).  Wait steps must be explicitly bounded.
         timeout: String,
+        /// Target namespace (optional).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
     },
     /// Execute an arbitrary command in the cluster context.
     Exec {

@@ -5,7 +5,7 @@
 # ------------------------------------------------------------------------------
 #
 # Copy workspace manifests first, build with stub sources to cache dependency
-# compilation, then copy real source and rebuild only project crates.
+# compilation, then copy real source and rebuild only the overlay-sync binary.
 
 FROM rust:1.96-alpine AS builder
 
@@ -20,45 +20,31 @@ WORKDIR /src
 # ------------------------------------------------------------------------------
 
 COPY Cargo.toml Cargo.lock ./
-COPY certs/Cargo.toml certs/Cargo.toml
-COPY crdt/Cargo.toml crdt/Cargo.toml
-COPY operator/Cargo.toml operator/Cargo.toml
-COPY scoring/Cargo.toml scoring/Cargo.toml
-COPY swim/Cargo.toml swim/Cargo.toml
+COPY overlay-sync/Cargo.toml overlay-sync/Cargo.toml
 
-# Strip workspace members not needed for the operator binary so this image build
-# does not need their manifests or source.
-RUN sed -i '/forge/d; /mock-providers/d; /overlay-sync/d; /xtask/d' Cargo.toml
+# Strip workspace members not needed for the overlay-sync binary.
+RUN sed -i '/certs/d; /crdt/d; /forge/d; /mock-providers/d; /operator/d; /scoring/d; /swim/d; /xtask/d' Cargo.toml
 
-RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src \
-    && echo '//! stub' > certs/src/lib.rs \
-    && echo '//! stub' > crdt/src/lib.rs \
-    && echo '//! stub' > operator/src/lib.rs \
-    && echo '//! stub' > scoring/src/lib.rs \
-    && echo '//! stub' > swim/src/lib.rs \
-    && printf '//! stub\nfn main() {}\n' > operator/src/main.rs
+RUN mkdir -p overlay-sync/src \
+    && echo '//! stub' > overlay-sync/src/lib.rs \
+    && printf '//! stub\nfn main() {}\n' > overlay-sync/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p operator --bin operator
+    cargo build --release -p overlay-sync --bin overlay-sync
 
 # ------------------------------------------------------------------------------
 # Build
 # ------------------------------------------------------------------------------
 
-COPY certs/src certs/src
-COPY crdt/src crdt/src
-COPY operator/src operator/src
-COPY scoring/src scoring/src
-COPY swim/src swim/src
+COPY overlay-sync/src overlay-sync/src
 
-RUN find certs/src crdt/src operator/src scoring/src swim/src \
-    -name '*.rs' -exec touch {} +
+RUN find overlay-sync/src -name '*.rs' -exec touch {} +
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p operator --bin operator \
-    && cp target/release/operator /usr/local/bin/operator
+    cargo build --release -p overlay-sync --bin overlay-sync \
+    && cp target/release/overlay-sync /usr/local/bin/overlay-sync
 
 # ------------------------------------------------------------------------------
 # Stage 2: Runtime
@@ -67,18 +53,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM alpine:3.23
 
 LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
-    org.opencontainers.image.description="Grid operator for multi-site AI routing" \
+    org.opencontainers.image.description="Grid routing overlay ConfigMap watcher" \
     org.opencontainers.image.licenses="MIT"
 
+ARG KUBECTL_VERSION=1.32.0
+
 RUN apk add --no-cache ca-certificates \
+    && wget -q "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+        -O /usr/local/bin/kubectl \
+    && chmod 0555 /usr/local/bin/kubectl \
     && addgroup -S grid \
     && adduser -S -G grid -h /nonexistent -s /sbin/nologin grid
 
 COPY --from=builder --chown=root:root --chmod=0555 \
-    /usr/local/bin/operator /usr/local/bin/operator
+    /usr/local/bin/overlay-sync /usr/local/bin/overlay-sync
 
-USER 100:101
+USER grid:grid
 
-EXPOSE 7946/udp
-
-ENTRYPOINT ["operator"]
+ENTRYPOINT ["overlay-sync"]

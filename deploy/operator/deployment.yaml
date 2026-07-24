@@ -37,14 +37,14 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
           env:
-            - name: GRID_SWIM_BIND_ADDR
-              value: "0.0.0.0:7946"
-            - name: GRID_SWIM_ADVERTISE_ADDR
-              value: "$(POD_IP):7946"
             - name: POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: GRID_SWIM_BIND_ADDR
+              value: "0.0.0.0:7946"
+            - name: GRID_SWIM_ADVERTISE_ADDR
+              value: "$(POD_IP):7946"
             - name: GRID_SWIM_SITE_NAME
               value: ""
             - name: GRID_SWIM_SEEDS

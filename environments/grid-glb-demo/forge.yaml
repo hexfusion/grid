@@ -34,15 +34,24 @@ spec:
 
   services:
     - name: grid-overlay-sync-us-east
-      image: "ghcr.io/praxis-proxy/grid-overlay-sync:sha-PLACEHOLDER"
+      image: "grid-overlay-sync:latest"
       autoStart: false
       network: environment
+      # TODO(forge): volumes referencing .forge/runtime/ resolve against
+      # config_dir (this directory) but .forge/ lives at the grid root.
+      # Blocked on forge state_dir expansion in volume sources.
+      # Workaround: start manually with docker run using absolute paths.
       volumes:
         - source: configs/overlay-sync
           target: /etc/overlay-sync
           readOnly: true
         - source: .forge/runtime/edge-us-east
           target: /output
+        - source: .forge/runtime/kubeconfig/edge-control
+          target: /kube
+          readOnly: true
+      env:
+        KUBECONFIG: /kube/config
       args:
         - "--config"
         - "/etc/overlay-sync/sync.yaml"
@@ -89,7 +98,8 @@ spec:
           url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
           sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
         - type: wait
-          resource: deployment/metallb-controller
+          resource: deployment/controller
+          namespace: metallb-system
           condition: available
           timeout: "120s"
         - type: metallb-auto-pool
@@ -102,6 +112,7 @@ spec:
           path: resources/grid-operator
         - type: wait
           resource: deployment/grid-operator
+          namespace: grid-system
           condition: available
           timeout: "120s"
 

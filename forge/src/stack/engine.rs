@@ -245,7 +245,12 @@ fn execute_step(
             resource,
             condition,
             timeout,
-        } => execute_wait(runner, resource, condition, timeout, sc).map(|()| 1),
+            namespace,
+        } => {
+            let spec = steps::kubectl_wait_spec(&sc.kube_context, resource, condition, timeout, namespace.as_deref());
+            let output = runner.run(&spec)?;
+            steps::check_success(&output, "kubectl wait").map(|()| 1)
+        },
         StepSpec::Exec { command } => execute_exec(runner, command).map(|()| 1),
         StepSpec::ForEach { property, steps: sub } => execute_foreach(runner, property, sub, tpl, sc),
         StepSpec::MetallbAutoPool { name } => execute_metallb(runner, name, sc).map(|()| 1),
@@ -340,19 +345,6 @@ fn execute_service(
     let spec = steps::kubectl_stdin_apply(&sc.kube_context, yaml.as_bytes());
     let output = runner.run(&spec)?;
     steps::check_success(&output, "kubectl apply")
-}
-
-/// Wait for a Kubernetes resource condition.
-fn execute_wait(
-    runner: &dyn CommandRunner,
-    resource: &str,
-    condition: &str,
-    timeout: &str,
-    sc: &StepContext,
-) -> Result<(), ForgeError> {
-    let spec = steps::kubectl_wait_spec(&sc.kube_context, resource, condition, timeout);
-    let output = runner.run(&spec)?;
-    steps::check_success(&output, "kubectl wait")
 }
 
 /// Execute an arbitrary command.
@@ -731,6 +723,7 @@ fn render_wait_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, 
         resource,
         condition,
         timeout,
+        namespace,
     } = step
     else {
         return Err(ForgeError::Config("expected Wait step".to_owned()));
@@ -739,6 +732,7 @@ fn render_wait_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, 
         resource: template::render(resource, tpl)?,
         condition: template::render(condition, tpl)?,
         timeout: template::render(timeout, tpl)?,
+        namespace: render_optional(namespace, tpl)?,
     })
 }
 

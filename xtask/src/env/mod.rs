@@ -4,6 +4,7 @@ pub(crate) mod certs;
 pub(crate) mod config;
 pub(crate) mod consumer;
 pub(crate) mod gateway;
+pub(crate) mod glb;
 pub(crate) mod image_overrides;
 pub(crate) mod images;
 pub(crate) mod kind;
@@ -706,6 +707,19 @@ pub(crate) enum Action {
         #[arg(long)]
         site: Option<String>,
     },
+
+    /// Verify GLB ingress failover readiness.
+    ///
+    /// Checks prerequisites (tools, forge binary, placeholder images),
+    /// then runs a 10-step structured verification of the GLB demo
+    /// environment from cluster health through edge inference routing.
+    /// Steps requiring running services are marked `BLOCKED` when
+    /// placeholder images are detected.
+    VerifyGridGlbIngress {
+        /// Path to the Forge environment config file.
+        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        forge_config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +778,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
         Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
         Action::VerifyOperatorInstallRbac { config, site } => env_verify_operator_install_rbac(config, site.as_deref()),
+        Action::VerifyGridGlbIngress { forge_config } => glb::verify_glb_ingress(forge_config),
     }
 }
 
@@ -4827,7 +4842,7 @@ fn verify_metrics_routing_phase(
 
 /// Outcome of a single `validate-all` step.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StepStatus {
+pub(crate) enum StepStatus {
     /// Step completed successfully.
     Pass,
     /// Step produced a fatal error.
@@ -4838,12 +4853,12 @@ enum StepStatus {
 
 impl StepStatus {
     /// Return true when this status should contribute to a non-zero exit code.
-    fn is_failure(&self) -> bool {
+    pub(crate) fn is_failure(&self) -> bool {
         *self == Self::Fail
     }
 
     /// Return the display label for this status.
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Pass => "PASS",
             Self::Fail => "FAIL",
@@ -4853,18 +4868,18 @@ impl StepStatus {
 }
 
 /// One row of the `validate-all` summary table.
-struct StepResult {
+pub(crate) struct StepResult {
     /// Short description of what this step validates.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// Outcome.
-    status: StepStatus,
+    pub(crate) status: StepStatus,
     /// One-line evidence or error summary (truncated).
-    evidence: String,
+    pub(crate) evidence: String,
 }
 
 impl StepResult {
     /// Construct a passing result.
-    fn pass(label: &'static str, evidence: impl Into<String>) -> Self {
+    pub(crate) fn pass(label: &'static str, evidence: impl Into<String>) -> Self {
         Self {
             label,
             status: StepStatus::Pass,
@@ -4873,7 +4888,7 @@ impl StepResult {
     }
 
     /// Construct a failing result from an error.
-    fn fail(label: &'static str, err: &dyn std::error::Error) -> Self {
+    pub(crate) fn fail(label: &'static str, err: &dyn std::error::Error) -> Self {
         Self {
             label,
             status: StepStatus::Fail,
@@ -4882,7 +4897,7 @@ impl StepResult {
     }
 
     /// Construct a blocked result with a human-readable reason.
-    fn blocked(label: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn blocked(label: &'static str, reason: impl Into<String>) -> Self {
         Self {
             label,
             status: StepStatus::Blocked,
@@ -4891,8 +4906,8 @@ impl StepResult {
     }
 }
 
-/// Truncate a string to `max` chars, appending "…" if truncated.
-fn safe_truncate_str(s: &str, max: usize) -> String {
+/// Truncate a string to `max` chars, appending "..." if truncated.
+pub(crate) fn safe_truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
     } else {
@@ -4901,7 +4916,7 @@ fn safe_truncate_str(s: &str, max: usize) -> String {
 }
 
 /// Print a Markdown summary table of all step results.
-fn print_validate_all_table(results: &[StepResult]) {
+pub(crate) fn print_validate_all_table(results: &[StepResult]) {
     eprintln!();
     eprintln!("| Step | Result | Evidence |");
     eprintln!("|---|---|---|");

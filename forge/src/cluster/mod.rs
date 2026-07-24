@@ -4,6 +4,7 @@
 //! [`kind`].
 
 pub mod kind;
+pub mod kubeconfig;
 
 use std::io::Write;
 

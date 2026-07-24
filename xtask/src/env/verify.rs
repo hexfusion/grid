@@ -379,7 +379,7 @@ fn send_chat_request(port: u16, model: &str) -> Result<HttpResponse, Box<dyn std
 }
 
 /// HTTP GET via `curl`.
-fn curl_get(url: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+pub(crate) fn curl_get(url: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let connect_timeout = CURL_CONNECT_TIMEOUT.to_string();
     let max_time = CURL_MAX_TIME.to_string();
     let output = Command::new("curl")
@@ -398,7 +398,7 @@ fn curl_get(url: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
 }
 
 /// HTTP POST via `curl`.
-fn curl_post(url: &str, body: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+pub(crate) fn curl_post(url: &str, body: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let connect_timeout = CURL_CONNECT_TIMEOUT.to_string();
     let max_time = CURL_MAX_TIME.to_string();
     let output = Command::new("curl")
