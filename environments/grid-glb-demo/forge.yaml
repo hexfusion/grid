@@ -14,27 +14,27 @@ spec:
     dnsZone: grid-glb.test
 
   clusters:
-    - name: edge-control
-      stacks: [gateway-api, metallb, grid-operator, edge-demo]
+    - name: site-us-east
+      stacks: [gateway-api, metallb, grid-operator, swim-lb, site-us-east-demo]
       properties:
         region: us-east
-        role: edge
+        role: site
 
-    - name: provider-east
-      stacks: [gateway-api, metallb, grid-operator, provider-east-demo, inference-sim]
-      properties:
-        region: us-east
-        role: provider
-
-    - name: provider-west
-      stacks: [gateway-api, metallb, grid-operator, provider-west-demo, inference-sim]
+    - name: site-us-west
+      stacks: [gateway-api, metallb, grid-operator, swim-lb, site-us-west-demo, inference-sim]
       properties:
         region: us-west
-        role: provider
+        role: site
+
+    - name: site-us-central
+      stacks: [gateway-api, metallb, grid-operator, swim-lb, site-us-central-demo, inference-sim]
+      properties:
+        region: us-central
+        role: site
 
   services:
     - name: grid-overlay-sync-us-east
-      image: "grid-overlay-sync:latest"
+      image: "grid-overlay-sync:glb-demo"
       autoStart: false
       network: environment
       volumes:
@@ -43,7 +43,7 @@ spec:
           readOnly: true
         - source: .forge/runtime/edge-us-east
           target: /output
-        - source: .forge/runtime/kubeconfig/edge-control
+        - source: .forge/runtime/kubeconfig/site-us-east
           target: /kube
           readOnly: true
       env:
@@ -55,7 +55,7 @@ spec:
       restart: on-failure
 
     - name: grid-edge-us-east
-      image: "praxis-ai:hot-reload-grid-route"
+      image: "praxis-ai:glb-demo"
       autoStart: false
       network: environment
       dependsOn:
@@ -113,36 +113,59 @@ spec:
           condition: available
           timeout: "120s"
 
-    edge-demo:
-      description: Grid network and edge site for GLB control plane
+    swim-lb:
+      description: SWIM membership LoadBalancer Service for cross-cluster discovery
+      steps:
+        - type: manifest
+          path: resources/operator-swim-service.yaml
+        - type: capture
+          resource: svc/operator-swim-lb
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: swim-lb-ip
+          timeout: "60s"
+          interval: "2s"
+
+    site-us-east-demo:
+      description: Grid network, site, and SWIM seed wiring for GLB entry point
       steps:
         - type: template-manifest
-          path: resources/gridnetwork.yaml
+          path: resources/gridnetwork-site-us-east.yaml
+        - type: template-manifest
+          path: resources/operator-env-site-us-east.yaml
         - type: template-file
           source: configs/edge-us-east/praxis.yaml
           target: .forge/runtime/edge-us-east/praxis/praxis.yaml
         - type: manifest
-          path: resources/edge-site.yaml
+          path: resources/site-us-east.yaml
         - type: manifest
           path: policies/provider-access.yaml
         - type: manifest
           path: policies/external-auth-demo.yaml
 
-    provider-east-demo:
-      description: East provider site and inference provider registration
+    site-us-west-demo:
+      description: US-West site, inference provider, and SWIM seed wiring
       steps:
+        - type: template-manifest
+          path: resources/gridnetwork-site-us-west.yaml
+        - type: template-manifest
+          path: resources/operator-env-site-us-west.yaml
         - type: manifest
-          path: resources/provider-east-site.yaml
+          path: resources/site-us-west.yaml
         - type: manifest
-          path: resources/provider-east-inference.yaml
+          path: resources/site-us-west-inference.yaml
 
-    provider-west-demo:
-      description: West provider site and inference provider registration
+    site-us-central-demo:
+      description: US-Central site, inference provider, and SWIM seed wiring
       steps:
+        - type: template-manifest
+          path: resources/gridnetwork-site-us-central.yaml
+        - type: template-manifest
+          path: resources/operator-env-site-us-central.yaml
         - type: manifest
-          path: resources/provider-west-site.yaml
+          path: resources/site-us-central.yaml
         - type: manifest
-          path: resources/provider-west-inference.yaml
+          path: resources/site-us-central-inference.yaml
 
     inference-sim:
       description: Simulated inference backends with LoadBalancer exposure

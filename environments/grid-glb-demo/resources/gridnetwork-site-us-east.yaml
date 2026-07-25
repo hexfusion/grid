@@ -2,10 +2,16 @@ apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridNetwork
 metadata:
   name: glb-demo
+  labels:
+    grid.praxis-proxy.io/auto-discover-sites: "true"
 spec:
   gridId: ""
   region: us-east
   zone: us-east-1a
+
+  seeds:
+    - "{{ captures.site-us-west.swim-lb-ip }}:7946"
+    - "{{ captures.site-us-central.swim-lb-ip }}:7946"
 
   swim:
     probeInterval: "5s"
@@ -15,7 +21,7 @@ spec:
   gatewayRefs:
     - name: consumer-gateway
       namespace: grid-system
-      localSiteName: edge-control-site
+      localSiteName: site-us-east
       consumerConfig:
         enabled: true
         configMapName: praxis-consumer-config
@@ -23,12 +29,12 @@ spec:
         credentialMountBase: /run/secrets/grid-credentials
         tlsCertMountPath: /etc/praxis/tls
         clusterEndpoints:
-          - cluster: provider-east
-            address: "{{ captures.provider-east.provider-gateway-ip }}:8080"
+          - cluster: site-us-west
+            address: "{{ captures.site-us-west.provider-gateway-ip }}:8080"
             transport:
               mode: plaintext
-          - cluster: provider-west
-            address: "{{ captures.provider-west.provider-gateway-ip }}:8080"
+          - cluster: site-us-central
+            address: "{{ captures.site-us-central.provider-gateway-ip }}:8080"
             transport:
               mode: plaintext
 

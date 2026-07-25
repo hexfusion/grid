@@ -1,7 +1,7 @@
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: InferenceProvider
 metadata:
-  name: sim-provider-west
+  name: sim-provider-us-west
 spec:
   gridNetworkRef: glb-demo
   providerKind: simulator

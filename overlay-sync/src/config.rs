@@ -30,7 +30,7 @@ pub struct SyncConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SourceConfig {
-    /// Kubernetes context name (e.g. `kind-grid-glb-edge-control`).
+    /// Kubernetes context name (e.g. `kind-grid-glb-site-us-east`).
     pub context: String,
     /// Kubernetes namespace containing the [`ConfigMap`].
     ///

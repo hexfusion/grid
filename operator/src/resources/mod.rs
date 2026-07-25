@@ -1,5 +1,8 @@
 //! Kubernetes resource builders for the Grid Operator.
 
+/// Site-level geography and load-aware admission for routing overlays.
+pub(crate) mod geography;
+
 /// Operator-owned consumer Praxis config renderer.
 ///
 /// Generates the `praxis.yaml` content for consumer gateway `ConfigMap`s from

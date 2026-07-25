@@ -1,5 +1,5 @@
 source:
-  context: kind-grid-glb-edge-control
+  context: kind-grid-glb-site-us-east
   namespace: grid-system
   configMap: grid-overlay-glb-demo-consumer-gateway
   key: grid-config.json

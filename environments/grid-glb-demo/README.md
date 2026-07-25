@@ -2,9 +2,10 @@
 
 Multi-cluster Grid environment demonstrating external ingress and
 file-based Grid overlay hot-reload. Three Kind clusters simulate a
-realistic topology: one edge-control plane running Praxis AI as the
-external entry point, and two provider clusters hosting simulated
-inference backends exposed via MetalLB LoadBalancer Services.
+peer-site mesh topology. All three are equal peer sites — "edge" and
+"provider" are per-request roles, not permanent cluster types. In this
+demo flow, `site-us-east` acts as the edge entry point and
+`site-us-west` / `site-us-central` host simulated inference backends.
 
 ## Architecture
 
@@ -21,26 +22,37 @@ inference backends exposed via MetalLB LoadBalancer Services.
             +---------------+---------------+
             v                               v
    +--------------+                +--------------+
-   |provider-east |                |provider-west |
-   |  (Kind)      |                |  (Kind)      |
-   |  GridSite    |                |  GridSite    |
-   |  Operator    |                |  Operator    |
-   |  mock-provs  |                |  mock-provs  |
-   |  LB :8080    |                |  LB :8080    |
+   |site-us-west  |                |site-us-central|
+   |  (Kind)      |                |  (Kind)       |
+   |  GridSite    |                |  GridSite     |
+   |  Operator    |                |  Operator     |
+   |  mock-provs  |                |  mock-provs   |
+   |  LB :8080    |                |  LB :8080     |
+   |  SWIM :7946  |                |  SWIM :7946   |
    +--------------+                +--------------+
+         ^      SWIM/CRDT gossip          ^
+         +--------------------------------+
 ```
 
-Each provider cluster exposes its mock-inference backend through a
+Each provider-role site exposes its mock-inference backend through a
 MetalLB-backed LoadBalancer Service (`provider-gateway`) on port 8080.
-The edge-control cluster's GridNetwork references these LoadBalancer
+The `site-us-east` cluster's GridNetwork references these LoadBalancer
 IPs as `clusterEndpoints`, enabling the Grid overlay to route inference
 requests across the cross-cluster Docker network.
+
+All three sites run Grid operators with SWIM membership enabled. Each
+operator advertises via a MetalLB-backed LoadBalancer Service
+(`operator-swim-lb`) on UDP port 7946, and seeds are wired through
+per-site GridNetwork templates. Operators discover each other through
+SWIM, propagate provider state via CRDT, and the `site-us-east`
+operator renders a routing overlay ConfigMap with candidates from all
+three sites.
 
 Two host services complete the data path:
 
 - **grid-overlay-sync-us-east** watches the operator-generated routing
   overlay ConfigMap (`grid-overlay-glb-demo-consumer-gateway`) on
-  edge-control and writes its `grid-config.json` key to a
+  `site-us-east` and writes its `grid-config.json` key to a
   shared runtime directory (`.forge/runtime/edge-us-east/` when run
   from the repository root).
 - **grid-edge-us-east** runs Praxis AI with file-based Grid config,
@@ -66,15 +78,33 @@ Two host services complete the data path:
 
 ### Current Development Limits
 
-- The demo uses local development images:
-  - `grid-overlay-sync:latest`
-  - `praxis-ai:hot-reload-grid-route`
+- The demo uses local development images tagged `:glb-demo`:
+  - `grid-overlay-sync:glb-demo` (overlay ConfigMap poller)
+  - `praxis-ai:glb-demo` (edge gateway with hot-reload + session affinity)
+  - `grid-operator:glb-demo` (operator with overlay metadata emission)
+  - `grid-mock-providers:glb-demo` (simulated inference backends)
 - Transport between edge and providers is set to `plaintext` for
   initial development. Production requires `mutual_tls` with proper
   SNI and certificate references.
-- Geo/load-aware routing, session affinity, and semantic routing are
-  planned follow-up capabilities. This demo proves the external ingress
-  data path and hot-reload behavior, not those policy layers.
+- Session affinity is enabled (`X-Session-Id` header) with in-memory
+  bindings. This is single-process/demo scope only — bindings do not
+  survive restarts or distribute across replicas. The current verifier
+  validates that the configuration loads; provider-attributed stickiness
+  proof requires backend attribution in responses or logs.
+- The operator renderer emits overlay metadata (`stable_id`,
+  `admission_state`, `selection_tier`, `rank`, `generated_at`) when it
+  has provider candidates. SWIM seed wiring is deterministic: each
+  site's GridNetwork seeds reference the other two sites' SWIM LB IPs,
+  and operators discover each other through SWIM/CRDT gossip.
+- `GRID_GATEWAY_ADDRESS` is not yet wired. The provider gateway IP is
+  captured by Forge after operator startup, so setting it requires
+  either operator self-discovery of its Service IP or an additional
+  stack pass. Overlay candidates still appear without it — the gateway
+  address enriches candidates but is not required for discovery.
+- Geo/load-aware ordering is implemented in the overlay renderer.
+  Semantic routing remains a planned follow-up capability. This demo
+  proves the external ingress data path, SWIM cross-cluster discovery,
+  hot-reload behavior, and edge process stability.
 
 ## Prerequisites
 
@@ -97,39 +127,42 @@ praxis-forge config validate --config environments/grid-glb-demo/forge.yaml
 praxis-forge up --config environments/grid-glb-demo/forge.yaml
 ```
 
-This creates three Kind clusters (`edge-control`, `provider-east`,
-`provider-west`) with a shared Docker network (`grid-glb-demo-net`).
+This creates three Kind clusters (`site-us-east`, `site-us-west`,
+`site-us-central`) with a shared Docker network (`grid-glb-demo-net`).
 The host edge services are marked `autoStart: false`, so `up` creates
 the clusters, networking, stacks, and runtime files without starting
 the local edge containers.
 
-### 3. Apply provider stacks
+### 3. Apply stacks (Pass 1 — infrastructure + SWIM LB capture)
 
-Apply stacks to provider clusters first. The `inference-sim` stack
-waits for the `provider-gateway` LoadBalancer Service to receive an IP,
-then captures it into Forge state automatically:
-
-```console
-praxis-forge stack apply provider-east --config environments/grid-glb-demo/forge.yaml
-praxis-forge stack apply provider-west --config environments/grid-glb-demo/forge.yaml
-```
-
-This installs Gateway API CRDs, MetalLB, the Grid operator, provider
-Grid CRDs, mock-inference Deployments, and the `provider-gateway`
-LoadBalancer Service on each provider cluster. The captured IPs are
-stored in `.forge/state.json` for use by downstream stacks.
-
-### 4. Apply edge-control stacks
+Apply all stacks. The `swim-lb` stack on each cluster creates a SWIM
+LoadBalancer Service and captures its MetalLB-assigned IP. The
+`inference-sim` stack captures provider gateway IPs. Per-site
+`template-manifest` steps for GridNetwork and operator env patches will
+fail on this pass because cross-cluster captures are not yet available —
+this is expected.
 
 ```console
-praxis-forge stack apply edge-control --config environments/grid-glb-demo/forge.yaml
+praxis-forge stack apply --config environments/grid-glb-demo/forge.yaml
 ```
 
-The `edge-demo` stack uses `template-manifest` to render
-`gridnetwork.yaml` with the captured provider gateway IPs. It also
-renders the edge Praxis config to
-`.forge/runtime/edge-us-east/praxis/praxis.yaml`. No manual YAML
-editing is required.
+### 4. Re-apply site-demo stacks (Pass 2 — seed wiring)
+
+With all SWIM LB IPs and provider gateway IPs captured in
+`.forge/state.json`, re-apply the site-demo stacks. Templates now
+resolve all cross-cluster capture references:
+
+```console
+praxis-forge stack apply site-us-east --config environments/grid-glb-demo/forge.yaml
+praxis-forge stack apply site-us-west --config environments/grid-glb-demo/forge.yaml
+praxis-forge stack apply site-us-central --config environments/grid-glb-demo/forge.yaml
+```
+
+Each site-demo stack renders a per-site GridNetwork with SWIM seeds
+pointing to the other two sites, and patches the operator Deployment
+with the correct `GRID_SWIM_ADVERTISE_ADDR` (LB IP, not Pod IP) and
+`GRID_SWIM_SITE_NAME`. The `site-us-east-demo` stack also renders the
+edge Praxis config with captured provider gateway IPs.
 
 ### 5. Verify cluster status
 
@@ -156,8 +189,10 @@ Both should return `ok` from the mock-inference health endpoint.
 Build the local images and start the two host services:
 
 ```console
-make overlay-sync-image
-# Build praxis-ai:hot-reload-grid-route from the AI hot-reload branch.
+make overlay-sync-image operator-image
+docker tag grid-overlay-sync:latest grid-overlay-sync:glb-demo
+docker tag grid-operator:latest grid-operator:glb-demo
+# Build praxis-ai:glb-demo from the AI hot-reload branch (ai/ repo).
 ```
 
 ```console
@@ -180,6 +215,20 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d @environments/grid-glb-demo/fixtures/requests/shared-model.json
 ```
 
+To exercise the session-affinity path, include the `X-Session-Id`
+header. Repeated requests with the same session ID should keep the same
+binding while the selected provider remains eligible. The mock response
+does not currently include provider attribution, so use edge logs or the
+automated verifier once attribution support is added to prove stickiness.
+
+```console
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Session-Id: demo-session-1" \
+  -H "X-Model: llama-3.1-8b" \
+  -d '{"model":"llama-3.1-8b","messages":[{"role":"user","content":"hello"}]}'
+```
+
 ### Shared Runtime Layout
 
 Both host services share a runtime directory on the Docker host:
@@ -190,7 +239,7 @@ Both host services share a runtime directory on the Docker host:
   praxis/praxis.yaml  # rendered by Forge from captured provider IPs
   tls/                # reserved for future mTLS certificates
 
-.forge/runtime/kubeconfig/edge-control/
+.forge/runtime/kubeconfig/site-us-east/
   config              # rewritten kubeconfig mounted into overlay-sync
 ```
 

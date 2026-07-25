@@ -15,11 +15,11 @@ data:
       "description": "Demo auth bypass - no real credentials required for simulator backends",
       "providers": [
         {
-          "name": "sim-provider-east",
+          "name": "sim-provider-us-west",
           "auth": {"strategy": "none"}
         },
         {
-          "name": "sim-provider-west",
+          "name": "sim-provider-us-central",
           "auth": {"strategy": "none"}
         }
       ]

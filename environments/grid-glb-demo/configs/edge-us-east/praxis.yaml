@@ -16,14 +16,18 @@ filter_chains:
         reload:
           enabled: true
           debounce_ms: 500
+        session_affinity:
+          enabled: true
+          header: X-Session-Id
+          ttl_secs: 3600
       - filter: load_balancer
         clusters:
-          - name: provider-east
+          - name: site-us-west
             endpoints:
-              - "{{ captures.provider-east.provider-gateway-ip }}:8080"
-          - name: provider-west
+              - "{{ captures.site-us-west.provider-gateway-ip }}:8080"
+          - name: site-us-central
             endpoints:
-              - "{{ captures.provider-west.provider-gateway-ip }}:8080"
+              - "{{ captures.site-us-central.provider-gateway-ip }}:8080"
 
 admin:
   address: "127.0.0.1:9901"

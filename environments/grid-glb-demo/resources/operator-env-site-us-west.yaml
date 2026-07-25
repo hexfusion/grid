@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grid-operator
+  namespace: grid-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: operator
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: GRID_SWIM_BIND_ADDR
+              value: "0.0.0.0:7946"
+            - name: GRID_SWIM_ADVERTISE_ADDR
+              value: "{{ captures.site-us-west.swim-lb-ip }}:7946"
+            - name: GRID_SWIM_SITE_NAME
+              value: "site-us-west"
+            - name: GRID_SWIM_SEEDS
+              value: ""
+            - name: GRID_GATEWAY_ADDRESS
+              value: ""
+            - name: RUST_LOG
+              value: "info"

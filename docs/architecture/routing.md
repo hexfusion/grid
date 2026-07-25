@@ -87,6 +87,23 @@ Candidate fields:
 | `cluster` | Praxis load-balancer cluster identity used for upstream routing. |
 | `fresh` | Whether provider status is considered fresh enough for normal routing. |
 | `credential` | Optional. Secret reference for upstream authentication. Present only for `api_provider` or authenticated `cloud_managed` candidates. **Never contains the token value** — only the Kubernetes Secret locating information. |
+| `stable_id` | Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. Suitable for consumer-side session binding keys. |
+| `admission_state` | Optional. Bounded admission state: `"new_and_existing"`, `"existing_only"`, or `"none"` (excluded). Derived from provider health and capacity metrics. |
+| `selection_tier` | Optional. Locality tier between consumer gateway and provider: `"same_site"`, `"same_zone"`, `"same_region"`, `"cross_region"`, or `"unknown"`. Derived from `GridSite` region and zone. |
+| `rank` | Optional. Zero-based position in the final sorted overlay. |
+
+Overlay-level fields:
+
+| Field | Meaning |
+|-------|---------|
+| `generated_at` | Optional. RFC 3339 timestamp of when the overlay was rendered. |
+
+The metadata fields above belong to the Grid overlay contract. The generated
+Praxis static `grid_route` configuration intentionally strips
+`stable_id`, `admission_state`, `selection_tier`, `rank`, and `generated_at`
+because current static `grid_route` candidate config rejects unknown fields.
+Praxis overlay-file hot reload consumes the raw Grid overlay and must remain
+forward-compatible with unknown overlay metadata fields.
 
 ### Credential field security contract
 
@@ -112,9 +129,67 @@ but runtime deployments must use a Praxis AI image that includes the filter.
 
 ## Candidate scoring and ordering
 
-The operator orders candidates before writing the overlay. It uses
-`scoring::score_backends` with provider configuration, optional live metrics,
-and optional CRDT-propagated provider metrics.
+The operator orders candidates before writing the overlay. Ordering proceeds
+in two phases:
+
+1. **Scoring.** Each provider is scored by `scoring::score_backends` using
+   provider configuration, optional live metrics, and optional
+   CRDT-propagated provider metrics. Providers with no live metrics use
+   neutral metric scores.
+
+2. **Enrichment and ordering.** Each candidate is enriched with admission
+   state, locality tier, stable ID, and rank. Candidates whose admission
+   state is `"none"` (unhealthy) are removed. Remaining candidates are
+   sorted by:
+   - Admission state: `new_and_existing` before `existing_only`.
+   - Locality tier: `same_site` < `same_zone` < `same_region` < `cross_region` < `unknown`.
+   - Score (descending): within the same admission and locality class, higher-scoring candidates first.
+   - Freshness: `fresh=true` before `fresh=false`.
+   - Alphabetical tiebreak: `(site, name, cluster)`.
+
+   After deduplication, each candidate receives a zero-based `rank`.
+
+This ordering ensures that a healthy cross-region provider (`new_and_existing`)
+always ranks before an overloaded same-region provider (`existing_only`).
+Admission state takes priority over locality so that capacity pressure triggers
+fallback to more distant but available providers.
+
+The enrichment and ordering phase runs after existing hard constraints (auth,
+capability, access policy, freshness, phase filters). It does not override
+data-residency or sovereignty constraints; those must be enforced separately
+before candidates reach the ordering phase.
+
+### Admission state derivation
+
+Admission state is threshold-based from current metrics only:
+
+| Condition | State |
+|-----------|-------|
+| No metrics available | `new_and_existing` |
+| `healthy = false` | `none` (excluded from overlay) |
+| `queue_depth > 0.85` or `kv_cache_utilization > 0.90` | `existing_only` |
+| Otherwise | `new_and_existing` |
+
+Hysteresis, hold-down timers, CAS, and shared active-active admission state
+are future work. The current implementation is a snapshot of the last observed
+metrics at reconcile time.
+
+### Locality tier derivation
+
+Locality tier is derived from `GridSite.spec.region` and `GridSite.spec.zone`:
+
+| Condition | Tier |
+|-----------|------|
+| Consumer and provider are the same named site | `same_site` |
+| Same region **and** same zone | `same_zone` |
+| Same region, different zone | `same_region` |
+| Different regions | `cross_region` |
+| Either site has no region | `unknown` |
+
+Zone comparison requires a region match because zone names are not globally
+unique.  When no `GridSite` geography is configured, all candidates receive
+`unknown` tier and ordering falls through to score-based ranking — preserving
+backward compatibility with deployments that predate geography fields.
 
 `Unavailable` providers are excluded. `Degraded` providers remain in the
 overlay with `fresh: false`. Providers with no live metrics use neutral metric

@@ -1,7 +1,7 @@
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridSite
 metadata:
-  name: provider-east-site
+  name: site-us-east
 spec:
   gridNetworkRef: glb-demo
   region: us-east

@@ -193,6 +193,12 @@ The following reflects the current state of relevant components:
 - **Grid deployment package**: The `/deploy` directory provides CRDs, operator
   manifests, and RBAC configuration.
 
+- **SWIM cross-cluster discovery**: The GLB demo wires deterministic SWIM
+  seeds through MetalLB-backed LoadBalancer Services (UDP 7946) captured by
+  Forge. Per-site GridNetwork templates reference captured SWIM LB IPs as
+  seeds, enabling operators to discover each other and propagate provider
+  state via CRDT without hard-coded Pod IPs.
+
 - **Forge**: The initial CLI crate supports `doctor`, `plan`, `config`,
   cluster lifecycle (`up`/`down`/`status`/`cluster` subcommands), persistent
   state with locking, Docker/Podman runtime detection, and ownership-safe
@@ -219,13 +225,11 @@ development environment. It is explicitly not a production GLB deployment.
 
 ### Components
 
-- **Provider clusters**: Two KIND clusters (e.g. `provider-east`,
-  `provider-west`) on a Forge-managed container network, each running Grid
-  operator, CRDs, inference simulators, and a Praxis provider gateway.
-
-- **Edge control cluster**: A KIND cluster providing the Grid control-plane
-  companion for the edge (operator, CRDs, overlay rendering). The Praxis edge
-  process itself remains a standalone container.
+- **Site clusters**: Three KIND clusters (e.g. `site-us-east`,
+  `site-us-west`, `site-us-central`) on a Forge-managed container network,
+  each running Grid operator, CRDs, and site-local resources. Any site can
+  act as edge or provider for a given request flow. Two sites run inference
+  simulators and a provider gateway; one hosts the Praxis edge process.
 
 - **Praxis AI edge container**: A standalone container connected to the Forge
   network, bound to `127.0.0.1` on the host for the POC. Configured with a
@@ -362,12 +366,21 @@ then orders provider candidates for that edge's perspective, considering
 policy eligibility, provider health and capacity, location affinity, cost, and
 deterministic tie-breaking.
 
-Per-edge location scoring — where Grid derives site distance from the edge's
-`GridSite` region and the provider's `GridSite` region — is not yet
-implemented.  Current scoring uses `backendKind` locality, which describes
-the provider relative to the declaring operator, not relative to an external
-edge.  A scoring correction is required before location affinity is accurate
-for external edge deployments.
+Per-edge location scoring is implemented via site-level geography comparison.
+The operator derives a locality tier (`same_site`, `same_zone`, `same_region`,
+`cross_region`, `unknown`) by comparing the consumer gateway's `GridSite`
+region and zone against each provider's `GridSite` region and zone.  This
+locality tier, together with threshold-based admission state, drives the
+candidate ordering in the overlay.  See [Routing — Candidate scoring and
+ordering](routing.md#candidate-scoring-and-ordering) for the full ordering
+contract.
+
+The `backendKind`-based locality score still contributes to the scoring
+signal within each locality tier, but the primary ordering dimension is now
+the geography-derived tier.
+
+Hysteresis, session binding, semantic routing, and shared active-active
+admission state remain future work.
 
 Location is an affinity, not a hard pin. A healthy cross-region provider must
 be preferred over an unavailable same-region provider.

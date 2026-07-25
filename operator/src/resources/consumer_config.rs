@@ -500,7 +500,10 @@ mod tests {
     use super::*;
     use crate::{
         crd::grid_network::EndpointTransport,
-        resources::routing_overlay::{ProjectedCredential, ProjectedCredentialRef, RoutingCandidate},
+        resources::{
+            geography::{AdmissionState, LocalityTier},
+            routing_overlay::{ProjectedCredential, ProjectedCredentialRef, RoutingCandidate},
+        },
     };
 
     // -----------------------------------------------------------------------
@@ -515,6 +518,10 @@ mod tests {
             cluster: cluster.to_owned(),
             fresh,
             credential: None,
+            stable_id: None,
+            admission_state: None,
+            selection_tier: None,
+            rank: None,
         }
     }
 
@@ -541,6 +548,10 @@ mod tests {
                     key: secret_key.to_owned(),
                 },
             }),
+            stable_id: None,
+            admission_state: None,
+            selection_tier: None,
+            rank: None,
         }
     }
 
@@ -549,6 +560,7 @@ mod tests {
             network: "test-net".to_owned(),
             local_site: "site-a".to_owned(),
             candidates,
+            generated_at: None,
         }
     }
 
@@ -604,6 +616,34 @@ mod tests {
         );
         assert!(yaml.contains("model-a"), "candidate name must appear");
         assert!(yaml.contains("gateway-site-a"), "cluster must appear in load_balancer");
+    }
+
+    #[test]
+    fn generated_praxis_yaml_omits_operator_overlay_metadata() {
+        let mut candidate = plain_candidate("inference_model", "model-a", "site-a", "gateway-site-a", true);
+        candidate.stable_id = Some("abcd1234".to_owned());
+        candidate.admission_state = Some(AdmissionState::NewAndExisting);
+        candidate.selection_tier = Some(LocalityTier::SameSite);
+        candidate.rank = Some(0);
+
+        let mut overlay = simple_overlay(vec![candidate]);
+        overlay.generated_at = Some("2026-07-24T12:00:00Z".to_owned());
+
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
+
+        for forbidden in ["stable_id", "admission_state", "selection_tier", "rank", "generated_at"] {
+            assert!(
+                !yaml.contains(forbidden),
+                "operator-only metadata field {forbidden} must not enter generated Praxis YAML"
+            );
+        }
     }
 
     #[test]
@@ -884,6 +924,7 @@ mod tests {
             network: "n".to_owned(),
             local_site: String::new(),
             candidates: vec![],
+            generated_at: None,
         };
         assert!(
             generate_consumer_praxis_config(

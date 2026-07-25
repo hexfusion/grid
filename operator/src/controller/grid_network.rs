@@ -333,6 +333,15 @@ async fn apply_configured_swim_key(
 
 /// Return a monotonic-ish revision for public-cert metadata broadcasts.
 ///
+/// Current UTC time as an RFC 3339 string.
+///
+/// Returns `None` on format failure rather than panicking.
+fn rfc3339_now() -> Option<String> {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
 /// Cert rotation updates the Kubernetes Secret, not necessarily the `GridNetwork`
 /// generation.  Use wall-clock nanoseconds so a reconcile after rotation is not
 /// suppressed as a duplicate metadata broadcast.
@@ -680,6 +689,7 @@ async fn reconcile_routing_overlay_inner(
             );
         }
 
+        let timestamp = rfc3339_now();
         let overlay = routing_overlay::render_routing_overlay(
             network,
             &sites,
@@ -687,6 +697,7 @@ async fn reconcile_routing_overlay_inner(
             &eligible_remote_owned,
             local_site,
             metrics_arg,
+            timestamp.as_deref(),
         )
         .map_err(OperatorError::OverlayRender)?;
         // Praxis grid_route rejects an empty candidates list at config load

@@ -74,7 +74,10 @@ fn candidate_to_value(c: &RoutingCandidate) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::routing_overlay::{RoutingCandidate, RoutingOverlay};
+    use crate::resources::{
+        geography::{AdmissionState, LocalityTier},
+        routing_overlay::{RoutingCandidate, RoutingOverlay},
+    };
 
     fn make_overlay(candidates: Vec<(&str, &str, &str)>) -> RoutingOverlay {
         RoutingOverlay {
@@ -89,8 +92,13 @@ mod tests {
                     cluster: cluster.to_owned(),
                     fresh: true,
                     credential: None,
+                    stable_id: None,
+                    admission_state: None,
+                    selection_tier: None,
+                    rank: None,
                 })
                 .collect(),
+            generated_at: None,
         }
     }
 
@@ -144,6 +152,35 @@ mod tests {
         assert_eq!(c.get("site").and_then(serde_json::Value::as_str), Some("site-a"));
         assert_eq!(c.get("cluster").and_then(serde_json::Value::as_str), Some("prov-a"));
         assert_eq!(c.get("fresh").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn overlay_metadata_is_not_emitted_in_grid_route_filter_value() {
+        let mut overlay = make_overlay(vec![("granite-3.3-8b", "site-a", "prov-a")]);
+        overlay.generated_at = Some("2026-07-24T12:00:00Z".to_owned());
+        let candidate = overlay.candidates.first_mut().unwrap_or_else(|| std::process::abort());
+        candidate.stable_id = Some("abcd1234".to_owned());
+        candidate.admission_state = Some(AdmissionState::NewAndExisting);
+        candidate.selection_tier = Some(LocalityTier::SameSite);
+        candidate.rank = Some(0);
+
+        let value = to_grid_route_value(&overlay, "X-Model");
+        assert!(
+            value.get("generated_at").is_none(),
+            "operator overlay timestamp must not enter static grid_route filter config"
+        );
+        let candidate = value
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        for key in ["stable_id", "admission_state", "selection_tier", "rank"] {
+            assert!(
+                !candidate.contains_key(key),
+                "operator-only metadata field {key} must not enter static grid_route filter config"
+            );
+        }
     }
 
     #[test]
