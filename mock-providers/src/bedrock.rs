@@ -9,22 +9,24 @@ use axum::{
     Router,
     body::Body,
     http::{Request, Response, StatusCode, header},
+    middleware::from_fn_with_state,
     routing::{get, post},
 };
 use serde_json::{Value, json};
 
-use crate::common;
+use crate::{AppState, common};
 
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the `Bedrock` mock router.
-pub fn router() -> Router {
+/// Build the `Bedrock` mock router with provider attribution.
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/model/{model_id}/converse", post(converse))
         .route("/model/{model_id}/converse-stream", post(converse_stream))
         .route("/health", get(common::health_ok))
+        .layer(from_fn_with_state(state, common::inject_provider_header))
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +157,8 @@ fn write_binary_event(buf: &mut Vec<u8>, payload: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::body::to_bytes;
 
     use super::*;
@@ -163,14 +167,23 @@ mod tests {
     // Test Utilities
     // -----------------------------------------------------------------------
 
+    /// Build a test `AppState` with a known provider site.
+    fn test_state() -> AppState {
+        AppState {
+            provider_site: Arc::from("test-site"),
+        }
+    }
+
     /// Send a request to the router and return the response.
     async fn send(req: Request<Body>) -> Response<Body> {
-        tower::ServiceExt::oneshot(router(), req).await.unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap_or_default()
-        })
+        tower::ServiceExt::oneshot(router(test_state()), req)
+            .await
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap_or_default()
+            })
     }
 
     fn sigv4_header() -> (http::HeaderName, &'static str) {

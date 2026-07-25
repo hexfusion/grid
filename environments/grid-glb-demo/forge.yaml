@@ -172,7 +172,7 @@ spec:
     inference-sim:
       description: Simulated inference backends with LoadBalancer exposure
       steps:
-        - type: manifest
+        - type: template-manifest
           path: resources/provider-workloads.yaml
         - type: manifest
           path: resources/provider-gateway.yaml

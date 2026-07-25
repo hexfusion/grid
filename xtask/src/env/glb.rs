@@ -1,17 +1,24 @@
 //! GLB ingress hot-reload verifier.
 //!
-//! Runs prerequisite checks then a structured 19-step verification
-//! representing the full GLB hot-reload proof.  Steps 1-4 validate
-//! prerequisite infrastructure.  Steps 5-10 verify SWIM cross-cluster
-//! discovery (LB services, advertise addresses, seeds, overlay
-//! metadata, gateway address advertisement, remote egress addresses).
+//! Runs prerequisite checks then a structured 23-step verification
+//! representing the full GLB proof.  Steps 1-4 validate prerequisite
+//! infrastructure.  Steps 5-10 verify SWIM cross-cluster discovery
+//! (LB services, advertise addresses, seeds, overlay metadata,
+//! gateway address advertisement, remote egress addresses).
 //! Steps 11-12 check site stacks and edge config.  Steps 13-14
 //! verify Forge-managed services are running.  Step 15 proves initial
-//! inference routing.  Steps 16-19 exercise the overlay hot-reload
-//! path: modify the overlay file, observe the reload, verify routing
-//! still works, and confirm the edge container was never restarted.
+//! inference routing.  Steps 16-19 prove session affinity: binding,
+//! reuse, drain setup, and drain verification.  Steps 20-23 exercise
+//! overlay hot-reload: modify the overlay, observe the reload, verify
+//! routing, and confirm edge container stability.
 
-use std::{path::Path, process::Command, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::Duration,
+};
 
 use crate::env::{StepResult, StepStatus, print_validate_all_table, safe_truncate_str, verify};
 
@@ -38,7 +45,7 @@ const CLUSTER_NAMES: &[&str] = &["site-us-east", "site-us-west", "site-us-centra
 const REQUIRED_TOOLS: &[&str] = &["kind", "kubectl", "curl", "docker"];
 
 /// Total number of verification steps.
-const TOTAL_STEPS: u32 = 19;
+const TOTAL_STEPS: u32 = 23;
 
 /// Provider-role clusters that advertise a gateway address.
 const PROVIDER_CLUSTERS: &[&str] = &["site-us-west", "site-us-central"];
@@ -75,7 +82,7 @@ const EDGE_CONTAINER: &str = "grid-glb-demo-grid-edge-us-east";
 /// Verify GLB ingress hot-reload readiness.
 ///
 /// Checks prerequisites (config, tools, forge binary, placeholder
-/// images), then runs a 19-step structured verification.  Exits
+/// images), then runs a 23-step structured verification.  Exits
 /// non-zero if any step is `FAIL` or `BLOCKED`.
 ///
 /// # Errors
@@ -116,11 +123,11 @@ pub(crate) fn verify_glb_ingress(forge_config: &Path) -> Result<(), Box<dyn std:
 #[derive(Debug)]
 struct PrereqContext {
     /// Path to the forge config file.
-    config: std::path::PathBuf,
+    config: PathBuf,
     /// Resolved forge binary path.
     forge_bin: String,
     /// Overlay file path (for hot-reload testing).
-    overlay_path: std::path::PathBuf,
+    overlay_path: PathBuf,
     /// Services blocked by placeholder images (warning only).
     placeholders: Vec<(String, String)>,
 }
@@ -147,7 +154,7 @@ fn check_prerequisites(forge_config: &Path) -> Result<PrereqContext, Box<dyn std
     Ok(PrereqContext {
         config: forge_config.to_path_buf(),
         forge_bin,
-        overlay_path: std::path::PathBuf::from(OVERLAY_FILE),
+        overlay_path: PathBuf::from(OVERLAY_FILE),
         placeholders,
     })
 }
@@ -268,7 +275,7 @@ fn parse_edge_host_port(config_text: &str, service_name: &str) -> Option<u16> {
 // Verification steps
 // ---------------------------------------------------------------------------
 
-/// Run all 19 verification steps.
+/// Run all 23 verification steps.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
@@ -410,10 +417,66 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         return;
     }
 
+    // Step 16: Session affinity — initial bind.
+    step_banner(16, "session affinity bind");
+    let provider_a = match check_session_bind(EDGE_PORT) {
+        Ok((evidence, provider)) => {
+            results.push(StepResult::pass("session affinity bind", evidence));
+            provider
+        },
+        Err(e) => {
+            results.push(StepResult::fail("session affinity bind", e.as_ref()));
+            block_remaining(17, "session bind failed", results);
+            return;
+        },
+    };
+
+    // Step 17: Session affinity — reuse.
+    step_banner(17, "session affinity reuse");
+    let reuse_ok = record_step("session affinity reuse", results, || {
+        check_session_reuse(EDGE_PORT, &provider_a)
+    });
+    if !reuse_ok {
+        block_remaining(18, "session reuse failed", results);
+        return;
+    }
+
+    // Step 18: Session drain — set candidate to existing_only.
+    step_banner(18, "session drain setup");
+    let drain_original = match setup_session_drain(&ctx.overlay_path, &provider_a) {
+        Ok((evidence, original)) => {
+            results.push(StepResult::pass("session drain setup", evidence));
+            Some(original)
+        },
+        Err(e) => {
+            results.push(StepResult::fail("session drain setup", e.as_ref()));
+            block_remaining(19, "drain setup failed", results);
+            return;
+        },
+    };
+
+    // Step 19: Session drain — verify routing.
+    step_banner(19, "session drain verified");
+    record_step("session drain verified", results, || {
+        check_session_drain(EDGE_PORT, &provider_a)
+    });
+
+    // Restore overlay after drain test.
+    if let Some(original) = &drain_original {
+        restore_overlay(&ctx.overlay_path, original);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
+        )]
+        {
+            thread::sleep(HOT_RELOAD_WAIT);
+        }
+    }
+
     let reload_count_before = count_overlay_reload_logs(EDGE_CONTAINER).unwrap_or(0);
 
-    // Step 16: Modify overlay (remove one provider).
-    step_banner(16, "modifying overlay for hot-reload test");
+    // Step 20: Modify overlay (remove one provider).
+    step_banner(20, "modifying overlay for hot-reload test");
     let original_overlay = match modify_overlay_for_test(&ctx.overlay_path) {
         Ok((evidence, original)) => {
             results.push(StepResult::pass("overlay modified", evidence));
@@ -421,13 +484,13 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         },
         Err(e) => {
             results.push(StepResult::fail("overlay modified", e.as_ref()));
-            block_remaining(17, "overlay modification failed", results);
+            block_remaining(21, "overlay modification failed", results);
             return;
         },
     };
 
-    // Step 17: Hot-reload observed.
-    step_banner(17, "checking hot-reload");
+    // Step 21: Hot-reload observed.
+    step_banner(21, "checking hot-reload");
     #[expect(
         clippy::disallowed_methods,
         reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
@@ -439,17 +502,17 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         check_hot_reload_observed(EDGE_CONTAINER, reload_count_before)
     });
 
-    // Step 18: Routing after reload.
-    step_banner(18, "sending post-reload inference request");
+    // Step 22: Routing after reload.
+    step_banner(22, "sending post-reload inference request");
     record_step("routing after reload", results, check_inference_routed);
 
-    // Restore overlay before step 19.
+    // Restore overlay before step 23.
     if let Some(original) = &original_overlay {
         restore_overlay(&ctx.overlay_path, original);
     }
 
-    // Step 19: Edge container stable (same ID, no restart).
-    step_banner(19, "checking edge container stability");
+    // Step 23: Edge container stable (same ID, no restart).
+    step_banner(23, "checking edge container stability");
     record_step("edge container stable", results, || {
         check_container_stable(EDGE_CONTAINER, edge_identity.as_ref())
     });
@@ -478,7 +541,7 @@ fn record_step(
     }
 }
 
-/// Labels for all 17 steps, indexed from 0.
+/// Labels for all 23 steps, indexed from 0.
 const STEP_LABELS: &[&str] = &[
     "prerequisites",
     "forge status",
@@ -495,6 +558,10 @@ const STEP_LABELS: &[&str] = &[
     "overlay-sync running",
     "edge service running",
     "inference routed",
+    "session affinity bind",
+    "session affinity reuse",
+    "session drain setup",
+    "session drain verified",
     "overlay modified",
     "hot-reload observed",
     "routing after reload",
@@ -780,7 +847,7 @@ fn validate_overlay_json(json: &str) -> Result<String, Box<dyn std::error::Error
 
 /// Step 9: `GRID_GATEWAY_ADDRESS` set on provider-role operators.
 fn check_provider_gateway_addr(
-    expected_addrs: &std::collections::BTreeMap<String, String>,
+    expected_addrs: &BTreeMap<String, String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut verified = Vec::new();
     for cluster in PROVIDER_CLUSTERS {
@@ -835,7 +902,7 @@ fn verify_expected_gateway_addr(
 ///
 /// [`GridSite`]: crate
 fn check_remote_gridsite_egress(
-    expected_addrs: &std::collections::BTreeMap<String, String>,
+    expected_addrs: &BTreeMap<String, String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context("site-us-east");
     let output = Command::new("kubectl")
@@ -863,7 +930,7 @@ fn check_remote_gridsite_egress(
 /// [`GridSite`]: crate
 fn parse_gridsite_egress(
     json: &str,
-    expected_addrs: &std::collections::BTreeMap<String, String>,
+    expected_addrs: &BTreeMap<String, String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let doc: serde_json::Value = serde_json::from_str(json)?;
     let items = doc
@@ -908,22 +975,20 @@ fn find_gridsite_egress<'a>(
 }
 
 /// Load expected provider gateway addresses from Forge's default state file.
-fn load_provider_gateway_addresses() -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn load_provider_gateway_addresses() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let state = std::fs::read_to_string(".forge/state.json")?;
     parse_provider_gateway_captures(&state)
 }
 
 /// Parse provider gateway captures from Forge state JSON.
-fn parse_provider_gateway_captures(
-    json: &str,
-) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn parse_provider_gateway_captures(json: &str) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let doc: serde_json::Value = serde_json::from_str(json)?;
     let captures = doc
         .get("captures")
         .and_then(serde_json::Value::as_object)
         .ok_or("Forge state missing captures")?;
 
-    let mut addrs = std::collections::BTreeMap::new();
+    let mut addrs = BTreeMap::new();
     for cluster in PROVIDER_CLUSTERS {
         let ip = captures
             .get(*cluster)
@@ -1015,7 +1080,7 @@ fn extract_service_identity(status_json: &serde_json::Value, service_name: &str)
     Some(ServiceIdentity { id, restart_count })
 }
 
-/// Step 9/12: Send an inference request and verify 200 OK.
+/// Step 15/22: Send an inference request and verify 200 OK.
 fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
     let resp = curl_post_with_auth(EDGE_PORT)?;
     if resp.status != 200 {
@@ -1030,11 +1095,82 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-/// Step 10: Modify the overlay file for hot-reload testing.
+/// Step 16: Bind a session and record which provider served it.
+fn check_session_bind(port: u16) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let resp = curl_edge_request(port, Some("glb-proof-a"))?;
+    if resp.status != 200 {
+        return Err(format!("session bind returned HTTP {}", resp.status).into());
+    }
+    let provider = extract_provider(&resp)?;
+    Ok((format!("session=glb-proof-a bound to {provider}"), provider))
+}
+
+/// Step 17: Verify the same session reuses the same provider.
+fn check_session_reuse(port: u16, expected_provider: &str) -> Result<String, Box<dyn std::error::Error>> {
+    for i in 0..2 {
+        let resp = curl_edge_request(port, Some("glb-proof-a"))?;
+        if resp.status != 200 {
+            return Err(format!("reuse request {i} returned HTTP {}", resp.status).into());
+        }
+        let provider = extract_provider(&resp)?;
+        if provider != expected_provider {
+            return Err(format!("session drift: expected {expected_provider}, got {provider}").into());
+        }
+    }
+    Ok(format!(
+        "session=glb-proof-a stable across 3 requests, provider={expected_provider}"
+    ))
+}
+
+/// Step 18: Drain a provider via `existing_only` and wait for reload.
+fn setup_session_drain(
+    overlay_path: &Path,
+    provider_site: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let reload_before = count_overlay_reload_logs(EDGE_CONTAINER).unwrap_or(0);
+    let (evidence, original) = modify_overlay_drain(overlay_path, provider_site)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
+    )]
+    {
+        thread::sleep(HOT_RELOAD_WAIT);
+    }
+    match check_hot_reload_observed(EDGE_CONTAINER, reload_before) {
+        Ok(reload_evidence) => Ok((format!("{evidence}; {reload_evidence}"), original)),
+        Err(e) => {
+            restore_overlay(overlay_path, &original);
+            Err(e)
+        },
+    }
+}
+
+/// Step 19: Verify drain routing — new session avoids drained, old retains.
+fn check_session_drain(port: u16, drained_provider: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let new_resp = curl_edge_request(port, Some("glb-proof-c"))?;
+    if new_resp.status != 200 {
+        return Err(format!("drain new-session returned HTTP {}", new_resp.status).into());
+    }
+    let new_provider = extract_provider(&new_resp)?;
+    if new_provider == drained_provider {
+        return Err(format!("new session routed to drained provider {drained_provider}").into());
+    }
+    let old_resp = curl_edge_request(port, Some("glb-proof-a"))?;
+    if old_resp.status != 200 {
+        return Err(format!("drain old-session returned HTTP {}", old_resp.status).into());
+    }
+    let old_provider = extract_provider(&old_resp)?;
+    if old_provider != drained_provider {
+        return Err(format!("existing session lost binding: expected {drained_provider}, got {old_provider}").into());
+    }
+    Ok(format!("new session={new_provider}, bound session={old_provider}"))
+}
+
+/// Step 20: Modify the overlay file for hot-reload testing.
 ///
-/// Reads the current overlay, removes one candidate, writes the
-/// modified version back.  Returns the evidence string and the
-/// original content for later restoration.
+/// Reads the current overlay, removes one candidate, and writes the
+/// modified version back. Returns the evidence string and the original
+/// content for later restoration.
 fn modify_overlay_for_test(overlay_path: &Path) -> Result<(String, String), Box<dyn std::error::Error>> {
     let original = std::fs::read_to_string(overlay_path).map_err(|e| format!("failed to read overlay: {e}"))?;
 
@@ -1061,7 +1197,7 @@ fn modify_overlay_for_test(overlay_path: &Path) -> Result<(String, String), Box<
     ))
 }
 
-/// Step 11: Check docker logs for hot-reload evidence and verify
+/// Step 21: Check docker logs for hot-reload evidence and verify
 /// the container was not restarted.
 fn check_hot_reload_observed(container: &str, previous_count: usize) -> Result<String, Box<dyn std::error::Error>> {
     let current_count = count_overlay_reload_logs(container)?;
@@ -1092,7 +1228,7 @@ fn count_reload_entries(logs: &str) -> usize {
     logs.matches("overlay reloaded").count()
 }
 
-/// Step 13: Verify the edge container was not restarted during the
+/// Step 23: Verify the edge container was not restarted during the
 /// hot-reload test.
 fn check_container_stable(
     container: &str,
@@ -1246,29 +1382,109 @@ pub(crate) fn find_service_in_status<'a>(
 
 /// Send a Chat Completions request to the edge with bearer auth.
 fn curl_post_with_auth(port: u16) -> Result<verify::HttpResponse, Box<dyn std::error::Error>> {
+    curl_edge_request(port, None)
+}
+
+/// Chat Completions request body used by the verifier.
+const CHAT_BODY: &str = r#"{"model":"sim-model-v1","messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#;
+
+/// Send a Chat Completions request with an optional session header.
+fn curl_edge_request(port: u16, session_id: Option<&str>) -> Result<verify::HttpResponse, Box<dyn std::error::Error>> {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    let body = r#"{"model":"sim-model-v1","messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#;
-    let output = Command::new("curl")
-        .args([
-            "-s",
-            "-w",
-            "\n%{http_code}",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "15",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "Authorization: Bearer test-token",
-            "-d",
-            body,
-            &url,
-        ])
-        .output()?;
-    verify::parse_curl_output(&String::from_utf8(output.stdout)?)
+    let header_file = header_dump_path();
+    let header_path = header_file.display().to_string();
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-s",
+        "-w",
+        "\n%{http_code}",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "15",
+        "-D",
+        &header_path,
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "Authorization: Bearer test-token",
+    ]);
+    if let Some(sid) = session_id {
+        cmd.args(["-H", &format!("X-Session-Id: {sid}")]);
+    }
+    cmd.args(["-d", CHAT_BODY, &url]);
+    let output = cmd.output()?;
+    let mut resp = verify::parse_curl_output(&String::from_utf8(output.stdout)?)?;
+    resp.headers = parse_header_file(&header_file);
+    drop(std::fs::remove_file(&header_file));
+    Ok(resp)
+}
+
+/// Temp file path for curl header dumps.
+fn header_dump_path() -> PathBuf {
+    std::env::temp_dir().join(format!("glb-verify-headers-{}", std::process::id()))
+}
+
+/// Parse a curl `-D` header dump file into a map with lowercase keys.
+fn parse_header_file(path: &Path) -> BTreeMap<String, String> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    parse_header_dump(&content)
+}
+
+/// Parse raw header dump text into a map with lowercase keys.
+fn parse_header_dump(text: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let k = key.trim().to_lowercase();
+            if !k.is_empty() && !k.starts_with("http/") {
+                map.insert(k, value.trim().to_owned());
+            }
+        }
+    }
+    map
+}
+
+/// Extract the `X-Grid-Demo-Provider` header from a response.
+fn extract_provider(resp: &verify::HttpResponse) -> Result<String, Box<dyn std::error::Error>> {
+    resp.headers
+        .get("x-grid-demo-provider")
+        .cloned()
+        .ok_or_else(|| "missing x-grid-demo-provider header".into())
+}
+
+/// Modify overlay to set a candidate's `admission_state` to `existing_only`.
+///
+/// Finds the candidate whose `site` field matches the given site name
+/// and changes its `admission_state`. Returns the evidence string and
+/// the original overlay content for restoration.
+fn modify_overlay_drain(overlay_path: &Path, site: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let original = std::fs::read_to_string(overlay_path).map_err(|e| format!("failed to read overlay: {e}"))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&original).map_err(|e| format!("failed to parse overlay: {e}"))?;
+    let candidates = doc
+        .get_mut("candidates")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("overlay missing candidates array")?;
+    let mut found = false;
+    for c in candidates.iter_mut() {
+        let s = c.get("site").and_then(serde_json::Value::as_str);
+        if s == Some(site) {
+            c.as_object_mut().ok_or("candidate is not an object")?.insert(
+                "admission_state".to_owned(),
+                serde_json::Value::String("existing_only".to_owned()),
+            );
+            found = true;
+        }
+    }
+    if !found {
+        return Err(format!("no candidate with site={site}").into());
+    }
+    let modified = serde_json::to_string(&doc).map_err(|e| format!("failed to serialize: {e}"))?;
+    write_overlay(overlay_path, &modified)?;
+    Ok((format!("drained site={site}"), original))
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,6 +1701,19 @@ spec:
     }
 
     #[test]
+    fn block_remaining_adds_each_remaining_step_once() {
+        let mut results = vec![StepResult::pass("prerequisites", "ok")];
+        block_remaining(22, "reload failed", &mut results);
+        let blocked = results
+            .iter()
+            .filter(|r| r.status == StepStatus::Blocked)
+            .collect::<Vec<_>>();
+        assert_eq!(blocked.len(), 2, "steps 22 and 23 should be blocked once");
+        assert_eq!(blocked.first().map(|r| r.label), Some("routing after reload"));
+        assert_eq!(blocked.get(1).map(|r| r.label), Some("edge container stable"));
+    }
+
+    #[test]
     fn overlay_sync_service_check_pass() {
         let status = status_with_services("running", Some("abc123"));
         let result = check_service_running(&status, OVERLAY_SYNC_SERVICE);
@@ -1591,7 +1820,7 @@ spec:
 
     #[test]
     fn gridsite_egress_found() {
-        let expected = std::collections::BTreeMap::from([
+        let expected = BTreeMap::from([
             ("site-us-west".to_owned(), "172.18.0.5:8080".to_owned()),
             ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
         ]);
@@ -1616,7 +1845,7 @@ spec:
 
     #[test]
     fn gridsite_egress_missing_fails() {
-        let expected = std::collections::BTreeMap::from([
+        let expected = BTreeMap::from([
             ("site-us-west".to_owned(), "172.18.0.5:8080".to_owned()),
             ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
         ]);
@@ -1641,7 +1870,7 @@ spec:
 
     #[test]
     fn gridsite_egress_mismatch_fails() {
-        let expected = std::collections::BTreeMap::from([
+        let expected = BTreeMap::from([
             ("site-us-west".to_owned(), "172.18.0.9:8080".to_owned()),
             ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
         ]);
@@ -1708,6 +1937,106 @@ spec:
             STEP_LABELS.len(),
             TOTAL_STEPS as usize,
             "STEP_LABELS length must match TOTAL_STEPS",
+        );
+    }
+
+    #[test]
+    fn parse_header_dump_basic() {
+        let dump = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-grid-demo-provider: site-us-west\r\n\r\n";
+        let map = parse_header_dump(dump);
+        assert_eq!(
+            map.get("x-grid-demo-provider").map(String::as_str),
+            Some("site-us-west"),
+            "should parse provider header"
+        );
+        assert_eq!(
+            map.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "should parse content-type"
+        );
+        assert!(!map.contains_key("http/1.1 200 ok"), "should skip HTTP status line");
+    }
+
+    #[test]
+    fn parse_header_dump_empty() {
+        let map = parse_header_dump("");
+        assert!(map.is_empty(), "empty input should produce empty map");
+    }
+
+    #[test]
+    fn extract_provider_present() {
+        let resp = verify::HttpResponse {
+            status: 200,
+            body: String::new(),
+            headers: BTreeMap::from([("x-grid-demo-provider".to_owned(), "site-us-central".to_owned())]),
+        };
+        let result = extract_provider(&resp);
+        assert_eq!(
+            result.ok().as_deref(),
+            Some("site-us-central"),
+            "should extract provider"
+        );
+    }
+
+    #[test]
+    fn extract_provider_missing() {
+        let resp = verify::HttpResponse {
+            status: 200,
+            body: String::new(),
+            headers: BTreeMap::new(),
+        };
+        assert!(extract_provider(&resp).is_err(), "missing header should return error");
+    }
+
+    #[test]
+    fn modify_overlay_drain_sets_existing_only_for_matching_site() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("grid-config.json");
+        let original = serde_json::json!({
+            "candidates": [
+                {"site": "site-us-west", "admission_state": "new_and_existing"},
+                {"site": "site-us-central", "admission_state": "new_and_existing"}
+            ]
+        })
+        .to_string();
+        std::fs::write(&path, &original).unwrap_or_else(|_| std::process::abort());
+
+        let (evidence, returned_original) =
+            modify_overlay_drain(&path, "site-us-west").unwrap_or_else(|_| std::process::abort());
+        let modified: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_default())
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(evidence.contains("site=site-us-west"), "evidence: {evidence}");
+        assert_eq!(returned_original, original, "must return original for restore");
+        assert_eq!(
+            modified
+                .pointer("/candidates/0/admission_state")
+                .and_then(serde_json::Value::as_str),
+            Some("existing_only")
+        );
+        assert_eq!(
+            modified
+                .pointer("/candidates/1/admission_state")
+                .and_then(serde_json::Value::as_str),
+            Some("new_and_existing")
+        );
+    }
+
+    #[test]
+    fn modify_overlay_drain_missing_site_fails() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"candidates": [{"site": "site-us-central"}]}).to_string(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        let Err(err) = modify_overlay_drain(&path, "site-us-west") else {
+            std::process::abort()
+        };
+        assert!(
+            err.to_string().contains("site=site-us-west"),
+            "error should name missing site: {err}"
         );
     }
 }

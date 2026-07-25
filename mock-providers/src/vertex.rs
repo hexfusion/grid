@@ -10,28 +10,30 @@ use axum::{
     Router,
     body::Body,
     http::{Request, Response, StatusCode},
+    middleware::from_fn_with_state,
     routing::{get, post},
 };
 use serde_json::{Value, json};
 
-use crate::common;
+use crate::{AppState, common};
 
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the `Vertex` AI mock router.
+/// Build the `Vertex` AI mock router with provider attribution.
 ///
 /// Uses a wildcard route because axum does not allow colons in
 /// path parameters (`{model}:generateContent` is invalid). The
 /// handler inspects the path suffix to dispatch.
-pub fn router() -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route(
             "/v1/projects/{project}/locations/{location}/publishers/google/models/{*rest}",
             post(dispatch),
         )
         .route("/health", get(common::health_ok))
+        .layer(from_fn_with_state(state, common::inject_provider_header))
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +122,8 @@ fn streaming_chunks() -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::{body::to_bytes, http::header};
 
     use super::*;
@@ -128,14 +132,23 @@ mod tests {
     // Test Utilities
     // -----------------------------------------------------------------------
 
+    /// Build a test `AppState` with a known provider site.
+    fn test_state() -> AppState {
+        AppState {
+            provider_site: Arc::from("test-site"),
+        }
+    }
+
     /// Send a request to the router and return the response.
     async fn send(req: Request<Body>) -> Response<Body> {
-        tower::ServiceExt::oneshot(router(), req).await.unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap_or_default()
-        })
+        tower::ServiceExt::oneshot(router(test_state()), req)
+            .await
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap_or_default()
+            })
     }
 
     const GENERATE_URL: &str =

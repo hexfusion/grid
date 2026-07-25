@@ -13,12 +13,13 @@ use axum::{
     Router,
     body::Body,
     http::{Request, Response, StatusCode},
+    middleware::from_fn_with_state,
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::common;
+use crate::{AppState, common};
 
 /// Read the optional expected bearer token from `MOCK_EXPECTED_BEARER_TOKEN`.
 ///
@@ -32,13 +33,14 @@ fn expected_bearer_token() -> Option<String> {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the `OpenAI` mock router.
-pub fn router() -> Router {
+/// Build the `OpenAI` mock router with provider attribution.
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/models", get(list_models))
         .route("/health", get(common::health_ok))
+        .layer(from_fn_with_state(state, common::inject_provider_header))
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +280,8 @@ fn responses_streaming_chunks(model: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::body::to_bytes;
     use http::header;
 
@@ -287,14 +291,23 @@ mod tests {
     // Test Utilities
     // -----------------------------------------------------------------------
 
+    /// Build a test `AppState` with a known provider site.
+    fn test_state() -> AppState {
+        AppState {
+            provider_site: Arc::from("test-site"),
+        }
+    }
+
     /// Send a request to the router and return the response.
     async fn send(req: Request<Body>) -> Response<Body> {
-        tower::ServiceExt::oneshot(router(), req).await.unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap_or_default()
-        })
+        tower::ServiceExt::oneshot(router(test_state()), req)
+            .await
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap_or_default()
+            })
     }
 
     fn auth_header() -> (http::HeaderName, http::HeaderValue) {
@@ -599,5 +612,23 @@ mod tests {
         let body = to_bytes(resp.into_body(), 65_536).await.unwrap_or_default();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("[DONE]"), "should end with [DONE]");
+    }
+
+    #[tokio::test]
+    async fn provider_site_header_present() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(auth_header().0, auth_header().1)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"gpt-4o","stream":false}"#))
+            .unwrap_or_default();
+
+        let resp = send(req).await;
+        let hdr = resp
+            .headers()
+            .get(common::PROVIDER_HEADER_NAME)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(hdr, Some("test-site"), "should contain configured provider site");
     }
 }

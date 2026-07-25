@@ -21,6 +21,9 @@ spec:
           image: "grid-mock-providers:glb-demo"
           imagePullPolicy: Never
           args: ["--provider", "openai", "--port", "8080"]
+          env:
+            - name: MOCK_PROVIDER_SITE
+              value: "{{ cluster.name }}"
           ports:
             - name: http
               containerPort: 8080

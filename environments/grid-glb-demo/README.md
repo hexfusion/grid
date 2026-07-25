@@ -88,9 +88,10 @@ Two host services complete the data path:
   SNI and certificate references.
 - Session affinity is enabled (`X-Session-Id` header) with in-memory
   bindings. This is single-process/demo scope only — bindings do not
-  survive restarts or distribute across replicas. The current verifier
-  validates that the configuration loads; provider-attributed stickiness
-  proof requires backend attribution in responses or logs.
+  survive restarts or distribute across replicas. Each mock provider
+  returns an `X-Grid-Demo-Provider` response header containing its
+  site name (e.g., `site-us-west`), enabling the automated verifier
+  to prove session stickiness and drain behavior end-to-end.
 - The operator renderer emits overlay metadata (`stable_id`,
   `admission_state`, `selection_tier`, `rank`, `generated_at`) when it
   has provider candidates. SWIM seed wiring is deterministic: each
@@ -135,7 +136,34 @@ The host edge services are marked `autoStart: false`, so `up` creates
 the clusters, networking, stacks, and runtime files without starting
 the local edge containers.
 
-### 3. Apply stacks (Pass 1 — infrastructure + SWIM LB capture)
+### 3. Build and load local images
+
+Build the Grid-local images and load Kubernetes images into the Kind
+clusters before applying stacks. The demo uses `imagePullPolicy:
+Never`, so Kind must already have these images locally.
+
+```console
+make overlay-sync-image operator-image
+docker tag grid-overlay-sync:latest grid-overlay-sync:glb-demo
+docker tag grid-operator:latest grid-operator:glb-demo
+docker build -t grid-mock-providers:glb-demo -f mock-providers/Containerfile .
+
+praxis-forge cluster load-image site-us-east grid-operator:glb-demo \
+  --config environments/grid-glb-demo/forge.yaml
+praxis-forge cluster load-image site-us-west grid-operator:glb-demo \
+  --config environments/grid-glb-demo/forge.yaml
+praxis-forge cluster load-image site-us-central grid-operator:glb-demo \
+  --config environments/grid-glb-demo/forge.yaml
+praxis-forge cluster load-image site-us-west grid-mock-providers:glb-demo \
+  --config environments/grid-glb-demo/forge.yaml
+praxis-forge cluster load-image site-us-central grid-mock-providers:glb-demo \
+  --config environments/grid-glb-demo/forge.yaml
+```
+
+Build `praxis-ai:glb-demo` from the AI hot-reload branch in the
+`ai/` repo before starting the host edge service.
+
+### 4. Apply stacks (Pass 1 — infrastructure + SWIM LB capture)
 
 Apply all stacks. The `swim-lb` stack on each cluster creates a SWIM
 LoadBalancer Service and captures its MetalLB-assigned IP. The
@@ -148,7 +176,7 @@ this is expected.
 praxis-forge stack apply --config environments/grid-glb-demo/forge.yaml
 ```
 
-### 4. Re-apply site-demo stacks (Pass 2 — seed wiring)
+### 5. Re-apply site-demo stacks (Pass 2 — seed wiring)
 
 With all SWIM LB IPs and provider gateway IPs captured in
 `.forge/state.json`, re-apply the site-demo stacks. Templates now
@@ -166,7 +194,7 @@ with the correct `GRID_SWIM_ADVERTISE_ADDR` (LB IP, not Pod IP) and
 `GRID_SWIM_SITE_NAME`. The `site-us-east-demo` stack also renders the
 edge Praxis config with captured provider gateway IPs.
 
-### 5. Verify cluster status
+### 6. Verify cluster status
 
 ```console
 praxis-forge status --config environments/grid-glb-demo/forge.yaml
@@ -174,7 +202,7 @@ praxis-forge status --config environments/grid-glb-demo/forge.yaml
 
 All three clusters should show `phase=running, live`.
 
-### 6. Verify provider gateway reachability
+### 7. Verify provider gateway reachability
 
 From the Docker host, confirm the provider gateways respond (IPs
 are in `.forge/state.json` under `captures`):
@@ -186,16 +214,9 @@ curl -s http://<west-ip>:8080/health
 
 Both should return `ok` from the mock-inference health endpoint.
 
-### 7. Start host services
+### 8. Start host services
 
-Build the local images and start the two host services:
-
-```console
-make overlay-sync-image operator-image
-docker tag grid-overlay-sync:latest grid-overlay-sync:glb-demo
-docker tag grid-operator:latest grid-operator:glb-demo
-# Build praxis-ai:glb-demo from the AI hot-reload branch (ai/ repo).
-```
+Start the two host services:
 
 ```console
 praxis-forge service start grid-overlay-sync-us-east --config environments/grid-glb-demo/forge.yaml
@@ -218,10 +239,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 To exercise the session-affinity path, include the `X-Session-Id`
-header. Repeated requests with the same session ID should keep the same
-binding while the selected provider remains eligible. The mock response
-does not currently include provider attribution, so use edge logs or the
-automated verifier once attribution support is added to prove stickiness.
+header. Repeated requests with the same session ID keep the same
+provider binding while the selected provider remains eligible. The
+response `X-Grid-Demo-Provider` header identifies which site served
+the request (demo-only attribution, not part of the production API).
 
 ```console
 curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -261,11 +282,14 @@ cargo xtask env verify-grid-glb-ingress \
   --forge-config environments/grid-glb-demo/forge.yaml
 ```
 
-The proof checks the running Forge environment, verifies provider
-gateway reachability, sends an inference request through the edge,
-edits the local overlay file to remove one provider, observes a new
-`overlay reloaded` log entry, sends a second inference request, and
-confirms the edge container ID and restart count remain stable.
+The 23-step proof checks the running Forge environment, verifies
+provider gateway reachability, sends an inference request through the
+edge, proves session affinity (binding, reuse, drain with
+`existing_only`, and drain verification via `X-Grid-Demo-Provider`
+header), edits the local overlay file to remove one provider, observes
+a new `overlay reloaded` log entry, sends a post-reload inference
+request, and confirms the edge container ID and restart count remain
+stable.
 
 ## Teardown
 

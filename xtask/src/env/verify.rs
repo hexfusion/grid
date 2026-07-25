@@ -6,6 +6,7 @@
 //! Uses `kubectl port-forward` for host access and `curl` for HTTP.
 
 use std::{
+    collections::BTreeMap,
     net::TcpListener,
     process::{Child, Command, Stdio},
     time::Duration,
@@ -359,6 +360,8 @@ pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     /// Response body.
     pub(crate) body: String,
+    /// Response headers (lowercase keys).
+    pub(crate) headers: BTreeMap<String, String>,
 }
 
 /// Query `/v1/models` and return the list of model IDs.
@@ -433,6 +436,7 @@ pub(crate) fn parse_curl_output(raw: &str) -> Result<HttpResponse, Box<dyn std::
     Ok(HttpResponse {
         status,
         body: body.to_owned(),
+        headers: BTreeMap::new(),
     })
 }
 

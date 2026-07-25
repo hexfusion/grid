@@ -27,7 +27,7 @@ spec:
             - name: GRID_SWIM_SITE_NAME
               value: "site-us-west"
             - name: GRID_SWIM_SEEDS
-              value: ""
+              value: "{{ captures.site-us-east.swim-lb-ip }}:7946,{{ captures.site-us-central.swim-lb-ip }}:7946"
             - name: GRID_GATEWAY_ADDRESS
               value: "{{ captures.site-us-west.provider-gateway-ip }}:8080"
             - name: RUST_LOG

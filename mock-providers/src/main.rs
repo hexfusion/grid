@@ -10,8 +10,10 @@
     reason = "CLI binary that prints to the terminal"
 )]
 
+use std::sync::Arc;
+
 use clap::Parser;
-use mock_providers::{anthropic, bedrock, openai, vertex};
+use mock_providers::{AppState, anthropic, bedrock, openai, vertex};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -55,11 +57,15 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+    let provider_site = std::env::var("MOCK_PROVIDER_SITE").unwrap_or_else(|_| "unknown".to_owned());
+    let state = AppState {
+        provider_site: Arc::<str>::from(provider_site),
+    };
     let router = match cli.provider {
-        ProviderKind::Openai => openai::router(),
-        ProviderKind::Anthropic => anthropic::router(),
-        ProviderKind::Bedrock => bedrock::router(),
-        ProviderKind::Vertex => vertex::router(),
+        ProviderKind::Openai => openai::router(state),
+        ProviderKind::Anthropic => anthropic::router(state),
+        ProviderKind::Bedrock => bedrock::router(state),
+        ProviderKind::Vertex => vertex::router(state),
     };
 
     let addr = format!("0.0.0.0:{}", cli.port);

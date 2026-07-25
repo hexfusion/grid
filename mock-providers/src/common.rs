@@ -2,10 +2,31 @@
 
 use axum::{
     body::Body,
-    http::{Response, StatusCode, header},
+    extract::State,
+    http::{HeaderName, HeaderValue, Request, Response, StatusCode, header},
+    middleware::Next,
     response::IntoResponse,
 };
 use serde_json::Value;
+
+use crate::AppState;
+
+/// Header name for the demo provider site attribution.
+pub(crate) const PROVIDER_HEADER_NAME: &str = "x-grid-demo-provider";
+
+/// Axum middleware that injects `X-Grid-Demo-Provider` on every response.
+pub(crate) async fn inject_provider_header(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let mut resp = next.run(req).await;
+    if let Ok(val) = HeaderValue::from_str(&state.provider_site) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static(PROVIDER_HEADER_NAME), val);
+    }
+    resp
+}
 
 // ---------------------------------------------------------------------------
 // Response helpers
@@ -163,7 +184,7 @@ mod tests {
             header::AUTHORIZATION,
             "Bearer sk-test-key"
                 .parse()
-                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         );
         let token = extract_bearer(&headers);
         assert_eq!(token, Some("sk-test-key"), "should extract bearer token");
@@ -183,7 +204,7 @@ mod tests {
             header::AUTHORIZATION,
             "Basic dXNlcjpwYXNz"
                 .parse()
-                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         );
         let token = extract_bearer(&headers);
         assert!(token.is_none(), "should return None for non-Bearer scheme");
@@ -217,7 +238,7 @@ mod tests {
             header::AUTHORIZATION,
             "Bearer any-token"
                 .parse()
-                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         );
         assert!(
             validate_bearer(&headers, None).is_ok(),
@@ -232,7 +253,7 @@ mod tests {
             header::AUTHORIZATION,
             "Bearer correct-token"
                 .parse()
-                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         );
         assert!(
             validate_bearer(&headers, Some("correct-token")).is_ok(),
@@ -247,7 +268,7 @@ mod tests {
             header::AUTHORIZATION,
             "Bearer wrong-token"
                 .parse()
-                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         );
         let Err(err) = validate_bearer(&headers, Some("expected-token")) else {
             std::process::abort();

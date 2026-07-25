@@ -27,7 +27,7 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus,
+            GridNetworkStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase},
         inference_provider::InferenceProvider,
@@ -290,7 +290,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         .and_then(|l| l.get(LABEL_AUTO_DISCOVER_SITES))
         .is_some_and(|v| v == "true");
     if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim.as_ref(), membership.as_ref()) {
-        let plaintext = network.spec.tls.ca_secret_ref.is_none() && network.spec.tls.site_secret_ref.is_none();
+        let plaintext = network_uses_plaintext_egress(&network);
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
     }
 
@@ -1423,6 +1423,31 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
         (true, true) => "discovered-site".to_owned(),
     };
     candidate.chars().take(253).collect()
+}
+
+/// Whether auto-discovered remote `GridSite` egress should use plaintext.
+///
+/// Explicit `gatewayRefs[].consumerConfig.clusterEndpoints[].transport.mode`
+/// declarations are the source of truth when present.  If any endpoint is
+/// declared plaintext, auto-discovered `GridSite` egress is plaintext for this
+/// network.  This supports local/dev GLB demos where provider gateways are
+/// intentionally plain HTTP.
+///
+/// When no explicit plaintext endpoint exists, fall back to the top-level grid
+/// TLS references: a network with no CA or site certificate refs is treated as
+/// plaintext, while a network with either TLS ref keeps mutual TLS.
+fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
+    let has_plaintext_endpoint = network.spec.gateway_refs.iter().any(|gw| {
+        gw.consumer_config.as_ref().is_some_and(|cc| {
+            cc.cluster_endpoints.iter().any(|ep| {
+                ep.transport
+                    .as_ref()
+                    .is_some_and(|transport| transport.mode == TransportMode::Plaintext)
+            })
+        })
+    });
+
+    has_plaintext_endpoint || (network.spec.tls.ca_secret_ref.is_none() && network.spec.tls.site_secret_ref.is_none())
 }
 
 /// Create or update `GridSite` resources for remote Alive SWIM members.
@@ -2703,6 +2728,66 @@ mod tests {
         assert_ne!(
             name_net1, name_net2,
             "same site_id in different networks must produce different names"
+        );
+    }
+
+    fn network_with_endpoint_transport(mode: &str, sni: Option<&str>) -> GridNetwork {
+        let transport = match sni {
+            Some(sni) => serde_json::json!({"mode": mode, "sni": sni}),
+            None => serde_json::json!({"mode": mode}),
+        };
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "glb-demo" },
+            "spec": {
+                "gridId": "id",
+                "gatewayRefs": [{
+                    "name": "consumer-gateway",
+                    "namespace": "grid-system",
+                    "consumerConfig": {
+                        "enabled": true,
+                        "clusterEndpoints": [{
+                            "cluster": "sim-provider-us-west",
+                            "address": "172.19.255.212:8080",
+                            "transport": transport
+                        }]
+                    }
+                }],
+                "tls": {
+                    "caSecretRef": {"name": "ca", "namespace": "grid-system"},
+                    "siteSecretRef": {"name": "site", "namespace": "grid-system"},
+                    "swimKeyRef": null
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn network_uses_plaintext_egress_when_endpoint_transport_plaintext() {
+        let network = network_with_endpoint_transport("plaintext", None);
+        assert!(
+            network_uses_plaintext_egress(&network),
+            "explicit plaintext endpoint transport must drive discovered GridSite egress"
+        );
+    }
+
+    #[test]
+    fn network_uses_mutual_egress_when_endpoint_transport_mtls() {
+        let network = network_with_endpoint_transport("mutual_tls", Some("provider.example.com"));
+        assert!(
+            !network_uses_plaintext_egress(&network),
+            "mTLS endpoint transport plus TLS refs must keep discovered GridSite egress mutual"
+        );
+    }
+
+    #[test]
+    fn network_uses_plaintext_egress_when_no_tls_refs_present() {
+        let network = base_network();
+        assert!(
+            network_uses_plaintext_egress(&network),
+            "network with no CA/site TLS refs should fall back to plaintext"
         );
     }
 
