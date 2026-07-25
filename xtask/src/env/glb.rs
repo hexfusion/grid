@@ -1,15 +1,15 @@
 //! GLB ingress hot-reload verifier.
 //!
-//! Runs prerequisite checks then a structured 17-step verification
+//! Runs prerequisite checks then a structured 19-step verification
 //! representing the full GLB hot-reload proof.  Steps 1-4 validate
-//! prerequisite infrastructure.  Steps 5-8 verify SWIM cross-cluster
+//! prerequisite infrastructure.  Steps 5-10 verify SWIM cross-cluster
 //! discovery (LB services, advertise addresses, seeds, overlay
-//! metadata).  Steps 9-10 check site stacks and edge config.
-//! Steps 11-12 verify Forge-managed services are running.  Step 13
-//! proves initial inference routing.  Steps 14-17 exercise the
-//! overlay hot-reload path: modify the overlay file, observe the
-//! reload, verify routing still works, and confirm the edge
-//! container was never restarted.
+//! metadata, gateway address advertisement, remote egress addresses).
+//! Steps 11-12 check site stacks and edge config.  Steps 13-14
+//! verify Forge-managed services are running.  Step 15 proves initial
+//! inference routing.  Steps 16-19 exercise the overlay hot-reload
+//! path: modify the overlay file, observe the reload, verify routing
+//! still works, and confirm the edge container was never restarted.
 
 use std::{path::Path, process::Command, thread, time::Duration};
 
@@ -38,7 +38,10 @@ const CLUSTER_NAMES: &[&str] = &["site-us-east", "site-us-west", "site-us-centra
 const REQUIRED_TOOLS: &[&str] = &["kind", "kubectl", "curl", "docker"];
 
 /// Total number of verification steps.
-const TOTAL_STEPS: u32 = 17;
+const TOTAL_STEPS: u32 = 19;
+
+/// Provider-role clusters that advertise a gateway address.
+const PROVIDER_CLUSTERS: &[&str] = &["site-us-west", "site-us-central"];
 
 /// SWIM LB service name in the GLB demo.
 const SWIM_LB_SERVICE: &str = "operator-swim-lb";
@@ -72,7 +75,7 @@ const EDGE_CONTAINER: &str = "grid-glb-demo-grid-edge-us-east";
 /// Verify GLB ingress hot-reload readiness.
 ///
 /// Checks prerequisites (config, tools, forge binary, placeholder
-/// images), then runs a 17-step structured verification.  Exits
+/// images), then runs a 19-step structured verification.  Exits
 /// non-zero if any step is `FAIL` or `BLOCKED`.
 ///
 /// # Errors
@@ -265,7 +268,7 @@ fn parse_edge_host_port(config_text: &str, service_name: &str) -> Option<u16> {
 // Verification steps
 // ---------------------------------------------------------------------------
 
-/// Run all 17 verification steps.
+/// Run all 19 verification steps.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
@@ -323,8 +326,28 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
     step_banner(8, "checking overlay candidate metadata");
     record_step("overlay metadata", results, check_overlay_metadata);
 
-    // Step 9: Provider gateways reachable.
-    step_banner(9, "checking provider gateway reachability");
+    // Step 9: Provider gateway address advertised.
+    step_banner(9, "checking provider gateway address");
+    let provider_gateway_addrs = match load_provider_gateway_addresses() {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            results.push(StepResult::fail("provider gateway addr", e.as_ref()));
+            block_remaining(10, "provider gateway captures unavailable", results);
+            return;
+        },
+    };
+    record_step("provider gateway addr", results, || {
+        check_provider_gateway_addr(&provider_gateway_addrs)
+    });
+
+    // Step 10: Remote GridSite egress addresses.
+    step_banner(10, "checking remote GridSite egress addresses");
+    record_step("remote gridsite egress", results, || {
+        check_remote_gridsite_egress(&provider_gateway_addrs)
+    });
+
+    // Step 11: Provider gateways reachable.
+    step_banner(11, "checking provider gateway reachability");
     if gateways_ok {
         record_step("provider gateways reachable", results, || {
             check_provider_gateways_reachable()
@@ -336,11 +359,11 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         ));
     }
 
-    // Step 10: Edge config applied.
-    step_banner(10, "checking edge config applied");
+    // Step 12: Edge config applied.
+    step_banner(12, "checking edge config applied");
     record_step("edge config applied", results, check_site_stacks);
 
-    // Gate steps 11+ on placeholder images.
+    // Gate steps 13+ on placeholder images.
     if !ctx.placeholders.is_empty() {
         let reason = format!(
             "placeholder images: {}",
@@ -350,22 +373,22 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        block_remaining(11, &reason, results);
+        block_remaining(13, &reason, results);
         return;
     }
 
-    // Step 11: Overlay-sync service running.
-    step_banner(11, "checking overlay-sync service");
+    // Step 13: Overlay-sync service running.
+    step_banner(13, "checking overlay-sync service");
     let sync_ok = record_step("overlay-sync running", results, || {
         check_service_running(&status_json, OVERLAY_SYNC_SERVICE)
     });
     if !sync_ok {
-        block_remaining(12, "overlay-sync not running", results);
+        block_remaining(14, "overlay-sync not running", results);
         return;
     }
 
-    // Step 12: Edge service running — capture container ID.
-    step_banner(12, "capturing edge service identity");
+    // Step 14: Edge service running — capture container ID.
+    step_banner(14, "capturing edge service identity");
     let edge_identity = match check_service_running(&status_json, EDGE_SERVICE) {
         Ok(evidence) => {
             let captured = extract_service_identity(&status_json, EDGE_SERVICE);
@@ -374,23 +397,23 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         },
         Err(e) => {
             results.push(StepResult::fail("edge service running", e.as_ref()));
-            block_remaining(13, "edge not running", results);
+            block_remaining(15, "edge not running", results);
             return;
         },
     };
 
-    // Step 13: Inference routed (initial request).
-    step_banner(13, "sending inference request");
+    // Step 15: Inference routed (initial request).
+    step_banner(15, "sending inference request");
     let routed_ok = record_step("inference routed", results, check_inference_routed);
     if !routed_ok {
-        block_remaining(14, "initial inference failed", results);
+        block_remaining(16, "initial inference failed", results);
         return;
     }
 
     let reload_count_before = count_overlay_reload_logs(EDGE_CONTAINER).unwrap_or(0);
 
-    // Step 14: Modify overlay (remove one provider).
-    step_banner(14, "modifying overlay for hot-reload test");
+    // Step 16: Modify overlay (remove one provider).
+    step_banner(16, "modifying overlay for hot-reload test");
     let original_overlay = match modify_overlay_for_test(&ctx.overlay_path) {
         Ok((evidence, original)) => {
             results.push(StepResult::pass("overlay modified", evidence));
@@ -398,13 +421,13 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         },
         Err(e) => {
             results.push(StepResult::fail("overlay modified", e.as_ref()));
-            block_remaining(15, "overlay modification failed", results);
+            block_remaining(17, "overlay modification failed", results);
             return;
         },
     };
 
-    // Step 15: Hot-reload observed.
-    step_banner(15, "checking hot-reload");
+    // Step 17: Hot-reload observed.
+    step_banner(17, "checking hot-reload");
     #[expect(
         clippy::disallowed_methods,
         reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
@@ -416,17 +439,17 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         check_hot_reload_observed(EDGE_CONTAINER, reload_count_before)
     });
 
-    // Step 16: Routing after reload.
-    step_banner(16, "sending post-reload inference request");
+    // Step 18: Routing after reload.
+    step_banner(18, "sending post-reload inference request");
     record_step("routing after reload", results, check_inference_routed);
 
-    // Restore overlay before step 17.
+    // Restore overlay before step 19.
     if let Some(original) = &original_overlay {
         restore_overlay(&ctx.overlay_path, original);
     }
 
-    // Step 17: Edge container stable (same ID, no restart).
-    step_banner(17, "checking edge container stability");
+    // Step 19: Edge container stable (same ID, no restart).
+    step_banner(19, "checking edge container stability");
     record_step("edge container stable", results, || {
         check_container_stable(EDGE_CONTAINER, edge_identity.as_ref())
     });
@@ -465,6 +488,8 @@ const STEP_LABELS: &[&str] = &[
     "swim advertise addr",
     "gridnetwork seeds",
     "overlay metadata",
+    "provider gateway addr",
+    "remote gridsite egress",
     "provider gateways reachable",
     "edge config applied",
     "overlay-sync running",
@@ -753,7 +778,164 @@ fn validate_overlay_json(json: &str) -> Result<String, Box<dyn std::error::Error
     ))
 }
 
-/// Step 10: Check site-us-east stacks are applied.
+/// Step 9: `GRID_GATEWAY_ADDRESS` set on provider-role operators.
+fn check_provider_gateway_addr(
+    expected_addrs: &std::collections::BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut verified = Vec::new();
+    for cluster in PROVIDER_CLUSTERS {
+        let expected = expected_addrs
+            .get(*cluster)
+            .ok_or_else(|| format!("missing Forge capture for {cluster} provider gateway"))?;
+        let addr = get_operator_env_var(cluster, "GRID_GATEWAY_ADDRESS")?
+            .ok_or_else(|| format!("GRID_GATEWAY_ADDRESS not set on {cluster}"))?;
+        verify_expected_gateway_addr(cluster, "GRID_GATEWAY_ADDRESS", &addr, expected)?;
+        verified.push(format!("{cluster}={addr}"));
+    }
+    Ok(verified.join(", "))
+}
+
+/// Read one env var from the grid operator Deployment template.
+fn get_operator_env_var(cluster: &str, name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let context = kubectl_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "deploy",
+            "grid-operator",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].env}",
+        ])
+        .output()?;
+    let env_json = String::from_utf8(output.stdout)?;
+    Ok(parse_env_var_from_json(&env_json, name))
+}
+
+/// Verify an advertised gateway address exactly matches the Forge capture.
+fn verify_expected_gateway_addr(
+    cluster: &str,
+    field: &str,
+    actual: &str,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if actual.is_empty() || actual.contains("$(POD_IP)") {
+        return Err(format!("{field} on {cluster} is '{actual}' (expected captured IP)").into());
+    }
+    if actual != expected {
+        return Err(format!("{field} on {cluster} is '{actual}' (expected Forge capture '{expected}')").into());
+    }
+    Ok(())
+}
+
+/// Step 10: Remote [`GridSite`] egress addresses on the edge cluster.
+///
+/// [`GridSite`]: crate
+fn check_remote_gridsite_egress(
+    expected_addrs: &std::collections::BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let context = kubectl_context("site-us-east");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "gridsite",
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("kubectl get gridsite failed: {}", safe_truncate_str(stderr.trim(), 120)).into());
+    }
+    let raw = String::from_utf8(output.stdout)?;
+    parse_gridsite_egress(&raw, expected_addrs)
+}
+
+/// Parse [`GridSite`] list JSON and verify provider egress addresses.
+///
+/// [`GridSite`]: crate
+fn parse_gridsite_egress(
+    json: &str,
+    expected_addrs: &std::collections::BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let doc: serde_json::Value = serde_json::from_str(json)?;
+    let items = doc
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("gridsite list missing items")?;
+
+    let mut verified = Vec::new();
+    for provider in PROVIDER_CLUSTERS {
+        let expected = expected_addrs
+            .get(*provider)
+            .ok_or_else(|| format!("missing Forge capture for {provider} provider gateway"))?;
+        let addr = find_gridsite_egress(items, provider)?;
+        if addr.is_empty() {
+            return Err(format!("GridSite for {provider} has no egress address").into());
+        }
+        verify_expected_gateway_addr(provider, "GridSite egress", addr, expected)?;
+        verified.push(format!("{provider}={addr}"));
+    }
+    Ok(verified.join(", "))
+}
+
+/// Find one provider site's egress address in a `GridSite` list.
+fn find_gridsite_egress<'a>(
+    items: &'a [serde_json::Value],
+    provider: &str,
+) -> Result<&'a str, Box<dyn std::error::Error>> {
+    let site = items.iter().find(|item| {
+        item.get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|n| n == provider)
+    });
+    let Some(site) = site else {
+        return Err(format!("GridSite for {provider} not found on edge cluster").into());
+    };
+    Ok(site
+        .pointer("/spec/egress/address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(""))
+}
+
+/// Load expected provider gateway addresses from Forge's default state file.
+fn load_provider_gateway_addresses() -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let state = std::fs::read_to_string(".forge/state.json")?;
+    parse_provider_gateway_captures(&state)
+}
+
+/// Parse provider gateway captures from Forge state JSON.
+fn parse_provider_gateway_captures(
+    json: &str,
+) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let doc: serde_json::Value = serde_json::from_str(json)?;
+    let captures = doc
+        .get("captures")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("Forge state missing captures")?;
+
+    let mut addrs = std::collections::BTreeMap::new();
+    for cluster in PROVIDER_CLUSTERS {
+        let ip = captures
+            .get(*cluster)
+            .and_then(|c| c.get("provider-gateway-ip"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("Forge state missing captures.{cluster}.provider-gateway-ip"))?;
+        addrs.insert((*cluster).to_owned(), format!("{ip}:8080"));
+    }
+    Ok(addrs)
+}
+
+/// Step 12: Check site-us-east stacks are applied.
 fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context("site-us-east");
     let output = Command::new("kubectl")
@@ -1397,6 +1579,126 @@ spec:
         });
         let result = validate_overlay_json(&json.to_string());
         assert!(result.is_err(), "empty candidates should fail");
+    }
+
+    #[test]
+    fn provider_gateway_addr_env_parsed() {
+        let json = r#"[{"name":"GRID_GATEWAY_ADDRESS","value":"172.18.0.5:8080"}]"#;
+        let val = parse_env_var_from_json(json, "GRID_GATEWAY_ADDRESS");
+        assert_eq!(val.as_deref(), Some("172.18.0.5:8080"), "should parse gateway addr");
+    }
+
+    #[test]
+    fn gridsite_egress_found() {
+        let expected = std::collections::BTreeMap::from([
+            ("site-us-west".to_owned(), "172.18.0.5:8080".to_owned()),
+            ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
+        ]);
+        let json = serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "site-us-west"},
+                    "spec": {"egress": {"address": "172.18.0.5:8080"}}
+                },
+                {
+                    "metadata": {"name": "site-us-central"},
+                    "spec": {"egress": {"address": "172.18.0.6:8080"}}
+                }
+            ]
+        });
+        let result = parse_gridsite_egress(&json.to_string(), &expected);
+        assert!(result.is_ok(), "should find egress: {result:?}");
+        let evidence = result.unwrap_or_else(|_| std::process::abort());
+        assert!(evidence.contains("site-us-west="), "evidence: {evidence}");
+        assert!(evidence.contains("site-us-central="), "evidence: {evidence}");
+    }
+
+    #[test]
+    fn gridsite_egress_missing_fails() {
+        let expected = std::collections::BTreeMap::from([
+            ("site-us-west".to_owned(), "172.18.0.5:8080".to_owned()),
+            ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
+        ]);
+        let json = serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "site-us-west"},
+                    "spec": {"egress": {"address": ""}}
+                },
+                {
+                    "metadata": {"name": "site-us-central"},
+                    "spec": {"egress": {"address": "172.18.0.6:8080"}}
+                }
+            ]
+        });
+        let Err(err) = parse_gridsite_egress(&json.to_string(), &expected) else {
+            std::process::abort()
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("site-us-west"), "error should name site: {msg}");
+    }
+
+    #[test]
+    fn gridsite_egress_mismatch_fails() {
+        let expected = std::collections::BTreeMap::from([
+            ("site-us-west".to_owned(), "172.18.0.9:8080".to_owned()),
+            ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
+        ]);
+        let json = serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "site-us-west"},
+                    "spec": {"egress": {"address": "172.18.0.5:8080"}}
+                },
+                {
+                    "metadata": {"name": "site-us-central"},
+                    "spec": {"egress": {"address": "172.18.0.6:8080"}}
+                }
+            ]
+        });
+        let Err(err) = parse_gridsite_egress(&json.to_string(), &expected) else {
+            std::process::abort()
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected Forge capture"),
+            "error should name mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn provider_gateway_captures_parse() {
+        let json = serde_json::json!({
+            "captures": {
+                "site-us-west": {"provider-gateway-ip": "172.18.0.5"},
+                "site-us-central": {"provider-gateway-ip": "172.18.0.6"}
+            }
+        });
+        let captures = parse_provider_gateway_captures(&json.to_string()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            captures.get("site-us-west").map(String::as_str),
+            Some("172.18.0.5:8080")
+        );
+        assert_eq!(
+            captures.get("site-us-central").map(String::as_str),
+            Some("172.18.0.6:8080")
+        );
+    }
+
+    #[test]
+    fn provider_gateway_captures_missing_provider_fails() {
+        let json = serde_json::json!({
+            "captures": {
+                "site-us-west": {"provider-gateway-ip": "172.18.0.5"}
+            }
+        });
+        let Err(err) = parse_provider_gateway_captures(&json.to_string()) else {
+            std::process::abort()
+        };
+        assert!(
+            err.to_string().contains("site-us-central"),
+            "error should name missing provider: {err}"
+        );
     }
 
     #[test]

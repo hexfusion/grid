@@ -96,11 +96,13 @@ Two host services complete the data path:
   has provider candidates. SWIM seed wiring is deterministic: each
   site's GridNetwork seeds reference the other two sites' SWIM LB IPs,
   and operators discover each other through SWIM/CRDT gossip.
-- `GRID_GATEWAY_ADDRESS` is not yet wired. The provider gateway IP is
-  captured by Forge after operator startup, so setting it requires
-  either operator self-discovery of its Service IP or an additional
-  stack pass. Overlay candidates still appear without it — the gateway
-  address enriches candidates but is not required for discovery.
+- Provider-role sites advertise their data-plane gateway address via
+  SWIM state broadcast (`GRID_GATEWAY_ADDRESS` set from Forge-captured
+  provider gateway IP). Peer operators create `GridSite` resources with
+  `spec.egress.address` and advance them to Active phase, enabling
+  CRDT-discovered providers in the routing overlay. This is a
+  demo-scoped bridge using Forge captures; the production path is
+  operator self-discovery of its own Service IP.
 - Geo/load-aware ordering is implemented in the overlay renderer.
   Semantic routing remains a planned follow-up capability. This demo
   proves the external ingress data path, SWIM cross-cluster discovery,

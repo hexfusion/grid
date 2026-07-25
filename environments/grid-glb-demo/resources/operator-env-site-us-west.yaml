@@ -22,6 +22,6 @@ spec:
             - name: GRID_SWIM_SEEDS
               value: ""
             - name: GRID_GATEWAY_ADDRESS
-              value: ""
+              value: "{{ captures.site-us-west.provider-gateway-ip }}:8080"
             - name: RUST_LOG
               value: "info"

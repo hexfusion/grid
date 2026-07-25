@@ -197,7 +197,10 @@ The following reflects the current state of relevant components:
   seeds through MetalLB-backed LoadBalancer Services (UDP 7946) captured by
   Forge. Per-site GridNetwork templates reference captured SWIM LB IPs as
   seeds, enabling operators to discover each other and propagate provider
-  state via CRDT without hard-coded Pod IPs.
+  state via CRDT without hard-coded Pod IPs. Provider-role sites advertise
+  their data-plane gateway address via SWIM state broadcast, allowing peer
+  operators to populate `GridSite` egress addresses and advance remote sites
+  to Active phase.
 
 - **Forge**: The initial CLI crate supports `doctor`, `plan`, `config`,
   cluster lifecycle (`up`/`down`/`status`/`cluster` subcommands), persistent
