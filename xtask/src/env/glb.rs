@@ -694,7 +694,7 @@ fn check_gridnetwork_seeds() -> Result<String, Box<dyn std::error::Error>> {
                 "gridnetwork",
                 GRID_NETWORK_NAME,
                 "-o",
-                "jsonpath={.spec.seeds}",
+                "jsonpath={.spec.seeds[*]}",
             ])
             .output()?;
         let seeds_raw = String::from_utf8(output.stdout)?.trim().to_owned();
@@ -891,11 +891,12 @@ fn find_gridsite_egress<'a>(
     items: &'a [serde_json::Value],
     provider: &str,
 ) -> Result<&'a str, Box<dyn std::error::Error>> {
+    let expected_name = format!("{GRID_NETWORK_NAME}-{provider}");
     let site = items.iter().find(|item| {
         item.get("metadata")
             .and_then(|m| m.get("name"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|n| n == provider)
+            .is_some_and(|n| n == expected_name)
     });
     let Some(site) = site else {
         return Err(format!("GridSite for {provider} not found on edge cluster").into());
@@ -1597,11 +1598,11 @@ spec:
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "site-us-west"},
+                    "metadata": {"name": "glb-demo-site-us-west"},
                     "spec": {"egress": {"address": "172.18.0.5:8080"}}
                 },
                 {
-                    "metadata": {"name": "site-us-central"},
+                    "metadata": {"name": "glb-demo-site-us-central"},
                     "spec": {"egress": {"address": "172.18.0.6:8080"}}
                 }
             ]
@@ -1622,11 +1623,11 @@ spec:
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "site-us-west"},
+                    "metadata": {"name": "glb-demo-site-us-west"},
                     "spec": {"egress": {"address": ""}}
                 },
                 {
-                    "metadata": {"name": "site-us-central"},
+                    "metadata": {"name": "glb-demo-site-us-central"},
                     "spec": {"egress": {"address": "172.18.0.6:8080"}}
                 }
             ]
@@ -1647,11 +1648,11 @@ spec:
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "site-us-west"},
+                    "metadata": {"name": "glb-demo-site-us-west"},
                     "spec": {"egress": {"address": "172.18.0.5:8080"}}
                 },
                 {
-                    "metadata": {"name": "site-us-central"},
+                    "metadata": {"name": "glb-demo-site-us-central"},
                     "spec": {"egress": {"address": "172.18.0.6:8080"}}
                 }
             ]

@@ -96,12 +96,13 @@ async fn validate_network_ref(site: &GridSite, client: &Client) -> Result<(), Op
 /// - Pending → stays Pending (`GridNetwork` controller writes Discovered on SWIM Alive).
 /// - Discovered + gateway address → Connecting (gateway address known; control-plane eligibility assessment begins).
 /// - Discovered, no gateway address → stays Discovered.
-/// - Connecting → Active when the TCP probe succeeds and the configured fingerprint trust policy matches the received
-///   public certificate. Active indicates control-plane eligibility for overlay inclusion.
+/// - Connecting → Active when the TCP probe succeeds and either: (a) the egress transport is plaintext, or (b) the
+///   configured fingerprint trust policy matches the received public certificate. Active indicates control-plane
+///   eligibility for overlay inclusion.
 /// - Connecting → stays Connecting when the gateway is unreachable, trust material is missing or invalid, or the
-///   fingerprint policy is missing or mismatched.
-/// - Active → stays Active if gateway is reachable and the fingerprint trust policy still matches; otherwise demotes to
-///   Connecting or Unreachable.
+///   fingerprint policy is missing or mismatched (TLS transport only).
+/// - Active → stays Active if gateway is reachable and either plaintext transport or the fingerprint trust policy still
+///   matches; otherwise demotes to Connecting or Unreachable.
 /// - Unreachable → stays Unreachable.
 /// - Left → preserved.
 #[expect(
@@ -136,6 +137,29 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
                     GridSitePhase::Discovered,
                     "GatewayAddressMissing".to_owned(),
                     "gateway address not yet available; cannot advance to Connecting".to_owned(),
+                )
+            }
+        },
+        GridSitePhase::Connecting if is_plaintext_transport(site) => {
+            if let Some(addr) = probe_addr {
+                if tcp_probe(addr).await {
+                    (
+                        GridSitePhase::Active,
+                        "PlaintextTransportReachable".to_owned(),
+                        "gateway reachable; plaintext transport requires no certificate verification".to_owned(),
+                    )
+                } else {
+                    (
+                        GridSitePhase::Connecting,
+                        "GatewayUnreachable".to_owned(),
+                        "gateway not reachable via TCP probe; retrying".to_owned(),
+                    )
+                }
+            } else {
+                (
+                    GridSitePhase::Connecting,
+                    "GatewayAddressMissing".to_owned(),
+                    "gateway address not available; awaiting configuration".to_owned(),
                 )
             }
         },
@@ -225,6 +249,29 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
                     GridSitePhase::Connecting,
                     "GatewayAddressMissing".to_owned(),
                     "gateway address not available; awaiting configuration".to_owned(),
+                )
+            }
+        },
+        GridSitePhase::Active if is_plaintext_transport(site) => {
+            if let Some(addr) = probe_addr {
+                if tcp_probe(addr).await {
+                    (
+                        GridSitePhase::Active,
+                        "PlaintextTransportReachable".to_owned(),
+                        String::new(),
+                    )
+                } else {
+                    (
+                        GridSitePhase::Unreachable,
+                        "GatewayUnreachable".to_owned(),
+                        "gateway not reachable via TCP probe; site marked Unreachable".to_owned(),
+                    )
+                }
+            } else {
+                (
+                    GridSitePhase::Unreachable,
+                    "GatewayAddressMissing".to_owned(),
+                    "gateway address not available; site marked Unreachable".to_owned(),
                 )
             }
         },
@@ -320,6 +367,14 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
             "site has left the grid".to_owned(),
         ),
     }
+}
+
+/// Whether the site's egress transport is plaintext (no TLS).
+fn is_plaintext_transport(site: &GridSite) -> bool {
+    site.spec
+        .egress
+        .as_ref()
+        .is_some_and(|e| e.tls.mode.eq_ignore_ascii_case("plaintext"))
 }
 
 /// Attempt a TCP connection to `addr` with [`PROBE_TIMEOUT`].
@@ -963,5 +1018,98 @@ mod tests {
             Some(VALID_CERT_PEM),
             "publicCertPem must be set"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Plaintext transport — cert verification bypass
+    // -----------------------------------------------------------------------
+
+    fn site_with_plaintext_egress(phase: Option<GridSitePhase>, egress: &str) -> GridSite {
+        GridSite {
+            metadata: kube::api::ObjectMeta {
+                name: Some("test-site".to_owned()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: GridSiteSpec {
+                grid_network_ref: "test-net".to_owned(),
+                egress: Some(EgressConfig {
+                    address: egress.to_owned(),
+                    tls: EgressTls {
+                        mode: "Plaintext".to_owned(),
+                    },
+                }),
+                region: None,
+                sovereignty_zone: None,
+                zone: None,
+                trust: None,
+            },
+            status: phase.map(|p| GridSiteStatus {
+                phase: p,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_connecting_promotes_to_active_when_reachable() {
+        let (_listener, addr) = reachable_probe_addr();
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Connecting), &addr);
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+        assert_eq!(
+            phase,
+            GridSitePhase::Active,
+            "plaintext + reachable must promote to Active"
+        );
+        assert_eq!(reason, "PlaintextTransportReachable");
+    }
+
+    #[tokio::test]
+    async fn plaintext_connecting_stays_connecting_when_unreachable() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "127.0.0.1:19080");
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+        assert_eq!(
+            phase,
+            GridSitePhase::Connecting,
+            "plaintext + unreachable must stay Connecting"
+        );
+        assert_eq!(reason, "GatewayUnreachable");
+    }
+
+    #[tokio::test]
+    async fn plaintext_active_stays_active_when_reachable() {
+        let (_listener, addr) = reachable_probe_addr();
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Active), &addr);
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(
+            phase,
+            GridSitePhase::Active,
+            "plaintext Active + reachable must stay Active"
+        );
+        assert_eq!(reason, "PlaintextTransportReachable");
+    }
+
+    #[tokio::test]
+    async fn plaintext_active_demotes_when_unreachable() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Active), "127.0.0.1:19080");
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(
+            phase,
+            GridSitePhase::Unreachable,
+            "plaintext Active + unreachable must demote"
+        );
+        assert_eq!(reason, "GatewayUnreachable");
+    }
+
+    #[test]
+    fn is_plaintext_transport_detects_mode() {
+        let plaintext = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8080");
+        assert!(is_plaintext_transport(&plaintext), "Plaintext mode must be detected");
+
+        let mutual = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8080");
+        assert!(!is_plaintext_transport(&mutual), "Mutual mode must not be plaintext");
+
+        let no_egress = site_no_egress(Some(GridSitePhase::Connecting));
+        assert!(!is_plaintext_transport(&no_egress), "no egress must not be plaintext");
     }
 }

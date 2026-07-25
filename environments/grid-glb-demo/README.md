@@ -245,9 +245,12 @@ Both host services share a runtime directory on the Docker host:
   config              # rewritten kubeconfig mounted into overlay-sync
 ```
 
-The runtime directories are created by `praxis-forge up` and service
-startup. They are gitignored (`.forge/` in root `.gitignore`) and must
-not be committed.
+The runtime directories are prepared by Forge before starting host
+services. Writable bind-mount sources under `.forge/runtime/` are
+created with world-writable permissions for this local demo because the
+containers run as non-root users whose host UID is not known in advance.
+These directories are ephemeral, Forge-owned, gitignored (`.forge/` in
+root `.gitignore`), and must not be committed.
 
 ## Automated Proof
 

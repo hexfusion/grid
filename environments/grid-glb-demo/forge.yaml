@@ -129,6 +129,8 @@ spec:
     site-us-east-demo:
       description: Grid network, site, and SWIM seed wiring for GLB entry point
       steps:
+        - type: manifest
+          path: resources/operator-role-binding-grid-system.yaml
         - type: template-manifest
           path: resources/gridnetwork-site-us-east.yaml
         - type: template-manifest

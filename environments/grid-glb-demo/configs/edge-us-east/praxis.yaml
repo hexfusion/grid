@@ -22,10 +22,10 @@ filter_chains:
           ttl_secs: 3600
       - filter: load_balancer
         clusters:
-          - name: site-us-west
+          - name: sim-provider-us-west
             endpoints:
               - "{{ captures.site-us-west.provider-gateway-ip }}:8080"
-          - name: site-us-central
+          - name: sim-provider-us-central
             endpoints:
               - "{{ captures.site-us-central.provider-gateway-ip }}:8080"
 

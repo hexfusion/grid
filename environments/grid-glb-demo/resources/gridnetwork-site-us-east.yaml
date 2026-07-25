@@ -29,11 +29,11 @@ spec:
         credentialMountBase: /run/secrets/grid-credentials
         tlsCertMountPath: /etc/praxis/tls
         clusterEndpoints:
-          - cluster: site-us-west
+          - cluster: sim-provider-us-west
             address: "{{ captures.site-us-west.provider-gateway-ip }}:8080"
             transport:
               mode: plaintext
-          - cluster: site-us-central
+          - cluster: sim-provider-us-central
             address: "{{ captures.site-us-central.provider-gateway-ip }}:8080"
             transport:
               mode: plaintext

@@ -9,13 +9,17 @@ rules:
   #
   # The operator watches all three CRD types via kube-rs Controller::new
   # (requires list + watch).  It reads individual resources with get and
-  # writes spec and status via server-side apply (patch).
+  # writes spec and status via server-side apply (patch).  Auto-discovery
+  # of SWIM peers requires create + update on gridsites.
   - apiGroups: ["grid.praxis-proxy.io"]
     resources:
       - gridnetworks
-      - gridsites
       - inferenceproviders
     verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["grid.praxis-proxy.io"]
+    resources:
+      - gridsites
+    verbs: ["get", "list", "watch", "patch", "create", "update"]
 
   # Status subresources are authorized separately.
   - apiGroups: ["grid.praxis-proxy.io"]

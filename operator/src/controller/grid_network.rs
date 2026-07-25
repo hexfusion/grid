@@ -290,7 +290,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         .and_then(|l| l.get(LABEL_AUTO_DISCOVER_SITES))
         .is_some_and(|v| v == "true");
     if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim.as_ref(), membership.as_ref()) {
-        reconcile_discovered_sites(name, swim.site_name(), snapshot, client).await?;
+        let plaintext = network.spec.tls.ca_secret_ref.is_none() && network.spec.tls.site_secret_ref.is_none();
+        reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
     }
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
@@ -1435,7 +1436,7 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
 /// Phase ownership:
 /// - Pending → Discovered: this function (`GridNetwork` controller), based on SWIM Alive
 /// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
-/// - Connecting → Active: deployment workflow establishes trust before setting Active.
+/// - Connecting → Active: plaintext transport promotes on TCP probe; TLS transport requires trust verification.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential spec-apply + conditional status-patch per discovered site"
@@ -1453,6 +1454,7 @@ async fn reconcile_discovered_sites(
     local_site: &str,
     snapshot: &MembershipSnapshot,
     client: &Client,
+    plaintext: bool,
 ) -> Result<(), OperatorError> {
     let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
     if sites.is_empty() {
@@ -1479,13 +1481,14 @@ async fn reconcile_discovered_sites(
             }
         });
         if !site.egress_address.is_empty() {
+            let tls_mode = if plaintext { "Plaintext" } else { "Mutual" };
             spec_obj.get_mut("spec").and_then(|s| {
                 s.as_object_mut().map(|o| {
                     o.insert(
                         "egress".to_owned(),
                         serde_json::json!({
                             "address": site.egress_address,
-                            "tls": { "mode": "Mutual" }
+                            "tls": { "mode": tls_mode }
                         }),
                     );
                 })

@@ -130,6 +130,7 @@ pub fn start_service(
         let rm = rm_spec(params.binary, params.container_name);
         check_success(&runner.run(&rm)?, "rm")?;
     }
+    prepare_writable_volumes(&service.volumes, params.config_dir, params.state_dir)?;
     let spec = run_spec(params, service);
     let output = runner.run(&spec)?;
     check_success(&output, "run")
@@ -471,6 +472,9 @@ fn format_volume_arg(vol: &VolumeMount, config_dir: &Path, state_dir: &Path) -> 
 /// State directory prefix for volume source paths.
 const STATE_DIR_PREFIX: &str = ".forge/";
 
+/// Runtime directory prefix for writable service volumes.
+const RUNTIME_DIR_PREFIX: &str = ".forge/runtime/";
+
 /// Resolve a volume source path.
 ///
 /// Sources starting with `.forge/` are resolved against `state_dir`
@@ -489,6 +493,26 @@ fn resolve_source(source: &str, config_dir: &Path, state_dir: &Path) -> std::pat
         return canonical.join(suffix);
     }
     config_dir.join(source)
+}
+
+/// Ensure writable runtime directories exist before container start.
+///
+/// For each non-read-only volume whose source is under
+/// `.forge/runtime/`, creates the host directory and sets mode 0o777
+/// so non-root container processes can write.  Container UIDs are
+/// unpredictable (Alpine dynamic system users), so world-writable is
+/// the narrowest portable mode for these ephemeral, gitignored paths.
+fn prepare_writable_volumes(volumes: &[VolumeMount], config_dir: &Path, state_dir: &Path) -> Result<(), ForgeError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    for vol in volumes {
+        if vol.read_only || !vol.source.starts_with(RUNTIME_DIR_PREFIX) {
+            continue;
+        }
+        let path = resolve_source(&vol.source, config_dir, state_dir);
+        std::fs::create_dir_all(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))?;
+    }
+    Ok(())
 }
 
 /// Parse JSON labels from `docker inspect --format` output.
@@ -1142,6 +1166,86 @@ mod tests {
             display.contains(&expected),
             "should resolve .forge/ against state_dir: {display}"
         );
+    }
+
+    // ---------------------------------------------------------
+    // Writable volume preparation
+    // ---------------------------------------------------------
+
+    #[test]
+    fn prepare_writable_runtime_creates_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let vols = vec![VolumeMount {
+            source: ".forge/runtime/out".to_owned(),
+            target: "/output".to_owned(),
+            read_only: false,
+        }];
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
+        let created = state.join("runtime/out");
+        assert!(created.is_dir(), "directory should exist");
+        let mode = std::fs::metadata(&created)
+            .unwrap_or_else(|_| std::process::abort())
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o777, "mode should be 0o777, got {mode:o}");
+    }
+
+    #[test]
+    fn prepare_readonly_runtime_skipped() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let vols = vec![VolumeMount {
+            source: ".forge/runtime/kube".to_owned(),
+            target: "/kube".to_owned(),
+            read_only: true,
+        }];
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
+        let skipped = state.join("runtime/kube");
+        assert!(!skipped.exists(), "read-only runtime dir should not be created");
+    }
+
+    #[test]
+    fn prepare_non_runtime_source_skipped() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let vols = vec![VolumeMount {
+            source: "configs/app".to_owned(),
+            target: "/etc/app".to_owned(),
+            read_only: false,
+        }];
+        prepare_writable_volumes(&vols, &cfg, &state).unwrap_or_else(|_| std::process::abort());
+        let skipped = cfg.join("configs/app");
+        assert!(!skipped.exists(), "non-runtime config source should not be created");
+    }
+
+    #[test]
+    fn prepare_writable_runtime_idempotent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let vols = vec![VolumeMount {
+            source: ".forge/runtime/out".to_owned(),
+            target: "/output".to_owned(),
+            read_only: false,
+        }];
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
+        let created = state.join("runtime/out");
+        let mode = std::fs::metadata(&created)
+            .unwrap_or_else(|_| std::process::abort())
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o777, "mode should still be 0o777 after second call");
     }
 
     // ---------------------------------------------------------
