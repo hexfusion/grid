@@ -423,6 +423,17 @@ fn identity_spec(binary: &str, name: &str) -> CommandSpec {
     )
 }
 
+/// Build a `<binary> logs [--tail N] <name>` command spec.
+pub fn logs_spec(binary: &str, name: &str, tail: Option<u32>) -> CommandSpec {
+    let mut args: Vec<OsString> = vec!["logs".into()];
+    if let Some(n) = tail {
+        args.push("--tail".into());
+        args.push(n.to_string().into());
+    }
+    args.push(name.into());
+    build_spec(binary, args)
+}
+
 /// Construct a [`CommandSpec`] from a binary and argument list.
 fn build_spec(binary: &str, args: Vec<OsString>) -> CommandSpec {
     build_spec_with_redactions(binary, args, Vec::new())
@@ -573,6 +584,7 @@ pub fn dispatch(ctx: &ForgeContext<'_>, cmd: &ServiceCommand, writer: &mut dyn W
         ServiceCommand::List => handle_list(ctx, writer),
         ServiceCommand::Start { name } => handle_start(ctx, name, writer),
         ServiceCommand::Stop { name } => handle_stop(ctx, name, writer),
+        ServiceCommand::Logs { name, tail } => handle_logs(ctx, name, *tail, writer),
     }
 }
 
@@ -628,6 +640,31 @@ fn handle_stop(ctx: &ForgeContext<'_>, name: &str, writer: &mut dyn Write) -> Re
     mark_service_stopped(&mut st, name);
     state::save(&ctx.state_dir, &st)?;
     report_text_or_json(writer, &format!("stopped service '{name}'"), &ctx.format)
+}
+
+/// Handle `service logs`.
+fn handle_logs(
+    ctx: &ForgeContext<'_>,
+    name: &str,
+    tail: Option<u32>,
+    writer: &mut dyn Write,
+) -> Result<(), ForgeError> {
+    lookup_service(ctx, name)?;
+    let rt = crate::runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
+    let cname = container_name(&ctx.config.metadata.name, name);
+    let spec = logs_spec(&rt.binary, &cname, tail);
+    let output = ctx.runner.run(&spec)?;
+    if output.status != 0 {
+        return Err(ForgeError::Command {
+            program: spec.program.to_string_lossy().into_owned(),
+            message: format!("logs exited with status {}: {}", output.status, output.stderr.trim()),
+        });
+    }
+    writer.write_all(output.stdout.as_bytes()).map_err(ForgeError::Io)?;
+    if !output.stderr.is_empty() {
+        writer.write_all(output.stderr.as_bytes()).map_err(ForgeError::Io)?;
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------
@@ -1356,5 +1393,24 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("cannot parse service inspect"), "error message: {msg}");
+    }
+
+    // ---------------------------------------------------------
+    // logs_spec tests
+    // ---------------------------------------------------------
+
+    #[test]
+    fn logs_spec_without_tail() {
+        let spec = logs_spec("docker", "my-svc", None);
+        assert_eq!(spec.program, "docker", "program");
+        let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(args.as_slice(), &["logs", "my-svc"], "argv");
+    }
+
+    #[test]
+    fn logs_spec_with_tail() {
+        let spec = logs_spec("docker", "my-svc", Some(50));
+        let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(args.as_slice(), &["logs", "--tail", "50", "my-svc"], "argv with --tail");
     }
 }

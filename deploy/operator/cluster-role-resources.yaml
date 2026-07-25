@@ -24,6 +24,17 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "create", "patch"]
 
+  # ── Services (namespaced) ───────────────────────────────────────────
+  #
+  # Read paths:
+  #   - Provider gateway LoadBalancer Service (self-discovery of the
+  #     external address advertised via SWIM state broadcast)
+  #
+  # Only get is required; no write, list, or watch.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+
   # ── ConfigMaps (namespaced) ─────────────────────────────────────────
   #
   # Write paths:

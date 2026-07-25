@@ -30,7 +30,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -295,6 +295,14 @@ pub enum SetKeyError {
     RuntimeGone,
 }
 
+/// Error returned when [`SwimHandle::set_gateway_address`] fails.
+#[derive(Debug, thiserror::Error)]
+pub enum SetGatewayError {
+    /// The SWIM runtime has exited and the gateway channel is closed.
+    #[error("SWIM runtime has exited; gateway address not applied")]
+    RuntimeGone,
+}
+
 /// Error returned when seed addresses cannot be queued for announcement.
 #[derive(Debug, thiserror::Error)]
 pub enum SeedAnnounceError {
@@ -322,9 +330,6 @@ pub struct SwimHandle {
     /// Callers may use this to filter the local address from `spec.seeds`
     /// before calling [`SwimHandle::announce_seeds`].
     advertise_addr: SocketAddr,
-
-    /// Data-plane gateway address advertised in CRDT state broadcasts.
-    gateway_address: Option<String>,
 
     /// Watch channel receiver for SWIM membership snapshots.
     snapshot_rx: watch::Receiver<MembershipSnapshot>,
@@ -360,6 +365,21 @@ pub struct SwimHandle {
     /// The key value must **never** appear in logs, spans, error messages, or
     /// status fields.
     key_tx: watch::Sender<Option<Arc<swim::crypto::SwimKey>>>,
+
+    /// Current data-plane gateway address.
+    ///
+    /// Updated by [`SwimHandle::set_gateway_address`] after the runtime accepts
+    /// a change.  This keeps provider-state broadcasts aligned with async
+    /// Service self-discovery without keeping the runtime's watch channel open
+    /// after the run loop exits.
+    current_gateway: Arc<Mutex<Option<String>>>,
+
+    /// Watch sender for updating the data-plane gateway address at runtime.
+    ///
+    /// Used by the background discovery poller to push a newly-discovered
+    /// address to the SWIM run loop.  The run loop detects changes and
+    /// publishes a fresh gateway-address broadcast to peers.
+    gateway_tx: watch::Sender<Option<String>>,
 }
 
 impl SwimHandle {
@@ -379,10 +399,32 @@ impl SwimHandle {
         self.advertise_addr
     }
 
-    /// Return the configured data-plane gateway address, if any.
+    /// Return the current data-plane gateway address, if any.
     #[must_use]
-    pub fn gateway_address(&self) -> Option<&str> {
-        self.gateway_address.as_deref()
+    pub fn gateway_address(&self) -> Option<String> {
+        self.current_gateway.lock().map_or(None, |addr| addr.clone())
+    }
+
+    /// Update the data-plane gateway address at runtime.
+    ///
+    /// The SWIM run loop detects the change and publishes a fresh
+    /// gateway-address broadcast to peers.
+    ///
+    /// [`SwimHandle::gateway_address()`] reflects the last value accepted by
+    /// this channel, so provider-state broadcasts do not regress to the startup
+    /// address after discovery updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetGatewayError::RuntimeGone`] if the SWIM runtime has exited.
+    pub fn set_gateway_address(&self, addr: Option<String>) -> Result<(), SetGatewayError> {
+        self.gateway_tx
+            .send(addr.clone())
+            .map_err(|_e| SetGatewayError::RuntimeGone)?;
+        if let Ok(mut current) = self.current_gateway.lock() {
+            *current = addr;
+        }
+        Ok(())
     }
 
     /// Queue seed addresses for announcement to the SWIM runtime.
@@ -513,6 +555,8 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
     let (key_tx, key_rx) = watch::channel(initial_key);
+    let (gateway_tx, gateway_rx) = watch::channel(gateway_address.clone());
+    let current_gateway = Arc::new(Mutex::new(gateway_address.clone()));
     let channels = RuntimeChannels {
         snapshot_tx,
         timer_tx,
@@ -537,17 +581,19 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         channels,
         state_tx,
         key_rx,
+        gateway_rx,
     ));
 
     Ok(Arc::new(SwimHandle {
         site_name,
         advertise_addr,
-        gateway_address,
         snapshot_rx,
         state_rx,
         broadcast_tx,
         seed_tx,
         key_tx,
+        current_gateway,
+        gateway_tx,
     }))
 }
 
@@ -578,6 +624,7 @@ async fn run_loop(
     mut channels: RuntimeChannels,
     state_tx: watch::Sender<GridStateSnapshot>,
     mut key_rx: watch::Receiver<Option<Arc<swim::crypto::SwimKey>>>,
+    mut gateway_rx: watch::Receiver<Option<String>>,
 ) {
     let site_name = config.site_name.clone();
     let identity = NodeId::new(site_name.clone(), advertise_addr);
@@ -586,12 +633,12 @@ async fn run_loop(
     let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
-    let gateway_address = config.gateway_address.clone();
+    let mut gateway_address = config.gateway_address.clone();
     let mut gateway_address_revision = 0_u64;
     let mut next_gateway_republish_at = Instant::now();
 
-    if let Some(gateway_address) = gateway_address.as_deref() {
-        publish_gateway_address_broadcast(&mut node, &site_name, gateway_address_revision, gateway_address);
+    if let Some(addr) = gateway_address.as_deref() {
+        publish_gateway_address_broadcast(&mut node, &site_name, gateway_address_revision, addr);
     }
 
     // Announce to seed peers.  Errors are logged inside SwimNode::announce.
@@ -758,6 +805,32 @@ async fn run_loop(
                 // no new membership event arrives.
                 if has_aging_members(&tracked) {
                     drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now(), &node.gateway_addrs(), &node.cert_pems())));
+                }
+            }
+            Ok(()) = gateway_rx.changed() => {
+                gateway_address.clone_from(&gateway_rx.borrow_and_update());
+                if let Some(addr) = gateway_address.as_deref() {
+                    gateway_address_revision = gateway_address_revision.saturating_add(1);
+                    publish_gateway_address_broadcast(
+                        &mut node,
+                        &site_name,
+                        gateway_address_revision,
+                        addr,
+                    );
+                    let gossip_out = node.gossip();
+                    drain_output(
+                        gossip_out,
+                        &socket,
+                        &channels.timer_tx,
+                        &mut tracked,
+                        &channels.snapshot_tx,
+                        &node.gateway_addrs(),
+                        &node.cert_pems(),
+                        current_key.as_deref(),
+                    )
+                    .await;
+                    drop(state_tx.send(node.state_snapshot()));
+                    tracing::info!(addr = %addr, "gateway address updated at runtime");
                 }
             }
         }
@@ -1234,15 +1307,17 @@ mod tests {
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
         let (key_tx, _key_rx) = watch::channel(None);
+        let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
-            gateway_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
             seed_tx,
             key_tx,
+            current_gateway: Arc::new(Mutex::new(None)),
+            gateway_tx,
         };
         (handle, snapshot_tx, state_tx)
     }
@@ -1254,22 +1329,89 @@ mod tests {
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
         let (key_tx, _key_rx) = watch::channel(None);
+        let (gateway_tx, _gateway_rx) = watch::channel(Some("127.0.0.1:19080".to_owned()));
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
-            gateway_address: Some("127.0.0.1:19080".to_owned()),
             snapshot_rx,
             state_rx,
             broadcast_tx,
             seed_tx,
             key_tx,
+            current_gateway: Arc::new(Mutex::new(Some("127.0.0.1:19080".to_owned()))),
+            gateway_tx,
         };
         drop((snapshot_tx, state_tx));
 
         assert_eq!(
             handle.gateway_address(),
-            Some("127.0.0.1:19080"),
+            Some("127.0.0.1:19080".to_owned()),
             "handle must expose configured gateway address for state broadcasts"
+        );
+    }
+
+    #[test]
+    fn set_gateway_address_sends_to_channel() {
+        let (_snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+        let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
+        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        let (seed_tx, _seed_rx) = mpsc::channel(16);
+        let (key_tx, _key_rx) = watch::channel(None);
+        let (gateway_tx, mut gateway_rx) = watch::channel(None);
+        let handle = SwimHandle {
+            site_name: "test".to_owned(),
+            advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            snapshot_rx,
+            state_rx,
+            broadcast_tx,
+            seed_tx,
+            key_tx,
+            current_gateway: Arc::new(Mutex::new(None)),
+            gateway_tx,
+        };
+
+        let result = handle.set_gateway_address(Some("10.0.0.5:8080".to_owned()));
+        assert!(result.is_ok(), "set_gateway_address must succeed when channel is open");
+        assert!(gateway_rx.has_changed().unwrap_or(false), "watch must see change");
+        let val = gateway_rx.borrow_and_update().clone();
+        assert_eq!(val.as_deref(), Some("10.0.0.5:8080"), "receiver must see new address");
+        assert_eq!(
+            handle.gateway_address(),
+            Some("10.0.0.5:8080".to_owned()),
+            "handle must expose runtime-updated address"
+        );
+    }
+
+    #[test]
+    fn set_gateway_address_returns_error_when_runtime_gone() {
+        let (_snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+        let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
+        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        let (seed_tx, _seed_rx) = mpsc::channel(16);
+        let (key_tx, _key_rx) = watch::channel(None);
+        let (gateway_tx, gateway_rx) = watch::channel(None);
+        let handle = SwimHandle {
+            site_name: "test".to_owned(),
+            advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            snapshot_rx,
+            state_rx,
+            broadcast_tx,
+            seed_tx,
+            key_tx,
+            current_gateway: Arc::new(Mutex::new(None)),
+            gateway_tx,
+        };
+        drop(gateway_rx);
+
+        let result = handle.set_gateway_address(Some("10.0.0.5:8080".to_owned()));
+        assert!(
+            matches!(result, Err(SetGatewayError::RuntimeGone)),
+            "must return RuntimeGone when receiver is dropped"
+        );
+        assert_eq!(
+            handle.gateway_address(),
+            None,
+            "failed runtime update must not change cached gateway address"
         );
     }
 
@@ -1372,15 +1514,17 @@ mod tests {
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, mut seed_rx) = mpsc::channel(16);
         let (key_tx, _key_rx) = watch::channel(None);
+        let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
-            gateway_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
             seed_tx,
             key_tx,
+            current_gateway: Arc::new(Mutex::new(None)),
+            gateway_tx,
         };
         drop((snapshot_tx, state_tx));
 
@@ -1399,15 +1543,17 @@ mod tests {
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
         let (key_tx, _key_rx) = watch::channel(None);
+        let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
-            gateway_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
             seed_tx,
             key_tx,
+            current_gateway: Arc::new(Mutex::new(None)),
+            gateway_tx,
         };
         // Drop the receiver to simulate the runtime loop having exited.
         drop(seed_rx);

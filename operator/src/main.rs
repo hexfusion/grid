@@ -70,10 +70,14 @@ async fn main() {
         },
     };
 
-    // Start the SWIM runtime if GRID_SWIM_BIND_ADDR is set.
-    // The runtime runs in the background; failures are logged and the
-    // operator continues in static mode.
-    let swim = maybe_start_swim().await;
+    let swim = maybe_start_swim(&client).await;
+
+    if let Some(handle) = &swim {
+        tokio::spawn(operator::gateway::run_discovery_poller(
+            client.clone(),
+            Arc::clone(handle),
+        ));
+    }
 
     let ctx = Arc::new(OperatorCtx::new(client.clone(), swim));
 
@@ -97,11 +101,16 @@ async fn main() {
 /// Returns `Some(handle)` if `GRID_SWIM_BIND_ADDR` is set and the runtime
 /// starts successfully.  Returns `None` when the variable is absent,
 /// unparseable, or the bind fails (all logged at error level).
+///
+/// Gateway address resolution uses [`operator::gateway::resolve`]:
+/// `GRID_GATEWAY_ADDRESS` env var wins; otherwise the operator discovers
+/// its own provider gateway Service `LoadBalancer` IP from Kubernetes.
 #[expect(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
 )]
-async fn maybe_start_swim() -> Option<Arc<swim_runtime::SwimHandle>> {
+async fn maybe_start_swim(client: &Client) -> Option<Arc<swim_runtime::SwimHandle>> {
     let addr_str = std::env::var("GRID_SWIM_BIND_ADDR").ok()?;
     let bind_addr = match addr_str.parse() {
         Ok(a) => a,
@@ -113,9 +122,13 @@ async fn maybe_start_swim() -> Option<Arc<swim_runtime::SwimHandle>> {
     let advertise_addr = parse_optional_socket_addr_env("GRID_SWIM_ADVERTISE_ADDR");
     let seeds = parse_socket_addr_list_env("GRID_SWIM_SEEDS");
     let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
-    let gateway_address = std::env::var("GRID_GATEWAY_ADDRESS")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let gateway_address = match operator::gateway::resolve(client).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            tracing::error!(error = %e, "gateway address discovery failed; continuing without");
+            None
+        },
+    };
     let swim_key = parse_swim_key_env("GRID_SWIM_ENCRYPT_KEY");
     let cfg = SwimConfig {
         bind_addr,

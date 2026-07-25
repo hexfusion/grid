@@ -265,29 +265,37 @@ fn candidates_yaml_impl(overlay: &RoutingOverlay, emit_credential: bool) -> Stri
     overlay
         .candidates
         .iter()
-        .map(|c| {
-            let fresh_str = if c.fresh { "true" } else { "false" };
-            let mut lines = vec![
-                format!("         - kind: {}", c.kind),
-                format!("           name: {}", c.name),
-                format!("           site: {}", c.site),
-                // Use gateway-{site} to match the xtask load_balancer naming convention.
-                // The operator's candidate.cluster is the production reference.
-                format!("           cluster: gateway-{}", c.site),
-                format!("           fresh: {fresh_str}"),
-            ];
-            if let Some(cred) = c.credential.as_ref().filter(|_| emit_credential) {
-                lines.push("           credential:".to_owned());
-                lines.push(format!("             strategy: {}", cred.strategy));
-                lines.push("             secretRef:".to_owned());
-                lines.push(format!("               name: {}", cred.secret_ref.name));
-                lines.push(format!("               namespace: {}", cred.secret_ref.namespace));
-                lines.push(format!("               key: {}", cred.secret_ref.key));
-            }
-            lines.join("\n")
-        })
+        .map(|c| candidate_yaml_lines(c, emit_credential))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render one [`RoutingCandidate`] as indented YAML lines for embedding in a
+/// `grid_route` filter config stanza.
+fn candidate_yaml_lines(c: &RoutingCandidate, emit_credential: bool) -> String {
+    let fresh_str = if c.fresh { "true" } else { "false" };
+    let mut lines = vec![
+        format!("         - kind: {}", c.kind),
+        format!("           name: {}", c.name),
+        format!("           site: {}", c.site),
+        // Use gateway-{site} to match the xtask load_balancer naming convention.
+        format!("           cluster: gateway-{}", c.site),
+        format!("           fresh: {fresh_str}"),
+    ];
+    if let Some(cred) = c.credential.as_ref().filter(|_| emit_credential) {
+        emit_credential_yaml(&mut lines, cred);
+    }
+    lines.join("\n")
+}
+
+/// Append credential YAML lines to a candidate's line buffer.
+fn emit_credential_yaml(lines: &mut Vec<String>, cred: &ProjectedCredential) {
+    lines.push("           credential:".to_owned());
+    lines.push(format!("             strategy: {}", cred.strategy));
+    lines.push("             secretRef:".to_owned());
+    lines.push(format!("               name: {}", cred.secret_ref.name));
+    lines.push(format!("               namespace: {}", cred.secret_ref.namespace));
+    lines.push(format!("               key: {}", cred.secret_ref.key));
 }
 
 // ---------------------------------------------------------------------------

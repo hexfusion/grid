@@ -9,21 +9,22 @@
 //! # Scope
 //!
 //! Forge manages:
-//! - Kind cluster lifecycle
-//! - Host-level container services
-//! - Certificate generation and distribution
-//! - Composable deployment stacks
-//! - Cross-cluster networking
+//! - Kind cluster lifecycle (`up`/`down`/`cluster` subcommands)
+//! - Host-level container services (`service start`/`stop`/`logs`)
+//! - Composable deployment stacks (`stack apply`/`plan`/`status`)
+//! - Cross-cluster Docker networking
+//! - Template-based manifest rendering with capture variables
+//! - Persistent state under `.forge/`
 //!
 //! Forge does **not** perform project-specific assertions, CRD
 //! validation, or operator testing.  Those responsibilities belong
 //! to the consuming project's own test harness.
 //!
-//! # Current status (F4)
+//! Certificate generation/distribution and image building are
+//! planned but not yet implemented.
 //!
-//! F4 adds the generic stack execution engine: composable deployment
-//! stacks applied to KIND clusters via templates and sequential step
-//! execution, with `stack list/plan/apply/status` subcommands.
+//! Cross-cluster networking requires Docker; Podman support is
+//! limited to single-cluster environments.
 
 pub mod cli;
 pub mod cluster;

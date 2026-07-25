@@ -135,7 +135,8 @@ struct PrereqContext {
 /// Check all prerequisites and return a context for the verification
 /// steps.  Fails with a combined error if config, tools, or the forge
 /// binary are missing.  Placeholder images are stored in the context
-/// for per-step gating (warning, not fatal).
+/// for per-step gating (warning, not fatal).  `:latest` images in the
+/// GLB demo config are a hard failure.
 fn check_prerequisites(forge_config: &Path) -> Result<PrereqContext, Box<dyn std::error::Error>> {
     let (errors, forge_bin) = collect_prereq_errors(forge_config);
     if !errors.is_empty() {
@@ -144,6 +145,8 @@ fn check_prerequisites(forge_config: &Path) -> Result<PrereqContext, Box<dyn std
     }
 
     let config_text = std::fs::read_to_string(forge_config)?;
+    check_no_latest_images(&config_text, forge_config)?;
+
     let placeholders = detect_placeholder_images(&config_text);
     if !placeholders.is_empty() {
         warn_placeholder_images(&placeholders);
@@ -157,6 +160,33 @@ fn check_prerequisites(forge_config: &Path) -> Result<PrereqContext, Box<dyn std
         overlay_path: PathBuf::from(OVERLAY_FILE),
         placeholders,
     })
+}
+
+/// Fail if the forge config or its demo resource files use `:latest`.
+fn check_no_latest_images(config_text: &str, forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let latest_images = detect_latest_images(config_text);
+    if !latest_images.is_empty() {
+        report_latest_images(&latest_images);
+        return Err(format!(
+            "{} service(s) use :latest — GLB demo requires pinned tags",
+            latest_images.len()
+        )
+        .into());
+    }
+
+    let resource_latest = forge_config
+        .parent()
+        .map(detect_latest_in_resources)
+        .unwrap_or_default();
+    if !resource_latest.is_empty() {
+        report_latest_resources(&resource_latest);
+        return Err(format!(
+            "{} resource file(s) use :latest — GLB demo requires pinned tags",
+            resource_latest.len()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Print prerequisite errors to stderr.
@@ -173,6 +203,24 @@ fn warn_placeholder_images(placeholders: &[(String, String)]) {
     eprintln!();
     for (svc, img) in placeholders {
         eprintln!("  WARNING: service '{svc}' uses placeholder image '{img}' — steps 7+ will be BLOCKED");
+    }
+    eprintln!();
+}
+
+/// Report `:latest` images found in the forge config (fatal).
+fn report_latest_images(latest: &[(String, String)]) {
+    eprintln!();
+    for (svc, img) in latest {
+        eprintln!("  FAIL: service '{svc}' uses unpinned image '{img}'");
+    }
+    eprintln!();
+}
+
+/// Report `:latest` images found in demo resource files (fatal).
+fn report_latest_resources(latest: &[(PathBuf, String)]) {
+    eprintln!();
+    for (path, img) in latest {
+        eprintln!("  FAIL: {} uses unpinned image '{img}'", path.display());
     }
     eprintln!();
 }
@@ -247,6 +295,97 @@ pub(crate) fn detect_placeholder_images(config_text: &str) -> Vec<(String, Strin
         }
     }
     results
+}
+
+/// Detect `:latest`-tagged images in forge config text.
+///
+/// Same scanning pattern as [`detect_placeholder_images`] — tracks
+/// the nearest preceding `- name:` line as context.
+pub(crate) fn detect_latest_images(config_text: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let mut current_service = String::new();
+
+    for line in config_text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("- name:") {
+            rest.trim().clone_into(&mut current_service);
+        }
+        if let Some(raw) = extract_image_value(trimmed)
+            && image_is_latest(&raw)
+        {
+            results.push((current_service.clone(), raw));
+        }
+    }
+    results
+}
+
+/// Detect `:latest`-tagged images in YAML resource files under the
+/// demo directory's `resources/` subdirectory.
+fn detect_latest_in_resources(demo_dir: &Path) -> Vec<(PathBuf, String)> {
+    let resources_dir = demo_dir.join("resources");
+    let mut results = Vec::new();
+    let Ok(entries) = walk_yaml_files(&resources_dir) else {
+        return results;
+    };
+    for path in entries {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(raw) = extract_image_value(line.trim())
+                && image_is_latest(&raw)
+            {
+                results.push((path.clone(), raw));
+            }
+        }
+    }
+    results
+}
+
+/// Collect `.yaml` / `.yml` file paths under a directory recursively.
+fn walk_yaml_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(sub) = walk_yaml_files(&path) {
+                files.extend(sub);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "yaml" || ext == "yml") {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// Extract the image value from a YAML `image:` line.
+fn extract_image_value(trimmed: &str) -> Option<String> {
+    let rest = if let Some(r) = trimmed.strip_prefix("image:") {
+        r
+    } else if trimmed.contains("image:") {
+        trimmed.split("image:").nth(1)?
+    } else {
+        return None;
+    };
+    let raw = rest.trim().trim_matches('"').to_owned();
+    if raw.is_empty() { None } else { Some(raw) }
+}
+
+/// Check whether an image reference uses `:latest` (explicit or implied).
+///
+/// Digest-pinned images (`image@sha256:...`) are always considered
+/// pinned regardless of whether a tag is also present.
+fn image_is_latest(image: &str) -> bool {
+    if image.contains('@') {
+        return false;
+    }
+    let tag = image
+        .rsplit_once('/')
+        .map_or(image, |(_prefix, tail)| tail)
+        .rsplit_once(':')
+        .map(|(_name, tag)| tag);
+    tag == Some("latest") || tag.is_none()
 }
 
 /// Parse the host port for a named service from forge config text.
@@ -333,8 +472,8 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
     step_banner(8, "checking overlay candidate metadata");
     record_step("overlay metadata", results, check_overlay_metadata);
 
-    // Step 9: Provider gateway address advertised.
-    step_banner(9, "checking provider gateway address");
+    // Step 9: Provider gateway self-discovery.
+    step_banner(9, "checking provider gateway self-discovery");
     let provider_gateway_addrs = match load_provider_gateway_addresses() {
         Ok(addrs) => addrs,
         Err(e) => {
@@ -696,8 +835,8 @@ fn get_swim_lb_ip(context: &str, cluster: &str) -> Result<String, Box<dyn std::e
         .into());
     }
     let ip = String::from_utf8(output.stdout)?.trim().to_owned();
-    if ip.is_empty() {
-        return Err(format!("{SWIM_LB_SERVICE} on {cluster} has no external IP").into());
+    if !looks_like_ipv4(&ip) {
+        return Err(format!("{SWIM_LB_SERVICE} on {cluster} has invalid IP '{ip}'").into());
     }
     Ok(ip)
 }
@@ -725,8 +864,8 @@ fn check_swim_advertise_addr() -> Result<String, Box<dyn std::error::Error>> {
         let Some(addr) = addr else {
             return Err(format!("GRID_SWIM_ADVERTISE_ADDR not set on {cluster}").into());
         };
-        if addr.contains("$(POD_IP)") || addr.is_empty() {
-            return Err(format!("GRID_SWIM_ADVERTISE_ADDR on {cluster} is '{addr}' (expected LB IP)").into());
+        if addr.contains("$(POD_IP)") || addr.is_empty() || !addr.ends_with(":7946") {
+            return Err(format!("GRID_SWIM_ADVERTISE_ADDR on {cluster} is '{addr}' (expected LB IP:7946)").into());
         }
         verified.push(format!("{cluster}={addr}"));
     }
@@ -766,8 +905,8 @@ fn check_gridnetwork_seeds() -> Result<String, Box<dyn std::error::Error>> {
             .output()?;
         let seeds_raw = String::from_utf8(output.stdout)?.trim().to_owned();
         let count = parse_seeds_count(&seeds_raw);
-        if count < 2 {
-            return Err(format!("GridNetwork on {cluster} has {count} seed(s) (expected ≥2)").into());
+        if count != 2 {
+            return Err(format!("GridNetwork on {cluster} has {count} seed(s) (expected exactly 2)").into());
         }
         verified.push(format!("{cluster}={count}"));
     }
@@ -830,22 +969,47 @@ fn validate_overlay_json(json: &str) -> Result<String, Box<dyn std::error::Error
         return Err("overlay has 0 candidates".into());
     }
 
-    let required = ["stable_id", "admission_state", "selection_tier", "rank"];
-    for (i, c) in candidates.iter().enumerate() {
-        for field in &required {
-            if c.get(*field).is_none() {
-                return Err(format!("candidate[{i}] missing {field}").into());
-            }
-        }
-    }
-
+    validate_candidate_metadata(candidates)?;
     Ok(format!(
-        "{} candidate(s) with metadata, generated_at present",
+        "{} candidate(s), validated: stable_id, admission_state, selection_tier, rank, generated_at",
         candidates.len()
     ))
 }
 
-/// Step 9: `GRID_GATEWAY_ADDRESS` set on provider-role operators.
+/// Validate each candidate has required metadata fields with
+/// correct types and non-empty values.
+fn validate_candidate_metadata(candidates: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
+    let required_strings = ["stable_id", "admission_state", "selection_tier"];
+    for (i, c) in candidates.iter().enumerate() {
+        for field in &required_strings {
+            let val = c
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty());
+            if val.is_none() {
+                return Err(format!("candidate[{i}] missing or empty {field}").into());
+            }
+        }
+        let has_rank = c
+            .get("rank")
+            .is_some_and(|v| v.as_u64().is_some() || v.as_i64().is_some());
+        if !has_rank {
+            return Err(format!("candidate[{i}] missing or non-numeric rank").into());
+        }
+    }
+    Ok(())
+}
+
+/// Step 9: Provider gateway self-discovery.
+///
+/// Proves the operator's self-discovery path works end-to-end:
+///
+/// 1. The `provider-gateway` Service on each provider cluster has a `LoadBalancer` IP matching the independent Forge
+///    capture (verifier evidence only — the operator does not read captures).
+/// 2. The operator deployment does **not** have `GRID_GATEWAY_ADDRESS` set from Forge captures (confirming it uses
+///    self-discovery).
+/// 3. The remote `GridSite` egress address on the edge cluster equals the Service LB address (confirming the address
+///    was broadcast via SWIM).
 fn check_provider_gateway_addr(
     expected_addrs: &BTreeMap<String, String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -854,16 +1018,17 @@ fn check_provider_gateway_addr(
         let expected = expected_addrs
             .get(*cluster)
             .ok_or_else(|| format!("missing Forge capture for {cluster} provider gateway"))?;
-        let addr = get_operator_env_var(cluster, "GRID_GATEWAY_ADDRESS")?
-            .ok_or_else(|| format!("GRID_GATEWAY_ADDRESS not set on {cluster}"))?;
-        verify_expected_gateway_addr(cluster, "GRID_GATEWAY_ADDRESS", &addr, expected)?;
-        verified.push(format!("{cluster}={addr}"));
+        let actual = get_service_lb_address(cluster, "provider-gateway")?;
+        verify_expected_gateway_addr(cluster, "provider-gateway Service LB", &actual, expected)?;
+        verify_no_capture_injection(cluster)?;
+        verified.push(format!("{cluster}={actual} (self-discovered, broadcast via SWIM)"));
     }
     Ok(verified.join(", "))
 }
 
-/// Read one env var from the grid operator Deployment template.
-fn get_operator_env_var(cluster: &str, name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+/// Confirm the operator does not have `GRID_GATEWAY_ADDRESS` set from
+/// Forge capture templates (i.e. containing `captures.`).
+fn verify_no_capture_injection(cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context = kubectl_context(cluster);
     let output = Command::new("kubectl")
         .args([
@@ -879,10 +1044,61 @@ fn get_operator_env_var(cluster: &str, name: &str) -> Result<Option<String>, Box
         ])
         .output()?;
     let env_json = String::from_utf8(output.stdout)?;
-    Ok(parse_env_var_from_json(&env_json, name))
+    let gw_val = parse_env_var_from_json(&env_json, "GRID_GATEWAY_ADDRESS");
+    if let Some(val) = &gw_val.filter(|v| !v.is_empty()) {
+        return Err(
+            format!("GRID_GATEWAY_ADDRESS on {cluster} is '{val}' — should be unset for self-discovery").into(),
+        );
+    }
+    Ok(())
 }
 
-/// Verify an advertised gateway address exactly matches the Forge capture.
+/// Read the first `LoadBalancer` ingress IP from a Service, formatted as `ip:port`.
+fn get_service_lb_address(cluster: &str, service: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let raw = kubectl_service_lb_jsonpath(cluster, service)?;
+    parse_service_lb_output(&raw, cluster, service)
+}
+
+/// Run kubectl to fetch Service LB IP and port via jsonpath.
+fn kubectl_service_lb_jsonpath(cluster: &str, service: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let context = kubectl_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "svc",
+            service,
+            "-o",
+            "jsonpath={.status.loadBalancer.ingress[0].ip},{.spec.ports[0].port}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "kubectl get svc/{service} on {cluster} failed: {}",
+            safe_truncate_str(stderr.trim(), 120)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Parse `"ip,port"` output from kubectl jsonpath into `"ip:port"`.
+fn parse_service_lb_output(raw: &str, cluster: &str, service: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = raw.split(',').collect();
+    let ip = parts
+        .first()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("svc/{service} on {cluster} has no LoadBalancer IP"))?;
+    let port = parts.get(1).copied().unwrap_or("8080");
+    Ok(format!("{ip}:{port}"))
+}
+
+/// Verify a gateway address matches the independent Forge capture (verifier evidence only).
 fn verify_expected_gateway_addr(
     cluster: &str,
     field: &str,
@@ -974,7 +1190,8 @@ fn find_gridsite_egress<'a>(
         .unwrap_or(""))
 }
 
-/// Load expected provider gateway addresses from Forge's default state file.
+/// Load expected provider gateway addresses from Forge's default state file
+/// (verifier evidence only — operators self-discover their own addresses).
 fn load_provider_gateway_addresses() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let state = std::fs::read_to_string(".forge/state.json")?;
     parse_provider_gateway_captures(&state)
@@ -1001,7 +1218,8 @@ fn parse_provider_gateway_captures(json: &str) -> Result<BTreeMap<String, String
     Ok(addrs)
 }
 
-/// Step 12: Check site-us-east stacks are applied.
+/// Step 12: Verify the expected `GridNetwork` resource exists on the
+/// edge cluster.
 fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context("site-us-east");
     let output = Command::new("kubectl")
@@ -1012,23 +1230,19 @@ fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
             GRID_SYSTEM_NS,
             "get",
             "gridnetwork",
+            GRID_NETWORK_NAME,
             "--no-headers",
         ])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "kubectl get gridnetwork failed: {}",
+            "GridNetwork '{GRID_NETWORK_NAME}' not found on site-us-east: {}",
             safe_truncate_str(stderr.trim(), 120)
         )
         .into());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let count = stdout.lines().count();
-    if count == 0 {
-        return Err("no GridNetwork resources found on site-us-east".into());
-    }
-    Ok(format!("{count} GridNetwork resource(s) found"))
+    Ok(format!("GridNetwork '{GRID_NETWORK_NAME}' applied on site-us-east"))
 }
 
 /// Steps 7-8: Verify a service is running (phase=running,
@@ -1080,19 +1294,21 @@ fn extract_service_identity(status_json: &serde_json::Value, service_name: &str)
     Some(ServiceIdentity { id, restart_count })
 }
 
-/// Step 15/22: Send an inference request and verify 200 OK.
+/// Step 15/22: Send an inference request and verify 200 OK with
+/// provider attribution and model echo.
 fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
     let resp = curl_post_with_auth(EDGE_PORT)?;
     if resp.status != 200 {
         return Err(format!("inference request returned HTTP {}", resp.status).into());
     }
-    let model = serde_json::from_str::<serde_json::Value>(&resp.body)
-        .ok()
-        .and_then(|v| v.get("model").and_then(serde_json::Value::as_str).map(str::to_owned));
-    match model {
-        Some(m) => Ok(format!("HTTP 200, model={m}")),
-        None => Ok("HTTP 200".to_owned()),
-    }
+    let provider = extract_provider(&resp).map_err(|_e| "inference response missing X-Grid-Demo-Provider header")?;
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.body).map_err(|e| format!("inference response body is not valid JSON: {e}"))?;
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("inference response missing model field")?;
+    Ok(format!("HTTP 200, model={model}, provider={provider}"))
 }
 
 /// Step 16: Bind a session and record which provider served it.
@@ -1163,7 +1379,9 @@ fn check_session_drain(port: u16, drained_provider: &str) -> Result<String, Box<
     if old_provider != drained_provider {
         return Err(format!("existing session lost binding: expected {drained_provider}, got {old_provider}").into());
     }
-    Ok(format!("new session={new_provider}, bound session={old_provider}"))
+    Ok(format!(
+        "drained={drained_provider}, new session→{new_provider}, bound session→{old_provider}"
+    ))
 }
 
 /// Step 20: Modify the overlay file for hot-reload testing.
@@ -1332,6 +1550,12 @@ fn restore_overlay(overlay_path: &Path, original: &str) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Quick IPv4 format check (4 dot-separated octets, each 0-255).
+fn looks_like_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
 /// Build the kubectl context for a GLB demo cluster.
 fn kubectl_context(cluster_name: &str) -> String {
     format!("kind-{CLUSTER_PREFIX}-{cluster_name}")
@@ -1357,8 +1581,8 @@ fn get_provider_gateway_ip(context: &str) -> Result<String, Box<dyn std::error::
         return Err(format!("kubectl get svc failed: {}", safe_truncate_str(stderr.trim(), 120)).into());
     }
     let ip = String::from_utf8(output.stdout)?.trim().to_owned();
-    if ip.is_empty() {
-        return Err(format!("provider-gateway on {context} has no external IP").into());
+    if !looks_like_ipv4(&ip) {
+        return Err(format!("provider-gateway on {context} has invalid IP '{ip}'").into());
     }
     Ok(ip)
 }
@@ -1600,6 +1824,105 @@ spec:
     }
 
     #[test]
+    fn detects_latest_explicit_tag() {
+        let config = "\
+services:
+  - name: overlay-sync
+    image: \"grid-overlay-sync:latest\"
+  - name: edge
+    image: \"praxis-ai:glb-demo\"";
+        let latest = detect_latest_images(config);
+        assert_eq!(latest.len(), 1, "should find 1 :latest image");
+        assert_eq!(
+            latest.first().map(|(n, _)| n.as_str()),
+            Some("overlay-sync"),
+            "service name"
+        );
+        assert_eq!(
+            latest.first().map(|(_, i)| i.as_str()),
+            Some("grid-overlay-sync:latest"),
+            "image value"
+        );
+    }
+
+    #[test]
+    fn detects_latest_implicit_no_tag() {
+        let config = "\
+services:
+  - name: operator
+    image: grid-operator";
+        let latest = detect_latest_images(config);
+        assert_eq!(latest.len(), 1, "untagged image implies :latest");
+    }
+
+    #[test]
+    fn no_latest_in_pinned_config() {
+        let config = "\
+services:
+  - name: overlay-sync
+    image: \"grid-overlay-sync:glb-demo\"
+  - name: edge
+    image: \"praxis-ai:glb-demo\"";
+        let latest = detect_latest_images(config);
+        assert!(latest.is_empty(), "pinned tags should not trigger: {latest:?}");
+    }
+
+    #[test]
+    fn image_is_latest_checks() {
+        assert!(image_is_latest("grid-operator:latest"), "explicit :latest");
+        assert!(image_is_latest("grid-operator"), "no tag implies :latest");
+        assert!(!image_is_latest("grid-operator:glb-demo"), "pinned tag");
+        assert!(!image_is_latest("grid-operator:sha-abc123"), "sha tag");
+    }
+
+    #[test]
+    fn image_is_latest_registry_port() {
+        assert!(
+            !image_is_latest("localhost:5000/grid-operator:glb-demo"),
+            "registry port with pinned tag"
+        );
+        assert!(
+            image_is_latest("localhost:5000/grid-operator:latest"),
+            "registry port with :latest"
+        );
+        assert!(
+            image_is_latest("localhost:5000/grid-operator"),
+            "registry port with no tag"
+        );
+    }
+
+    #[test]
+    fn image_is_latest_digest_pinned() {
+        assert!(
+            !image_is_latest("repo/image@sha256:abcdef1234567890"),
+            "digest-pinned image"
+        );
+        assert!(
+            !image_is_latest("localhost:5000/repo/image@sha256:abcdef1234567890"),
+            "digest-pinned with registry port"
+        );
+    }
+
+    #[test]
+    fn detect_latest_in_resources_finds_nested_yaml() {
+        let dir = std::env::temp_dir().join(format!("glb-test-{}", std::process::id()));
+        let resources = dir.join("resources").join("nested");
+        std::fs::create_dir_all(&resources).unwrap_or_else(|_| std::process::abort());
+        std::fs::write(resources.join("bad.yaml"), "  image: grid-operator:latest\n")
+            .unwrap_or_else(|_| std::process::abort());
+        std::fs::write(resources.join("good.yaml"), "  image: grid-operator:glb-demo\n")
+            .unwrap_or_else(|_| std::process::abort());
+        std::fs::write(resources.join("notes.txt"), "  image: foo:latest\n").unwrap_or_else(|_| std::process::abort());
+        let results = detect_latest_in_resources(&dir);
+        assert_eq!(results.len(), 1, "should find 1 :latest in nested yaml: {results:?}");
+        assert!(
+            results.first().map(|(_, img)| img.as_str()) == Some("grid-operator:latest"),
+            "should report the image value"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
     fn parses_forge_status_clusters() {
         let status = status_with_services("running", Some("abc123"));
         let result = check_clusters_live(&status);
@@ -1754,6 +2077,23 @@ spec:
     }
 
     #[test]
+    fn looks_like_ipv4_valid() {
+        assert!(looks_like_ipv4("172.18.0.3"), "standard private IP");
+        assert!(looks_like_ipv4("10.0.0.1"), "class A private IP");
+        assert!(looks_like_ipv4("0.0.0.0"), "all zeros");
+        assert!(looks_like_ipv4("255.255.255.255"), "all max");
+    }
+
+    #[test]
+    fn looks_like_ipv4_invalid() {
+        assert!(!looks_like_ipv4(""), "empty string");
+        assert!(!looks_like_ipv4("not-an-ip"), "text");
+        assert!(!looks_like_ipv4("172.18.0"), "only 3 octets");
+        assert!(!looks_like_ipv4("172.18.0.3:7946"), "IP with port");
+        assert!(!looks_like_ipv4("256.0.0.1"), "octet out of range");
+    }
+
+    #[test]
     fn overlay_json_valid() {
         let json = serde_json::json!({
             "network": "glb-demo",
@@ -1812,10 +2152,54 @@ spec:
     }
 
     #[test]
-    fn provider_gateway_addr_env_parsed() {
-        let json = r#"[{"name":"GRID_GATEWAY_ADDRESS","value":"172.18.0.5:8080"}]"#;
-        let val = parse_env_var_from_json(json, "GRID_GATEWAY_ADDRESS");
-        assert_eq!(val.as_deref(), Some("172.18.0.5:8080"), "should parse gateway addr");
+    fn overlay_json_empty_stable_id_fails() {
+        let json = serde_json::json!({
+            "generated_at": "2026-07-25T00:00:00Z",
+            "candidates": [
+                {"stable_id": "", "admission_state": "admitted", "selection_tier": "preferred", "rank": 1}
+            ]
+        });
+        let Err(err) = validate_overlay_json(&json.to_string()) else {
+            std::process::abort()
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("stable_id"), "error should mention stable_id: {msg}");
+    }
+
+    #[test]
+    fn overlay_json_non_numeric_rank_fails() {
+        let json = serde_json::json!({
+            "generated_at": "2026-07-25T00:00:00Z",
+            "candidates": [
+                {"stable_id": "x", "admission_state": "a", "selection_tier": "t", "rank": "high"}
+            ]
+        });
+        let Err(err) = validate_overlay_json(&json.to_string()) else {
+            std::process::abort()
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("rank"), "error should mention rank: {msg}");
+    }
+
+    #[test]
+    fn provider_gateway_captures_parsed() {
+        let state = serde_json::json!({
+            "captures": {
+                "site-us-west": {"provider-gateway-ip": "172.18.0.5"},
+                "site-us-central": {"provider-gateway-ip": "172.18.0.6"}
+            }
+        });
+        let addrs = parse_provider_gateway_captures(&state.to_string()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            addrs.get("site-us-west").map(String::as_str),
+            Some("172.18.0.5:8080"),
+            "west"
+        );
+        assert_eq!(
+            addrs.get("site-us-central").map(String::as_str),
+            Some("172.18.0.6:8080"),
+            "central"
+        );
     }
 
     #[test]

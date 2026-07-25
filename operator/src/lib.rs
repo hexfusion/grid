@@ -20,6 +20,8 @@ pub mod metrics_scraper;
 pub mod resources;
 
 pub use resources::trust_bundle::sha256_fingerprint;
+/// Provider gateway address self-discovery.
+pub mod gateway;
 /// SWIM membership data model and status summarization.
 ///
 /// Pure data layer for peer discovery; the live UDP runtime is implemented in

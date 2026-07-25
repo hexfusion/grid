@@ -197,16 +197,23 @@ The following reflects the current state of relevant components:
   seeds through MetalLB-backed LoadBalancer Services (UDP 7946) captured by
   Forge. Per-site GridNetwork templates reference captured SWIM LB IPs as
   seeds, enabling operators to discover each other and propagate provider
-  state via CRDT without hard-coded Pod IPs. Provider-role sites advertise
-  their data-plane gateway address via SWIM state broadcast, allowing peer
-  operators to populate `GridSite` egress addresses and advance remote sites
-  to Active phase.
+  state via CRDT without hard-coded Pod IPs. Provider-role sites discover
+  their own data-plane gateway address from the `provider-gateway` Service
+  `LoadBalancer` IP. An initial lookup runs at startup; a background
+  poller retries periodically (default 5 s) until the address appears and
+  continues watching for changes. Discovered addresses are pushed to the
+  SWIM runtime via a watch channel and broadcast to peers, allowing peer
+  operators to populate `GridSite` egress addresses and advance remote
+  sites to Active phase.
 
-- **Forge**: The initial CLI crate supports `doctor`, `plan`, `config`,
-  cluster lifecycle (`up`/`down`/`status`/`cluster` subcommands), persistent
-  state with locking, Docker/Podman runtime detection, and ownership-safe
-  container network create/remove. Service lifecycle, stack execution, and
-  full POC environment composition are not yet implemented.
+- **Forge**: The CLI supports `doctor`, `plan`, `config`, cluster lifecycle
+  (`up`/`down`/`status`/`cluster`), service lifecycle (`service
+  start`/`stop`/`logs`/`list`), composable stack execution (`stack
+  apply`/`plan`/`status`/`list`, top-level `apply` alias), persistent state
+  with locking, Docker/Podman runtime detection, cross-cluster Docker
+  networking, template-manifest rendering with capture variables, and
+  `status --json`. Certificate management and image building are planned
+  but not yet implemented.
 
 - **`grid_route` overlay mode**: Praxis AI PR #339 introduces static candidate
   mode for `grid_route`. Overlay-file hot reload, which would allow dynamic
@@ -382,8 +389,7 @@ The `backendKind`-based locality score still contributes to the scoring
 signal within each locality tier, but the primary ordering dimension is now
 the geography-derived tier.
 
-Hysteresis, session binding, semantic routing, and shared active-active
-admission state remain future work.
+Hysteresis and semantic routing remain future work.
 
 Location is an affinity, not a hard pin. A healthy cross-region provider must
 be preferred over an unavailable same-region provider.

@@ -71,7 +71,18 @@ pub enum Command {
         force: bool,
     },
     /// Show the status of the environment.
-    Status,
+    Status {
+        /// Output as JSON (shorthand for `--output json`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply stacks to a cluster (alias for `stack apply`).
+    Apply {
+        /// Cluster name.
+        cluster: String,
+        /// Stack name (applies all assigned stacks if omitted).
+        stack: Option<String>,
+    },
     /// Individual cluster lifecycle commands.
     #[command(subcommand)]
     Cluster(ClusterCommand),
@@ -140,6 +151,14 @@ pub enum ServiceCommand {
     Stop {
         /// Service name.
         name: String,
+    },
+    /// Show logs for a service container.
+    Logs {
+        /// Service name.
+        name: String,
+        /// Number of lines to show from the end of the logs.
+        #[arg(long)]
+        tail: Option<u32>,
     },
 }
 

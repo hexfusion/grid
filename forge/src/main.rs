@@ -16,7 +16,8 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let mut stdout = std::io::stdout();
     let result = dispatch(&cli, &mut stdout);
-    handle_result(result, &cli.global.output)
+    let format = error_format(&cli);
+    handle_result(result, &format)
 }
 
 /// Dispatch the parsed command to its handler.
@@ -28,7 +29,14 @@ fn dispatch(cli: &Cli, writer: &mut dyn std::io::Write) -> Result<(), ForgeError
         Command::Config(sub) => dispatch_config(cli, sub, format, writer),
         Command::Up => dispatch_up(cli, writer),
         Command::Down { force } => dispatch_down(cli, *force, writer),
-        Command::Status => dispatch_status(cli, writer),
+        Command::Status { json } => dispatch_status(cli, *json, writer),
+        Command::Apply { cluster, stack } => {
+            let sub = StackCommand::Apply {
+                cluster: cluster.clone(),
+                stack: stack.clone(),
+            };
+            dispatch_stack(cli, &sub, writer)
+        },
         Command::Cluster(sub) => dispatch_cluster(cli, sub, writer),
         Command::Service(sub) => dispatch_service(cli, sub, writer),
         Command::Stack(sub) => dispatch_stack(cli, sub, writer),
@@ -117,10 +125,13 @@ fn dispatch_down(cli: &Cli, force: bool, writer: &mut dyn std::io::Write) -> Res
 }
 
 /// Dispatch the `status` command.
-fn dispatch_status(cli: &Cli, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
+fn dispatch_status(cli: &Cli, json_flag: bool, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
     let config = load_config_validated(cli)?;
     let runner = runner::SystemRunner;
-    let ctx = build_context(cli, &runner, &config);
+    let mut ctx = build_context(cli, &runner, &config);
+    if json_flag {
+        ctx.format = OutputFormat::Json;
+    }
     status::run(&ctx, writer)
 }
 
@@ -155,6 +166,15 @@ fn handle_result(result: Result<(), ForgeError>, format: &OutputFormat) -> std::
     };
     report_error(&e, format);
     std::process::ExitCode::FAILURE
+}
+
+/// Resolve the output format used for top-level error reporting.
+fn error_format(cli: &Cli) -> OutputFormat {
+    if matches!(cli.command, Command::Status { json: true }) {
+        OutputFormat::Json
+    } else {
+        cli.global.output.clone()
+    }
 }
 
 /// Print an error to stderr in the appropriate format.

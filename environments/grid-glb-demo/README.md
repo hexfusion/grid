@@ -97,17 +97,24 @@ Two host services complete the data path:
   has provider candidates. SWIM seed wiring is deterministic: each
   site's GridNetwork seeds reference the other two sites' SWIM LB IPs,
   and operators discover each other through SWIM/CRDT gossip.
-- Provider-role sites advertise their data-plane gateway address via
-  SWIM state broadcast (`GRID_GATEWAY_ADDRESS` set from Forge-captured
-  provider gateway IP). Peer operators create `GridSite` resources with
+- Provider-role sites discover their own data-plane gateway address
+  by reading the `provider-gateway` Service LoadBalancer IP from
+  Kubernetes (`GRID_GATEWAY_SERVICE_NAME` env var, default
+  `provider-gateway`). An initial lookup runs at startup; a background
+  poller then retries periodically (default 5 s, configurable via
+  `GRID_GATEWAY_DISCOVERY_INTERVAL_MS`) until the address appears and
+  continues polling for changes. When a new or changed address is
+  discovered, it is pushed to the SWIM runtime via a watch channel and
+  broadcast to peers. Peer operators create `GridSite` resources with
   `spec.egress.address` and advance them to Active phase, enabling
-  CRDT-discovered providers in the routing overlay. This is a
-  demo-scoped bridge using Forge captures; the production path is
-  operator self-discovery of its own Service IP.
+  CRDT-discovered providers in the routing overlay. The explicit
+  `GRID_GATEWAY_ADDRESS` env var is supported as an override for
+  non-standard topologies; when set, the background poller is skipped.
 - Geo/load-aware ordering is implemented in the overlay renderer.
-  Semantic routing remains a planned follow-up capability. This demo
-  proves the external ingress data path, SWIM cross-cluster discovery,
-  hot-reload behavior, and edge process stability.
+  Advanced route classification is deferred to a future iteration —
+  this demo proves the external ingress data path, SWIM cross-cluster
+  discovery, hot-reload behavior, session affinity, and provider
+  attribution without route class propagation.
 
 ## Prerequisites
 
@@ -143,11 +150,19 @@ clusters before applying stacks. The demo uses `imagePullPolicy:
 Never`, so Kind must already have these images locally.
 
 ```console
-make overlay-sync-image operator-image
-docker tag grid-overlay-sync:latest grid-overlay-sync:glb-demo
-docker tag grid-operator:latest grid-operator:glb-demo
-docker build -t grid-mock-providers:glb-demo -f mock-providers/Containerfile .
+make glb-demo-images
+```
 
+This builds three images tagged directly as `:glb-demo` (no `:latest`
+intermediate):
+
+- `grid-operator:glb-demo`
+- `grid-overlay-sync:glb-demo`
+- `grid-mock-providers:glb-demo`
+
+Load the Kubernetes images into the Kind clusters:
+
+```console
 praxis-forge cluster load-image site-us-east grid-operator:glb-demo \
   --config environments/grid-glb-demo/forge.yaml
 praxis-forge cluster load-image site-us-west grid-operator:glb-demo \
@@ -160,8 +175,10 @@ praxis-forge cluster load-image site-us-central grid-mock-providers:glb-demo \
   --config environments/grid-glb-demo/forge.yaml
 ```
 
-Build `praxis-ai:glb-demo` from the AI hot-reload branch in the
-`ai/` repo before starting the host edge service.
+Build `praxis-ai:glb-demo` from the AI repo (hot-reload branch)
+before starting the host edge service. The edge gateway requires
+file-based overlay hot-reload and session affinity support; advanced
+route classification is not required for this demo.
 
 ### 4. Apply stacks (Pass 1 — infrastructure + SWIM LB capture)
 
@@ -173,7 +190,9 @@ fail on this pass because cross-cluster captures are not yet available —
 this is expected.
 
 ```console
-praxis-forge stack apply --config environments/grid-glb-demo/forge.yaml
+praxis-forge stack apply site-us-east --config environments/grid-glb-demo/forge.yaml
+praxis-forge stack apply site-us-west --config environments/grid-glb-demo/forge.yaml
+praxis-forge stack apply site-us-central --config environments/grid-glb-demo/forge.yaml
 ```
 
 ### 5. Re-apply site-demo stacks (Pass 2 — seed wiring)
@@ -228,7 +247,7 @@ The overlay-sync service writes `grid-config.json` to
 read-only at `/etc/grid` and begins accepting requests on
 `127.0.0.1:8080`.
 
-### 8. Send a test request
+### 9. Send a test request
 
 Once both services are running:
 
@@ -283,13 +302,22 @@ cargo xtask env verify-grid-glb-ingress \
 ```
 
 The 23-step proof checks the running Forge environment, verifies
-provider gateway reachability, sends an inference request through the
-edge, proves session affinity (binding, reuse, drain with
-`existing_only`, and drain verification via `X-Grid-Demo-Provider`
-header), edits the local overlay file to remove one provider, observes
-a new `overlay reloaded` log entry, sends a post-reload inference
-request, and confirms the edge container ID and restart count remain
-stable.
+provider gateway reachability, validates overlay metadata
+(`stable_id`, `admission_state`, `selection_tier`, `rank`,
+`generated_at` — values checked, not just presence), sends an
+inference request through the edge and verifies provider attribution
+(`X-Grid-Demo-Provider` header) and model echo, proves session
+affinity (binding, reuse, drain with `existing_only`, and drain
+verification via provider attribution header), edits the local
+overlay file to remove one provider, observes a new `overlay
+reloaded` log entry, sends a post-reload inference request with
+provider attribution, and confirms the edge container ID and restart
+count remain stable.
+
+## Backlog / production gaps
+
+- Plaintext provider transport: production should use mutual TLS.
+- Advanced route classification is deferred.
 
 ## Teardown
 

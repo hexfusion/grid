@@ -8,6 +8,7 @@ resources:
   - cluster-role-binding-crd.yaml
   - cluster-role-resources.yaml
   - role-binding-default.yaml
+  - role-binding-grid-system.yaml
   - deployment.yaml
 
 labels:

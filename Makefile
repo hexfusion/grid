@@ -17,7 +17,9 @@ endif
 	test test-unit lint fmt doc audit \
 	coverage coverage-check \
 	require-container-engine \
-	images container operator-image overlay-sync-image kind-up kind-down \
+	images container operator-image overlay-sync-image \
+	mock-providers-image glb-demo-images \
+	kind-up kind-down \
 	dev-env dev-push dev-integration \
 	setup-hooks \
 	help
@@ -105,6 +107,15 @@ operator-image: | require-container-engine
 overlay-sync-image: | require-container-engine
 	$(CONTAINER_ENGINE) build -f deploy/overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
+mock-providers-image: | require-container-engine
+	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:latest .
+
+# GLB demo images — deterministic :glb-demo tags, no :latest dependency.
+glb-demo-images: | require-container-engine
+	$(CONTAINER_ENGINE) build -f deploy/operator/Containerfile -t grid-operator:glb-demo .
+	$(CONTAINER_ENGINE) build -f deploy/overlay-sync/Containerfile -t grid-overlay-sync:glb-demo .
+	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .
+
 # -------------------------------------------------------------------
 # KIND
 # -------------------------------------------------------------------
@@ -178,6 +189,8 @@ help:
 	@echo "  images               build container image"
 	@echo "  operator-image       build operator container image"
 	@echo "  overlay-sync-image   build overlay-sync container image"
+	@echo "  mock-providers-image build mock-providers container image"
+	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"
 	@echo ""
 	@echo "KIND:"
 	@echo "  kind-up          create cluster + deploy"

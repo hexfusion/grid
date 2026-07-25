@@ -81,9 +81,9 @@ SWIM runtime starts until a `GridNetwork` resource exists.
 It does not install Kind clusters, Praxis AI gateways,
 llm-d, mock EPP, MetalLB, Gateway API, or cross-cluster
 DNS.  Multi-cluster development environment composition
-is planned separately under the
+is handled by
 [Forge](https://github.com/praxis-proxy/grid/issues/2)
-direction.
+(`praxis-forge` CLI).
 
 Praxis AI gateway deployment is separate and requires:
 1. Praxis AI image with required filters (`grid_route`, `grid_credential_inject`)
@@ -278,7 +278,11 @@ exposes SWIM configuration through environment variables:
 | `GRID_SWIM_ADVERTISE_ADDR` | Address advertised to peers (defaults to `$(POD_IP):7946`) |
 | `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
 | `GRID_SWIM_SEEDS` | Comma-separated SWIM seed addresses |
-| `GRID_GATEWAY_ADDRESS` | Gateway address for site discovery |
+| `GRID_GATEWAY_ADDRESS` | Explicit gateway address override (skips self-discovery) |
+| `GRID_GATEWAY_SERVICE_NAME` | Service name for gateway self-discovery (default: `provider-gateway`) |
+| `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
+| `GRID_GATEWAY_PORT` | Port appended to discovered address (default: `8080`) |
+| `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses
@@ -478,8 +482,10 @@ The trust bootstrap for a remote site progresses through these steps:
 1. **SWIM discovery** — the peer is observed as Alive in SWIM membership.
    Phase: `Discovered`.  No trust established.
 
-2. **Gateway address known** — the remote operator advertises `GRID_GATEWAY_ADDRESS`
-   via SWIM state broadcast.  The local operator stores it in `GridSite.spec.egress.address`.
+2. **Gateway address known** — the remote operator advertises its resolved gateway
+   address via SWIM state broadcast.  The address is resolved by the self-discovery
+   poller (Service LoadBalancer lookup) or from the `GRID_GATEWAY_ADDRESS` override.
+   The local operator stores it in `GridSite.spec.egress.address`.
    Phase: `Connecting`.  No trust established.
 
 3. **Public cert material received** — the remote operator broadcasts its public site
@@ -744,21 +750,35 @@ public certificate (`tls.crt`) from the site Secret, not the private key (`tls.k
 
 ## GridSite gateway address configuration
 
-Set `GRID_GATEWAY_ADDRESS` on the operator process to advertise the data-plane
-gateway endpoint to SWIM peers.  This address is propagated through SWIM state
-broadcasts and used by the primary operator to populate `GridSite.spec.egress.address`
-for auto-discovered sites.
+The operator resolves and advertises its data-plane gateway address to SWIM
+peers.  This address is propagated through SWIM state broadcasts and used by
+the primary operator to populate `GridSite.spec.egress.address` for
+auto-discovered sites.
+
+**Self-discovery (default):** A background poller periodically looks up the
+`provider-gateway` LoadBalancer Service and extracts its external IP.  The
+poller retries every 5 seconds (configurable via
+`GRID_GATEWAY_DISCOVERY_INTERVAL_MS`) until the address appears, then
+continues watching for changes.  Discovered addresses are pushed to the SWIM
+runtime via a watch channel.
+
+**Explicit override:** Set `GRID_GATEWAY_ADDRESS` to skip the self-discovery
+poller entirely.
 
 ```bash
-# Example: operator running alongside a Praxis gateway on port 8080
+# Self-discovery (default): operator discovers from provider-gateway Service
+GRID_GATEWAY_SERVICE_NAME=provider-gateway ./operator
+
+# Explicit override: skip discovery poller
 GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
 ```
 
 **Requirements:**
 - Format: `host:port` or `IP:port` (any non-empty string is accepted; the remote
   operator stores it verbatim in `GridSite.spec.egress.address`)
-- When absent or empty: auto-discovered `GridSite` records have empty
-  `spec.egress.address` and stay in `Discovered` phase
+- When absent or empty and no LoadBalancer Service exists: auto-discovered
+  `GridSite` records have empty `spec.egress.address` and stay in `Discovered`
+  phase until the Service appears
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
   and the data-plane gateway address are distinct
 
@@ -816,8 +836,10 @@ separate steps.
 
 **Phase stays Discovered (not advancing to Connecting)**
 
-- The site has no `spec.egress.address`.  Configure `GRID_GATEWAY_ADDRESS` on the remote
-  operator and wait for the next reconcile to propagate the gateway address through SWIM.
+- The site has no `spec.egress.address`.  Verify the remote operator's
+  `provider-gateway` LoadBalancer Service exists and has an external IP assigned,
+  or set `GRID_GATEWAY_ADDRESS` as an explicit override.  The self-discovery poller
+  will propagate the address through SWIM once discovered.
 - Reason will be `GatewayAddressMissing`.
 
 **Phase stays Connecting**
@@ -830,9 +852,9 @@ separate steps.
   - `TrustMaterialMissing`: the TCP probe succeeded, but no public certificate has been received.
   - `TrustMaterialInvalid`: received trust material failed the structural PEM check.
   - `GatewayUnreachable`: the TCP probe to `spec.egress.address` failed.  Verify the gateway
-    is running and `GRID_GATEWAY_ADDRESS` is correct on the remote operator.
-  - `GatewayAddressMissing`: no egress address is set.  Configure `GRID_GATEWAY_ADDRESS` on
-    the remote operator.
+    is running and the remote operator's self-discovered or override address is correct.
+  - `GatewayAddressMissing`: no egress address is set.  Verify the remote operator's
+    `provider-gateway` LoadBalancer Service has an external IP, or set `GRID_GATEWAY_ADDRESS`.
 
 **Phase is Active, site became Unreachable**
 

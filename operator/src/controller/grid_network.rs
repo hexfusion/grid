@@ -1025,7 +1025,7 @@ fn publish_real_provider_state(
         }
     }
 
-    let gateway_address = swim.gateway_address().map(str::to_owned);
+    let gateway_address = swim.gateway_address();
     if snap.providers.is_empty() && gateway_address.is_none() {
         // No providers and no gateway address — nothing to broadcast.
         return;

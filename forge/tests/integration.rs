@@ -130,6 +130,37 @@ fn cli_accepts_status_command() {
 }
 
 #[test]
+fn cli_accepts_status_with_json_flag() {
+    let cli = Cli::try_parse_from(["praxis-forge", "status", "--json"]).unwrap_or_else(|_| {
+        std::process::abort();
+        #[expect(unreachable_code, reason = "abort prevents reaching this")]
+        {
+            unreachable!()
+        }
+    });
+    assert!(
+        matches!(cli.command, forge::cli::Command::Status { json: true }),
+        "status --json should set the json flag"
+    );
+}
+
+#[test]
+fn cli_accepts_status_with_global_output_json() {
+    let cli = Cli::try_parse_from(["praxis-forge", "--output", "json", "status"]).unwrap_or_else(|_| {
+        std::process::abort();
+        #[expect(unreachable_code, reason = "abort prevents reaching this")]
+        {
+            unreachable!()
+        }
+    });
+    assert_eq!(
+        cli.global.output,
+        forge::output::OutputFormat::Json,
+        "global --output json should still work for status"
+    );
+}
+
+#[test]
 fn cli_accepts_cluster_create() {
     let result = Cli::try_parse_from(["praxis-forge", "cluster", "create", "hub"]);
     assert!(result.is_ok(), "cluster create should parse: {result:?}");
@@ -185,6 +216,34 @@ fn cli_accepts_service_start() {
 fn cli_accepts_service_stop() {
     let result = Cli::try_parse_from(["praxis-forge", "service", "stop", "edge"]);
     assert!(result.is_ok(), "service stop should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_service_logs() {
+    let result = Cli::try_parse_from(["praxis-forge", "service", "logs", "edge"]);
+    assert!(result.is_ok(), "service logs should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_service_logs_with_tail() {
+    let result = Cli::try_parse_from(["praxis-forge", "service", "logs", "edge", "--tail", "100"]);
+    assert!(result.is_ok(), "service logs --tail should parse: {result:?}");
+}
+
+// ---------------------------------------------------------------
+// Top-level apply alias
+// ---------------------------------------------------------------
+
+#[test]
+fn cli_accepts_top_level_apply() {
+    let result = Cli::try_parse_from(["praxis-forge", "apply", "hub"]);
+    assert!(result.is_ok(), "top-level apply should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_top_level_apply_with_stack() {
+    let result = Cli::try_parse_from(["praxis-forge", "apply", "hub", "base"]);
+    assert!(result.is_ok(), "top-level apply with stack should parse: {result:?}");
 }
 
 // ---------------------------------------------------------------
