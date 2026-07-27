@@ -991,35 +991,62 @@ The narrated output includes:
 - provider affinity, drain, hot-reload, and pod-stability evidence; and
 - edge withdrawal, recovery, and stable-URL evidence.
 
-### Demo-Only Attribution Headers
+### Request, Provider-Hop, And Demo Evidence Headers
 
-The demo stamps response headers that identify which edge and provider served
-each request. These headers exist solely so that the verifier can make runtime
-assertions about routing behavior. Without them, requests through different
-edges or providers return identical response bodies, and no client-side test
-could prove active/active routing, session stickiness, or withdrawal/recovery.
+The narrated proof uses three different header categories. Only the
+`X-Grid-Demo-*` response fields are client-visible test evidence. Session
+inputs drive configured affinity behavior, while `x-grid-peer-*` fields are
+the authenticated edge-to-provider protocol and must not be treated as
+demo-only attribution.
 
-```text
-X-Grid-Demo-Edge-Gateway            which edge cluster handled the request
-X-Grid-Demo-Provider-Gateway        which provider gateway forwarded it
-X-Grid-Demo-Provider                which backend cluster produced the response
-X-Grid-Demo-Backend-Provider-Attribution  backend-side provider identity
-X-Grid-Demo-Backend-Request-Id      unique request identifier from the backend
-```
+#### Affinity And Request Metadata
 
-These headers are **not part of Praxis or Grid production code**. They are
-configured entirely within this demo environment:
+| Header | Set by | Scope and purpose |
+|---|---|---|
+| `X-Edge-Session-Id` | Verifier client | Affinity input configured on the GTM emulator. Consistent hashing maps the value to a healthy edge so repeated requests can prove edge stability. A production GTM owns its own affinity contract. |
+| `X-Session-Id` | Verifier client | Affinity input configured on `grid_route`. It binds related requests to an eligible provider and allows the verifier to distinguish established sessions from new sessions during drain. The configured header name is deployment-specific. |
+| `X-Model` | `json_body_field` | Gateway-local routing signal extracted from the request body's `model` field. It lets `grid_route` and `grid_provider_route` match the requested model without reparsing the body. It is internal request metadata, not path-attribution evidence. |
 
-- The edge header is a `headers` filter entry in
-  `configs/edge/praxis.yaml` — a standard Praxis response-header injection,
-  not a Grid-specific mechanism.
-- The provider and backend headers are set by the mock-inference server in
-  `mock-providers/`, which is a test binary that does not ship in production.
+#### Authenticated Provider-Hop Protocol
 
-No Praxis filter, Grid operator, or production crate references these header
-names. Removing this demo environment removes every trace of them. A production
-deployment would use distributed tracing or access logs for path attribution,
-not response headers.
+| Header | Set by | Scope and purpose |
+|---|---|---|
+| `x-grid-peer-selected-candidate` | Edge `grid_route` | Carries the stable candidate selected from the edge overlay. The provider validates it against provider-owned candidate, model, and path policy. |
+| `x-grid-peer-hop-request-id` | Edge `grid_route` | Bounded correlation identifier for the authenticated provider hop. |
+
+The edge removes client-supplied copies before setting these fields. They are
+sent only for clusters explicitly configured as provider hops. The provider
+consumes them only after downstream mTLS and `peer_identity_trust`, then removes
+them before the backend request. No credential reference or credential value
+crosses this boundary.
+
+For backend-side proof, `grid_provider_route` replaces any inbound
+`x-grid-provider-attribution` and `x-grid-provider-request-id` values with its
+provider-owned identity and correlation ID. The strict mock backend reflects
+those bounded values under demo response names, proving that the request passed
+through the provider pipeline rather than reaching the backend directly.
+
+#### Demo-Only Response Evidence
+
+| Header | Set by | Verifier assertion |
+|---|---|---|
+| `X-Grid-Demo-Edge-Gateway` | Edge `headers` configuration | Identifies the edge that handled the request and proves both edges serve traffic. |
+| `X-Grid-Demo-Provider-Gateway` | `grid_provider_route` when `emit_demo_attribution: true` | Identifies the provider gateway that accepted and authorized the provider hop. |
+| `X-Grid-Demo-Provider` | Strict mock backend | Identifies the backend provider site that produced the response. |
+| `X-Grid-Demo-Backend-Provider-Attribution` | Strict mock backend | Reflects the provider-owned attribution received by the backend and must match the provider gateway. |
+| `X-Grid-Demo-Backend-Request-Id` | Strict mock backend | Reflects the provider-owned correlation ID and must be present and non-empty. |
+
+These response fields exist solely so the verifier can make runtime assertions
+about the observed path. The edge field uses ordinary demo configuration. The
+provider-gateway field is an opt-in mode of `grid_provider_route`; it is not
+emitted unless `emit_demo_attribution` is enabled. The remaining fields come
+from `mock-providers`, which is test infrastructure rather than a production
+backend.
+
+No authorization decision trusts a demo response field. A production
+deployment would normally disable demo attribution and use distributed
+tracing, metrics, or access logs for path evidence. The authenticated
+`x-grid-peer-*` provider-hop contract remains part of the real Grid data path.
 
 ## Repository Layout
 
