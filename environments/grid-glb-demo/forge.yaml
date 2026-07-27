@@ -117,6 +117,8 @@ spec:
       description: SWIM membership LoadBalancer Service for cross-cluster discovery
       steps:
         - type: manifest
+          path: resources/grid-system-namespace.yaml
+        - type: manifest
           path: resources/operator-swim-service.yaml
         - type: capture
           resource: svc/operator-swim-lb

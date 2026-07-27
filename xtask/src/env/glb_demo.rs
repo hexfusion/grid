@@ -541,6 +541,32 @@ mod setup_tests {
     }
 
     #[test]
+    fn swim_service_stack_creates_its_namespace_first() -> Result<(), Box<dyn std::error::Error>> {
+        let source = workspace_root().join("environments/grid-glb-demo/forge.yaml");
+        let forge: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(source)?)?;
+        let steps = forge
+            .get("spec")
+            .and_then(|value| value.get("stacks"))
+            .and_then(|value| value.get("swim-lb"))
+            .and_then(|value| value.get("steps"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .ok_or("swim-lb steps must be a sequence")?;
+
+        let first_path = steps
+            .first()
+            .and_then(|value| value.get("path"))
+            .and_then(serde_yaml::Value::as_str);
+        let second_path = steps
+            .get(1)
+            .and_then(|value| value.get("path"))
+            .and_then(serde_yaml::Value::as_str);
+
+        assert_eq!(first_path, Some("resources/grid-system-namespace.yaml"));
+        assert_eq!(second_path, Some("resources/operator-swim-service.yaml"));
+        Ok(())
+    }
+
+    #[test]
     fn operator_site_configuration_preserves_the_base_deployment() -> Result<(), Box<dyn std::error::Error>> {
         let forge = fs::read_to_string(workspace_root().join("environments/grid-glb-demo/forge.yaml"))?;
         for site in ["east-edge", "east-provider", "west-edge", "west-provider"] {

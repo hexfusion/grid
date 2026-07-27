@@ -5,6 +5,36 @@ two active Praxis edge gateways and two private Praxis provider gateways. Grid
 discovers provider capacity, renders a local routing overlay for each edge,
 and updates the running edge without restarting it.
 
+New to Grid or Praxis? Start with the
+[Architecture Overview](../../docs/architecture/overview.md) for component
+ownership and the
+[External Client Ingress](../../docs/architecture/external-ingress.md) design
+for the production routing and security contract.
+
+## What This Demo Teaches About Praxis
+
+- **Praxis is a configurable proxy runtime, not one fixed appliance.** The same
+  Praxis AI image serves as the global-ingress emulator, public inference edge,
+  and private provider gateway. Its listener and filter configuration defines
+  the role.
+- **Grid is the control plane; Praxis is the data plane.** Grid operators
+  discover and score providers, then write edge-local routing overlays. Praxis
+  handles requests from an in-memory view without calling Kubernetes, SWIM, or
+  the operator on the request path.
+- **Edge selection and provider selection solve different problems.** A global
+  traffic manager chooses a healthy public edge. After parsing the request,
+  `grid_route` chooses an eligible inference provider.
+- **Security is enforced again at the provider.** Reaching an edge does not
+  grant backend access. The provider gateway authenticates the edge identity,
+  validates the selected route, owns the final-hop credential, and protects the
+  private backend.
+- **Sessions can remain stable while capacity changes.** Edge affinity and
+  provider affinity use separate keys. Admission can stop new provider sessions
+  without breaking an established binding.
+- **Routing state can change without replacing the proxy.** Kubernetes projects
+  an operator-rendered overlay into the edge pod, and Praxis validates and
+  reloads it while the pod UID and restart count remain unchanged.
+
 The narrated demo is organized around four primary displays:
 
 1. active/active global routing with independent Grid provider selection;
@@ -52,6 +82,58 @@ The demo creates five Kind clusters. Every Praxis process runs in Kubernetes.
              private backend              private backend
 ```
 
+### One Praxis Runtime, Three Jobs
+
+| Praxis role | Request-path responsibility | Grid participation |
+|---|---|---|
+| GTM emulator | Terminates the demo's public TLS connection, checks edge health, and selects an edge using `X-Edge-Session-Id` | None; it selects edges rather than providers |
+| Edge gateway | Parses the inference request, applies edge policy, runs `grid_route`, and opens the authenticated provider hop | Consumes its edge-local overlay |
+| Provider gateway | Authenticates the edge, validates the candidate/model/path, injects the provider credential, and proxies to the private backend | Advertises provider capacity through its local operator |
+
+This role separation comes from configuration and deployment boundaries, not
+three unrelated proxy implementations. Praxis Core supplies the listener,
+TLS, load-balancing, and proxy runtime; Praxis AI supplies the inference-aware
+filters; Grid prepares the provider state those filters consume.
+
+### Scaling The Topology Down
+
+The five-cluster layout makes every routing and security boundary visible, but
+it is not the minimum deployment shape. A smaller installation can run the
+client-facing edge pipeline and the final-hop provider pipeline in one Praxis
+deployment:
+
+```text
+client
+  -> Praxis edge and provider pipelines
+  -> local backend or external model API
+  -> client
+```
+
+That shape is useful for one cluster, one administrative domain, or a compact
+development installation. Grid can still prepare provider candidates, and
+Praxis can still parse requests, apply policy, select a backend, and inject a
+final-hop credential.
+
+The hierarchical edge-to-provider topology becomes important when the platform
+needs stronger separation. Collapsing the roles gives up several properties:
+
+- **Independent trust boundary:** there is no distinct gateway-to-gateway mTLS
+  hop where the provider can authenticate and authorize the calling edge.
+- **Failure and scaling isolation:** edge traffic and backend/provider traffic
+  share a deployment lifecycle, resource envelope, and failure domain.
+- **Provider-owned credentials and policy:** credentials can remain local, but
+  they are no longer isolated behind a separately administered provider
+  gateway with its own route and peer policy.
+- **Independent provider-site behavior:** a fully collapsed topology has no
+  distinct provider site to withdraw, scale, or fail independently. Remote
+  provider choice and crossed-region failover require a separately reachable
+  provider endpoint.
+
+The right shape depends on ownership and failure boundaries, not merely cluster
+count. Start compact when one team owns the entire path; introduce provider
+gateways and the hierarchical peer-to-peer path when sites, credentials,
+capacity, or policy need independent control.
+
 | Cluster | Praxis workload | Grid role |
 |---|---|---|
 | `gtm-emulator` | GTM emulator | None; local stand-in for managed global ingress |
@@ -64,14 +146,133 @@ The four edge/provider clusters each run a Grid operator and participate in
 one SWIM mesh. The GTM emulator is deliberately outside that mesh because it
 selects an edge, not an inference provider.
 
+### Demo Infrastructure: How The Clusters Connect
+
+Forge attaches all five Kind clusters to one dedicated Docker bridge network.
+It gives each cluster a non-overlapping MetalLB address pool from that shared
+network. The edge and GTM entry points are ordinary Kubernetes
+`LoadBalancer` Services:
+
+```text
+client
+  -> GTM MetalLB VIP:8443
+  -> Service/gtm-emulator
+  -> GTM Praxis pod
+  -> edge MetalLB VIP:8080
+  -> Service/edge-gateway
+  -> edge Praxis pod
+```
+
+After each edge Service becomes ready, Forge captures
+`.status.loadBalancer.ingress[0].ip`. Those two captured VIPs, with port
+`8080`, become the Praxis GTM emulator's upstream endpoints. Traffic reaches
+the selected VIP across the shared Docker network; Kubernetes Service routing
+then sends it to the edge pod's `http` target port.
+
+The GTM configuration does not address a NodePort, `hostPort`, host-network
+socket, or `kubectl port-forward`. Kubernetes may allocate implementation
+NodePorts for a `LoadBalancer` Service, but this demo neither discovers nor
+uses them. The client similarly reaches the GTM emulator through its captured
+MetalLB VIP, using `curl --resolve` to bind `api.grid-glb.test` to that address.
+
+The GTM-to-edge hop is plaintext HTTP only inside this isolated demo network.
+A production traffic manager should use authenticated TLS or mTLS to each
+Praxis edge origin.
+
+## End-to-End Request Example
+
+The outer traffic-management decision and the inner Grid decision are
+independent. In this example, the stable endpoint sends the client to the east
+edge because that edge is healthy and matches the client's edge-affinity key.
+After the request reaches that edge, `grid_route` independently matches the
+requested model and selects from the eligible provider candidates and ranks in
+the east edge's loaded overlay.
+
+The demo actively proves one reason this choice changes: a high queue metric
+causes the operator to mark the initially selected provider
+`existing_only`. The bound provider session remains there, while a new provider
+session selects the other fully admitted provider. It separately proves
+provider health withdrawal and provider-side peer, model, and path policy. It
+does not claim to exercise geographic, latency, cost, or every possible
+capacity signal. The resulting crossed path can be:
+
+```text
+client
+  -> HTTPS api.grid-glb.test
+  -> Praxis GTM emulator selects the healthy east edge
+  -> east public Praxis edge gateway
+     -> authenticates and parses the OpenAI-compatible request
+     -> grid_route reads the east edge's local overlay
+     -> selects the west provider
+  -> verified mTLS provider hop
+  -> west private Praxis provider gateway
+     -> peer_identity_trust authenticates the east edge
+     -> grid_provider_route validates candidate, model, and path
+     -> grid_credential_inject replaces the client credential
+  -> west private backend
+  -> west provider gateway
+  -> east edge gateway
+  -> GTM emulator
+  -> client
+```
+
+The response attribution identifies the selected edge, provider gateway, and
+backend. This lets the narration prove the observed live path rather than infer
+it from manifests or configured endpoints.
+
 ## Primary Demonstrations
 
-| Display | What the audience sees |
-|---|---|
-| Active/active global and provider routing | One verified HTTPS name reaches both Praxis edges. Grid independently selects from both providers, and controlled drain or withdrawal demonstrates a crossed edge/provider path through live response attribution. |
-| Secure provider boundary | Both provider gateways require edge mTLS identities, apply peer and route policy, replace the consumer credential only for the final hop, and keep the backend private behind Kubernetes NetworkPolicy. Positive and negative probes are reported together. |
-| Session affinity, drain, and hot reload | Repeated requests remain on the same edge and provider. A high provider queue metric changes admission to `existing_only`: the bound session stays, a new session moves, and both edge overlays update without restarting Praxis. |
-| Edge withdrawal and recovery | The east edge is scaled to zero. The same HTTPS name and edge affinity key converge to west, then return to east after Kubernetes restores the Deployment and the GTM emulator health check admits it again. |
+1. **Active/active global and provider routing**
+
+   **Feature Summary:** One verified HTTPS name reaches both active Praxis
+   edges, while Grid independently selects from both inference providers.
+
+   **User Story:** As an inference consumer, I need a stable endpoint that
+   continues serving while edge and provider selection adapt independently.
+
+   **Technical Implementation:** The GTM emulator selects a healthy edge;
+   `grid_route` then selects an eligible provider from that edge's local
+   operator-rendered overlay.
+
+2. **Secure provider boundary**
+
+   **Feature Summary:** Private provider gateways authenticate edge peers,
+   enforce provider-local routes, and replace credentials only for the final
+   backend hop.
+
+   **User Story:** As a provider, I need to expose inference capacity without
+   exposing my backend or accepting consumer credentials as provider
+   credentials.
+
+   **Technical Implementation:** Provider gateways require mTLS, apply
+   `peer_identity_trust` and `grid_provider_route`, run
+   `grid_credential_inject`, and reach a backend protected by NetworkPolicy.
+
+3. **Session affinity, provider drain, and hot reload**
+
+   **Feature Summary:** Established sessions remain stable while new sessions
+   move away from a provider that stops accepting new work.
+
+   **User Story:** As an inference consumer, I need conversational continuity;
+   as an operator, I need to drain capacity without disrupting bound sessions.
+
+   **Technical Implementation:** Provider metrics change admission to
+   `existing_only`; Grid regenerates both edge overlays and Praxis loads them
+   without restarting its pods.
+
+4. **Edge withdrawal and recovery**
+
+   **Feature Summary:** The stable HTTPS endpoint continues through the
+   remaining edge when one edge is withdrawn, then restores active/active
+   service after recovery.
+
+   **User Story:** As a reliability operator, I need a failed or maintained
+   edge removed from service and safely returned without changing the client
+   endpoint.
+
+   **Technical Implementation:** The demo scales one edge Deployment to zero;
+   GTM health checks withdraw it, preserve service through the other edge, and
+   admit it again after Kubernetes restores readiness.
 
 ## Production Architecture And Local Emulation
 
@@ -178,6 +379,12 @@ uses authenticated TLS or mTLS to each edge origin.
 
 ## Grid Discovery And Overlay Rendering
 
+### User Story
+
+As a platform operator, I need provider availability and capacity changes to
+reach every edge without placing a remote control-plane call on the inference
+request path.
+
 ### Summary
 
 The Grid operators in the four edge/provider clusters exchange site and
@@ -221,6 +428,20 @@ The overlay contains stable candidate identity, site, cluster, admission state,
 selection tier, rank, and provider credential reference metadata. The edge
 config maps the candidate clusters to the provider gateway LoadBalancer
 addresses and requires verified upstream mTLS.
+
+### What The Demo Proves
+
+The verifier reads both operator-owned ConfigMaps and requires each one to:
+
+- identify the edge that owns the view through `local_site`;
+- contain both provider candidates before failure testing;
+- carry the expected provider address, model, admission, rank, and credential
+  reference metadata; and
+- be mounted into the Praxis pod that serves that edge.
+
+This proves more than eventual provider discovery. It proves that replicated
+provider facts became a usable, edge-specific data-plane input without adding
+a control-plane lookup to each inference request.
 
 ## Active/Active Global And Provider Routing
 
@@ -273,20 +494,8 @@ rank, preserves provider session affinity, and emits authenticated
 `x-grid-peer-*` hop context for the selected provider. The following
 `load_balancer` owns only transport to the selected cluster.
 
-Example where GTM chooses the east edge and Grid chooses the west provider:
-
-```text
-client
-  -> GTM emulator
-  -> east public edge gateway
-  -> east edge uses east Grid overlay
-  -> west private provider gateway
-  -> west backend
-  -> west private provider gateway
-  -> east public edge gateway
-  -> GTM emulator
-  -> client
-```
+The [end-to-end request example](#end-to-end-request-example) shows the full
+crossed edge/provider path and the policy enforced at each hop.
 
 The topology supports these paths:
 
@@ -302,6 +511,17 @@ force all four combinations while provider state is unchanged. It proves both
 active edges, proves both providers through normal routing and controlled
 withdrawal, and reports any crossed edge/provider path observed in live
 responses.
+
+### What The Demo Proves
+
+- The stable HTTPS name returns a successful attributed inference response.
+- Bounded affinity-key discovery finds live requests served by both edges,
+  proving that neither edge is merely a configured standby.
+- Both edge overlays contain both providers.
+- Response attribution distinguishes the outer edge choice from the inner
+  provider choice and reports crossed paths when they occur.
+- Withdrawing one edge or provider preserves service through the corresponding
+  healthy alternative.
 
 ## Secure Provider Gateway
 
@@ -357,15 +577,26 @@ The verifier proves:
 | Unknown candidate | HTTP 403 |
 | Unsupported path or model | Rejected |
 
+The successful probe must also return matching edge, provider-gateway, backend,
+and backend-request attribution. A TLS handshake alone is not counted as a
+successful provider route, and a resource manifest alone is not counted as
+proof of enforcement.
+
 ### Credential And Backend Isolation
 
-### Summary
+#### User Story
+
+As a provider owner, I need my backend credential and private service to remain
+inside my provider site, even when requests arrive through a remote public
+edge.
+
+#### Summary
 
 The provider gateway and backend share a Kubernetes Secret local to their
 provider cluster. The gateway reads the value from a mounted file; the backend
 uses the same Secret only to verify the demo request.
 
-### Technical Implementation
+#### Technical Implementation
 
 The verifier sends `Authorization: Bearer test-token` to the public edge. The
 strict backend proves that this client-supplied fixture is not accepted:
@@ -404,15 +635,45 @@ There are two independent affinity layers:
 
 ### Technical Implementation
 
-The provider-affinity proof binds one session and repeats it. It then sets the
-selected mock backend's normalized queue-depth signal above the configured
-admission threshold. The provider operator scrapes that metric, derives
-`existing_only`, publishes the provider state through SWIM, and the edge
-operator renders the updated overlay. The proof verifies:
+The two keys intentionally solve different problems. The GTM emulator uses
+consistent hashing on `X-Edge-Session-Id` to choose a healthy edge.
+`grid_route` uses `X-Session-Id` to bind a session to an eligible provider for
+up to the configured one-hour TTL. A crossed route can therefore keep the
+client on the east edge while keeping its provider session on the west
+provider.
+
+The provider-affinity proof first sends a request with a new
+`X-Session-Id`, records the selected provider from response attribution, and
+repeats the request twice. All three responses must identify the same provider.
+
+The drain proof then changes the selected mock backend's normalized queue-depth
+metric from the ready value `0.10` to `0.95`. The operator's admission policy
+marks a provider `existing_only` above its `0.85` queue threshold. The change
+travels through the normal control-plane path:
+
+```text
+mock backend exports queue metric
+  -> provider operator scrapes and normalizes the metric
+  -> InferenceProvider admission becomes existing_only
+  -> SWIM distributes the provider fact
+  -> each edge operator reconciles its local overlay ConfigMap
+  -> Kubernetes updates the projected file in the edge pod
+  -> grid_route validates and reloads the new overlay
+```
+
+The edge configuration watches `/etc/grid/grid-config.json` with hot reload
+enabled and a 500 ms debounce. Requests continue using the last accepted
+in-memory view while the projected file settles; the request path does not
+parse the ConfigMap or call the operator.
+
+### What The Demo Proves
+
+The verifier requires all of the following:
 
 - the existing session remains on the selected provider;
-- a new session avoids that provider;
-- the running edge observes an overlay reload; and
+- a newly generated session avoids the `existing_only` provider;
+- the operator-owned overlay contains the new admission state;
+- the running edge emits a later `overlay reloaded` event; and
 - the edge pod UID and restart count remain unchanged.
 
 The verifier then scales the selected provider backend to zero. Provider
@@ -428,7 +689,29 @@ patch operator-owned overlay or status resources.
 
 ## Failure Scenarios
 
+### User Story
+
+As a reliability operator, I need edge and provider failures to withdraw only
+the affected path, preserve service through healthy alternatives, and recover
+without manual routing edits.
+
+### Summary
+
+The demo changes live Kubernetes workloads and provider metrics rather than
+patching Grid-owned status or overlay data. Each scenario waits for the
+resulting health, SWIM, reconciliation, and Praxis reload behavior before
+claiming recovery.
+
 ### Edge Withdrawal
+
+**User Story:** As an inference consumer, I need the same public hostname to
+continue working when an edge site becomes unavailable.
+
+**Summary:** The GTM layer removes an unhealthy edge from new selections and
+continues through the other active edge. Grid provider selection still happens
+after that edge decision.
+
+**Implementation and proof:**
 
 ```text
 before: client -> GTM emulator -> east edge -> provider
@@ -444,7 +727,23 @@ recovery:
   -> same hostname and edge session reach east again
 ```
 
+The verifier scales the east edge Deployment to zero rather than editing the
+GTM endpoint list. The emulator's one-second TCP health check requires two
+failed checks before withdrawal. The east-bound affinity key must then receive
+HTTP 200 from the west edge under the same HTTPS name. After restoration, the
+Deployment must become ready and the original key must be served by east
+again.
+
 ### Provider Drain
+
+**User Story:** As a provider operator, I need to stop admitting new sessions
+before maintenance while allowing already bound work to continue.
+
+**Summary:** Capacity pressure changes provider admission, not basic health.
+The provider remains reachable for existing sessions while new sessions move
+to the other admitted provider.
+
+**Implementation and proof:**
 
 ```text
 mock queue metric rises above 0.85
@@ -457,7 +756,21 @@ existing session -> selected provider remains eligible for existing work
 new session      -> alternate admitted provider
 ```
 
+The proof starts with a known provider binding, raises the selected provider's
+queue metric to `0.95`, waits for the edge overlay to show
+`existing_only`, and waits for a live reload. It then requires the old session
+to retain its provider and a newly generated session to select the alternate
+provider.
+
 ### Provider Unavailability
+
+**User Story:** As a platform operator, I need a provider that can no longer
+serve requests removed from every edge's eligible routing view.
+
+**Summary:** Health failure removes the provider candidate, rather than asking
+each edge or consumer to discover the failure independently.
+
+**Implementation and proof:**
 
 ```text
 selected backend becomes unavailable
@@ -469,7 +782,22 @@ selected backend becomes unavailable
 recovery restores the backend, provider phase, candidate, and live edge view
 ```
 
+The verifier scales the selected backend to zero and waits for the provider
+health controller, SWIM propagation, edge reconciliation, and Praxis reload.
+It requires a successful request through the remaining provider and confirms
+that the edge pod was neither replaced nor restarted. Cleanup restores the
+backend and requires the candidate and another reload to return.
+
 ### Invalid Provider Peer
+
+**User Story:** As a provider owner, I need possession of network connectivity
+or a certificate from the wrong identity domain to be insufficient for backend
+access.
+
+**Summary:** Provider access is authenticated and authorized at the provider
+gateway before route selection or credential injection.
+
+**Implementation and proof:**
 
 ```text
 untrusted client
@@ -477,6 +805,11 @@ untrusted client
   -> rejected
   -> private backend never receives the request
 ```
+
+Negative probes cover no certificate, the wrong CA, the wrong SNI, the wrong
+organization, and an untrusted certificate digest. Valid edge identities must
+complete TLS and pass peer policy; the negative identities must fail at the
+expected layer.
 
 ## Run The Demo
 
@@ -494,6 +827,8 @@ export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:b5e42b38
 export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:8c10b74553a83a51af8fc3316f616697c4fd9b28eabe019c61d372989cb18839
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
+cargo build -p forge
+
 cargo xtask env run-grid-glb-demo \
   --forge-config environments/grid-glb-demo/forge.yaml \
   2>&1 | tee grid-glb-demo-output.txt
@@ -502,10 +837,11 @@ cargo xtask env run-grid-glb-demo \
 These temporary integration images are published under `ghcr.io/nerdalert`
 until equivalent project images are available under
 `ghcr.io/praxis-proxy`. The three digest references are mutually compatible.
-The command builds the Rust orchestration tools locally, creates five
-single-node Kind clusters, pulls the declared images, deploys the environment,
-and runs all four primary displays. A non-zero exit means at least one runtime
-assertion failed; the complete narration remains in
+The explicit build makes `target/debug/praxis-forge` available to the xtask
+runner. The demo command then creates five single-node Kind clusters, pulls the
+declared images, deploys the environment, and runs all four primary displays. A
+non-zero exit means at least one runtime assertion failed; the complete
+narration remains in
 `grid-glb-demo-output.txt`.
 
 Rerun only the narration without recreating the environment:
@@ -529,6 +865,7 @@ cargo run -p forge -- \
 - Linux with Docker;
 - Kind, kubectl, curl, and OpenSSL on `PATH`;
 - Rust and the repository-pinned nightly toolchain;
+- a locally built `praxis-forge` binary (`cargo build -p forge`);
 - capacity for five single-node Kind clusters; and
 - either the three local demo images or accessible registry images.
 
@@ -575,9 +912,10 @@ make glb-demo-images
 Build `praxis-ai:glb-demo` from a compatible AI integration branch. The Grid
 repository does not vendor Praxis AI.
 
-### One-Command Setup And Narration
+### Setup And Narration
 
 ```bash
+cargo build -p forge
 cargo xtask env run-grid-glb-demo 2>&1 | tee grid-glb-demo-output.txt
 ```
 
@@ -712,28 +1050,75 @@ The integration image used by this demo combines these AI changes:
 The three PRs remain independently owned even when a temporary integration
 image combines them for end-to-end validation.
 
-## Demonstrated And Non-Demonstrated Boundaries
+## Capability Guide
 
-Demonstrated:
+### Proven In This Demo
 
-- one verified HTTPS name over two active Praxis edges;
-- Kubernetes-native edge and provider deployments;
-- four-cluster Grid discovery and two edge-local overlays;
-- both active edges, both providers, and a controlled crossed-region path;
-- provider mTLS, peer authorization, and exact local route mapping;
-- final-hop credential replacement and private backend policy;
-- edge and provider session affinity;
-- provider drain and overlay hot reload without edge restart; and
-- edge withdrawal, recovery, and failback.
+- **One Praxis runtime in three roles:** live Kubernetes Deployments run the
+  GTM emulator, both public edges, and both private provider gateways from the
+  same Praxis AI image with role-specific pipelines.
+- **Local request-time routing:** four Grid operators exchange provider facts
+  over SWIM, each edge receives its own rendered overlay, and Praxis routes
+  without a request-time control-plane call.
+- **Two independent routing layers:** one verified HTTPS name reaches both
+  active edges, while Grid independently selects from both providers and
+  reports crossed edge/provider paths from response attribution.
+- **Provider security boundary:** mTLS, certificate identity, peer policy,
+  candidate/model/path validation, final-hop credential replacement, and
+  NetworkPolicy-enforced backend isolation all receive positive and negative
+  runtime probes.
+- **Two-layer session behavior:** repeated edge and provider sessions remain
+  stable under separate affinity keys.
+- **Metrics-driven provider drain:** a queue metric changes admission to
+  `existing_only`; the established session stays and a new session selects the
+  other provider.
+- **Live overlay reload:** provider drain, withdrawal, and recovery update the
+  operator-owned overlays without replacing or restarting the Praxis edge pod.
+- **Edge and provider failure recovery:** an unavailable provider disappears
+  from the edge view, and an unavailable edge is withdrawn behind the same
+  HTTPS name before both are restored.
 
-Not demonstrated:
+### Available, But Outside This Walkthrough
 
-- managed DNS or Anycast behavior;
-- real Internet geo-latency or capacity-based edge steering;
-- authenticated GTM-to-edge origin transport;
-- production SWIM encryption and managed key rotation;
-- shared GTM affinity state across emulator replicas;
-- WAF, DDoS, rate-limit, or public certificate automation;
-- in-flight streaming migration;
-- production provider credentials or external commercial APIs; and
-- multi-replica control-plane or data-plane high availability within one site.
+- **Compact deployment:** one Praxis deployment can host edge and final-hop
+  provider pipelines when a separate provider trust or failure domain is not
+  required.
+- **Cluster-local workload ingress:** an in-cluster consumer gateway can use the
+  same Grid provider-routing contract without a public GTM layer.
+- **Additional provider scoring inputs:** Grid implements locality, queue,
+  KV-cache utilization, prefix-cache hit ratio, latency, and cost inputs. This
+  walkthrough actively changes queue admission and health rather than varying
+  every scoring dimension.
+- **Responses API parsing:** Praxis AI can extract models from `/v1/responses`;
+  this walkthrough uses the Chat Completions request shape.
+- **Rejected-update protection:** the overlay reload path validates
+  replacements and retains its accepted routing state when an update is
+  invalid; this walkthrough narrates valid drain, withdrawal, and recovery
+  updates.
+- **Authenticated GTM origin transport:** Praxis supports TLS transport
+  primitives, but the local emulator uses plaintext HTTP to the edge Services
+  inside the isolated demo network.
+
+### Requires A Production Platform Or Further Work
+
+- **Internet-scale edge steering:** production geographic, latency, weighted,
+  capacity, and policy steering belongs to a managed DNS, Anycast, cloud global
+  load balancer, or enterprise GSLB product. This is managed DNS/GTM, not mDNS;
+  multicast DNS is unrelated to this architecture.
+- **Public-edge protection:** WAF, DDoS mitigation, public certificate
+  lifecycle, and Internet-facing rate controls belong to the selected ingress
+  platform and its Praxis edge policy.
+- **Globally shared edge affinity:** affinity shared across multiple GTM
+  replicas or products requires a capability supplied by that GTM product or a
+  deliberately designed shared state service.
+- **In-flight stream migration:** an established streaming response is not
+  moved between edges or providers after its upstream connection is created.
+- **Production trust automation:** SWIM sender/origin hardening, managed key
+  rotation, certificate rotation, revocation, and full readiness conditions
+  remain production-hardening work.
+- **Per-site replica failure proof:** this environment uses one replica for each
+  role and does not claim multi-replica control-plane or data-plane availability
+  within a site.
+- **Production backends and credentials:** the demo intentionally uses strict
+  mock inference backends and generated credentials rather than commercial
+  APIs or production secrets.

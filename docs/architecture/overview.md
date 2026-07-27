@@ -35,6 +35,43 @@ Grid CRDs + local health + remote SWIM/CRDT state
 The request hot path stays local.  A request should not call Kubernetes, SWIM,
 CRDT, or the Grid operator to decide where to go.
 
+## Global Ingress and Provider Boundaries
+
+External ingress uses two independent routing decisions:
+
+```text
+external client
+  -> managed DNS / Anycast / global traffic manager selects an edge
+  -> Praxis AI edge gateway authenticates and parses the request
+  -> grid_route selects an eligible provider from the local Grid overlay
+  -> gateway-to-gateway mTLS
+  -> Praxis AI provider gateway authenticates the edge
+  -> provider-local route and credential policy
+  -> private inference backend
+```
+
+The global traffic manager owns the stable public name, edge health, public
+traffic steering, and edge withdrawal. Grid does not replace that service.
+Grid begins after a request reaches a Praxis edge and selects the provider that
+can satisfy the authenticated inference request.
+
+The edge and provider fleets are independently replicated. An east edge may
+select a west provider, and a west edge may select an east provider. This
+separation keeps model, tenant, provider admission, and capacity policy out of
+DNS while allowing the outer traffic-management layer to focus on edge
+availability and client-to-edge policy.
+
+The provider gateway is a security boundary rather than a transparent proxy.
+It authenticates the edge certificate, validates the selected candidate
+against provider-local policy, removes untrusted internal headers, injects any
+provider-owned final-hop credential, and forwards only to an authorized private
+backend.
+
+See [External Client Ingress](external-ingress.md) for the complete production
+contract and the
+[Global Ingress Demo](../../environments/grid-glb-demo/README.md) for automated
+runtime proof of the principal flows and failure cases.
+
 ## The Stack
 
 Grid sits above the Praxis data plane:
@@ -171,18 +208,26 @@ semantics.
 
 ## Request Flow
 
-Once the overlay is loaded, traffic follows the gateway pipeline:
+Once the overlay is loaded, a remote-provider request follows two gateway
+pipelines:
 
 ```text
 client request
-  → Praxis AI consumer gateway
+  → Praxis AI consumer or edge gateway
   → request-format filter extracts model/tool metadata
-  → grid_route selects a candidate cluster from the loaded overlay
-  → optional grid_credential_inject adds provider auth at the final hop
-  → load_balancer selects an endpoint inside the chosen cluster
-  → Pingora sends the request upstream
+  → grid_route selects a provider gateway from the loaded overlay
+  → gateway-to-gateway mTLS
+  → Praxis AI provider gateway
+  → peer_identity_trust authenticates the calling Grid peer
+  → grid_provider_route validates the selected candidate and local route
+  → grid_credential_inject adds provider auth for the final backend hop
+  → load_balancer selects the authorized local backend
   → response returns to the client
 ```
+
+When the consumer gateway itself owns the final backend connection, it can run
+the final-hop credential and load-balancing stages locally. A remote provider
+credential remains at the provider site and is never sent to the edge.
 
 For Chat Completions-style requests, the parser is typically a generic body
 field extractor.  For `/v1/responses`, Praxis AI uses
@@ -232,11 +277,15 @@ The current handoff boundary is:
 |---|---|
 | Grid operator | Render and apply the consumer `ConfigMap` |
 | Kubernetes | Project the updated `ConfigMap` into the Praxis AI pod filesystem |
-| Deployment owner | Restart, roll out, or otherwise reload the gateway so it consumes the updated config |
+| Praxis AI | Strictly validate the projected overlay and atomically replace the accepted in-memory routing snapshot |
+| Deployment owner | Mount the overlay, configure reload policy, and monitor loaded revision, rejection, and age |
 
 This keeps Grid outside the request path and outside the gateway deployment
-lifecycle.  Grid updates desired routing configuration; it does not restart
-Praxis pods or prove the gateway has loaded the latest file.
+lifecycle. Grid updates desired routing configuration; Praxis AI can load a
+valid update without a pod restart and retains its last-known-good snapshot
+when a replacement is invalid. Grid does not restart Praxis pods, and an
+applied `ConfigMap` alone is not proof that the gateway accepted its newest
+revision.
 
 When transport configuration changes, such as changing a remote endpoint from
 `plaintext` to `mutual_tls` or updating `transport.sni`, the deployment owner
