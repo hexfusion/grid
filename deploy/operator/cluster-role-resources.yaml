@@ -40,11 +40,13 @@ rules:
   # Write paths:
   #   - Routing overlay ConfigMap (grid-overlay-{network}-{gateway})
   #   - Consumer Praxis config ConfigMap (consumerConfig.configMapName)
+  #   - SWIM revision reservation (read and resourceVersion update)
   #
-  # All writes use server-side apply (patch).  SSA on a non-existent
-  # resource requires create, so both create and patch are granted.
+  # Overlay/config writes use server-side apply. The revision reservation uses
+  # get plus update so concurrent starts receive a resourceVersion conflict
+  # instead of reusing a published revision range.
   # The namespace is the GatewayRef namespace declared in the
   # GridNetwork spec.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["create", "patch"]
+    verbs: ["get", "create", "patch", "update"]

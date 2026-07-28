@@ -34,4 +34,8 @@ pub enum OperatorError {
     /// SWIM encryption key configuration failed.
     #[error("swim key configuration: {0}")]
     SwimKeyConfig(String),
+
+    /// A watched resource is missing required metadata.
+    #[error("invalid resource: {0}")]
+    InvalidResource(String),
 }

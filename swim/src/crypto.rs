@@ -106,6 +106,14 @@ pub enum CryptoError {
     /// same error — GCM does not distinguish between the two cases.
     #[error("SWIM packet authentication failed (wrong key or tampered data)")]
     AuthFailed,
+
+    /// AES-256-GCM encryption failed.
+    ///
+    /// Infallible in practice once the cipher and nonce are valid, but
+    /// propagated as an error instead of aborting so callers can skip the
+    /// packet gracefully.
+    #[error("SWIM packet encryption failed")]
+    EncryptFailed,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,21 +125,24 @@ pub enum CryptoError {
 /// Returns the encrypted frame including the [`MAGIC`] prefix, version byte,
 /// random nonce, ciphertext, and 16-byte GCM tag.  The nonce is generated from
 /// the OS RNG so repeated calls produce distinct ciphertexts.
-#[must_use]
-pub fn encrypt(key: &SwimKey, plaintext: &[u8]) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`CryptoError::EncryptFailed`] if GCM encryption fails (infallible
+/// in practice once the cipher and nonce are valid).
+pub fn encrypt(key: &SwimKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Aes256Gcm::generate_nonce(OsRng);
-    // AES-256-GCM encrypt is infallible once the cipher and nonce are valid.
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
-        .unwrap_or_else(|_| std::process::abort());
+        .map_err(|_e| CryptoError::EncryptFailed)?;
 
     let mut out = Vec::with_capacity(OVERHEAD + plaintext.len());
     out.extend_from_slice(&MAGIC);
     out.push(ENCRYPTED_VERSION);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
-    out
+    Ok(out)
 }
 
 /// Decrypt and authenticate a SWIM UDP payload.
@@ -182,7 +193,7 @@ mod tests {
     #[test]
     fn encrypt_then_decrypt_round_trip() {
         let key = test_key(0x42);
-        let ciphertext = encrypt(&key, PLAINTEXT);
+        let ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         let recovered = decrypt(&key, &ciphertext).unwrap_or_else(|_| std::process::abort());
         assert_eq!(recovered, PLAINTEXT, "decrypted payload must match original");
     }
@@ -191,7 +202,7 @@ mod tests {
     fn wrong_key_fails() {
         let key_a = test_key(0x01);
         let key_b = test_key(0x02);
-        let ciphertext = encrypt(&key_a, PLAINTEXT);
+        let ciphertext = encrypt(&key_a, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         assert!(
             matches!(decrypt(&key_b, &ciphertext), Err(CryptoError::AuthFailed)),
             "wrong key must produce AuthFailed"
@@ -201,7 +212,7 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails() {
         let key = test_key(0x07);
-        let mut ciphertext = encrypt(&key, PLAINTEXT);
+        let mut ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         // Flip a bit in the ciphertext body (past the 17-byte header).
         // Using get_mut to satisfy indexing_slicing lint.
         if let Some(b) = ciphertext.get_mut(20) {
@@ -251,7 +262,7 @@ mod tests {
     #[test]
     fn unknown_version_fails() {
         let key = test_key(0x55);
-        let mut ciphertext = encrypt(&key, PLAINTEXT);
+        let mut ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         if let Some(b) = ciphertext.get_mut(4) {
             *b = 0xFF;
         }
@@ -264,7 +275,7 @@ mod tests {
     #[test]
     fn empty_plaintext_round_trips() {
         let key = test_key(0x00);
-        let ciphertext = encrypt(&key, b"");
+        let ciphertext = encrypt(&key, b"").unwrap_or_else(|_| std::process::abort());
         let recovered = decrypt(&key, &ciphertext).unwrap_or_else(|_| std::process::abort());
         assert!(recovered.is_empty(), "empty plaintext decrypts to empty");
     }
@@ -272,8 +283,8 @@ mod tests {
     #[test]
     fn nonces_differ_across_encryptions() {
         let key = test_key(0xAB);
-        let c1 = encrypt(&key, PLAINTEXT);
-        let c2 = encrypt(&key, PLAINTEXT);
+        let c1 = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
+        let c2 = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         let nonce1 = c1.get(5..17).unwrap_or_else(|| std::process::abort());
         let nonce2 = c2.get(5..17).unwrap_or_else(|| std::process::abort());
         assert_ne!(nonce1, nonce2, "repeated encryptions must produce distinct nonces");
@@ -285,7 +296,7 @@ mod tests {
     fn ciphertext_does_not_contain_plaintext() {
         let key = test_key(0xDE);
         let plaintext = b"secret provider state";
-        let ciphertext = encrypt(&key, plaintext);
+        let ciphertext = encrypt(&key, plaintext).unwrap_or_else(|_| std::process::abort());
         let tag_start = ciphertext.len().saturating_sub(TAG_LEN);
         let body = ciphertext.get(17..tag_start).unwrap_or_else(|| std::process::abort());
         assert!(
@@ -297,7 +308,7 @@ mod tests {
     #[test]
     fn wrong_magic_byte_produces_bad_magic() {
         let key = test_key(0x13);
-        let mut ciphertext = encrypt(&key, PLAINTEXT);
+        let mut ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         if let Some(b) = ciphertext.get_mut(0) {
             *b ^= 0x01;
         }
@@ -310,7 +321,7 @@ mod tests {
     #[test]
     fn wire_format_structure() {
         let key = test_key(0x77);
-        let ciphertext = encrypt(&key, PLAINTEXT);
+        let ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             ciphertext.get(..4).unwrap_or_else(|| std::process::abort()),
             b"GRID",

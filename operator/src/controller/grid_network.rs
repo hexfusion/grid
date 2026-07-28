@@ -165,6 +165,22 @@ pub fn network_refs_from_grid_site(site: GridSite) -> Option<ObjectRef<GridNetwo
 }
 
 // ---------------------------------------------------------------------------
+// Resource name helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the resource name from a watched [`GridNetwork`].
+///
+/// kube-rs guarantees `metadata.name` is present on watched resources.
+/// Returns an error for defensive requeue instead of aborting the process.
+fn grid_network_name(network: &GridNetwork) -> Result<&str, OperatorError> {
+    network
+        .metadata
+        .name
+        .as_deref()
+        .ok_or_else(|| OperatorError::InvalidResource("GridNetwork missing metadata.name".into()))
+}
+
+// ---------------------------------------------------------------------------
 // Reconcile
 // ---------------------------------------------------------------------------
 
@@ -184,11 +200,7 @@ pub fn network_refs_from_grid_site(site: GridSite) -> Option<ObjectRef<GridNetwo
     reason = "sequential reconcile steps with cert broadcast; extracting cert into a helper would obscure the security boundary"
 )]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
-    let name = network
-        .metadata
-        .name
-        .as_deref()
-        .unwrap_or_else(|| std::process::abort());
+    let name = grid_network_name(&network)?;
 
     info!(name, "reconciling GridNetwork");
 
@@ -240,6 +252,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Obtain a live membership snapshot here - used both for staleness override below
     // and for phase determination after the overlay step.
     // When swim is None (runtime not configured), falls through to static phase logic.
+    let swim_runtime_running = ctx.swim.as_ref().is_none_or(|handle| handle.is_running());
     let membership = ctx.swim.as_ref().map(|h| h.snapshot());
 
     // Downgrade providers from Dead/Suspect SWIM members to Degraded so the overlay
@@ -258,10 +271,14 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
 
     let grid_id = resolve_grid_id(&network);
-    let phase = determine_phase(&network, &grid_id, membership.as_ref());
+    let phase = if swim_runtime_running {
+        determine_phase(&network, &grid_id, membership.as_ref())
+    } else {
+        GridNetworkPhase::Degraded
+    };
 
     // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
-    let distributed_provider_count = if let Some(swim) = ctx.swim.as_ref() {
+    let distributed_provider_count = if let Some(swim) = ctx.swim.as_ref().filter(|handle| handle.is_running()) {
         publish_real_provider_state(swim, name, &providers, &raw_metrics);
         count_remote_provider_records(swim, name)
     } else {
@@ -477,7 +494,10 @@ fn announce_crd_seeds(
     // Always announce the full set for robustness (idempotent, handles channel-full retries).
     let prev = last_seeds
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(|e| {
+            tracing::warn!("last_seeds lock poisoned, recovering");
+            e.into_inner()
+        })
         .get(name)
         .cloned()
         .unwrap_or_default();
@@ -504,7 +524,10 @@ fn announce_crd_seeds(
     if seeds.is_empty() {
         last_seeds
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!("last_seeds lock poisoned, recovering");
+                e.into_inner()
+            })
             .insert(name.to_owned(), seeds);
         return;
     }
@@ -524,7 +547,10 @@ fn announce_crd_seeds(
     // Update tracked seed set only on successful queue.
     last_seeds
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(|e| {
+            tracing::warn!("last_seeds lock poisoned, recovering");
+            e.into_inner()
+        })
         .insert(name.to_owned(), seeds);
 }
 
@@ -646,11 +672,7 @@ async fn reconcile_routing_overlay_inner(
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
 ) -> Result<Vec<ConsumerConfigStatus>, OperatorError> {
-    let network_name = network
-        .metadata
-        .name
-        .as_deref()
-        .unwrap_or_else(|| std::process::abort());
+    let network_name = grid_network_name(network)?;
 
     let sites = list_all_grid_sites(client).await?;
 
@@ -811,15 +833,15 @@ async fn apply_overlay_for_gateway(
     gw_ref: &GatewayRef,
     client: &Client,
 ) -> Result<(), OperatorError> {
-    let network_name = network
-        .metadata
-        .name
-        .as_deref()
-        .unwrap_or_else(|| std::process::abort());
+    let network_name = grid_network_name(network)?;
 
     let cm = routing_overlay::build_overlay_configmap(overlay, network_name, &gw_ref.name, &gw_ref.namespace)
         .map_err(OperatorError::Json)?;
-    let cm_name = cm.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
+    let cm_name = cm
+        .metadata
+        .name
+        .as_deref()
+        .ok_or_else(|| OperatorError::InvalidResource("overlay ConfigMap missing metadata.name".into()))?;
 
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     api.patch(cm_name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
@@ -1154,11 +1176,7 @@ async fn update_status(
     distributed_provider_count: u32,
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
 ) -> Result<(), OperatorError> {
-    let name = network
-        .metadata
-        .name
-        .as_deref()
-        .unwrap_or_else(|| std::process::abort());
+    let name = grid_network_name(network)?;
 
     let connected_sites = membership.map_or(0, MembershipSnapshot::connected_count);
 

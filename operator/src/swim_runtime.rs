@@ -30,7 +30,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -50,6 +50,23 @@ use crate::swim::{MemberRecord, MemberStatus, MembershipSnapshot};
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+/// Durably reserved revision range and node generation for one runtime.
+///
+/// The operator must persist the range's upper bound and node generation
+/// before calling [`start`]. A crash can therefore waste revisions, but a
+/// replacement process cannot reuse a revision already visible to peers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionLease {
+    /// First transport revision available to this process.
+    pub first_revision: u64,
+    /// Last transport revision available to this process.
+    pub last_revision: u64,
+    /// First foca identity generation reserved for this process.
+    pub first_node_generation: u64,
+    /// Last foca identity generation reserved for this process.
+    pub last_node_generation: u64,
+}
 
 /// Configuration for the SWIM runtime.
 #[derive(Clone)]
@@ -100,6 +117,9 @@ pub struct SwimConfig {
     /// The key value must **never** appear in logs, tracing spans, error messages,
     /// Kubernetes resources, or process output.
     pub swim_key: Option<swim::crypto::SwimKey>,
+
+    /// Revision range and node generation reserved durably before startup.
+    pub revision_lease: RevisionLease,
 }
 
 impl std::fmt::Debug for SwimConfig {
@@ -111,6 +131,7 @@ impl std::fmt::Debug for SwimConfig {
             .field("seeds", &self.seeds)
             .field("gateway_address", &self.gateway_address)
             .field("swim_key", &self.swim_key.map(|_| "<redacted>"))
+            .field("revision_lease", &self.revision_lease)
             .finish()
     }
 }
@@ -249,6 +270,53 @@ struct RuntimeChannels {
 /// Period between bounded anti-entropy publications of local provider state.
 const STATE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Default TTL for dead SWIM members before eviction from the tracked table.
+///
+/// 300 seconds = 10 × foca's WAN `suspect_to_down_after` (30 s), giving
+/// ample time for the full Alive → Suspect → Dead lifecycle and peer
+/// convergence before cleanup.  Override with `GRID_SWIM_DEAD_MEMBER_TTL_SECS`.
+const DEFAULT_DEAD_MEMBER_TTL_SECS: u64 = 300;
+/// Suspect entries that fail to transition are removed after this bound.
+const SUSPECT_MEMBER_TTL: Duration = Duration::from_secs(120);
+/// Maximum membership records retained by the operator-side mirror.
+const MAX_TRACKED_MEMBERS: usize = 1_024;
+/// Maximum suspect and dead records retained inside the total member bound.
+const MAX_NON_ALIVE_MEMBERS: usize = 512;
+
+/// Process-local allocator over a range reserved durably before startup.
+struct RevisionClock {
+    /// Next unused revision in this process's durable lease.
+    next: u64,
+    /// Inclusive upper bound of this process's durable lease.
+    last: u64,
+}
+
+impl RevisionClock {
+    /// Validate and initialize an allocator over a durable lease.
+    fn new(lease: &RevisionLease) -> Result<Self, SwimRuntimeError> {
+        if lease.first_revision == 0 || lease.first_revision > lease.last_revision {
+            return Err(SwimRuntimeError::InvalidRevisionLease {
+                first: lease.first_revision,
+                last: lease.last_revision,
+            });
+        }
+        Ok(Self {
+            next: lease.first_revision,
+            last: lease.last_revision,
+        })
+    }
+
+    /// Return the next reserved revision, or `None` after lease exhaustion.
+    fn take(&mut self) -> Option<u64> {
+        let revision = self.next;
+        if revision > self.last {
+            return None;
+        }
+        self.next = self.next.saturating_add(1);
+        Some(revision)
+    }
+}
+
 /// Retains the latest local provider-state payload for bounded anti-entropy.
 ///
 /// Foca intentionally removes a custom broadcast after its transmission
@@ -271,38 +339,35 @@ impl RetainedStateBroadcast {
     fn update(
         current: Option<Self>,
         mut broadcast: swim::StateBroadcast,
+        revision: u64,
     ) -> Result<(Self, Option<swim::StateBroadcast>), String> {
         debug_assert!(
             broadcast.carries_grid_state(),
             "retained anti-entropy accepts provider/capability state only"
         );
         let canonical_payload = canonical_state_payload(&broadcast)?;
-
-        if current
-            .as_ref()
-            .is_some_and(|retained| retained.canonical_payload == canonical_payload)
+        if let Some(retained) = current
+            && retained.canonical_payload == canonical_payload
         {
-            let retained = current.unwrap_or_else(|| std::process::abort());
             return Ok((retained, None));
         }
 
-        let last_revision = next_transport_revision(current.as_ref().map_or(0, |retained| retained.last_revision));
-        broadcast.revision = last_revision;
+        broadcast.revision = revision;
         let outbound = broadcast.clone();
         Ok((
             Self {
                 canonical_payload,
                 broadcast,
-                last_revision,
+                last_revision: revision,
             },
             Some(outbound),
         ))
     }
 
     /// Create a fresh transport revision for periodic anti-entropy.
-    fn republish(&mut self) -> swim::StateBroadcast {
-        self.last_revision = next_transport_revision(self.last_revision);
-        self.broadcast.revision = self.last_revision;
+    fn republish(&mut self, revision: u64) -> swim::StateBroadcast {
+        self.last_revision = revision;
+        self.broadcast.revision = revision;
         self.broadcast.clone()
     }
 }
@@ -330,6 +395,24 @@ pub enum SwimRuntimeError {
         /// The underlying IO error.
         #[source]
         source: std::io::Error,
+    },
+
+    /// The reserved transport-revision range is empty or invalid.
+    #[error("invalid SWIM revision lease: first={first}, last={last}")]
+    InvalidRevisionLease {
+        /// First reserved revision.
+        first: u64,
+        /// Last reserved revision.
+        last: u64,
+    },
+
+    /// The reserved node-generation range is empty or invalid.
+    #[error("invalid SWIM node-generation lease: first={first}, last={last}")]
+    InvalidNodeGenerationLease {
+        /// First reserved generation.
+        first: u64,
+        /// Last reserved generation.
+        last: u64,
     },
 }
 
@@ -428,20 +511,15 @@ pub struct SwimHandle {
     /// status fields.
     key_tx: watch::Sender<Option<Arc<swim::crypto::SwimKey>>>,
 
-    /// Current data-plane gateway address.
-    ///
-    /// Updated by [`SwimHandle::set_gateway_address`] after the runtime accepts
-    /// a change.  This keeps provider-state broadcasts aligned with async
-    /// Service self-discovery without keeping the runtime's watch channel open
-    /// after the run loop exits.
-    current_gateway: Arc<Mutex<Option<String>>>,
-
     /// Watch sender for updating the data-plane gateway address at runtime.
     ///
     /// Used by the background discovery poller to push a newly-discovered
     /// address to the SWIM run loop.  The run loop detects changes and
     /// publishes a fresh gateway-address broadcast to peers.
     gateway_tx: watch::Sender<Option<String>>,
+
+    /// Runtime liveness published by the task monitor.
+    runtime_tx: watch::Sender<bool>,
 }
 
 impl SwimHandle {
@@ -464,7 +542,13 @@ impl SwimHandle {
     /// Return the current data-plane gateway address, if any.
     #[must_use]
     pub fn gateway_address(&self) -> Option<String> {
-        self.current_gateway.lock().map_or(None, |addr| addr.clone())
+        self.gateway_tx.borrow().clone()
+    }
+
+    /// Return whether the SWIM runtime task is still running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        *self.runtime_tx.borrow()
     }
 
     /// Update the data-plane gateway address at runtime.
@@ -480,13 +564,7 @@ impl SwimHandle {
     ///
     /// Returns [`SetGatewayError::RuntimeGone`] if the SWIM runtime has exited.
     pub fn set_gateway_address(&self, addr: Option<String>) -> Result<(), SetGatewayError> {
-        self.gateway_tx
-            .send(addr.clone())
-            .map_err(|_e| SetGatewayError::RuntimeGone)?;
-        if let Ok(mut current) = self.current_gateway.lock() {
-            *current = addr;
-        }
-        Ok(())
+        self.gateway_tx.send(addr).map_err(|_e| SetGatewayError::RuntimeGone)
     }
 
     /// Queue seed addresses for announcement to the SWIM runtime.
@@ -514,9 +592,17 @@ impl SwimHandle {
 
     /// Clone the most recently published [`MembershipSnapshot`].
     ///
-    /// Returns the snapshot without blocking.
+    /// Returns the snapshot without blocking. If the runtime task has stopped,
+    /// every retained peer is reported as [`MemberStatus::Dead`] so callers
+    /// cannot mistake the last received view for live membership.
     pub fn snapshot(&self) -> MembershipSnapshot {
-        self.snapshot_rx.borrow().clone()
+        let mut snapshot = self.snapshot_rx.borrow().clone();
+        if !self.is_running() {
+            for member in &mut snapshot.members {
+                member.status = MemberStatus::Dead;
+            }
+        }
+        snapshot
     }
 
     /// Clone the most recently merged CRDT [`GridStateSnapshot`].
@@ -542,19 +628,22 @@ impl SwimHandle {
     pub fn reconciliation_events(&self) -> impl Stream<Item = ()> + Send + Sync + 'static {
         let membership_rx = self.snapshot_rx.clone();
         let state_rx = self.state_rx.clone();
-        let previous = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow());
+        let runtime_rx = self.runtime_tx.subscribe();
+        let previous = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
         stream::unfold(
-            (membership_rx, state_rx, previous),
-            |(mut membership_rx, mut state_rx, mut previous)| async move {
+            (membership_rx, state_rx, runtime_rx, previous),
+            |(mut membership_rx, mut state_rx, mut runtime_rx, mut previous)| async move {
                 loop {
                     tokio::select! {
                         result = membership_rx.changed() => result.ok()?,
                         result = state_rx.changed() => result.ok()?,
+                        result = runtime_rx.changed() => result.ok()?,
                     }
-                    let current = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow());
+                    let current =
+                        reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
                     if current != previous {
                         previous = current;
-                        return Some(((), (membership_rx, state_rx, previous)));
+                        return Some(((), (membership_rx, state_rx, runtime_rx, previous)));
                     }
                 }
             },
@@ -611,6 +700,8 @@ impl SwimHandle {
 /// Stable SWIM data that can change rendered Grid resources.
 #[derive(Debug, PartialEq)]
 struct ReconciliationView {
+    /// Whether the runtime task is still serving membership updates.
+    runtime_alive: bool,
     /// Membership and peer metadata, sorted by site identity.
     members: Vec<ReconciliationMember>,
     /// Distributed provider and capability state.
@@ -637,7 +728,11 @@ struct ReconciliationMember {
 }
 
 /// Build the deduplicated view used by [`SwimHandle::reconciliation_events`].
-fn reconciliation_view(membership: &MembershipSnapshot, state: &GridStateSnapshot) -> ReconciliationView {
+fn reconciliation_view(
+    membership: &MembershipSnapshot,
+    state: &GridStateSnapshot,
+    runtime_alive: bool,
+) -> ReconciliationView {
     let mut members: Vec<ReconciliationMember> = membership
         .members
         .iter()
@@ -658,6 +753,7 @@ fn reconciliation_view(membership: &MembershipSnapshot, state: &GridStateSnapsho
     members.sort();
 
     ReconciliationView {
+        runtime_alive,
         members,
         state: state.clone(),
     }
@@ -684,6 +780,15 @@ fn reconciliation_view(membership: &MembershipSnapshot, state: &GridStateSnapsho
     reason = "channel setup, socket bind, runtime spawn — linear startup sequence"
 )]
 pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeError> {
+    let revisions = RevisionClock::new(&config.revision_lease)?;
+    if config.revision_lease.first_node_generation == 0
+        || config.revision_lease.first_node_generation > config.revision_lease.last_node_generation
+    {
+        return Err(SwimRuntimeError::InvalidNodeGenerationLease {
+            first: config.revision_lease.first_node_generation,
+            last: config.revision_lease.last_node_generation,
+        });
+    }
     let socket = UdpSocket::bind(config.bind_addr)
         .await
         .map_err(|source| SwimRuntimeError::Bind {
@@ -704,8 +809,8 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
     let (key_tx, key_rx) = watch::channel(initial_key);
-    let (gateway_tx, gateway_rx) = watch::channel(gateway_address.clone());
-    let current_gateway = Arc::new(Mutex::new(gateway_address.clone()));
+    let (gateway_tx, gateway_loop_rx) = watch::channel(gateway_address.clone());
+    let (runtime_tx, _) = watch::channel(true);
     let channels = RuntimeChannels {
         snapshot_tx,
         timer_tx,
@@ -723,15 +828,24 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         "SWIM runtime starting"
     );
 
-    tokio::spawn(run_loop(
+    let run_loop_handle = tokio::spawn(run_loop(
         Arc::new(socket),
         config,
         advertise_addr,
         channels,
         state_tx,
         key_rx,
-        gateway_rx,
+        gateway_loop_rx,
+        revisions,
     ));
+    let runtime_monitor_tx = runtime_tx.clone();
+    tokio::spawn(async move {
+        match run_loop_handle.await {
+            Ok(()) => tracing::info!("SWIM runtime exited"),
+            Err(e) => tracing::error!(error = %e, "SWIM runtime panicked"),
+        }
+        runtime_monitor_tx.send_replace(false);
+    });
 
     Ok(Arc::new(SwimHandle {
         site_name,
@@ -741,8 +855,8 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         broadcast_tx,
         seed_tx,
         key_tx,
-        current_gateway,
         gateway_tx,
+        runtime_tx,
     }))
 }
 
@@ -764,7 +878,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
 #[expect(clippy::large_stack_frames, reason = "async future over UDP socket + foca node")]
 #[expect(
     clippy::too_many_arguments,
-    reason = "key_rx added to support runtime encryption key loading; separate struct would obscure the startup sequence"
+    reason = "runtime channels and state are passed explicitly to preserve single-task ownership"
 )]
 async fn run_loop(
     socket: Arc<UdpSocket>,
@@ -773,22 +887,36 @@ async fn run_loop(
     mut channels: RuntimeChannels,
     state_tx: watch::Sender<GridStateSnapshot>,
     mut key_rx: watch::Receiver<Option<Arc<swim::crypto::SwimKey>>>,
-    mut gateway_rx: watch::Receiver<Option<String>>,
+    mut gateway_loop_rx: watch::Receiver<Option<String>>,
+    mut revisions: RevisionClock,
 ) {
     let site_name = config.site_name.clone();
-    let identity = NodeId::new(site_name.clone(), advertise_addr);
-    let (event_tx, _event_rx) = mpsc::channel(1);
-    let mut node = SwimNode::new(identity, event_tx);
+    let identity = NodeId::with_generation_range(
+        site_name.clone(),
+        advertise_addr,
+        config.revision_lease.first_node_generation,
+        config.revision_lease.last_node_generation,
+    );
+    let mut node = SwimNode::with_origin_capacity(identity, MAX_TRACKED_MEMBERS);
     let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
     let mut seed_addrs = config.seeds.clone();
     let mut next_seed_announce_at = Instant::now() + Duration::from_secs(5);
     let mut gateway_address = config.gateway_address.clone();
-    let mut gateway_address_revision = initial_metadata_revision();
+    let Some(mut gateway_address_revision) = revisions.take() else {
+        tracing::error!("SWIM revision lease exhausted during startup");
+        return;
+    };
     let mut next_gateway_republish_at = Instant::now();
     let mut retained_state_broadcast: Option<RetainedStateBroadcast> = None;
     let mut next_state_republish_at = Instant::now() + STATE_REPUBLISH_INTERVAL;
+    let dead_member_ttl = Duration::from_secs(
+        std::env::var("GRID_SWIM_DEAD_MEMBER_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DEAD_MEMBER_TTL_SECS),
+    );
 
     if let Some(addr) = gateway_address.as_deref() {
         publish_gateway_address_broadcast(&mut node, &site_name, gateway_address_revision, addr);
@@ -870,7 +998,11 @@ async fn run_loop(
                         if let Some(gateway_address) = gateway_address.as_deref() {
                             let now = Instant::now();
                             if now >= next_gateway_republish_at {
-                                gateway_address_revision = gateway_address_revision.saturating_add(1);
+                                let Some(revision) = revisions.take() else {
+                                    tracing::error!("SWIM revision lease exhausted during gateway republish");
+                                    return;
+                                };
+                                gateway_address_revision = revision;
                                 publish_gateway_address_broadcast(
                                     &mut node,
                                     &site_name,
@@ -913,7 +1045,11 @@ async fn run_loop(
             }
             Some(mut bc) = channels.broadcast_rx.recv() => {
                 if bc.carries_grid_state() {
-                    match RetainedStateBroadcast::update(retained_state_broadcast.take(), bc) {
+                    let Some(revision) = revisions.take() else {
+                        tracing::error!("SWIM revision lease exhausted during state publication");
+                        return;
+                    };
+                    match RetainedStateBroadcast::update(retained_state_broadcast.take(), bc, revision) {
                         Ok((retained, Some(outbound))) => {
                             retained_state_broadcast = Some(retained);
                             bc = outbound;
@@ -972,7 +1108,11 @@ async fn run_loop(
                 let now = Instant::now();
                 if now >= next_state_republish_at {
                     if let Some(retained) = retained_state_broadcast.as_mut() {
-                        let bc = retained.republish();
+                        let Some(revision) = revisions.take() else {
+                            tracing::error!("SWIM revision lease exhausted during state repair");
+                            return;
+                        };
+                        let bc = retained.republish(revision);
                         if let Err(e) = node.publish_state_broadcast(&bc) {
                             tracing::warn!(error = %e, "failed to encode retained state broadcast");
                         } else {
@@ -1013,18 +1153,29 @@ async fn run_loop(
                     }
                     next_seed_announce_at = now + Duration::from_secs(5);
                 }
-                // Age is derived from an internal Instant, but SwimHandle readers
-                // only see the latest published MembershipSnapshot.  Republish
-                // while any member is Dead/Suspect so age_secs advances even when
-                // no new membership event arrives.
-                if has_aging_members(&tracked) {
-                    drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now(), &node.gateway_addrs(), &node.cert_pems())));
+                let evicted = prune_tracked_members(&mut tracked, now, dead_member_ttl);
+                for origin in &evicted {
+                    node.evict_origin(origin);
+                }
+                // Republish while age changes or after eviction so readers see
+                // a coherent bounded membership view.
+                if has_aging_members(&tracked) || !evicted.is_empty() {
+                    drop(channels.snapshot_tx.send(members_snapshot(
+                        &tracked,
+                        now,
+                        &node.gateway_addrs(),
+                        &node.cert_pems(),
+                    )));
                 }
             }
-            Ok(()) = gateway_rx.changed() => {
-                gateway_address.clone_from(&gateway_rx.borrow_and_update());
+            Ok(()) = gateway_loop_rx.changed() => {
+                gateway_address.clone_from(&gateway_loop_rx.borrow_and_update());
                 if let Some(addr) = gateway_address.as_deref() {
-                    gateway_address_revision = gateway_address_revision.saturating_add(1);
+                    let Some(revision) = revisions.take() else {
+                        tracing::error!("SWIM revision lease exhausted during gateway update");
+                        return;
+                    };
+                    gateway_address_revision = revision;
                     publish_gateway_address_broadcast(
                         &mut node,
                         &site_name,
@@ -1049,27 +1200,6 @@ async fn run_loop(
             }
         }
     }
-}
-
-/// Seed restart-safe metadata revisions from wall-clock milliseconds.
-///
-/// Gateway metadata is a replaceable current-value lane, not a causal CRDT
-/// counter. A process-local zero seed lets peers retain a larger invalidation
-/// key from the previous operator instance and discard the restarted
-/// instance's advertisements. Milliseconds advance substantially faster than
-/// the once-per-second republish counter, so a normal restart starts beyond
-/// the prior process's revision range.
-fn initial_metadata_revision() -> u64 {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
-}
-
-/// Return a restart-safe, strictly increasing transport revision.
-fn next_transport_revision(previous: u64) -> u64 {
-    initial_metadata_revision().max(previous.saturating_add(1))
 }
 
 /// Encode provider-state content without its replaceable transport revision.
@@ -1109,6 +1239,10 @@ fn publish_gateway_address_broadcast(node: &mut SwimNode, site_name: &str, revis
     clippy::too_many_arguments,
     reason = "distinct runtime state pointers; a wrapper struct would obscure the data-flow"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "encrypt error handling match block added 5 lines; splitting would separate the send and encrypt logic"
+)]
 async fn drain_output(
     output: swim::AccumulatedOutput,
     socket: &UdpSocket,
@@ -1122,7 +1256,13 @@ async fn drain_output(
     for msg in output.messages {
         // Encrypt outgoing packet when a key is configured.
         let payload: std::borrow::Cow<'_, [u8]> = if let Some(key) = swim_key {
-            std::borrow::Cow::Owned(swim::crypto::encrypt(key, &msg.data))
+            match swim::crypto::encrypt(key, &msg.data) {
+                Ok(encrypted) => std::borrow::Cow::Owned(encrypted),
+                Err(e) => {
+                    tracing::warn!(error = %e, addr = %msg.addr, "SWIM encrypt failed, dropping packet");
+                    continue;
+                },
+            }
         } else {
             std::borrow::Cow::Borrowed(&msg.data)
         };
@@ -1145,7 +1285,7 @@ async fn drain_output(
     // Capture a single `now` for all events in this batch so age is consistent.
     let now = Instant::now();
     for event in output.events {
-        apply_member_event(event, tracked, now);
+        apply_member_event_bounded(event, tracked, now);
         changed = true;
     }
     if changed {
@@ -1167,10 +1307,27 @@ async fn drain_output(
 /// | `Suspect` (first time or was `Alive`) | Set to `now` | `Suspect` |
 /// | `Suspect` (already `Suspect`/`Dead`) | Preserved (age grows monotonically) | `Suspect` |
 /// | `Left` / unknown (`Dead`) | Set to `now` if not already set | `Dead` |
+fn apply_member_event_bounded(event: MemberEvent, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
+    let site_name = match &event {
+        MemberEvent::Joined { site_name, .. }
+        | MemberEvent::Left { site_name }
+        | MemberEvent::Suspect { site_name } => site_name,
+    };
+    if !tracked.contains_key(site_name) && tracked.len() >= MAX_TRACKED_MEMBERS {
+        tracing::warn!(
+            max_members = MAX_TRACKED_MEMBERS,
+            "SWIM tracked-member capacity reached; ignoring event for an unknown member"
+        );
+        return;
+    }
+    apply_member_event(event, tracked, now);
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "exhaustive match over all member-event variants with per-event age-tracking logic; splitting would obscure the status-change semantics"
 )]
+/// Apply one membership event without enforcing the outer table capacity.
 fn apply_member_event(event: MemberEvent, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
     match event {
         MemberEvent::Joined { site_name, addr } => {
@@ -1236,6 +1393,54 @@ fn apply_left_event(site_name: String, tracked: &mut HashMap<String, TrackedMemb
     );
 }
 
+/// Remove expired or excess non-alive records and return their origins.
+#[expect(
+    clippy::too_many_lines,
+    reason = "age expiry and deterministic capacity eviction share one candidate ordering"
+)]
+fn prune_tracked_members(
+    tracked: &mut HashMap<String, TrackedMember>,
+    now: Instant,
+    dead_ttl: Duration,
+) -> Vec<String> {
+    let mut candidates: Vec<(Instant, String)> = tracked
+        .iter()
+        .filter_map(|(site, member)| {
+            let changed_at = member.status_changed_at?;
+            let expired = match member.status {
+                MemberStatus::Alive => false,
+                MemberStatus::Suspect => now.saturating_duration_since(changed_at) >= SUSPECT_MEMBER_TTL,
+                MemberStatus::Dead => now.saturating_duration_since(changed_at) >= dead_ttl,
+            };
+            expired.then(|| (changed_at, site.clone()))
+        })
+        .collect();
+
+    let non_alive_count = tracked
+        .values()
+        .filter(|member| member.status != MemberStatus::Alive)
+        .count();
+    if non_alive_count > MAX_NON_ALIVE_MEMBERS {
+        let mut non_alive: Vec<(Instant, String)> = tracked
+            .iter()
+            .filter_map(|(site, member)| {
+                (member.status != MemberStatus::Alive)
+                    .then_some((member.status_changed_at.unwrap_or(now), site.clone()))
+            })
+            .collect();
+        non_alive.sort();
+        candidates.extend(non_alive.into_iter().take(non_alive_count - MAX_NON_ALIVE_MEMBERS));
+    }
+
+    candidates.sort();
+    candidates.dedup_by(|left, right| left.1 == right.1);
+    let evicted: Vec<String> = candidates.into_iter().map(|(_, site)| site).collect();
+    for site in &evicted {
+        tracked.remove(site);
+    }
+    evicted
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1299,6 +1504,15 @@ mod tests {
 
     fn now() -> Instant {
         Instant::now()
+    }
+
+    fn test_revision_lease(seed: u64) -> RevisionLease {
+        RevisionLease {
+            first_revision: seed,
+            last_revision: seed + 10_000,
+            first_node_generation: seed,
+            last_node_generation: seed + 100,
+        }
     }
 
     #[test]
@@ -1560,8 +1774,8 @@ mod tests {
             broadcast_tx,
             seed_tx,
             key_tx,
-            current_gateway: Arc::new(Mutex::new(None)),
             gateway_tx,
+            runtime_tx: watch::channel(true).0,
         };
         (handle, snapshot_tx, state_tx)
     }
@@ -1680,6 +1894,31 @@ mod tests {
                 .is_err(),
             "identical provider gossip must not trigger reconciliation"
         );
+
+        handle.runtime_tx.send_replace(false);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "runtime termination must trigger reconciliation"
+        );
+    }
+
+    #[test]
+    fn stopped_runtime_never_reports_retained_members_alive() {
+        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        drop(snapshot_tx.send(MembershipSnapshot {
+            members: vec![reconciliation_member(MemberStatus::Alive, 0)],
+        }));
+        handle.runtime_tx.send_replace(false);
+
+        let snapshot = handle.snapshot();
+        assert!(!handle.is_running());
+        assert_eq!(
+            snapshot.members.first().unwrap_or_else(|| std::process::abort()).status,
+            MemberStatus::Dead
+        );
+        assert_eq!(snapshot.connected_count(), 0);
     }
 
     #[test]
@@ -1698,8 +1937,8 @@ mod tests {
             broadcast_tx,
             seed_tx,
             key_tx,
-            current_gateway: Arc::new(Mutex::new(Some("127.0.0.1:19080".to_owned()))),
             gateway_tx,
+            runtime_tx: watch::channel(true).0,
         };
         drop((snapshot_tx, state_tx));
 
@@ -1717,7 +1956,7 @@ mod tests {
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
         let (key_tx, _key_rx) = watch::channel(None);
-        let (gateway_tx, mut gateway_rx) = watch::channel(None);
+        let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
@@ -1726,24 +1965,21 @@ mod tests {
             broadcast_tx,
             seed_tx,
             key_tx,
-            current_gateway: Arc::new(Mutex::new(None)),
             gateway_tx,
+            runtime_tx: watch::channel(true).0,
         };
 
         let result = handle.set_gateway_address(Some("10.0.0.5:8080".to_owned()));
         assert!(result.is_ok(), "set_gateway_address must succeed when channel is open");
-        assert!(gateway_rx.has_changed().unwrap_or(false), "watch must see change");
-        let val = gateway_rx.borrow_and_update().clone();
-        assert_eq!(val.as_deref(), Some("10.0.0.5:8080"), "receiver must see new address");
         assert_eq!(
             handle.gateway_address(),
             Some("10.0.0.5:8080".to_owned()),
-            "handle must expose runtime-updated address"
+            "handle must expose runtime-updated address via watch"
         );
     }
 
     #[test]
-    fn set_gateway_address_returns_error_when_runtime_gone() {
+    fn set_gateway_address_returns_error_without_runtime_receiver() {
         let (_snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
         let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
@@ -1758,29 +1994,53 @@ mod tests {
             broadcast_tx,
             seed_tx,
             key_tx,
-            current_gateway: Arc::new(Mutex::new(None)),
             gateway_tx,
+            runtime_tx: watch::channel(false).0,
         };
         drop(gateway_rx);
 
         let result = handle.set_gateway_address(Some("10.0.0.5:8080".to_owned()));
         assert!(
             matches!(result, Err(SetGatewayError::RuntimeGone)),
-            "must return RuntimeGone when receiver is dropped"
+            "set_gateway_address must report a stopped runtime"
         );
         assert_eq!(
             handle.gateway_address(),
             None,
-            "failed runtime update must not change cached gateway address"
+            "failed update must not change the sender's retained value"
         );
     }
 
     #[test]
-    fn metadata_revision_seed_is_restart_scale_and_nondecreasing() {
-        let first = initial_metadata_revision();
-        let second = initial_metadata_revision();
-        assert!(first > 1_000_000_000_000);
-        assert!(second >= first);
+    fn revision_clock_uses_reserved_range_once() {
+        let lease = RevisionLease {
+            first_revision: 41,
+            last_revision: 42,
+            first_node_generation: 7,
+            last_node_generation: 8,
+        };
+        let mut clock = RevisionClock::new(&lease).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(clock.take(), Some(41));
+        assert_eq!(clock.take(), Some(42));
+        assert_eq!(clock.take(), None);
+        assert_eq!(clock.take(), None);
+    }
+
+    #[test]
+    fn revision_clock_rejects_invalid_range() {
+        let lease = RevisionLease {
+            first_revision: 42,
+            last_revision: 41,
+            first_node_generation: 7,
+            last_node_generation: 8,
+        };
+        assert!(
+            matches!(
+                RevisionClock::new(&lease),
+                Err(SwimRuntimeError::InvalidRevisionLease { .. })
+            ),
+            "runtime must reject an empty reserved range"
+        );
     }
 
     fn provider_broadcast(queue_depth: f64) -> swim::StateBroadcast {
@@ -1813,7 +2073,7 @@ mod tests {
     fn retained_state_deduplicates_updates_and_republishes_with_new_revision() {
         let original = provider_broadcast(0.1);
         let (retained, first) =
-            RetainedStateBroadcast::update(None, original.clone()).unwrap_or_else(|_| std::process::abort());
+            RetainedStateBroadcast::update(None, original.clone(), 100).unwrap_or_else(|_| std::process::abort());
         let first = first.unwrap_or_else(|| std::process::abort());
         assert!(
             first.revision > original.revision,
@@ -1821,7 +2081,7 @@ mod tests {
         );
 
         let (retained, duplicate) =
-            RetainedStateBroadcast::update(Some(retained), original).unwrap_or_else(|_| std::process::abort());
+            RetainedStateBroadcast::update(Some(retained), original, 101).unwrap_or_else(|_| std::process::abort());
         assert!(
             duplicate.is_none(),
             "an identical controller reconcile must not reset the foca transmission budget"
@@ -1829,7 +2089,7 @@ mod tests {
 
         let changed = provider_broadcast(0.8);
         let (mut retained, changed_outbound) =
-            RetainedStateBroadcast::update(Some(retained), changed).unwrap_or_else(|_| std::process::abort());
+            RetainedStateBroadcast::update(Some(retained), changed, 102).unwrap_or_else(|_| std::process::abort());
         let changed_outbound = changed_outbound.unwrap_or_else(|| std::process::abort());
         assert!(
             changed_outbound.revision > first.revision,
@@ -1844,7 +2104,7 @@ mod tests {
             "changed provider state must publish immediately"
         );
 
-        let repair = retained.republish();
+        let repair = retained.republish(103);
         assert!(
             repair.revision > changed_outbound.revision,
             "anti-entropy must use a fresh transport revision"
@@ -1964,8 +2224,8 @@ mod tests {
             broadcast_tx,
             seed_tx,
             key_tx,
-            current_gateway: Arc::new(Mutex::new(None)),
             gateway_tx,
+            runtime_tx: watch::channel(true).0,
         };
         drop((snapshot_tx, state_tx));
 
@@ -1993,10 +2253,9 @@ mod tests {
             broadcast_tx,
             seed_tx,
             key_tx,
-            current_gateway: Arc::new(Mutex::new(None)),
             gateway_tx,
+            runtime_tx: watch::channel(true).0,
         };
-        // Drop the receiver to simulate the runtime loop having exited.
         drop(seed_rx);
 
         let addr: SocketAddr = "10.0.0.2:7946".parse().unwrap_or_else(|_| std::process::abort());
@@ -2020,6 +2279,7 @@ mod tests {
             seeds: Vec::new(),
             gateway_address: None,
             swim_key: None,
+            revision_lease: test_revision_lease(1),
         };
         let handle = start(cfg).await;
         assert!(handle.is_ok(), "start must succeed with an available port");
@@ -2042,6 +2302,7 @@ mod tests {
             seeds: Vec::new(),
             gateway_address: None,
             swim_key: None,
+            revision_lease: test_revision_lease(20_000),
         };
         let result = start(cfg).await;
         assert!(result.is_err(), "start on an already-bound port must fail");
@@ -2061,6 +2322,7 @@ mod tests {
             seeds: Vec::new(),
             gateway_address: None,
             swim_key: None,
+            revision_lease: test_revision_lease(40_000),
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
 
@@ -2071,10 +2333,131 @@ mod tests {
             seeds: vec![addr1],
             gateway_address: None,
             swim_key: None,
+            revision_lease: test_revision_lease(60_000),
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 
         wait_until_member_alive(&handle1, "node-2").await;
         drop(handle2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dead-member eviction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dead_member_evicted_after_ttl() {
+        let ttl = Duration::from_secs(300);
+        let t0 = now();
+        let t_dead = t0 + Duration::from_secs(10);
+
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(left("site-a"), &mut tracked, t_dead);
+        assert!(
+            prune_tracked_members(&mut tracked, t_dead + ttl - Duration::from_secs(1), ttl).is_empty(),
+            "dead member must remain before TTL"
+        );
+        assert_eq!(
+            prune_tracked_members(&mut tracked, t_dead + ttl, ttl),
+            vec!["site-a".to_owned()],
+            "dead member must be evicted at TTL"
+        );
+        assert!(tracked.is_empty(), "evicted member must be removed");
+    }
+
+    #[test]
+    fn alive_member_not_evicted() {
+        let ttl = Duration::from_secs(300);
+        let t0 = now();
+        let t_check = t0 + ttl + Duration::from_secs(100);
+
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+
+        assert!(
+            prune_tracked_members(&mut tracked, t_check, ttl).is_empty(),
+            "alive member must never be evicted by non-alive retention"
+        );
+    }
+
+    #[test]
+    fn suspect_member_is_bounded_by_ttl() {
+        let ttl = Duration::from_secs(300);
+        let t0 = now();
+        let t_suspect = t0 + Duration::from_secs(5);
+
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
+        assert!(
+            prune_tracked_members(
+                &mut tracked,
+                t_suspect + SUSPECT_MEMBER_TTL - Duration::from_secs(1),
+                ttl
+            )
+            .is_empty(),
+            "suspect member must remain before its TTL"
+        );
+        assert_eq!(
+            prune_tracked_members(&mut tracked, t_suspect + SUSPECT_MEMBER_TTL, ttl),
+            vec!["site-a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn evicted_site_can_rejoin() {
+        let ttl = Duration::from_secs(300);
+        let t0 = now();
+        let t_dead = t0 + Duration::from_secs(10);
+        let t_evict = t0 + Duration::from_secs(10) + ttl + Duration::from_secs(1);
+        let t_rejoin = t_evict + Duration::from_secs(5);
+
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(left("site-a"), &mut tracked, t_dead);
+
+        prune_tracked_members(&mut tracked, t_evict, ttl);
+        assert!(tracked.is_empty(), "site must be evicted");
+
+        // Rejoin creates fresh entry.
+        apply_member_event(joined("site-a"), &mut tracked, t_rejoin);
+        assert_eq!(tracked.len(), 1, "rejoined site must create fresh entry");
+        let member = tracked.get("site-a").unwrap_or_else(|| std::process::abort());
+        assert_eq!(member.status, MemberStatus::Alive, "rejoined member must be Alive");
+        assert!(
+            member.status_changed_at.is_none(),
+            "rejoined member must have no age tracking"
+        );
+    }
+
+    #[test]
+    fn unknown_left_churn_is_hard_bounded() {
+        let mut tracked = HashMap::new();
+        let now = now();
+        for index in 0..(MAX_TRACKED_MEMBERS * 4) {
+            apply_member_event_bounded(left(&format!("site-{index:05}")), &mut tracked, now);
+        }
+        assert_eq!(
+            tracked.len(),
+            MAX_TRACKED_MEMBERS,
+            "unknown dead-member events must not grow the mirror past its hard bound"
+        );
+    }
+
+    #[test]
+    fn non_alive_capacity_evicts_oldest_deterministically() {
+        let now = now();
+        let mut tracked = HashMap::new();
+        for index in 0..(MAX_NON_ALIVE_MEMBERS + 2) {
+            apply_member_event(
+                left(&format!("site-{index:05}")),
+                &mut tracked,
+                now + Duration::from_secs(u64::try_from(index).unwrap_or(u64::MAX)),
+            );
+        }
+        let evicted = prune_tracked_members(&mut tracked, now, Duration::from_secs(10_000));
+        assert_eq!(evicted, vec!["site-00000".to_owned(), "site-00001".to_owned()]);
+        assert_eq!(tracked.len(), MAX_NON_ALIVE_MEMBERS);
     }
 }

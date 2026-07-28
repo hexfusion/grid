@@ -11,12 +11,12 @@ use std::{collections::BTreeMap, num::NonZeroU32, time::Duration};
 
 use crdt::GridStateSnapshot;
 use rand::{SeedableRng as _, rngs::SmallRng};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use crate::{
-    AccumulatedOutput, GridRuntime, MemberEvent, NodeId,
+    AccumulatedOutput, GridRuntime, NodeId,
     runtime::TimerEvent,
-    state_broadcast::{StateBroadcast, StateBroadcastHandler},
+    state_broadcast::{DEFAULT_MAX_RETAINED_ORIGINS, OriginStateHandle, StateBroadcast, StateBroadcastHandler},
 };
 
 // ---------------------------------------------------------------------------
@@ -63,6 +63,9 @@ pub struct SwimNode {
     /// Updated by the [`StateBroadcastHandler`] inside foca when a broadcast
     /// carrying a `site_cert_pem` extension is received.
     cert_pems_rx: watch::Receiver<BTreeMap<String, String>>,
+
+    /// Immediate control path for coordinated per-origin state eviction.
+    origin_state: OriginStateHandle,
 }
 
 impl SwimNode {
@@ -71,9 +74,14 @@ impl SwimNode {
     /// Uses foca's WAN configuration with periodic announce, down-member
     /// recovery, and gossip enabled.
     ///
-    /// Membership events are forwarded to `event_tx`.  Callers may also
-    /// process events from [`AccumulatedOutput::events`] directly.
-    pub fn new(identity: NodeId, event_tx: mpsc::Sender<MemberEvent>) -> Self {
+    /// Membership events are available in [`AccumulatedOutput::events`]
+    /// after each foca interaction.
+    pub fn new(identity: NodeId) -> Self {
+        Self::with_origin_capacity(identity, DEFAULT_MAX_RETAINED_ORIGINS)
+    }
+
+    /// Create a node with an explicit hard bound for retained state origins.
+    pub fn with_origin_capacity(identity: NodeId, max_origins: usize) -> Self {
         let seed = {
             // Truncate nanoseconds to u64; we want spread, not precision.
             #[expect(
@@ -91,18 +99,24 @@ impl SwimNode {
         let codec = foca::BincodeCodec(bincode::config::standard());
 
         let site_id = identity.site_name().to_owned();
-        let handler = StateBroadcastHandler::new(site_id);
+        let (handler, origin_state) = StateBroadcastHandler::with_capacity(site_id, max_origins);
         let state_rx = handler.subscribe();
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
         let cert_pems_rx = handler.subscribe_cert_pems();
 
         Self {
             foca: foca::Foca::with_custom_broadcast(identity, grid_config(), rng, codec, handler),
-            runtime: GridRuntime::new(event_tx),
+            runtime: GridRuntime::new(),
             state_rx,
             gateway_addrs_rx,
             cert_pems_rx,
+            origin_state,
         }
+    }
+
+    /// Immediately remove provider, metadata, and revision state for one origin.
+    pub fn evict_origin(&self, origin: &str) {
+        self.origin_state.remove_origin(origin);
     }
 
     /// Feed an incoming UDP packet to foca.
@@ -248,7 +262,6 @@ fn grid_config() -> foca::Config {
 #[cfg(test)]
 mod tests {
     use crdt::{Capability, GridStateSnapshot, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
-    use tokio::sync::mpsc;
 
     use super::*;
     use crate::state_broadcast::StateBroadcastError;
@@ -266,9 +279,8 @@ mod tests {
         )
     }
 
-    fn make_node(site: &str, port: u16) -> (SwimNode, mpsc::Receiver<MemberEvent>) {
-        let (tx, rx) = mpsc::channel(16);
-        (SwimNode::new(local_id(site, port), tx), rx)
+    fn make_node(site: &str, port: u16) -> (SwimNode, ()) {
+        (SwimNode::new(local_id(site, port)), ())
     }
 
     fn provider_snap(site: &str, queue: f64) -> GridStateSnapshot {
@@ -314,8 +326,7 @@ mod tests {
 
     #[test]
     fn new_creates_node_without_panic() {
-        let (tx, _rx) = mpsc::channel(1);
-        let _node = SwimNode::new(local_id("test", 19_101), tx);
+        let _node = SwimNode::new(local_id("test", 19_101));
     }
 
     #[test]

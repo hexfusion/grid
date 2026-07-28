@@ -7,8 +7,6 @@
 
 use std::net::SocketAddr;
 
-use tokio::sync::mpsc;
-
 use crate::{event::MemberEvent, identity::NodeId};
 
 // ---------------------------------------------------------------------------
@@ -104,23 +102,25 @@ impl AccumulatedOutput {
 pub struct GridRuntime {
     /// Accumulated output from foca operations.
     output: AccumulatedOutput,
-
-    /// Channel for forwarding membership events to the operator.
-    event_tx: mpsc::Sender<MemberEvent>,
 }
 
 impl GridRuntime {
-    /// Create a new runtime with the given event channel.
-    pub fn new(event_tx: mpsc::Sender<MemberEvent>) -> Self {
+    /// Create a new runtime.
+    pub fn new() -> Self {
         Self {
             output: AccumulatedOutput::new(),
-            event_tx,
         }
     }
 
     /// Take the accumulated output, replacing it with an empty one.
     pub fn take_output(&mut self) -> AccumulatedOutput {
         std::mem::take(&mut self.output)
+    }
+}
+
+impl Default for GridRuntime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -134,11 +134,22 @@ impl foca::Runtime<NodeId> for GridRuntime {
             foca::Notification::MemberDown(id) => MemberEvent::Left {
                 site_name: id.site_name().to_owned(),
             },
+            // Rename(old, new): a member restarted with a higher generation at
+            // the same address.  Emit Left for the old identity and Joined for
+            // the new one so tracked state resets cleanly.
+            foca::Notification::Rename(old, new) => {
+                self.output.events.push(MemberEvent::Left {
+                    site_name: old.site_name().to_owned(),
+                });
+                MemberEvent::Joined {
+                    site_name: new.site_name().to_owned(),
+                    addr: new.socket_addr(),
+                }
+            },
             _ => return,
         };
 
-        self.output.events.push(event.clone());
-        drop(self.event_tx.try_send(event));
+        self.output.events.push(event);
     }
 
     fn send_to(&mut self, to: NodeId, data: &[u8]) {
@@ -174,8 +185,7 @@ mod tests {
 
     #[test]
     fn send_to_accumulates_messages() {
-        let (tx, _rx) = mpsc::channel(16);
-        let mut rt = GridRuntime::new(tx);
+        let mut rt = GridRuntime::new();
         let id = test_node("peer");
         rt.send_to(id, b"hello");
         let output = rt.take_output();
@@ -184,8 +194,7 @@ mod tests {
 
     #[test]
     fn submit_after_accumulates_timers() {
-        let (tx, _rx) = mpsc::channel(16);
-        let mut rt = GridRuntime::new(tx);
+        let mut rt = GridRuntime::new();
         let timer = foca::Timer::ProbeRandomMember(0);
         rt.submit_after(timer, std::time::Duration::from_secs(5));
         let output = rt.take_output();
@@ -194,8 +203,7 @@ mod tests {
 
     #[test]
     fn take_output_resets() {
-        let (tx, _rx) = mpsc::channel(16);
-        let mut rt = GridRuntime::new(tx);
+        let mut rt = GridRuntime::new();
         rt.send_to(test_node("peer"), b"data");
         let first = rt.take_output();
         assert!(!first.is_empty(), "first take should have data");

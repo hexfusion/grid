@@ -5,7 +5,10 @@
 //!
 //! [`BroadcastHandler`]: foca::BroadcastHandler
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use crdt::GridStateSnapshot;
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,9 @@ pub const STATE_BROADCAST_VERSION_V1: u16 = 1;
 
 /// Current wire-format version.
 pub const STATE_BROADCAST_VERSION: u16 = STATE_BROADCAST_VERSION_V1;
+
+/// Default hard bound for distinct origins retained by one broadcast handler.
+pub const DEFAULT_MAX_RETAINED_ORIGINS: usize = 1_024;
 
 /// Broadcast envelope carrying one CRDT grid-state snapshot.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -311,6 +317,85 @@ pub enum StateBroadcastError {
     },
 }
 
+/// Per-origin metadata retained by the broadcast handler.
+#[derive(Default)]
+struct RetainedOrigins {
+    /// Highest provider-state revision received from each origin.
+    latest_by_origin: BTreeMap<String, u64>,
+    /// Gateway addresses received from each origin site.
+    gateway_addrs: BTreeMap<String, String>,
+    /// Highest gateway-address revision received from each origin.
+    latest_gateway_revision_by_origin: BTreeMap<String, u64>,
+    /// Public site certificate PEMs received from each origin site.
+    cert_pems: BTreeMap<String, String>,
+    /// Highest certificate revision received from each origin.
+    latest_cert_revision_by_origin: BTreeMap<String, u64>,
+}
+
+impl RetainedOrigins {
+    /// Return every origin represented by any retained map.
+    fn known_origins(&self) -> BTreeSet<String> {
+        self.latest_by_origin
+            .keys()
+            .chain(self.gateway_addrs.keys())
+            .chain(self.latest_gateway_revision_by_origin.keys())
+            .chain(self.cert_pems.keys())
+            .chain(self.latest_cert_revision_by_origin.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// Remove every revision and metadata value associated with one origin.
+    fn remove(&mut self, origin: &str) {
+        self.latest_by_origin.remove(origin);
+        self.gateway_addrs.remove(origin);
+        self.latest_gateway_revision_by_origin.remove(origin);
+        self.cert_pems.remove(origin);
+        self.latest_cert_revision_by_origin.remove(origin);
+    }
+}
+
+/// Shared control path for immediate, coordinated origin eviction.
+///
+/// Operations take a synchronous lock only while updating in-memory maps. The
+/// lock is never held across an async suspension point.
+#[derive(Clone)]
+pub(crate) struct OriginStateHandle {
+    /// Per-origin revisions and metadata shared with the foca handler.
+    retained: Arc<Mutex<RetainedOrigins>>,
+    /// Merged provider-state publisher.
+    state_tx: watch::Sender<GridStateSnapshot>,
+    /// Gateway-address publisher.
+    gateway_addrs_tx: watch::Sender<BTreeMap<String, String>>,
+    /// Public-certificate publisher.
+    cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
+}
+
+impl OriginStateHandle {
+    /// Acquire retained state, recovering a poisoned lock without hiding it.
+    fn lock(&self) -> MutexGuard<'_, RetainedOrigins> {
+        self.retained
+            .lock()
+            .unwrap_or_else(|error: PoisonError<MutexGuard<'_, RetainedOrigins>>| {
+                tracing::warn!("SWIM retained-origin lock poisoned; recovering guarded state");
+                error.into_inner()
+            })
+    }
+
+    /// Remove all state associated with an origin and publish the result.
+    pub(crate) fn remove_origin(&self, origin: &str) {
+        self.lock().remove(origin);
+        self.state_tx
+            .send_modify(|snapshot| snapshot.remove_origin_providers(origin));
+        self.gateway_addrs_tx.send_modify(|addresses| {
+            addresses.remove(origin);
+        });
+        self.cert_pems_tx.send_modify(|certs| {
+            certs.remove(origin);
+        });
+    }
+}
+
 /// foca custom broadcast handler for CRDT grid-state snapshots.
 ///
 /// Merges incoming [`StateBroadcast`] payloads into a shared
@@ -320,14 +405,8 @@ pub struct StateBroadcastHandler {
     /// Shared merged state — written here, read by all subscribers.
     state_tx: watch::Sender<GridStateSnapshot>,
 
-    /// Highest revision received from each origin.
-    latest_by_origin: BTreeMap<String, u64>,
-
-    /// Gateway addresses received from each origin site.
-    gateway_addrs: BTreeMap<String, String>,
-
-    /// Highest gateway-address revision received from each origin.
-    latest_gateway_revision_by_origin: BTreeMap<String, u64>,
+    /// Per-origin revisions and metadata shared with the eviction control path.
+    retained: Arc<Mutex<RetainedOrigins>>,
 
     /// Watch channel for broadcasting gateway address updates to observers.
     ///
@@ -335,16 +414,11 @@ pub struct StateBroadcastHandler {
     /// Subscribers observe the full map keyed by origin site name.
     gateway_addrs_tx: watch::Sender<BTreeMap<String, String>>,
 
-    /// Public site certificate PEMs received from each origin site.
-    ///
-    /// Contains only public certificate material — never private keys.
-    cert_pems: BTreeMap<String, String>,
-
-    /// Highest certificate revision received from each origin.
-    latest_cert_revision_by_origin: BTreeMap<String, u64>,
-
     /// Watch channel for broadcasting public cert PEM updates to observers.
     cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
+
+    /// Hard bound for per-origin revision and metadata maps.
+    max_origins: usize,
 }
 
 impl StateBroadcastHandler {
@@ -356,19 +430,37 @@ impl StateBroadcastHandler {
     /// [`subscribe`]: StateBroadcastHandler::subscribe
     #[must_use]
     pub fn new(site_id: String) -> Self {
+        Self::with_capacity(site_id, DEFAULT_MAX_RETAINED_ORIGINS).0
+    }
+
+    /// Create a bounded handler and a sender for coordinated origin eviction.
+    ///
+    /// `max_origins` is clamped to at least one. When the bound is reached, a
+    /// previously retained origin is removed deterministically before a new
+    /// origin is accepted.
+    #[must_use]
+    pub(crate) fn with_capacity(site_id: String, max_origins: usize) -> (Self, OriginStateHandle) {
         let (tx, _) = watch::channel(GridStateSnapshot::new(site_id));
         let (gw_tx, _) = watch::channel(BTreeMap::new());
         let (cert_tx, _) = watch::channel(BTreeMap::new());
-        Self {
-            state_tx: tx,
-            latest_by_origin: BTreeMap::new(),
-            gateway_addrs: BTreeMap::new(),
-            latest_gateway_revision_by_origin: BTreeMap::new(),
-            gateway_addrs_tx: gw_tx,
-            cert_pems: BTreeMap::new(),
-            latest_cert_revision_by_origin: BTreeMap::new(),
-            cert_pems_tx: cert_tx,
-        }
+        let max_origins = max_origins.max(1);
+        let retained = Arc::new(Mutex::new(RetainedOrigins::default()));
+        let control = OriginStateHandle {
+            retained: Arc::clone(&retained),
+            state_tx: tx.clone(),
+            gateway_addrs_tx: gw_tx.clone(),
+            cert_pems_tx: cert_tx.clone(),
+        };
+        (
+            Self {
+                state_tx: tx,
+                retained,
+                gateway_addrs_tx: gw_tx,
+                cert_pems_tx: cert_tx,
+                max_origins,
+            },
+            control,
+        )
     }
 
     /// Return a receiver for the live merged grid-state snapshot.
@@ -396,14 +488,23 @@ impl StateBroadcastHandler {
 
     /// Return the gateway address advertised by `site`, if any.
     #[must_use]
-    pub fn gateway_address_for_site(&self, site: &str) -> Option<&str> {
-        self.gateway_addrs.get(site).map(String::as_str)
+    pub fn gateway_address_for_site(&self, site: &str) -> Option<String> {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gateway_addrs
+            .get(site)
+            .cloned()
     }
 
     /// Return a snapshot of all known gateway addresses, keyed by site name.
     #[must_use]
-    pub fn gateway_addrs(&self) -> &BTreeMap<String, String> {
-        &self.gateway_addrs
+    pub fn gateway_addrs(&self) -> BTreeMap<String, String> {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gateway_addrs
+            .clone()
     }
 
     /// Return a receiver for the live public cert PEM map.
@@ -417,29 +518,41 @@ impl StateBroadcastHandler {
     ///
     /// The returned PEM is the public certificate only — never a private key.
     #[must_use]
-    pub fn cert_pem_for_site(&self, site: &str) -> Option<&str> {
-        self.cert_pems.get(site).map(String::as_str)
+    pub fn cert_pem_for_site(&self, site: &str) -> Option<String> {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cert_pems
+            .get(site)
+            .cloned()
     }
 
     /// Return a snapshot of all known public cert PEMs, keyed by site name.
     #[must_use]
-    pub fn cert_pems(&self) -> &BTreeMap<String, String> {
-        &self.cert_pems
+    pub fn cert_pems(&self) -> BTreeMap<String, String> {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cert_pems
+            .clone()
     }
 
     /// Store and publish the gateway address carried by a broadcast, if any.
-    fn store_gateway_address(&mut self, broadcast: &StateBroadcast) {
+    fn store_gateway_address(&self, broadcast: &StateBroadcast) {
         if let Some(gw) = &broadcast.gateway_address {
-            let latest = self
+            let mut retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+            let latest = retained
                 .latest_gateway_revision_by_origin
                 .get(&broadcast.origin_site)
                 .copied();
             if latest.is_some_and(|revision| revision > broadcast.revision) {
                 return;
             }
-            self.latest_gateway_revision_by_origin
+            retained
+                .latest_gateway_revision_by_origin
                 .insert(broadcast.origin_site.clone(), broadcast.revision);
-            self.gateway_addrs.insert(broadcast.origin_site.clone(), gw.clone());
+            retained.gateway_addrs.insert(broadcast.origin_site.clone(), gw.clone());
+            drop(retained);
             self.gateway_addrs_tx.send_modify(|m| {
                 m.insert(broadcast.origin_site.clone(), gw.clone());
             });
@@ -450,18 +563,64 @@ impl StateBroadcastHandler {
     ///
     /// Only the public certificate PEM is stored — private key material must
     /// never appear in a `StateBroadcast` payload.
-    fn store_site_cert_pem(&mut self, broadcast: &StateBroadcast) {
+    fn store_site_cert_pem(&self, broadcast: &StateBroadcast) {
         if let Some(pem) = &broadcast.site_cert_pem {
-            let latest = self.latest_cert_revision_by_origin.get(&broadcast.origin_site).copied();
+            let mut retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+            let latest = retained
+                .latest_cert_revision_by_origin
+                .get(&broadcast.origin_site)
+                .copied();
             if latest.is_some_and(|revision| revision > broadcast.revision) {
                 return;
             }
-            self.latest_cert_revision_by_origin
+            retained
+                .latest_cert_revision_by_origin
                 .insert(broadcast.origin_site.clone(), broadcast.revision);
-            self.cert_pems.insert(broadcast.origin_site.clone(), pem.clone());
+            retained.cert_pems.insert(broadcast.origin_site.clone(), pem.clone());
+            drop(retained);
             self.cert_pems_tx.send_modify(|m| {
                 m.insert(broadcast.origin_site.clone(), pem.clone());
             });
+        }
+    }
+
+    /// Return every origin represented by the handler's retained maps.
+    fn known_origins(&self) -> BTreeSet<String> {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .known_origins()
+    }
+
+    /// Remove one origin from provider state, metadata, and revision guards.
+    fn remove_origin(&self, origin: &str) {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(origin);
+        self.state_tx
+            .send_modify(|snapshot| snapshot.remove_origin_providers(origin));
+        self.gateway_addrs_tx.send_modify(|addresses| {
+            addresses.remove(origin);
+        });
+        self.cert_pems_tx.send_modify(|certs| {
+            certs.remove(origin);
+        });
+    }
+
+    /// Enforce the hard origin bound before accepting an unknown origin.
+    fn make_room_for(&self, incoming_origin: &str) {
+        let origins = self.known_origins();
+        if origins.contains(incoming_origin) || origins.len() < self.max_origins {
+            return;
+        }
+        if let Some(origin) = origins.into_iter().next() {
+            tracing::warn!(
+                evicted_origin = %origin,
+                max_origins = self.max_origins,
+                "SWIM state origin capacity reached; evicting retained origin"
+            );
+            self.remove_origin(&origin);
         }
     }
 }
@@ -470,6 +629,10 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
     type Error = StateBroadcastError;
     type Key = StateBroadcastKey;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "decode, independent metadata lanes, and provider-state revision checks form one atomic receive path"
+    )]
     fn receive_item(&mut self, data: &[u8], _sender: Option<&NodeId>) -> Result<Option<Self::Key>, Self::Error> {
         let broadcast = StateBroadcast::decode(data)?;
         if broadcast.version != STATE_BROADCAST_VERSION {
@@ -478,6 +641,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
                 actual: broadcast.version,
             });
         }
+        self.make_room_for(&broadcast.origin_site);
 
         // Metadata-only broadcasts (gateway address or cert PEM, empty CRDT
         // snapshot) have independent revision lanes. They must not be rejected
@@ -488,7 +652,13 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             return Ok(Some(broadcast.key()));
         }
 
-        let latest = self.latest_by_origin.get(&broadcast.origin_site).copied();
+        let latest = self
+            .retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .latest_by_origin
+            .get(&broadcast.origin_site)
+            .copied();
         if latest.is_some_and(|latest| latest > broadcast.revision) {
             return Ok(None);
         }
@@ -505,7 +675,10 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
             snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
         });
-        self.latest_by_origin
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .latest_by_origin
             .insert(broadcast.origin_site.clone(), broadcast.revision);
         Ok(Some(broadcast.key()))
     }
@@ -867,7 +1040,7 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
         assert!(key.is_some(), "extended broadcast must be accepted");
         assert_eq!(
-            handler.gateway_address_for_site("site-p"),
+            handler.gateway_address_for_site("site-p").as_deref(),
             Some("10.0.0.2:19080"),
             "gateway address must be stored"
         );
@@ -902,7 +1075,7 @@ mod tests {
             "equal-revision gateway-only update must not re-merge state"
         );
         assert_eq!(
-            handler.gateway_address_for_site("site-p"),
+            handler.gateway_address_for_site("site-p").as_deref(),
             Some("10.0.0.2:19080"),
             "gateway address must update even when provider revision is unchanged"
         );
@@ -935,7 +1108,7 @@ mod tests {
             "provider state must merge after gateway-only update"
         );
         assert_eq!(
-            handler.gateway_address_for_site("site-p"),
+            handler.gateway_address_for_site("site-p").as_deref(),
             Some("10.0.0.2:19080"),
             "gateway address must remain available"
         );
@@ -958,7 +1131,7 @@ mod tests {
             "gateway-only update must use its independent revision lane"
         );
         assert_eq!(
-            handler.gateway_address_for_site("site-p"),
+            handler.gateway_address_for_site("site-p").as_deref(),
             Some("10.0.0.2:8443"),
             "provider-state revision must not leave the gateway address stale"
         );
@@ -982,7 +1155,10 @@ mod tests {
 
         assert!(receive(&mut handler, &newer).is_some());
         assert!(receive(&mut handler, &older).is_some());
-        assert_eq!(handler.gateway_address_for_site("site-p"), Some("10.0.0.8:8443"));
+        assert_eq!(
+            handler.gateway_address_for_site("site-p").as_deref(),
+            Some("10.0.0.8:8443")
+        );
     }
 
     #[test]
@@ -1005,7 +1181,7 @@ mod tests {
             .with_cert(Some(cert.to_owned()));
 
         assert!(receive(&mut handler, &broadcast).is_some());
-        assert_eq!(handler.cert_pem_for_site("site-p"), Some(cert));
+        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
     }
 
     #[test]
@@ -1028,7 +1204,7 @@ mod tests {
 
         assert!(receive(&mut handler, &newer).is_some());
         assert!(receive(&mut handler, &older).is_some());
-        assert_eq!(handler.cert_pem_for_site("site-p"), Some("new-cert"));
+        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some("new-cert"));
     }
 
     #[test]
@@ -1074,7 +1250,7 @@ mod tests {
         );
 
         assert!(handler.snapshot().provider("net", "site-p", "provider").is_some());
-        assert_eq!(handler.cert_pem_for_site("site-p"), Some(cert));
+        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
     }
 
     #[test]
@@ -1097,8 +1273,11 @@ mod tests {
         );
 
         assert!(handler.snapshot().provider("net", "site-p", "provider").is_some());
-        assert_eq!(handler.gateway_address_for_site("site-p"), Some("10.0.0.2:19080"));
-        assert_eq!(handler.cert_pem_for_site("site-p"), Some(cert));
+        assert_eq!(
+            handler.gateway_address_for_site("site-p").as_deref(),
+            Some("10.0.0.2:19080")
+        );
+        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
     }
 
     #[test]
@@ -1114,6 +1293,64 @@ mod tests {
         assert!(
             handler.gateway_address_for_site("site-p").is_none(),
             "v1 broadcast must not set gateway address"
+        );
+    }
+
+    #[test]
+    fn coordinated_eviction_removes_all_origin_state_before_next_item() {
+        let (mut handler, origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 4);
+        let cert = "public-cert";
+        let original = StateBroadcast::new(
+            "site-a".to_owned(),
+            10,
+            snapshot("site-a", 10, 0.4),
+            Some("10.0.0.1:8443".to_owned()),
+        )
+        .with_cert(Some(cert.to_owned()));
+        assert!(receive(&mut handler, &original).is_some());
+        origin_state.remove_origin("site-a");
+
+        assert!(handler.snapshot().provider("net", "site-a", "provider").is_none());
+        assert!(handler.gateway_address_for_site("site-a").is_none());
+        assert!(handler.cert_pem_for_site("site-a").is_none());
+
+        let restarted = StateBroadcast::new(
+            "site-a".to_owned(),
+            1,
+            snapshot("site-a", 1, 0.8),
+            Some("10.0.0.9:8443".to_owned()),
+        );
+        assert!(
+            receive(&mut handler, &restarted).is_some(),
+            "eviction must clear the old revision watermark so a restarted origin can rejoin"
+        );
+        assert_eq!(
+            handler.gateway_address_for_site("site-a").as_deref(),
+            Some("10.0.0.9:8443")
+        );
+    }
+
+    #[test]
+    fn origin_maps_are_hard_bounded() {
+        let (mut handler, _origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 2);
+        for (origin, revision) in [("site-b", 1), ("site-c", 2), ("site-a", 3)] {
+            let broadcast = StateBroadcast::new(
+                origin.to_owned(),
+                revision,
+                snapshot(origin, revision, 0.3),
+                Some(format!("10.0.0.{revision}:8443")),
+            )
+            .with_cert(Some(format!("cert-{origin}")));
+            assert!(receive(&mut handler, &broadcast).is_some());
+        }
+
+        let origins = handler.known_origins();
+        assert_eq!(origins.len(), 2);
+        assert!(origins.contains("site-a"));
+        assert!(origins.contains("site-c"));
+        assert!(
+            handler.snapshot().provider("net", "site-b", "provider").is_none(),
+            "capacity eviction must remove provider state with metadata"
         );
     }
 }

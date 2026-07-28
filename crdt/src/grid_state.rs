@@ -222,6 +222,14 @@ impl GridStateSnapshot {
         }
     }
 
+    /// Remove all provider records originating from `origin_site`.
+    ///
+    /// Used by the SWIM runtime's dead-member eviction sweep to clean up
+    /// state from a site that has been dead longer than the eviction TTL.
+    pub fn remove_origin_providers(&mut self, origin_site: &str) {
+        self.providers.retain(|_, p| p.site_id != origin_site);
+    }
+
     /// Return a provider by network/site/provider identity.
     #[must_use]
     pub fn provider(&self, network_id: &str, site_id: &str, provider_id: &str) -> Option<&ProviderState> {
@@ -524,6 +532,29 @@ mod tests {
         assert!(
             provider.access_policy.match_labels.is_empty(),
             "missing access_policy field must default to empty (allow all)"
+        );
+    }
+
+    #[test]
+    fn remove_origin_providers_clears_only_matching_site() {
+        let mut snap = GridStateSnapshot::new("consumer".to_owned());
+        snap.upsert_provider(provider("site-a", "p1", 1, 0.5));
+        snap.upsert_provider(provider("site-a", "p2", 1, 0.6));
+        snap.upsert_provider(provider("site-b", "p1", 1, 0.4));
+
+        snap.remove_origin_providers("site-a");
+
+        assert!(
+            snap.provider("net", "site-a", "p1").is_none(),
+            "evicted origin's providers must be removed"
+        );
+        assert!(
+            snap.provider("net", "site-a", "p2").is_none(),
+            "all providers from evicted origin must be removed"
+        );
+        assert!(
+            snap.provider("net", "site-b", "p1").is_some(),
+            "other origins' providers must be preserved"
         );
     }
 }

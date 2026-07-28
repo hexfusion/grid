@@ -8,8 +8,10 @@ use std::net::SocketAddr;
 
 /// A membership change observed by the SWIM runtime.
 ///
-/// Sent from the SWIM runtime to the `GridSite` controller
-/// via a `tokio::sync::mpsc` channel.
+/// Published in [`AccumulatedOutput::events`] after each foca
+/// interaction and consumed by the operator's `drain_output` loop.
+///
+/// [`AccumulatedOutput::events`]: crate::AccumulatedOutput
 #[derive(Clone, Debug)]
 pub enum MemberEvent {
     /// A new site has joined the grid.

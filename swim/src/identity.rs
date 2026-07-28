@@ -27,10 +27,16 @@ use serde::{Deserialize, Serialize};
 /// let id = NodeId::new("cluster-a".to_owned(), "10.0.0.1:7946".parse().unwrap());
 /// assert_eq!(id.site_name(), "cluster-a");
 /// ```
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeId {
     /// Restart-scale generation used to supersede an older process identity.
     generation: u64,
+
+    /// Highest generation reserved for this process.
+    ///
+    /// This is process-local control state, not part of the wire identity.
+    #[serde(skip, default = "maximum_generation")]
+    generation_limit: u64,
 
     /// Site name (stable across restarts).
     site_name: String,
@@ -46,6 +52,41 @@ impl NodeId {
     pub fn new(site_name: String, addr: SocketAddr) -> Self {
         Self {
             generation: initial_generation(),
+            generation_limit: u64::MAX,
+            site_name,
+            addr,
+        }
+    }
+
+    /// Create a process identity with a generation reserved by the caller.
+    ///
+    /// Grid's operator uses this constructor after durably reserving a
+    /// restart-monotonic generation in Kubernetes.
+    #[must_use]
+    pub fn with_generation(site_name: String, addr: SocketAddr, generation: u64) -> Self {
+        Self {
+            generation,
+            generation_limit: generation,
+            site_name,
+            addr,
+        }
+    }
+
+    /// Create a process identity with a durably reserved generation range.
+    ///
+    /// Foca may renew an identity after the local member is declared down.
+    /// Renewal stops at `last_generation`, preventing the process from using a
+    /// generation that a replacement process could reserve.
+    #[must_use]
+    pub fn with_generation_range(
+        site_name: String,
+        addr: SocketAddr,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Self {
+        Self {
+            generation: first_generation,
+            generation_limit: last_generation.max(first_generation),
             site_name,
             addr,
         }
@@ -60,6 +101,7 @@ impl NodeId {
     pub fn seed(addr: SocketAddr) -> Self {
         Self {
             generation: 0,
+            generation_limit: 0,
             site_name: format!("seed-{addr}"),
             addr,
         }
@@ -78,6 +120,14 @@ impl NodeId {
     }
 }
 
+impl PartialEq for NodeId {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation && self.site_name == other.site_name && self.addr == other.addr
+    }
+}
+
+impl Eq for NodeId {}
+
 impl foca::Identity for NodeId {
     type Addr = SocketAddr;
 
@@ -86,11 +136,15 @@ impl foca::Identity for NodeId {
     }
 
     fn renew(&self) -> Option<Self> {
-        self.generation.checked_add(1).map(|generation| Self {
-            generation,
-            site_name: self.site_name.clone(),
-            addr: self.addr,
-        })
+        self.generation
+            .checked_add(1)
+            .filter(|generation| *generation <= self.generation_limit)
+            .map(|generation| Self {
+                generation,
+                generation_limit: self.generation_limit,
+                site_name: self.site_name.clone(),
+                addr: self.addr,
+            })
     }
 
     fn win_addr_conflict(&self, other: &Self) -> bool {
@@ -98,12 +152,18 @@ impl foca::Identity for NodeId {
     }
 }
 
-/// Seed a process identity from wall-clock nanoseconds.
+/// Default generation limit for identities decoded from the wire.
+const fn maximum_generation() -> u64 {
+    u64::MAX
+}
+
+/// Seed a standalone process identity from wall-clock nanoseconds.
 ///
 /// A process-local zero value cannot supersede the membership identity retained
 /// for a previous process at the same advertised address. Nanosecond-scale
 /// generations preserve ordering across ordinary restarts and leave room for
-/// foca's in-process renewals.
+/// foca's in-process renewals. Production operator startup uses
+/// [`NodeId::with_generation`] with a durably reserved generation instead.
 fn initial_generation() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -178,10 +238,34 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
         let id = NodeId {
             generation: u64::MAX,
+            generation_limit: u64::MAX,
             site_name: "site".to_owned(),
             addr,
         };
         assert!(id.renew().is_none(), "generation must not wrap");
+    }
+
+    #[test]
+    fn with_generation_uses_exact_reserved_value() {
+        let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let id = NodeId::with_generation("test".to_owned(), addr, 42);
+        assert_eq!(id.generation, 42, "generation must use the durable reservation");
+    }
+
+    #[test]
+    fn reserved_generation_range_bounds_renewal() {
+        let addr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let first = NodeId::with_generation_range("test".to_owned(), addr, 41, 42);
+        let second = first.renew().unwrap_or_else(|| std::process::abort());
+        assert_eq!(second.generation, 42);
+        assert!(second.renew().is_none(), "renewal must stop at the durable reservation");
+    }
+
+    #[test]
+    fn with_generation_accepts_zero_for_seeded_tests() {
+        let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let id = NodeId::with_generation("test".to_owned(), addr, 0);
+        assert_eq!(id.generation, 0);
     }
 
     #[test]
