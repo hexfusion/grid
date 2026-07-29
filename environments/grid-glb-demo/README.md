@@ -41,9 +41,9 @@ The narrated demo is organized around five scenarios:
 2. a secure provider boundary with mTLS, peer authorization, private backend
    policy, and final-hop credential replacement;
 3. two-layer session affinity with metrics-driven provider drain and overlay
-   hot reload; and
+   hot reload;
 4. edge withdrawal, recovery, and failback behind one HTTPS name; and
-5. sequential Grid operator restarts followed by a five-minute request soak.
+5. sequential Grid operator restarts followed by a configured request soak.
 
 Every reported `PASS` is based on a runtime assertion. A manifest expressing
 intent does not count as proof.
@@ -654,10 +654,27 @@ mock backend exports queue metric
   -> grid_route validates and reloads the new overlay
 ```
 
-The edge configuration watches `/etc/grid/grid-config.json` with hot reload
-enabled and a 500 ms debounce. Requests continue using the last accepted
-in-memory view while the projected file settles; the request path does not
-parse the ConfigMap or call the operator.
+The edge configuration watches the versioned
+`/etc/grid/grid-overlay.json` envelope with hot reload enabled and a 500 ms
+debounce. The same ConfigMap also carries the legacy `grid-config.json`
+payload during the compatibility transition. Requests continue using the last
+accepted in-memory view while the projected file settles; the request path
+does not parse the ConfigMap or call the operator.
+
+Each semantic routing change receives a content-addressed revision. The full
+demo follows that exact value through four independently observed stages:
+
+```text
+Grid renders revision A
+  -> Kubernetes distributes revision A in the ConfigMap
+  -> Praxis validates and accepts revision A
+  -> a routed request proves it was served by revision A
+```
+
+Formatting, timestamps, and provenance do not change the semantic revision.
+Candidate order, admission, endpoints, credential references, and other
+routing content do. The verifier rejects any disagreement between the
+rendered, distributed, accepted, and serving values.
 
 ### What The Demo Proves
 
@@ -678,7 +695,24 @@ overlay and routes a new request through the remaining provider.
 Cleanup restores the backend replica count and queue metric, requires the
 provider to return to `Available`, requires both edge candidates to return to
 `new_and_existing`, and confirms another live reload. The verifier does not
-patch operator-owned overlay or status resources.
+patch operator-owned overlay or status resources to simulate provider drain,
+withdrawal, or recovery.
+
+Full mode finishes with a bounded failure-safety proof.  The verifier
+temporarily pauses the edge Grid operator (controlled fault injection)
+so its self-healing reconciliation does not overwrite the deliberately
+corrupted `ConfigMap` — this is not a production overlay-distribution
+path.  With the operator paused, the verifier writes an invalid content
+digest to the envelope key specifically to exercise the contract
+validator, requires the running edge to reject the update while
+continuing to serve its last-known-good revision, and then replaces the
+edge pod while the invalid content is still mounted.  It never patches
+Grid status.  The replacement must remain unready, proving that cold
+startup fails closed.  The verifier restores the valid envelope and the
+original operator replica count, then requires the edge and inference
+path to recover before teardown.  Both restoration steps are attempted
+independently so that a `ConfigMap` failure does not leave the operator
+scaled down.
 
 ## Demo 4: Failure, Withdrawal, And Recovery
 
@@ -840,8 +874,8 @@ after that recovery.
 Full mode restarts each of the four Grid operators one at a time. After every
 restart, the replacement Deployment must become ready, both edge overlays must
 still contain both providers, and a request must complete through the stable
-HTTPS endpoint. The demo then sends requests every five seconds for five
-minutes and requires every request to succeed while reaching both edges.
+HTTPS endpoint. The demo then sends requests for the configured soak interval
+and duration, requiring every request to succeed while reaching both edges.
 
 ```mermaid
 flowchart LR
@@ -850,7 +884,7 @@ flowchart LR
     Overlay --> Request[Inference request succeeds]
     Request --> Next{More Grid operators?}
     Next -->|yes| Restart
-    Next -->|no| Soak[Five-minute request soak]
+    Next -->|no| Soak[Configured request soak]
     Soak --> Proof[All requests pass through both edges]
 ```
 
@@ -862,22 +896,23 @@ Quick mode skips this longer durability proof.
 
 ### Quickstart
 
-Clone Grid, select published immutable image references, and run the complete
+Clone Grid, select published immutable image references, and run the quick
 setup plus narration:
 
 ```bash
 git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:10764e2c90af69b3a0dcffe98265da455705ce1f32aff6111a6bce3062f9319e
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:6b7e1af6ab033d15f7293fbdc15ff1ff375ef9686b5635cd2a2c01490babdfd0
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:8c10b74553a83a51af8fc3316f616697c4fd9b28eabe019c61d372989cb18839
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:52ef822b9b1737979f0b61a570bddad539705456d3cefa94da9fa31d8350c147
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:b0aea67f5a534720b1ce98d4af420689e4f4c36ce73d85d1aa867e41f6c32522
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:2a0f32449ec38575cb2e91a8a5e9c70b4e0a990a219c4480fe364b8a52f21a59
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
 cargo build -p forge
 
 cargo xtask env run-grid-glb-demo \
   --forge-config environments/grid-glb-demo/forge.yaml \
+  --quick \
   --teardown \
   2>&1 | tee grid-glb-demo-output.txt
 ```
@@ -887,16 +922,19 @@ until equivalent project images are available under
 `ghcr.io/praxis-proxy`. The three digest references are mutually compatible.
 The explicit build makes `target/debug/praxis-forge` available to the xtask
 runner. The demo command then creates five single-node Kind clusters, pulls the
-declared images, deploys the environment, and runs all five primary displays. A
-non-zero exit means at least one runtime assertion failed; the complete
+declared images, deploys the environment, and runs the core routing and
+security displays. A non-zero exit means at least one runtime assertion failed;
+the complete
 narration remains in `grid-glb-demo-output.txt` and machine-readable results
-are written to the evidence directory (see [Generated Artifacts](#generated-artifacts)).
+are written to the evidence directory (see
+[Generated Artifacts](#generated-artifacts)).
 
 Rerun only the narration without recreating the environment:
 
 ```bash
 cargo xtask env demonstrate-grid-glb \
   --forge-config environments/grid-glb-demo/.forge.resolved.yaml \
+  --quick \
   2>&1 | tee grid-glb-demo-rerun.txt
 ```
 
@@ -941,10 +979,10 @@ image reference is local, set the policy to `Never`, pull any registry images
 into the local container engine first, and let the xtask load all three images
 into the Kind clusters.
 
-`GRID_XTASK_GATEWAY_IMAGE` must include `grid_route`,
-`grid_provider_route`, `grid_credential_inject`, hot reload, downstream mTLS,
-upstream mTLS, and peer identity trust. The legacy mock-EPP image is not used
-by this demo.
+`GRID_XTASK_GATEWAY_IMAGE` must include `grid_route`, versioned overlay
+validation, accepted/serving revision evidence, `grid_provider_route`,
+`grid_credential_inject`, hot reload, downstream mTLS, upstream mTLS, and peer
+identity trust. The legacy mock-EPP image is not used by this demo.
 
 ### Local Images
 
@@ -969,7 +1007,10 @@ repository does not vendor Praxis AI.
 
 ```bash
 cargo build -p forge
-cargo xtask env run-grid-glb-demo 2>&1 | tee grid-glb-demo-output.txt
+cargo xtask env run-grid-glb-demo \
+  --quick \
+  --teardown \
+  2>&1 | tee grid-glb-demo-output.txt
 ```
 
 The command:
@@ -985,11 +1026,12 @@ The command:
 9. deploys both edge sites and mounts each operator-rendered overlay;
 10. deploys the GTM emulator after both edge addresses are known;
 11. runs the Grid routing and provider-boundary proof;
-12. discovers both active edge paths and proves two-layer affinity; and
-13. runs Kubernetes edge withdrawal, recovery, and failback;
-14. restarts all four Grid operators sequentially and proves routing recovery;
-    and
-15. runs a five-minute request soak through the stable HTTPS endpoint.
+12. performs a basic session-affinity check.
+
+Full mode continues by proving repeated two-layer affinity and provider drain,
+running Kubernetes edge withdrawal, recovery, and failback, restarting all four
+Grid operators sequentially, and running a configured request soak through the
+stable HTTPS endpoint.
 
 Setup and narration can be run separately:
 
@@ -998,6 +1040,7 @@ cargo xtask env setup-grid-glb
 
 cargo xtask env demonstrate-grid-glb \
   --forge-config environments/grid-glb-demo/.forge.resolved.yaml \
+  --quick \
   2>&1 | tee grid-glb-demo-output.txt
 ```
 
@@ -1007,20 +1050,25 @@ The demo supports two modes that control scenario depth:
 
 | Mode | Flag | Scenarios |
 |---|---|---|
-| Full (default) | `--full` or omitted | Discovery, routing, security, session affinity, drain, edge withdrawal/recovery, Grid operator restart recovery, and a five-minute request soak |
-| Quick | `--quick` | Discovery, routing, and security boundary only |
+| Quick (recommended first run) | `--quick` | Active/active routing, the rendered-to-serving overlay revision chain, one inference request, a basic affinity check, and the secure provider boundary |
+| Full (extended validation) | `--full` | Every quick check plus repeated edge/provider affinity, provider drain, edge withdrawal/recovery, sequential Grid operator restart recovery, and a configured request soak |
 
-Quick mode runs scenarios 1-2 (active/active routing and secure provider
-boundary) and skips scenarios 3-5 (session affinity/drain, edge
-withdrawal/recovery, Grid restarts, and soak). The flags are mutually
-exclusive.
+Quick mode runs scenarios 1-2. It creates the same five-cluster topology as
+full mode, so it still proves the real deployment, discovery, request, and
+security path while skipping the longer lifecycle exercises.
+
+Full mode runs all five scenarios. Provider drain, edge withdrawal and
+recovery, four sequential operator restarts, and the configured request soak
+make it the extended validation path. Use it for release validation and changes
+that affect routing state, recovery, or the distributed runtime. The flags are
+mutually exclusive; omitting both currently selects full mode.
 
 ```bash
-# Quick mode: discovery, routing, and security only
-cargo xtask env run-grid-glb-demo --quick
+# Quick mode: normal first run
+cargo xtask env run-grid-glb-demo --quick --teardown
 
-# Full mode (default): all scenarios
-cargo xtask env run-grid-glb-demo --full
+# Full mode: extended lifecycle and resilience validation
+cargo xtask env run-grid-glb-demo --full --teardown
 ```
 
 ### Lifecycle Controls
@@ -1033,13 +1081,15 @@ cargo xtask env run-grid-glb-demo --full
 
 ```bash
 # Run and clean up
-cargo xtask env run-grid-glb-demo --teardown
+cargo xtask env run-grid-glb-demo --quick --teardown
 
 # Run, but keep clusters if something fails
-cargo xtask env run-grid-glb-demo --teardown --keep-on-failure
+cargo xtask env run-grid-glb-demo --quick --teardown --keep-on-failure
 
 # Specify a custom evidence directory
-cargo xtask env run-grid-glb-demo --evidence-dir /tmp/glb-evidence
+cargo xtask env run-grid-glb-demo \
+  --quick \
+  --evidence-dir .forge/evidence/manual-run
 ```
 
 ### Generated Artifacts
@@ -1137,6 +1187,7 @@ demo-only attribution.
 |---|---|---|
 | `x-grid-peer-selected-candidate` | Edge `grid_route` | Carries the stable candidate selected from the edge overlay. The provider validates it against provider-owned candidate, model, and path policy. |
 | `x-grid-peer-hop-request-id` | Edge `grid_route` | Bounded correlation identifier for the authenticated provider hop. |
+| `x-grid-peer-overlay-revision` | Edge `grid_route` | Carries the content-addressed revision from the exact overlay snapshot used to select the provider. The provider validates its bounded SHA-256 form and treats it as correlation evidence, not authorization. |
 
 The edge removes client-supplied copies before setting these fields. They are
 sent only for clusters explicitly configured as provider hops. The provider
@@ -1145,10 +1196,12 @@ them before the backend request. No credential reference or credential value
 crosses this boundary.
 
 For backend-side proof, `grid_provider_route` replaces any inbound
-`x-grid-provider-attribution` and `x-grid-provider-request-id` values with its
-provider-owned identity and correlation ID. The strict mock backend reflects
+`x-grid-provider-attribution`, `x-grid-provider-request-id`, and
+`x-grid-provider-overlay-revision` values with provider-owned identity,
+correlation, and validated revision values. The strict mock backend reflects
 those bounded values under demo response names, proving that the request passed
-through the provider pipeline rather than reaching the backend directly.
+through the provider pipeline rather than reaching the backend directly. The
+edge-owned `x-grid-peer-*` fields never reach the backend.
 
 #### Demo-Only Response Evidence
 
@@ -1159,6 +1212,7 @@ through the provider pipeline rather than reaching the backend directly.
 | `X-Grid-Demo-Provider` | Strict mock backend | Identifies the backend provider site that produced the response. |
 | `X-Grid-Demo-Backend-Provider-Attribution` | Strict mock backend | Reflects the provider-owned attribution received by the backend and must match the provider gateway. |
 | `X-Grid-Demo-Backend-Request-Id` | Strict mock backend | Reflects the provider-owned correlation ID and must be present and non-empty. |
+| `X-Grid-Demo-Backend-Overlay-Revision` | Strict mock backend | Reflects the provider-owned revision and must match the rendered, distributed, accepted, and serving revision for the request. |
 
 These response fields exist solely so the verifier can make runtime assertions
 about the observed path. The edge field uses ordinary demo configuration. The
@@ -1242,10 +1296,6 @@ image combines them for end-to-end validation.
   every scoring dimension.
 - **Responses API parsing:** Praxis AI can extract models from `/v1/responses`;
   this walkthrough uses the Chat Completions request shape.
-- **Rejected-update protection:** the overlay reload path validates
-  replacements and retains its accepted routing state when an update is
-  invalid; this walkthrough narrates valid drain, withdrawal, and recovery
-  updates.
 - **Authenticated GTM origin transport:** Praxis supports TLS transport
   primitives, but the local emulator uses plaintext HTTP to the edge Services
   inside the isolated demo network.

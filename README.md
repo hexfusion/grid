@@ -21,74 +21,34 @@ Praxis AI supplies the AI-specific routing and credential filters.
 
 ## Getting started
 
-Some Kind validations require Praxis AI and Praxis Core features that are still
-pending merge or project-owned image publication. Until those images are
-available, use the documented xtask image override environment variables for
-local development runs.
+Start with the [Global Ingress Demo](environments/grid-glb-demo/README.md).
+It provides a copy-and-paste deployment, explains the Grid and Praxis
+architecture, narrates each request and failure scenario, records runtime
+evidence, and tears the environment down when complete.
 
-```sh
-# Validate operator routing overlay generation in kind
-cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
+```bash
+git clone https://github.com/praxis-proxy/grid.git
+cd grid
 
-# Validate generated CRD schema contains required fields
-cargo xtask env verify-crd-schema
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:52ef822b9b1737979f0b61a570bddad539705456d3cefa94da9fa31d8350c147
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:b0aea67f5a534720b1ce98d4af420689e4f4c36ce73d85d1aa867e41f6c32522
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:2a0f32449ec38575cb2e91a8a5e9c70b4e0a990a219c4480fe364b8a52f21a59
+export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
-# Validate in-cluster operator install/RBAC behavior
-cargo xtask env verify-operator-install-rbac -c tests/env/operator-routing-multisite.toml
-
-# Validate the dedicated llm-d-compatible provider-gateway path
-# Uses Praxis AI ext_proc with mock EPP test image
-cargo xtask env verify-llmd-compatible-routing -c tests/env/operator-routing-multisite.toml
-
-# Validate /v1/responses request parsing and Grid overlay routing
-cargo xtask env verify-responses-routing -c tests/env/operator-routing-multisite.toml
-
-# Validate full-grid routing across local, remote, cloud mock, and API mock
-cargo xtask env verify-full-grid-routing -c tests/env/operator-routing-two-provider.toml
-
-# Validate API-provider fallback with static header injection
-cargo xtask env verify-api-fallback -c tests/env/operator-routing.toml
-
-# Validate native grid_route → grid_credential_inject credential injection.
-# Tokens are read from a mounted Secret file and stay out of Praxis ConfigMaps.
-cargo xtask env verify-api-fallback-native -c tests/env/operator-routing.toml
-
-# Validate SWIM membership from env-var startup seeds
-cargo xtask env verify-swim-membership -c tests/env/operator-routing.toml
-
-# Validate SWIM membership from GridNetwork.spec.seeds
-cargo xtask env verify-swim-crd-seeds -c tests/env/operator-routing.toml
-
-# Validate CRDT provider-state propagation over SWIM
-cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
-
-# Validate CRDT-origin overlay rendering over SWIM
-cargo xtask env verify-swim-overlay -c tests/env/operator-routing-multisite.toml
-
-# Validate CRDT-origin routing over SWIM
-cargo xtask env verify-swim-routing -c tests/env/operator-routing-two-provider.toml
-
-# Validate encrypted SWIM transport behavior and failure cases
-cargo xtask env verify-swim-encryption -c tests/env/operator-routing-multisite.toml
-
-# Validate transitive three-node SWIM mesh propagation and routing eligibility
-cargo xtask env verify-swim-mesh-three-node -c tests/env/operator-routing-multisite.toml
-
-# Validate GridSite trust fingerprint promotion and fail-closed rotation
-cargo xtask env verify-gridsite-trust-fingerprint -c tests/env/operator-routing-multisite.toml
-
-# Validate metrics-driven candidate ordering and routing
-cargo xtask env verify-metrics-routing -c tests/env/operator-routing-two-provider.toml
-
-# Validate operator-created GridSite discovery and join lifecycle
-cargo xtask env verify-site-join-discovery -c tests/env/operator-routing-multisite.toml
-
-# Validate route-away behavior when a SWIM peer is lost
-cargo xtask env verify-failover-under-lost-peer -c tests/env/operator-routing-two-provider.toml
-
-# Validate stale remote candidate eviction from rendered overlays
-cargo xtask env verify-stale-gc-ttl -c tests/env/operator-routing-two-provider.toml
+cargo build -p forge
+cargo xtask env run-grid-glb-demo \
+  --forge-config environments/grid-glb-demo/forge.yaml \
+  --quick \
+  --teardown \
+  2>&1 | tee grid-glb-demo-output.txt
 ```
+
+These temporary integration images are published under `ghcr.io/nerdalert`
+until equivalent project images are available. The detailed demo guide
+documents prerequisites, full validation mode, evidence, and troubleshooting.
+
+The development guide documents focused test and validation commands for
+contributors.
 
 ## Documentation
 
