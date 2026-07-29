@@ -35,14 +35,15 @@ for the production routing and security contract.
   an operator-rendered overlay into the edge pod, and Praxis validates and
   reloads it while the pod UID and restart count remain unchanged.
 
-The narrated demo is organized around four scenarios:
+The narrated demo is organized around five scenarios:
 
 1. active/active global routing with independent Grid provider selection;
 2. a secure provider boundary with mTLS, peer authorization, private backend
    policy, and final-hop credential replacement;
 3. two-layer session affinity with metrics-driven provider drain and overlay
    hot reload; and
-4. edge withdrawal, recovery, and failback behind one HTTPS name.
+4. edge withdrawal, recovery, and failback behind one HTTPS name; and
+5. sequential Grid operator restarts followed by a five-minute request soak.
 
 Every reported `PASS` is based on a runtime assertion. A manifest expressing
 intent does not count as proof.
@@ -826,6 +827,37 @@ organization, and an untrusted certificate digest. Valid edge identities must
 complete TLS and pass peer policy; the negative identities must fail at the
 expected layer.
 
+## Demo 5: Grid Restart Recovery And Request Soak
+
+### User Story
+
+As a platform operator, I need control-plane pod replacement to preserve
+converged routing, and I need successful inference traffic to remain stable
+after that recovery.
+
+### Summary
+
+Full mode restarts each of the four Grid operators one at a time. After every
+restart, the replacement Deployment must become ready, both edge overlays must
+still contain both providers, and a request must complete through the stable
+HTTPS endpoint. The demo then sends requests every five seconds for five
+minutes and requires every request to succeed while reaching both edges.
+
+```mermaid
+flowchart LR
+    Restart[Restart one Grid operator] --> Ready[Replacement pod becomes ready]
+    Ready --> Overlay[Both edge overlays remain complete]
+    Overlay --> Request[Inference request succeeds]
+    Request --> Next{More Grid operators?}
+    Next -->|yes| Restart
+    Next -->|no| Soak[Five-minute request soak]
+    Soak --> Proof[All requests pass through both edges]
+```
+
+Operators are restarted sequentially so the test exercises normal rolling
+maintenance rather than intentionally taking the entire discovery mesh down.
+Quick mode skips this longer durability proof.
+
 ## Run The Demo
 
 ### Quickstart
@@ -838,7 +870,7 @@ git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
 export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:10764e2c90af69b3a0dcffe98265da455705ce1f32aff6111a6bce3062f9319e
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:b5e42b381b62fec4bf2ec1f208d220816133e32c3f405fbdec85145915c11e06
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:6b7e1af6ab033d15f7293fbdc15ff1ff375ef9686b5635cd2a2c01490babdfd0
 export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:8c10b74553a83a51af8fc3316f616697c4fd9b28eabe019c61d372989cb18839
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
@@ -846,6 +878,7 @@ cargo build -p forge
 
 cargo xtask env run-grid-glb-demo \
   --forge-config environments/grid-glb-demo/forge.yaml \
+  --teardown \
   2>&1 | tee grid-glb-demo-output.txt
 ```
 
@@ -854,10 +887,10 @@ until equivalent project images are available under
 `ghcr.io/praxis-proxy`. The three digest references are mutually compatible.
 The explicit build makes `target/debug/praxis-forge` available to the xtask
 runner. The demo command then creates five single-node Kind clusters, pulls the
-declared images, deploys the environment, and runs all four primary displays. A
+declared images, deploys the environment, and runs all five primary displays. A
 non-zero exit means at least one runtime assertion failed; the complete
-narration remains in
-`grid-glb-demo-output.txt`.
+narration remains in `grid-glb-demo-output.txt` and machine-readable results
+are written to the evidence directory (see [Generated Artifacts](#generated-artifacts)).
 
 Rerun only the narration without recreating the environment:
 
@@ -867,7 +900,7 @@ cargo xtask env demonstrate-grid-glb \
   2>&1 | tee grid-glb-demo-rerun.txt
 ```
 
-Remove the five clusters:
+Remove the five clusters with `--teardown` (preferred) or manually:
 
 ```bash
 cargo run -p forge -- \
@@ -953,7 +986,10 @@ The command:
 10. deploys the GTM emulator after both edge addresses are known;
 11. runs the Grid routing and provider-boundary proof;
 12. discovers both active edge paths and proves two-layer affinity; and
-13. runs Kubernetes edge withdrawal, recovery, and failback.
+13. runs Kubernetes edge withdrawal, recovery, and failback;
+14. restarts all four Grid operators sequentially and proves routing recovery;
+    and
+15. runs a five-minute request soak through the stable HTTPS endpoint.
 
 Setup and narration can be run separately:
 
@@ -964,6 +1000,74 @@ cargo xtask env demonstrate-grid-glb \
   --forge-config environments/grid-glb-demo/.forge.resolved.yaml \
   2>&1 | tee grid-glb-demo-output.txt
 ```
+
+### Demo Modes
+
+The demo supports two modes that control scenario depth:
+
+| Mode | Flag | Scenarios |
+|---|---|---|
+| Full (default) | `--full` or omitted | Discovery, routing, security, session affinity, drain, edge withdrawal/recovery, Grid operator restart recovery, and a five-minute request soak |
+| Quick | `--quick` | Discovery, routing, and security boundary only |
+
+Quick mode runs scenarios 1-2 (active/active routing and secure provider
+boundary) and skips scenarios 3-5 (session affinity/drain, edge
+withdrawal/recovery, Grid restarts, and soak). The flags are mutually
+exclusive.
+
+```bash
+# Quick mode: discovery, routing, and security only
+cargo xtask env run-grid-glb-demo --quick
+
+# Full mode (default): all scenarios
+cargo xtask env run-grid-glb-demo --full
+```
+
+### Lifecycle Controls
+
+| Flag | Behavior |
+|---|---|
+| `--teardown` | Delete all Kind clusters after setup and proof execution, including after a failure |
+| `--keep-on-failure` | With `--teardown`, retain a partially or fully deployed environment when a proof fails |
+| `--evidence-dir <path>` | Override the default evidence output directory |
+
+```bash
+# Run and clean up
+cargo xtask env run-grid-glb-demo --teardown
+
+# Run, but keep clusters if something fails
+cargo xtask env run-grid-glb-demo --teardown --keep-on-failure
+
+# Specify a custom evidence directory
+cargo xtask env run-grid-glb-demo --evidence-dir /tmp/glb-evidence
+```
+
+### Generated Artifacts
+
+Each run writes machine-readable evidence to a timestamped directory under
+`.forge/evidence/` (or the path given by `--evidence-dir`):
+
+```text
+.forge/evidence/glb-demo-20260728T120000Z/
+  narration.txt     # High-level scenario narration and final summary
+  results.json      # Structured evidence report
+```
+
+The `results.json` file uses a versioned schema (`schema_version: "1"`) and
+contains:
+
+- **mode**: `"quick"` or `"full"`
+- **status**: `"pass"` or `"fail"`
+- **error**: bounded, single-line failure detail when the run fails
+- **capabilities**: per-scenario result, evidence string, and pass/fail/skipped
+- **observed_paths**: response-derived edge/provider routing paths
+- **lifecycle**: teardown actions performed and their results
+- **artifacts**: paths to generated files
+
+The evidence schema does not collect Secret values, private keys, bearer
+tokens, or credentials. Treat the separately captured combined command output
+as operational logs and review it before sharing. The `.forge/` directory is
+in `.gitignore`.
 
 ## Grid Routing And Provider-Boundary Proof
 

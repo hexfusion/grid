@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 /// AI Grid development tasks.
 #[derive(Debug, Parser)]
 #[command(name = "xtask", about = "AI Grid development tasks")]
-struct Cli {
+pub(crate) struct Cli {
     /// Subcommand to run.
     #[command(subcommand)]
     command: Command,

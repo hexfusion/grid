@@ -16,7 +16,9 @@ use std::{
 
 use sha2::{Digest as _, Sha256};
 
-use crate::env::{StepResult, StepStatus, certs, kubectl, print_validate_all_table, safe_truncate_str, verify};
+use crate::env::{
+    DemoMode, StepResult, StepStatus, certs, kubectl, print_validate_all_table, safe_truncate_str, verify,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -70,6 +72,12 @@ const PRIMARY_EDGE: &str = "east-edge";
 
 /// Maximum time for provider state to traverse reconciliation and SWIM.
 const PROVIDER_STATE_WAIT: Duration = Duration::from_secs(180);
+
+/// Maximum time for request routing to reflect an accepted overlay update.
+const DATA_PLANE_CONVERGENCE_WAIT: Duration = Duration::from_secs(45);
+
+/// Delay between request-path convergence probes.
+const DATA_PLANE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Queue depth that admits both new and existing sessions.
 const PROVIDER_QUEUE_READY: &str = "0.10";
@@ -508,11 +516,27 @@ fn restart_deployment(provider: &str, deployment: &str) -> Result<(), Box<dyn st
 /// Returns an error if hard prerequisites fail (config, tools,
 /// forge binary) or any verification step is not `PASS`.
 pub(crate) fn verify_grid_routing(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    verify_grid_routing_with_mode(forge_config, DemoMode::Full)
+}
+
+/// Run the Grid routing and provider-boundary proof with mode gating.
+///
+/// In [`DemoMode::Quick`] mode, steps after "inference routed" (session
+/// affinity, drain, withdrawal, hot-reload, pod stability) are skipped.
+///
+/// # Errors
+///
+/// Returns an error if hard prerequisites fail or any executed step is
+/// not `PASS`.
+pub(crate) fn verify_grid_routing_with_mode(
+    forge_config: &Path,
+    mode: DemoMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("grid-routing: checking prerequisites...");
     let ctx = check_prerequisites(forge_config)?;
 
     let mut results: Vec<StepResult> = Vec::new();
-    run_steps(&ctx, &mut results);
+    run_steps(&ctx, mode, &mut results);
 
     eprintln!();
     eprintln!("## Grid Routing And Provider-Boundary Proof");
@@ -838,7 +862,7 @@ fn image_is_latest(image: &str) -> bool {
     clippy::too_many_lines,
     reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
 )]
-fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
+fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>) {
     // Forge config validation.
     proof_banner("validating forge config");
     let config_ok = record_step("prerequisites", results, || {
@@ -991,6 +1015,10 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         return;
     }
 
+    if mode == DemoMode::Quick {
+        return;
+    }
+
     // Session affinity initial bind.
     proof_banner("checking session affinity bind");
     let provider_a = match check_session_bind(EDGE_PORT) {
@@ -1030,7 +1058,8 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
 
     // Session drain routing verification.
     proof_banner("checking provider drain");
-    let drain_proof = check_session_drain(EDGE_PORT, &provider_a);
+    let drain_proof =
+        wait_for_data_plane_convergence("provider drain routing", || check_session_drain(EDGE_PORT, &provider_a));
     let drain_restore = restore_provider_admission(PRIMARY_EDGE, &provider_a);
     match (drain_proof, drain_restore) {
         (Ok(proof), Ok(restored)) => {
@@ -1080,7 +1109,9 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
 
     // Routing after reload.
     proof_banner("sending post-reload inference request");
-    record_step("routing after reload", results, check_inference_routed);
+    record_step("routing after reload", results, || {
+        wait_for_data_plane_convergence("post-reload routing", check_inference_routed)
+    });
 
     // Restore the provider and require the operator-generated overlay to recover.
     let restore_result = restore_withdrawn_provider(PRIMARY_EDGE, &withdrawal);
@@ -2387,6 +2418,38 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
     ))
 }
 
+/// Retry a request assertion while a projected overlay reaches the data plane.
+fn wait_for_data_plane_convergence<T>(
+    description: &str,
+    check: impl FnMut() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    wait_for_check(
+        description,
+        DATA_PLANE_CONVERGENCE_WAIT,
+        DATA_PLANE_PROBE_INTERVAL,
+        check,
+    )
+}
+
+/// Run a check until it succeeds or its bounded convergence window expires.
+fn wait_for_check<T>(
+    description: &str,
+    timeout: Duration,
+    interval: Duration,
+    mut check: impl FnMut() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match check() {
+            Ok(value) => return Ok(value),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(format!("{description} did not converge within {timeout:?}: {error}").into());
+            },
+            Err(_) => thread::park_timeout(interval),
+        }
+    }
+}
+
 /// Bind a session and record which provider served it.
 fn check_session_bind(port: u16) -> Result<(String, String), Box<dyn std::error::Error>> {
     let resp = curl_edge_request(port, Some("glb-proof-a"))?;
@@ -3164,6 +3227,20 @@ clusters:
         assert_eq!(count_reload_entries(logs), 2, "should count reload entries");
     }
 
+    #[test]
+    fn convergence_wait_retries_transient_failures() -> Result<(), Box<dyn std::error::Error>> {
+        let mut attempts = 0;
+        let value = wait_for_check("test check", Duration::from_secs(1), Duration::ZERO, || {
+            attempts += 1;
+            if attempts < 3 {
+                return Err(std::io::Error::other("transient").into());
+            }
+            Ok("ready")
+        })?;
+        assert_eq!(value, "ready");
+        assert_eq!(attempts, 3);
+        Ok(())
+    }
 
     #[test]
     fn blocked_steps_cause_nonzero_exit() {

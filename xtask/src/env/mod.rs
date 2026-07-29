@@ -29,6 +29,65 @@ use self::config::ClusterRole;
 use self::config::{EnvConfig, ProviderBackend};
 
 // ---------------------------------------------------------------------------
+// GLB demo shared types
+// ---------------------------------------------------------------------------
+
+/// Scenario depth for the GLB demo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DemoMode {
+    /// Discovery, routing, and security boundary only.
+    Quick,
+    /// All scenarios including drain, recovery, restarts, and soak.
+    Full,
+}
+
+/// Scenario-selection options shared by GLB demo commands.
+#[derive(Debug, clap::Args)]
+pub(crate) struct GlbDemoModeOptions {
+    /// Run only discovery, routing, and security boundary scenarios.
+    #[arg(long, conflicts_with = "full")]
+    pub(crate) quick: bool,
+
+    /// Run all scenarios, including restarts and a five-minute soak (default).
+    #[arg(long, conflicts_with = "quick")]
+    pub(crate) full: bool,
+}
+
+impl GlbDemoModeOptions {
+    /// Resolve the selected demo mode.
+    pub(crate) fn mode(&self) -> DemoMode {
+        if self.quick { DemoMode::Quick } else { DemoMode::Full }
+    }
+}
+
+/// Lifecycle and evidence options for a complete GLB demo run.
+#[derive(Debug, clap::Args)]
+pub(crate) struct GlbDemoOptions {
+    /// Scenario depth.
+    #[command(flatten)]
+    pub(crate) mode_options: GlbDemoModeOptions,
+
+    /// Delete all Kind clusters after the demo completes.
+    #[arg(long)]
+    pub(crate) teardown: bool,
+
+    /// With `--teardown`, retain clusters on failure for debugging.
+    #[arg(long, requires = "teardown")]
+    pub(crate) keep_on_failure: bool,
+
+    /// Directory for machine-readable evidence output.
+    #[arg(long)]
+    pub(crate) evidence_dir: Option<PathBuf>,
+}
+
+impl GlbDemoOptions {
+    /// Resolve the selected demo mode.
+    pub(crate) fn mode(&self) -> DemoMode {
+        self.mode_options.mode()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared infrastructure helpers
 // ---------------------------------------------------------------------------
 
@@ -750,6 +809,9 @@ pub(crate) enum Action {
         /// Path to the Forge environment config file.
         #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
+        /// Demo mode.
+        #[command(flatten)]
+        options: GlbDemoModeOptions,
     },
 
     /// Create the complete local GLB environment from image overrides.
@@ -764,6 +826,9 @@ pub(crate) enum Action {
         /// Path to the source Forge environment config file.
         #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
+        /// Demo mode and lifecycle options.
+        #[command(flatten)]
+        options: GlbDemoOptions,
     },
 }
 
@@ -826,9 +891,11 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyGridGlbRouting { forge_config } => glb::verify_grid_routing(forge_config),
         Action::PrepareGridGlbProviderBoundary => glb::prepare_provider_boundary(),
         Action::VerifyGridGlbGtmEmulator { forge_config } => gtm_emulator::verify(forge_config),
-        Action::DemonstrateGridGlb { forge_config } => glb_demo::demonstrate(forge_config),
+        Action::DemonstrateGridGlb { forge_config, options } => {
+            glb_demo::demonstrate_with_options(forge_config, options)
+        },
         Action::SetupGridGlb { forge_config } => glb_demo::setup(forge_config).map(|_| ()),
-        Action::RunGridGlbDemo { forge_config } => glb_demo::run(forge_config),
+        Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
     }
 }
 
