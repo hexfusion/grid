@@ -76,7 +76,8 @@ fn ensure_network(
         }));
     }
     networking::create_network(ctx.runner, binary, &net_name, env_name)?;
-    set_network_active(state, &net_name);
+    let cidr = networking::inspect_network_cidr(ctx.runner, binary, &net_name)?;
+    set_network_active(state, &net_name, &cidr);
     Ok(Some(NetworkSetup {
         name: net_name,
         dry_run: false,
@@ -88,17 +89,22 @@ fn wants_network(ctx: &ForgeContext<'_>) -> bool {
     ctx.config.spec.network.as_ref().is_some_and(|n| n.cross_cluster)
 }
 
-/// Record the network as active in state, preserving existing pools.
-fn set_network_active(state: &mut state::ForgeState, name: &str) {
+/// Record the live network identity, preserving only compatible pools.
+fn set_network_active(state: &mut state::ForgeState, name: &str, cidr: &str) {
     if let Some(ref mut net) = state.network {
+        let network_changed = net.name != name || net.cidr.as_deref() != Some(cidr);
+        if network_changed {
+            net.cluster_pools.clear();
+        }
         name.clone_into(&mut net.name);
         net.phase = NetworkPhase::Active;
+        net.cidr = Some(cidr.to_owned());
         return;
     }
     state.network = Some(state::NetworkState {
         name: name.to_owned(),
         phase: NetworkPhase::Active,
-        cidr: None,
+        cidr: Some(cidr.to_owned()),
         cluster_pools: Vec::new(),
     });
 }
@@ -879,6 +885,15 @@ spec:
         }
     }
 
+    /// Formatted Docker IPAM response for the test network.
+    fn network_cidr(cidr: &str) -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: format!(r#"[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]"#),
+            stderr: String::new(),
+        }
+    }
+
     #[test]
     fn up_creates_network_when_configured() {
         let dir = test_dir();
@@ -886,6 +901,10 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond(
+            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            network_cidr("172.18.0.0/16"),
+        );
         runner.respond("docker", empty_ok());
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());
@@ -950,7 +969,7 @@ spec:
     }
 
     #[test]
-    fn set_network_active_preserves_existing_pools() {
+    fn set_network_active_preserves_compatible_pools() {
         let mut st = state::empty();
         st.network = Some(state::NetworkState {
             name: "old-net".to_owned(),
@@ -961,11 +980,32 @@ spec:
                 range: "172.18.255.231-172.18.255.250".to_owned(),
             }],
         });
-        set_network_active(&mut st, "test-net");
+        set_network_active(&mut st, "old-net", "172.18.0.0/16");
         let net = st.network.as_ref().unwrap_or_else(|| std::process::abort());
-        assert_eq!(net.name, "test-net", "name should update");
+        assert_eq!(net.name, "old-net", "name should be preserved");
         assert_eq!(net.cidr.as_deref(), Some("172.18.0.0/16"), "cidr should be preserved");
         assert_eq!(net.cluster_pools.len(), 1, "pools should be preserved");
+    }
+
+    #[test]
+    fn set_network_active_clears_pools_when_cidr_changes() {
+        let mut st = state::empty();
+        st.network = Some(state::NetworkState {
+            name: "test-net".to_owned(),
+            phase: NetworkPhase::Gone,
+            cidr: Some("172.19.0.0/16".to_owned()),
+            cluster_pools: vec![state::ClusterPool {
+                cluster: "hub".to_owned(),
+                range: "172.19.255.231-172.19.255.250".to_owned(),
+            }],
+        });
+
+        set_network_active(&mut st, "test-net", "172.18.0.0/16");
+
+        let net = st.network.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(net.phase, NetworkPhase::Active);
+        assert_eq!(net.cidr.as_deref(), Some("172.18.0.0/16"));
+        assert!(net.cluster_pools.is_empty(), "stale pools must be discarded");
     }
 
     #[test]
@@ -975,6 +1015,10 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond(
+            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            network_cidr("172.18.0.0/16"),
+        );
         runner.respond("docker", empty_ok());
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());
@@ -1025,6 +1069,10 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond(
+            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            network_cidr("172.18.0.0/16"),
+        );
         runner.respond("docker", empty_ok());
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());

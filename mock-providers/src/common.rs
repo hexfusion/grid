@@ -26,6 +26,12 @@ pub(crate) const BACKEND_PROVIDER_CAPTURE_HEADER: &str = "x-grid-demo-backend-pr
 /// Safe backend-capture response field for provider request ID.
 pub(crate) const BACKEND_REQUEST_ID_CAPTURE_HEADER: &str = "x-grid-demo-backend-request-id";
 
+/// Provider-owned overlay revision received after peer-context validation.
+const OVERLAY_REVISION_INPUT: &str = "x-grid-provider-overlay-revision";
+
+/// Safe backend-capture response field for overlay revision.
+pub(crate) const BACKEND_OVERLAY_REVISION_CAPTURE: &str = "x-grid-demo-backend-overlay-revision";
+
 /// Axum middleware that injects bounded demo evidence on every response.
 pub(crate) async fn inject_provider_header(
     State(state): State<AppState>,
@@ -34,6 +40,7 @@ pub(crate) async fn inject_provider_header(
 ) -> Response<Body> {
     let provider_attribution = req.headers().get(PROVIDER_ATTRIBUTION_INPUT).cloned();
     let provider_request_id = req.headers().get(PROVIDER_REQUEST_ID_INPUT).cloned();
+    let overlay_revision = req.headers().get(OVERLAY_REVISION_INPUT).cloned();
     let mut resp = next.run(req).await;
     if let Ok(val) = HeaderValue::from_str(&state.provider_site) {
         resp.headers_mut()
@@ -46,6 +53,10 @@ pub(crate) async fn inject_provider_header(
     if let Some(value) = provider_request_id {
         resp.headers_mut()
             .insert(HeaderName::from_static(BACKEND_REQUEST_ID_CAPTURE_HEADER), value);
+    }
+    if let Some(value) = overlay_revision {
+        resp.headers_mut()
+            .insert(HeaderName::from_static(BACKEND_OVERLAY_REVISION_CAPTURE), value);
     }
     resp
 }

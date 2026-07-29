@@ -15,10 +15,13 @@ GridNetwork + InferenceProvider CRDs
 Grid Operator
         |
         v
-Routing overlay ConfigMap
+Versioned routing overlay ConfigMap
         |
         v
-Praxis consumer gateway
+Praxis validates and accepts a routing snapshot
+        |
+        v
+grid_route serves from that exact snapshot
         |
         v
 Praxis provider gateway
@@ -38,13 +41,58 @@ For each `GridNetwork` and gateway reference, the operator:
 3. Reads remote provider records received through CRDT state.
 4. Converts providers into scoring backends and routing candidates.
 5. Scores and orders candidates.
-6. Server-side applies an overlay `ConfigMap`.
+6. Builds a versioned, content-addressed overlay envelope.
+7. Server-side applies an overlay `ConfigMap`.
+8. Reports rendered and distributed revision state on the `GridNetwork`.
 
-The overlay key is `grid-config.json`.
+The `ConfigMap` contains:
+
+| Key | Purpose |
+|---|---|
+| `grid-overlay.json` | Versioned envelope with scope, provenance, digest, and routing payload. |
+| `grid-config.json` | Bare routing payload for consumers that have not enabled the envelope contract. |
+
+Both keys describe the same routing state.
 
 ## Routing overlay format
 
-The overlay is a compact JSON document consumed by Praxis:
+The envelope is the authoritative observable contract consumed by Praxis AI:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "revision": {
+    "kind": "content_addressed",
+    "algorithm": "sha256",
+    "value": "64-lowercase-hex-characters"
+  },
+  "content_digest": {
+    "algorithm": "sha256",
+    "value": "64-lowercase-hex-characters"
+  },
+  "scope": {
+    "network": "production",
+    "gateway": "inference-edge",
+    "namespace": "praxis-system",
+    "local_site": "site-east"
+  },
+  "provenance": {
+    "producer": "grid-operator",
+    "producer_version": "0.1.0",
+    "grid_network_name": "production",
+    "grid_network_uid": "00000000-0000-0000-0000-000000000000",
+    "grid_network_generation": 12,
+    "rendered_at": "2026-07-29T00:00:00Z"
+  },
+  "overlay": {
+    "network": "production",
+    "local_site": "site-east",
+    "candidates": []
+  }
+}
+```
+
+The nested `overlay` is the compact routing payload:
 
 ```json
 {
@@ -76,6 +124,71 @@ The overlay is a compact JSON document consumed by Praxis:
   ]
 }
 ```
+
+### Revision semantics
+
+The v1 revision is the lowercase SHA-256 digest of the RFC 8785 canonical form
+of these routing-relevant fields:
+
+- `network`
+- `local_site`
+- the ordered `candidates` array
+
+Timestamps, provenance, Kubernetes metadata, and envelope annotations are not
+part of the semantic payload. Re-rendering identical routing state therefore
+produces the same revision. Candidate membership, order, admission, locality,
+freshness, credential references, or other serialized candidate content
+changes the revision.
+
+In schema v1, `revision.value` and `content_digest.value` are identical. Praxis
+AI rejects an envelope when either value is malformed, the values disagree, or
+the recomputed digest does not match.
+
+### Scope and provenance
+
+Scope binds an overlay to one network, gateway, namespace, and local site.
+Praxis AI deployments configure the scope they expect and reject a validly
+encoded overlay intended for a different gateway. Enabling expected scope also
+requires the envelope format; the consumer cannot silently downgrade to the
+unscoped legacy payload.
+
+Provenance identifies the producing Grid operator and source `GridNetwork`.
+Praxis AI validates required values and bounds before accepting the envelope.
+Provenance supports audit and diagnosis but is not an authorization credential.
+
+The `ConfigMap` repeats the schema version, semantic revision, and content
+digest in `grid.praxis-proxy.io/*` annotations so Kubernetes tooling can inspect
+the contract without decoding the data value.
+
+### Revision lifecycle
+
+The contract distinguishes four observable stages:
+
+| Stage | Owner | Evidence |
+|---|---|---|
+| **Rendered** | Grid operator | `GridNetwork.status.overlayStatus[].renderedRevision` |
+| **Distributed** | Grid operator and Kubernetes | `distributedRevision` plus the applied `ConfigMap` `resourceVersion` |
+| **Accepted** | Praxis AI | Successful validation and atomic snapshot-load event |
+| **Serving** | Praxis AI request path | The selected immutable snapshot revision attached to provider-hop telemetry |
+
+On a successful apply, rendered and distributed revisions match. If Grid
+renders revision B but cannot apply it, status can report rendered B while
+retaining distributed A and its `resourceVersion`. This distinction prevents a
+render attempt from being mistaken for a deployed routing change.
+
+Praxis AI performs bounded reads and strict validation before replacing its
+in-memory snapshot. Invalid cold-start state fails closed. An invalid update
+retains the same-process last-known-good snapshot, and an unchanged semantic
+revision does not cause a replacement. The request path reads the immutable
+accepted snapshot from memory and does not read Kubernetes, the filesystem,
+SWIM, or Grid APIs.
+
+For a provider hop, `grid_route` removes any caller-supplied revision context
+and sets `x-grid-peer-overlay-revision` from the exact snapshot that served the
+selection. The provider gateway validates its syntax, consumes it after peer
+authentication, removes it from the forwarded request, and sets
+`x-grid-provider-overlay-revision` for backend telemetry. These headers provide
+correlation; they do not replace mTLS identity or provider-local route policy.
 
 Candidate fields:
 
@@ -566,7 +679,11 @@ provider gateway
 ```
 
 Grid chooses the provider site. llm-d or the provider-local scheduler chooses
-the concrete pod, GPU, or endpoint inside that site.
+the concrete pod, GPU, or endpoint inside that site. Envoy ExternalProcessor
+service integration is owned by
+[`praxis-proxy/extproc`](https://github.com/praxis-proxy/extproc); it is an
+optional provider-local integration and is not part of the Grid overlay
+contract.
 
 ## Metrics and CRDT inputs
 
@@ -656,7 +773,7 @@ that already hold relevant KV-cache entries — are not implemented in the curre
 operator.  The `kv_cache_utilization` signal influences scoring but does not
 implement affinity-aware routing.
 
-## When grid-config.json regenerates
+## When the routing overlay regenerates
 
 The overlay `ConfigMap` is regenerated by the Grid Operator whenever the owning
 `GridNetwork` reconciles.
@@ -676,9 +793,14 @@ disappears, the overlay is not rewritten at packet time — it updates when the
 operator's next reconciliation loop observes the new SWIM/member/provider state
 and re-renders.
 
-Rendering a new `ConfigMap` does not mean the gateway has loaded it.  Praxis
-gateways do not automatically reload from a changed `ConfigMap` volume
-mount — a pod restart, rollout, or explicit gateway reload is required.  See
+Rendering or distributing a new `ConfigMap` does not mean the gateway accepted
+it. Praxis AI `grid_route` can watch a projected `grid-overlay.json`, validate
+the replacement, and atomically install a new snapshot without a pod restart.
+The deployment must mount the full projected directory rather than a
+`subPath`, enable overlay-file reload, and configure its expected scope.
+
+Consumers that do not enable overlay-file reload still require a rollout or
+another deployment-owned reload mechanism. See
 [Consumer Config](consumer-config.md#reload-and-rollout).
 
 ## Relevant files
@@ -687,6 +809,7 @@ mount — a pod restart, rollout, or explicit gateway reload is required.  See
 |------|------|
 | `operator/src/controller/grid_network.rs` | Reconcile loop wiring for metrics, CRDT snapshots, overlay rendering, and status. |
 | `operator/src/resources/routing_overlay.rs` | Provider-to-candidate mapping, scoring input construction, and overlay JSON rendering. |
+| `operator/src/resources/overlay_envelope.rs` | Envelope construction, RFC 8785 canonicalization, semantic digest, scope, and provenance. |
 | `operator/src/resources/provider_metrics.rs` | Prometheus scrape and metric-name mapping for `metricsConfig`. |
 | `scoring/src/scoring.rs` | Six-signal backend scoring implementation. |
 | `swim/src/state_broadcast.rs` | CRDT state broadcast handler used by SWIM custom broadcasts. |

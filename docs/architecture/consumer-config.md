@@ -188,12 +188,14 @@ transport does not enable TLS — it is almost certainly a misconfiguration.
 Either change the mode to `mutual_tls` (if TLS is intended) or remove `sni`
 from the endpoint.
 
-**Consumer pod does not reload when the ConfigMap changes**
+**Consumer pod does not reload generated static configuration**
 
-Praxis gateways do not automatically reload from a changed ConfigMap volume
-mount.  A pod restart, rollout, or explicit gateway reload is required after the
-operator updates the `ConfigMap`.  See [Reload and rollout](#reload-and-rollout)
-below.
+Praxis gateways do not automatically reload the complete generated Praxis
+configuration from a changed `ConfigMap` volume mount. A pod restart, rollout,
+or explicit gateway reload is required after the operator updates that static
+configuration. The versioned routing overlay is a separate projected file that
+`grid_route` can validate and hot-reload in process. See
+[Reload and rollout](#reload-and-rollout) below.
 
 ## Edge-ingress deployments
 
@@ -208,23 +210,24 @@ static endpoint/TLS topology.  The intended architecture separates these:
 
 - **Static topology** (listener config, endpoint addresses, TLS material,
   filter chain structure): changes require a gateway reload or restart.
-- **Dynamic overlay** (`grid-config.json` candidate data): changes should be
-  consumable without a full restart, via overlay-file hot reload.
+- **Dynamic overlay** (`grid-overlay.json` envelope): changes are consumable
+  without a full restart through `grid_route` overlay-file hot reload.
 
-Dynamic overlay hot reload depends on Praxis AI `grid_route` overlay-file
-mode with in-process snapshot replacement.  Until that capability is merged
-and proven, overlay updates require the same gateway restart as static config
-changes.  Do not assume that a `ConfigMap` update automatically affects live
-edge traffic today.
+Praxis AI validates each projected envelope before atomically replacing the
+in-memory route snapshot. A malformed replacement retains the same-process
+last-known-good snapshot. The deployment must mount the projected directory
+rather than a `subPath`, enable overlay-file mode, and configure the expected
+overlay scope. A `ConfigMap` update is not serving evidence until Praxis AI
+reports that it accepted the distributed revision.
 
 See [External Client Ingress](external-ingress.md) for the full edge
 deployment architecture.
 
 ## Reload and rollout
 
-The operator applies the consumer Praxis `ConfigMap` on every reconcile.  The
+The operator applies the consumer Praxis `ConfigMap` on every reconcile. The
 consumer gateway pod is not owned by the operator and is not automatically
-restarted when the `ConfigMap` changes.
+restarted when the complete generated Praxis configuration changes.
 
 To apply updated config to a running consumer pod, restart the `Deployment`:
 
@@ -232,9 +235,10 @@ To apply updated config to a running consumer pod, restart the `Deployment`:
 kubectl rollout restart deployment/praxis-consumer -n <namespace>
 ```
 
-Automatic reload support is outside the current operator contract.  Deployment
-owners are responsible for restarting or reloading the gateway when generated
-config or mounted Secret content changes.
+The dynamic routing overlay can reload independently as described above.
+Deployment owners remain responsible for restarting or explicitly reloading
+the gateway when static listener, filter-pipeline, endpoint/TLS topology, or
+mounted Secret content changes.
 
 ## Security
 

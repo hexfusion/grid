@@ -322,11 +322,13 @@ fn cluster_index(ctx: &ForgeContext<'_>, name: &str) -> usize {
 /// Record a newly computed pool allocation in state.
 fn record_pool_allocation(st: &mut state::ForgeState, cluster: &str, alloc: &engine::PoolAllocation) {
     if let Some(ref mut net) = st.network {
-        if net.cidr.is_none() {
+        if net.cidr.as_deref() != Some(&alloc.cidr) {
             net.cidr = Some(alloc.cidr.clone());
+            net.cluster_pools.clear();
         }
-        let already = net.cluster_pools.iter().any(|p| p.cluster == cluster);
-        if !already {
+        if let Some(existing) = net.cluster_pools.iter_mut().find(|p| p.cluster == cluster) {
+            alloc.range.clone_into(&mut existing.range);
+        } else {
             net.cluster_pools.push(ClusterPool {
                 cluster: cluster.to_owned(),
                 range: alloc.range.clone(),
@@ -758,5 +760,57 @@ mod tests {
         let params = result.unwrap_or_else(|| std::process::abort());
         assert_eq!(params.dns_zone, "forge.test", "should default to forge.test");
         assert_eq!(params.cluster_index, 0, "hub should be index 0");
+    }
+
+    #[test]
+    fn record_pool_allocation_replaces_stale_network_allocations() {
+        let mut st = state::empty();
+        st.network = Some(state::NetworkState {
+            name: "test-net".to_owned(),
+            phase: state::NetworkPhase::Active,
+            cidr: Some("172.19.0.0/16".to_owned()),
+            cluster_pools: vec![ClusterPool {
+                cluster: "spoke".to_owned(),
+                range: "172.19.255.211-172.19.255.230".to_owned(),
+            }],
+        });
+        let allocation = engine::PoolAllocation {
+            cidr: "172.18.0.0/16".to_owned(),
+            range: "172.18.255.231-172.18.255.250".to_owned(),
+        };
+
+        record_pool_allocation(&mut st, "hub", &allocation);
+
+        let network = st.network.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(network.cidr.as_deref(), Some("172.18.0.0/16"));
+        assert_eq!(network.cluster_pools.len(), 1);
+        let pool = network.cluster_pools.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(pool.cluster, "hub");
+        assert_eq!(pool.range, allocation.range);
+    }
+
+    #[test]
+    fn record_pool_allocation_updates_existing_cluster_range() {
+        let mut st = state::empty();
+        st.network = Some(state::NetworkState {
+            name: "test-net".to_owned(),
+            phase: state::NetworkPhase::Active,
+            cidr: Some("172.18.0.0/16".to_owned()),
+            cluster_pools: vec![ClusterPool {
+                cluster: "hub".to_owned(),
+                range: "172.18.255.200-172.18.255.219".to_owned(),
+            }],
+        });
+        let allocation = engine::PoolAllocation {
+            cidr: "172.18.0.0/16".to_owned(),
+            range: "172.18.255.231-172.18.255.250".to_owned(),
+        };
+
+        record_pool_allocation(&mut st, "hub", &allocation);
+
+        let network = st.network.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(network.cluster_pools.len(), 1);
+        let pool = network.cluster_pools.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(pool.range, allocation.range);
     }
 }

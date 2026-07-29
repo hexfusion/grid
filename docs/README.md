@@ -6,8 +6,9 @@
   boundaries, workspace crates, and terminology.
 - [Custom Resource Definitions](architecture/crds.md) — `GridNetwork`,
   `GridSite`, `InferenceProvider`, and provider status shape.
-- [Routing](architecture/routing.md) — overlay rendering, candidate ordering,
-  `grid_route`, `peer_identity_trust`, and provider-side request forwarding.
+- [Routing](architecture/routing.md) — versioned overlay contract, revision
+  lifecycle, candidate ordering, `grid_route`, `peer_identity_trust`, and
+  provider-side request forwarding.
 - [Scoring](architecture/scoring.md) — operator-side candidate scoring,
   metrics input, and request-time scoring boundaries.
 - [Auth and Policy](architecture/auth.md) — provider authentication strategies,

@@ -223,6 +223,8 @@ fn resolve_binary(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Result<S
 fn mark_network_gone(state: &mut state::ForgeState) {
     if let Some(ref mut ns) = state.network {
         ns.phase = NetworkPhase::Gone;
+        ns.cidr = None;
+        ns.cluster_pools.clear();
     }
 }
 
@@ -481,6 +483,18 @@ spec:
         }
     }
 
+    /// Assert that removing a network invalidates its address allocations.
+    fn assert_network_allocation_cleared(state_dir: &std::path::Path) {
+        let state = state::load(state_dir).unwrap_or_else(|_| std::process::abort());
+        let network = state.network.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(network.phase, NetworkPhase::Gone);
+        assert!(network.cidr.is_none(), "removed network must not retain its CIDR");
+        assert!(
+            network.cluster_pools.is_empty(),
+            "removed network must not retain MetalLB pools"
+        );
+    }
+
     #[test]
     fn down_removes_network() {
         let dir = test_dir();
@@ -505,6 +519,7 @@ spec:
         let mut buf = Vec::new();
         run(&ctx, false, &mut buf).unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("network rm"), "should remove network");
+        assert_network_allocation_cleared(dir.path());
         let text = String::from_utf8_lossy(&buf);
         assert!(text.contains("removed network"), "should report removal: {text}");
     }

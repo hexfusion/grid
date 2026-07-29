@@ -35,7 +35,7 @@
 //!
 //! - Name: `grid-overlay-{network}-{gateway}` (≤ 63 chars). Long names receive a deterministic FNV-1a hash suffix to
 //!   avoid collisions.
-//! - Data key: `grid-config.json`
+//! - Data keys: `grid-config.json` (legacy) + `grid-overlay.json` (versioned envelope)
 //! - Serialization failures are returned as errors, not silently defaulted.
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
@@ -1422,19 +1422,46 @@ pub(crate) fn is_candidate_fresh(provider: &InferenceProvider) -> bool {
 /// serialised.  In practice this cannot fail for the current type
 /// definition, but the caller must handle it to prevent silently
 /// applying an empty config.
+#[expect(
+    clippy::too_many_lines,
+    reason = "dual-key ConfigMap construction with optional envelope and annotations"
+)]
 pub fn build_overlay_configmap(
     overlay: &RoutingOverlay,
+    envelope: Option<&super::overlay_envelope::OverlayEnvelope>,
     network_name: &str,
     gateway_name: &str,
     namespace: &str,
 ) -> Result<ConfigMap, serde_json::Error> {
-    let json = serde_json::to_string_pretty(overlay)?;
+    let legacy_json = serde_json::to_string_pretty(overlay)?;
     let name = overlay_configmap_name(network_name, gateway_name);
 
-    let data = BTreeMap::from([("grid-config.json".to_owned(), json)]);
+    let mut data = BTreeMap::from([("grid-config.json".to_owned(), legacy_json)]);
+
+    let annotations = if let Some(env) = envelope {
+        let envelope_json = serde_json::to_string_pretty(env)?;
+        data.insert(super::overlay_envelope::ENVELOPE_KEY.to_owned(), envelope_json);
+        Some(BTreeMap::from([
+            (
+                super::overlay_envelope::ANNOTATION_SCHEMA_VERSION.to_owned(),
+                env.schema_version.clone(),
+            ),
+            (
+                super::overlay_envelope::ANNOTATION_REVISION.to_owned(),
+                env.revision.value.clone(),
+            ),
+            (
+                super::overlay_envelope::ANNOTATION_CONTENT_DIGEST.to_owned(),
+                env.content_digest.value.clone(),
+            ),
+        ]))
+    } else {
+        None
+    };
 
     Ok(ConfigMap {
         metadata: kube::api::ObjectMeta {
+            annotations,
             labels: Some(overlay_labels(network_name, gateway_name)),
             name: Some(name),
             namespace: Some(namespace.to_owned()),
@@ -1458,7 +1485,7 @@ pub fn build_overlay_configmap(
 ///
 /// The total of the hash-suffixed form is always ≤ 63 characters:
 /// `"grid-overlay-"` (13) + 20 + `"-"` + 20 + `"-"` + 8 = 63.
-fn overlay_configmap_name(network_name: &str, gateway_name: &str) -> String {
+pub(crate) fn overlay_configmap_name(network_name: &str, gateway_name: &str) -> String {
     let raw = format!("grid-overlay-{network_name}-{gateway_name}");
     if raw.len() <= MAX_K8S_NAME {
         return raw;
@@ -1630,7 +1657,7 @@ mod tests {
     }
 
     fn build_cm(overlay: &RoutingOverlay, net: &str, gw: &str) -> ConfigMap {
-        build_overlay_configmap(overlay, net, gw, "ns").unwrap_or_else(|_| std::process::abort())
+        build_overlay_configmap(overlay, None, net, gw, "ns").unwrap_or_else(|_| std::process::abort())
     }
 
     fn test_provider_with_backend_kind(name: &str, network: &str, backend_kind: &str) -> InferenceProvider {
@@ -3012,7 +3039,7 @@ mod tests {
         let network = test_network("net");
         let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None, None)
             .unwrap_or_else(|_| std::process::abort());
-        let result = build_overlay_configmap(&overlay, "net", "gw", "ns");
+        let result = build_overlay_configmap(&overlay, None, "net", "gw", "ns");
         assert!(result.is_ok(), "well-formed overlay must serialize without error");
     }
 

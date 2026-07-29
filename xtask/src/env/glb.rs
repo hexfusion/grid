@@ -136,6 +136,18 @@ const BACKEND_PROVIDER_CAPTURE_HEADER: &str = "x-grid-demo-backend-provider-attr
 /// Safe backend capture of the provider-owned request ID.
 const BACKEND_REQUEST_ID_CAPTURE_HEADER: &str = "x-grid-demo-backend-request-id";
 
+/// Safe backend capture of the provider-validated serving overlay revision.
+const BACKEND_OVERLAY_REVISION_CAPTURE: &str = "x-grid-demo-backend-overlay-revision";
+
+/// Overlay envelope `ConfigMap` annotation for the schema version.
+const OVERLAY_ANNOTATION_SCHEMA: &str = "grid.praxis-proxy.io/overlay-schema-version";
+
+/// Overlay envelope `ConfigMap` annotation for the semantic revision.
+const OVERLAY_ANNOTATION_REVISION: &str = "grid.praxis-proxy.io/overlay-revision";
+
+/// Overlay envelope `ConfigMap` annotation for the content digest.
+const OVERLAY_ANNOTATION_DIGEST: &str = "grid.praxis-proxy.io/overlay-content-digest";
+
 /// External credential sent to the edge; intentionally differs from provider auth.
 const CLIENT_BEARER_TOKEN: &str = "test-token";
 
@@ -911,9 +923,17 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>)
     proof_banner("checking GridNetwork seeds");
     record_step("gridnetwork seeds", results, check_gridnetwork_seeds);
 
-    // Overlay metadata.
+    // Overlay metadata — waits for the operator status and ConfigMap
+    // resourceVersions to converge after concurrent reconciliation.
     proof_banner("checking overlay candidate metadata");
-    record_step("overlay metadata", results, check_overlay_metadata);
+    record_step("overlay metadata", results, || {
+        wait_for_check(
+            "overlay metadata",
+            DATA_PLANE_CONVERGENCE_WAIT,
+            DATA_PLANE_PROBE_INTERVAL,
+            check_overlay_metadata,
+        )
+    });
 
     // Provider gateway self-discovery.
     proof_banner("checking provider gateway self-discovery");
@@ -1118,10 +1138,24 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>)
 
     // Edge pod stability.
     proof_banner("checking edge pod stability");
-    record_step("edge pod stable", results, move || {
+    let stable = record_step("edge pod stable", results, move || {
         let restore_evidence = restore_result?;
         let stable_evidence = check_edge_pod_stable(PRIMARY_EDGE, &edge_identity)?;
         Ok(format!("{stable_evidence}; {restore_evidence}"))
+    });
+    if !stable {
+        block_remaining(
+            "invalid overlay protection",
+            "provider restoration or edge stability failed",
+            results,
+        );
+        return;
+    }
+
+    // Invalid reload retains the serving snapshot; cold startup fails closed.
+    proof_banner("checking invalid overlay protection");
+    record_step("invalid overlay protection", results, || {
+        check_invalid_overlay_protection(PRIMARY_EDGE)
     });
 }
 
@@ -1179,6 +1213,7 @@ const PROOF_LABELS: &[&str] = &[
     "hot-reload observed",
     "routing after reload",
     "edge pod stable",
+    "invalid overlay protection",
 ];
 
 /// Verify provider gateway Service selector and port on each site.
@@ -1692,6 +1727,22 @@ fn kubectl_jsonpath(
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+/// Read a `ConfigMap` annotation by key, parsing the full JSON to avoid
+/// `kubectl` `JSONPath` issues with dotted annotation keys.
+fn annotation_value(
+    context: &str,
+    configmap: &str,
+    annotation_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let raw = kubectl_jsonpath(context, "configmap", configmap, "{.metadata.annotations}")?;
+    let map: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("ConfigMap {configmap} annotations not valid JSON: {e}"))?;
+    map.get(annotation_key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("annotation {annotation_key:?} missing on {configmap}").into())
+}
+
 /// Block the named assertion and every dependent assertion after it.
 fn block_remaining(from_label: &str, reason: &str, results: &mut Vec<StepResult>) {
     let start = PROOF_LABELS
@@ -1895,33 +1946,118 @@ fn parse_seeds_count(raw: &str) -> usize {
     trimmed.split(' ').filter(|s| !s.is_empty()).count()
 }
 
-/// Verify the overlay [`ConfigMap`] candidate metadata.
+/// Verify the overlay [`ConfigMap`] candidate metadata and envelope.
+///
+/// Checks both the legacy `grid-config.json` and the envelope
+/// `grid-overlay.json` keys, validates envelope structure, and verifies
+/// `ConfigMap` annotations match the envelope revision and digest.
 ///
 /// [`ConfigMap`]: https://kubernetes.io/docs/concepts/configuration/configmap/
+#[expect(clippy::too_many_lines, reason = "sequential dual-key and annotation verification")]
 fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context(PRIMARY_EDGE);
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            &context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "get",
-            "cm",
-            OVERLAY_CONFIGMAP,
-            "-o",
-            "jsonpath={.data.grid-config\\.json}",
-        ])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("overlay ConfigMap not found: {}", safe_truncate_str(stderr.trim(), 120)).into());
+
+    let legacy_raw = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-config\.json}")?;
+    if legacy_raw.trim().is_empty() {
+        return Err("overlay ConfigMap legacy key grid-config.json is empty".into());
     }
-    let raw = String::from_utf8(output.stdout)?;
-    if raw.trim().is_empty() {
-        return Err("overlay ConfigMap data is empty".into());
+    let legacy_evidence = validate_overlay_json(&legacy_raw)?;
+
+    let envelope_raw = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-overlay\.json}")?;
+    if envelope_raw.trim().is_empty() {
+        return Err("overlay ConfigMap envelope key grid-overlay.json is missing or empty".into());
     }
-    validate_overlay_json(&raw)
+    let envelope: serde_json::Value = serde_json::from_str(&envelope_raw)?;
+    let schema_version = envelope
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("envelope missing schema_version")?;
+    if schema_version != "1.0.0" {
+        return Err(format!("envelope schema_version={schema_version:?}, expected \"1.0.0\"").into());
+    }
+    let revision = envelope
+        .pointer("/revision/value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("envelope missing revision.value")?;
+    let digest = envelope
+        .pointer("/content_digest/value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("envelope missing content_digest.value")?;
+    if revision != digest {
+        return Err(format!(
+            "envelope revision={} != content_digest={}",
+            safe_truncate_str(revision, 16),
+            safe_truncate_str(digest, 16)
+        )
+        .into());
+    }
+
+    let ann_schema = annotation_value(&context, OVERLAY_CONFIGMAP, OVERLAY_ANNOTATION_SCHEMA)?;
+    let ann_revision = annotation_value(&context, OVERLAY_CONFIGMAP, OVERLAY_ANNOTATION_REVISION)?;
+    let ann_digest = annotation_value(&context, OVERLAY_CONFIGMAP, OVERLAY_ANNOTATION_DIGEST)?;
+
+    if ann_schema != schema_version {
+        return Err(format!("annotation schema={ann_schema:?} != envelope {schema_version:?}").into());
+    }
+    if ann_revision != revision {
+        return Err("annotation revision != envelope revision".into());
+    }
+    if ann_digest != digest {
+        return Err("annotation digest != envelope content_digest".into());
+    }
+
+    let config_map_resource_version =
+        kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, "{.metadata.resourceVersion}")?;
+    let overlay_status_raw = kubectl_jsonpath(&context, "gridnetwork", GRID_NETWORK_NAME, "{.status.overlayStatus}")?;
+    let overlay_status: serde_json::Value = serde_json::from_str(&overlay_status_raw)
+        .map_err(|e| format!("GridNetwork overlayStatus is not valid JSON: {e}"))?;
+    let gateway_status = overlay_status
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.get("gatewayName").and_then(serde_json::Value::as_str) == Some("edge-gateway"))
+        })
+        .ok_or("GridNetwork status missing overlay entry for edge-gateway")?;
+    let status_phase = gateway_status
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("GridNetwork overlay status missing phase")?;
+    let rendered_revision = gateway_status
+        .get("renderedRevision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("GridNetwork overlay status missing renderedRevision")?;
+    let distributed_revision = gateway_status
+        .get("distributedRevision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("GridNetwork overlay status missing distributedRevision")?;
+    let status_resource_version = gateway_status
+        .get("configMapResourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("GridNetwork overlay status missing configMapResourceVersion")?;
+    if status_phase != "Distributed" {
+        return Err(format!("GridNetwork overlay status phase={status_phase:?}, expected \"Distributed\"").into());
+    }
+    if rendered_revision != revision || distributed_revision != revision {
+        return Err("GridNetwork rendered/distributed revisions do not match the envelope revision".into());
+    }
+    if status_resource_version != config_map_resource_version {
+        return Err(format!(
+            "GridNetwork distributed resourceVersion={status_resource_version:?} != ConfigMap resourceVersion={config_map_resource_version:?}"
+        )
+        .into());
+    }
+
+    eprintln!("  rendered → revision={}", safe_truncate_str(rendered_revision, 16));
+    eprintln!(
+        "  distributed → revision={}, resourceVersion={config_map_resource_version}",
+        safe_truncate_str(distributed_revision, 16)
+    );
+
+    Ok(format!(
+        "dual-key: {legacy_evidence}; envelope: schema=1.0.0, revision={}, annotations and Grid status verified",
+        safe_truncate_str(revision, 16)
+    ))
 }
 
 /// Validate overlay JSON contains candidates with required metadata.
@@ -2257,6 +2393,7 @@ pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::erro
 /// Validate one edge cluster's overlay content and volume projection.
 fn verify_single_edge_overlay(edge: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context = kubectl_context(edge);
+
     let overlay = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-config\.json}")?;
     let document: serde_json::Value = serde_json::from_str(&overlay)?;
     let local_site = document
@@ -2274,6 +2411,10 @@ fn verify_single_edge_overlay(edge: &str) -> Result<(), Box<dyn std::error::Erro
         )
         .into());
     }
+
+    let revision = overlay_revision(edge)?;
+    eprintln!("  distributed → {edge}: revision={}", safe_truncate_str(&revision, 16));
+
     let mounted = kubectl_jsonpath(
         &context,
         "deployment",
@@ -2284,6 +2425,133 @@ fn verify_single_edge_overlay(edge: &str) -> Result<(), Box<dyn std::error::Erro
         return Err(format!("{edge} edge-gateway mounts overlay `ConfigMap` {mounted:?}").into());
     }
     Ok(())
+}
+
+/// Read the semantic revision from one edge's distributed envelope.
+fn overlay_revision(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let envelope_raw = kubectl_jsonpath(
+        &kubectl_context(edge),
+        "configmap",
+        OVERLAY_CONFIGMAP,
+        r"{.data.grid-overlay\.json}",
+    )?;
+    if envelope_raw.trim().is_empty() {
+        return Err(format!("{edge} overlay ConfigMap missing grid-overlay.json key").into());
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_str(&envelope_raw).map_err(|e| format!("{edge} envelope JSON parse failed: {e}"))?;
+    envelope
+        .pointer("/revision/value")
+        .and_then(serde_json::Value::as_str)
+        .filter(|revision| !revision.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{edge} envelope missing revision.value").into())
+}
+
+/// Maximum time to wait for an edge gateway to accept a distributed overlay
+/// revision. Covers Kubernetes projected `ConfigMap` refresh (kubelet sync
+/// period, default up to 60 s) plus the file watcher debounce (500 ms).
+const EDGE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Interval between edge log polls while waiting for overlay acceptance.
+const EDGE_ACCEPTANCE_POLL: Duration = Duration::from_secs(2);
+
+/// Prove that Praxis accepted the exact revision distributed to an edge.
+///
+/// Polls the edge gateway logs at [`EDGE_ACCEPTANCE_POLL`] intervals until
+/// the logs contain either the initial `"overlay snapshot initialized"` event
+/// or a later `"overlay reloaded"` event with an `accepted_revision` field
+/// matching `revision`, or
+/// [`EDGE_ACCEPTANCE_TIMEOUT`] expires.
+fn verify_edge_accepted_revision(edge: &str, revision: &str) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_edge_revision_acceptance(
+        edge,
+        revision,
+        EDGE_ACCEPTANCE_TIMEOUT,
+        EDGE_ACCEPTANCE_POLL,
+        edge_gateway_logs,
+    )
+}
+
+/// Testable core of the edge acceptance barrier.
+///
+/// `log_source` is injected so unit tests can supply synthetic logs without
+/// a live cluster.
+fn wait_for_edge_revision_acceptance(
+    edge: &str,
+    revision: &str,
+    timeout: Duration,
+    interval: Duration,
+    log_source: impl Fn(&str) -> Result<String, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last_accepted: Option<String> = None;
+    loop {
+        let logs = log_source(edge)?;
+        if logs_prove_acceptance(&logs, revision) {
+            return Ok(());
+        }
+        last_accepted = extract_last_accepted_revision(&logs).or(last_accepted);
+        if Instant::now() >= deadline {
+            let observed = last_accepted.as_deref().unwrap_or("none");
+            return Err(format!(
+                "{edge} did not accept overlay revision {} within {timeout:?}; \
+                 last observed accepted_revision={observed}",
+                safe_truncate_str(revision, 16),
+            )
+            .into());
+        }
+        thread::park_timeout(interval);
+    }
+}
+
+/// Check whether a single log line proves the edge accepted `revision`.
+///
+/// Requires one individual line to contain a recognized snapshot-acceptance
+/// event and the exact field `accepted_revision="<revision>"`. The revision
+/// must appear as an exact quoted value, not as a substring of a longer field
+/// or an unrelated context.
+fn logs_prove_acceptance(logs: &str, revision: &str) -> bool {
+    logs.lines().any(|line| {
+        (line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
+            && accepted_revision_from_line(line) == Some(revision)
+    })
+}
+
+/// Extract an exact `accepted_revision` field from one tracing log line.
+///
+/// `tracing` renders debug-recorded string fields with quotes and
+/// display-recorded string fields without them, so both encodings are valid.
+/// The field must start at the beginning of the line or after whitespace to
+/// avoid matching the suffix of `previous_serving_revision`.
+fn accepted_revision_from_line(line: &str) -> Option<&str> {
+    const FIELD: &str = "accepted_revision=";
+    for (index, _) in line.match_indices(FIELD) {
+        let has_field_boundary = index == 0
+            || line
+                .get(..index)
+                .and_then(|prefix| prefix.chars().next_back())
+                .is_some_and(char::is_whitespace);
+        if !has_field_boundary {
+            continue;
+        }
+        let value = line.get(index + FIELD.len()..)?;
+        let value = if let Some(quoted) = value.strip_prefix('"') {
+            quoted.split('"').next()
+        } else {
+            value.split_whitespace().next()
+        };
+        return value.filter(|revision| !revision.is_empty());
+    }
+    None
+}
+
+/// Extract the most recent `accepted_revision` value from logs.
+fn extract_last_accepted_revision(logs: &str) -> Option<String> {
+    logs.lines()
+        .rev()
+        .find_map(accepted_revision_from_line)
+        .map(str::to_owned)
 }
 
 /// Kubernetes pod identity used to prove hot reload did not restart the edge.
@@ -2301,10 +2569,14 @@ fn check_edge_gateway_pods() -> Result<(String, EdgePodIdentity), Box<dyn std::e
     let mut evidence = Vec::new();
     for edge in EDGE_CLUSTERS {
         let identity = edge_pod_identity(edge)?;
+        let revision = overlay_revision(edge)?;
+        verify_edge_accepted_revision(edge, &revision)?;
+        eprintln!("  accepted → {edge}: revision={}", safe_truncate_str(&revision, 16));
         evidence.push(format!(
-            "{edge}=uid:{}, restarts:{}",
+            "{edge}=uid:{}, restarts:{}, accepted_revision:{}",
             safe_truncate_str(&identity.uid, 12),
-            identity.restart_count
+            identity.restart_count,
+            safe_truncate_str(&revision, 16)
         ));
         if *edge == PRIMARY_EDGE {
             primary = Some(identity);
@@ -2406,6 +2678,21 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
         .get(BACKEND_REQUEST_ID_CAPTURE_HEADER)
         .filter(|value| !value.is_empty())
         .ok_or("inference response missing backend provider-request-id capture")?;
+    let serving_revision = resp
+        .headers
+        .get(BACKEND_OVERLAY_REVISION_CAPTURE)
+        .filter(|value| !value.is_empty())
+        .ok_or("inference response missing serving overlay revision")?;
+    let distributed_revision = overlay_revision(PRIMARY_EDGE)?;
+    if serving_revision != &distributed_revision {
+        return Err(format!(
+            "serving revision {} != distributed revision {}",
+            safe_truncate_str(serving_revision, 16),
+            safe_truncate_str(&distributed_revision, 16)
+        )
+        .into());
+    }
+    eprintln!("  serving → revision={}", safe_truncate_str(serving_revision, 16));
     let body: serde_json::Value =
         serde_json::from_str(&resp.body).map_err(|e| format!("inference response body is not valid JSON: {e}"))?;
     let model = body
@@ -2413,8 +2700,9 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
         .and_then(serde_json::Value::as_str)
         .ok_or("inference response missing model field")?;
     Ok(format!(
-        "HTTP 200, model={model}, provider={provider}, gateway={provider_gateway}, backend_request_id={}, provider credential replaced client-supplied credential",
-        safe_truncate_str(backend_request_id, 16)
+        "HTTP 200, model={model}, provider={provider}, gateway={provider_gateway}, backend_request_id={}, overlay_revision={}, provider credential replaced client-supplied credential",
+        safe_truncate_str(backend_request_id, 16),
+        safe_truncate_str(serving_revision, 16)
     ))
 }
 
@@ -2549,6 +2837,11 @@ fn check_hot_reload_observed(edge: &str, previous_count: usize) -> Result<String
 
 /// Count overlay reload log entries for a Kubernetes edge pod.
 fn count_overlay_reload_logs(edge: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(count_reload_entries(&edge_gateway_logs(edge)?))
+}
+
+/// Read bounded logs from one edge gateway deployment.
+fn edge_gateway_logs(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -2569,8 +2862,32 @@ fn count_overlay_reload_logs(edge: &str) -> Result<usize, Box<dyn std::error::Er
     }
     let logs = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{logs}{stderr}");
-    Ok(count_reload_entries(&combined))
+    Ok(strip_csi_sgr(&format!("{logs}{stderr}")))
+}
+
+/// Strip CSI SGR (Select Graphic Rendition) sequences from log output.
+///
+/// Handles only the `ESC [ <params> <letter>` sequences that
+/// `tracing-subscriber` emits for bold, dim, italic, color, and
+/// reset.  This is NOT a general ANSI/VT escape parser — it does
+/// not handle OSC, DCS, APC, or multi-byte CSI final bytes.
+fn strip_csi_sgr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for final_byte in chars.by_ref() {
+                    if final_byte.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Count hot-reload log entries in text.
@@ -2601,6 +2918,234 @@ fn check_edge_pod_stable(edge: &str, expected: &EdgePodIdentity) -> Result<Strin
         safe_truncate_str(&current.uid, 12),
         current.restart_count
     ))
+}
+
+/// Prove last-known-good reload behavior and fail-closed cold startup.
+///
+/// The test corrupts only the envelope digest in the operator-owned
+/// `ConfigMap`, never its legacy key or any Secret. The original envelope is
+/// restored on every exit path.
+///
+/// The test temporarily pauses the edge Grid operator (controlled
+/// fault injection) so its self-healing reconciliation does not
+/// overwrite the deliberately corrupted `ConfigMap`.  This is not
+/// a production overlay-distribution path.
+#[expect(
+    clippy::too_many_lines,
+    clippy::indexing_slicing,
+    reason = "sequential end-to-end proof with known-shape JSON mutation"
+)]
+fn check_invalid_overlay_protection(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let valid_envelope = kubectl_jsonpath(
+        &kubectl_context(edge),
+        "configmap",
+        OVERLAY_CONFIGMAP,
+        r"{.data.grid-overlay\.json}",
+    )?;
+    let valid_document: serde_json::Value = serde_json::from_str(&valid_envelope)?;
+    let valid_revision = valid_document
+        .pointer("/revision/value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("valid envelope missing revision.value")?
+        .to_owned();
+    let mut invalid_document = valid_document;
+    invalid_document["content_digest"]["value"] = serde_json::Value::String("0".repeat(64));
+    let invalid_envelope = serde_json::to_string_pretty(&invalid_document)?;
+
+    let previous_rejections = count_invalid_reload_logs(edge).unwrap_or(0);
+    let previous_pod = edge_pod_identity(edge)?;
+
+    let original_replicas = operator_replicas(edge)?;
+    scale_operator(edge, 0)?;
+
+    let patch_result = patch_overlay_envelope(edge, &invalid_envelope);
+
+    let proof = patch_result.and_then(|()| {
+        wait_for_invalid_reload_rejection(edge, previous_rejections)?;
+        let lkg_evidence = wait_for_data_plane_convergence("last-known-good request", check_inference_routed)?;
+        wait_for_cold_start_rejection(edge, &previous_pod.uid)?;
+        Ok::<_, Box<dyn std::error::Error>>(lkg_evidence)
+    });
+
+    let restore = restore_overlay_resources(
+        edge,
+        &valid_envelope,
+        original_replicas,
+        patch_overlay_envelope,
+        scale_operator,
+    );
+
+    let recovery = restore.and_then(|()| {
+        kubectl::wait_for_rollout_ns(&kubectl_context(edge), "edge-gateway", GRID_SYSTEM_NS, edge)?;
+        wait_for_data_plane_convergence("edge recovery after valid overlay restore", check_inference_routed)
+    });
+
+    match (proof, recovery) {
+        (Ok(lkg), Ok(recovered)) => Ok(format!(
+            "invalid revision rejected; last-known-good {} remained serving; cold start failed closed; valid overlay restored; {lkg}; recovery: {recovered}",
+            safe_truncate_str(&valid_revision, 16)
+        )),
+        (Err(proof_error), Ok(_)) => Err(proof_error),
+        (Ok(_), Err(restore_error)) => {
+            Err(format!("invalid overlay proof passed but restoration failed: {restore_error}").into())
+        },
+        (Err(proof_error), Err(restore_error)) => {
+            Err(format!("{proof_error}; restoration also failed: {restore_error}").into())
+        },
+    }
+}
+
+/// Function pointer for envelope patch operations.
+type PatchFn = fn(&str, &str) -> Result<(), Box<dyn std::error::Error>>;
+
+/// Function pointer for operator scale operations.
+type ScaleFn = fn(&str, u32) -> Result<(), Box<dyn std::error::Error>>;
+
+/// Restore the valid envelope and operator replica count.
+///
+/// Both steps are attempted independently so that a `ConfigMap`
+/// restore failure does not prevent the operator from being scaled
+/// back up.  All errors are collected and reported together.
+///
+/// This function performs only resource restoration (pure).  The caller
+/// is responsible for waiting on rollout and data-plane recovery.
+fn restore_overlay_resources(
+    edge: &str,
+    valid_envelope: &str,
+    original_replicas: u32,
+    patch_fn: PatchFn,
+    scale_fn: ScaleFn,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut errors: Vec<String> = Vec::new();
+
+    if let Err(e) = patch_fn(edge, valid_envelope) {
+        errors.push(format!("envelope restore: {e}"));
+    }
+
+    if let Err(e) = scale_fn(edge, original_replicas) {
+        errors.push(format!("operator restore to {original_replicas}: {e}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; ").into())
+    }
+}
+
+/// Replace only the projected envelope key in one edge `ConfigMap`.
+fn patch_overlay_envelope(edge: &str, envelope: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::json!({
+        "data": {
+            "grid-overlay.json": envelope,
+        }
+    });
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "--type=merge",
+            "-p",
+            &serde_json::to_string(&patch)?,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to patch {edge} overlay envelope: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Wait for a new invalid-reload log entry from the running edge.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded polling in synchronous xtask validation"
+)]
+fn wait_for_invalid_reload_rejection(edge: &str, previous_count: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + EDGE_ACCEPTANCE_TIMEOUT;
+    while Instant::now() < deadline {
+        if count_invalid_reload_logs(edge)? > previous_count {
+            return Ok(());
+        }
+        thread::sleep(DATA_PLANE_PROBE_INTERVAL);
+    }
+    Err(format!("{edge} did not report rejection of the invalid overlay update").into())
+}
+
+/// Count invalid overlay reloads in bounded edge logs.
+fn count_invalid_reload_logs(edge: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(edge_gateway_logs(edge)?
+        .matches("overlay reload failed, retaining previous snapshot")
+        .count())
+}
+
+/// Delete the serving pod and require the replacement to reject invalid
+/// startup content rather than becoming ready.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::too_many_lines,
+    reason = "bounded polling in synchronous xtask validation"
+)]
+fn wait_for_cold_start_rejection(edge: &str, previous_uid: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "-n",
+            GRID_SYSTEM_NS,
+            "delete",
+            "pod",
+            "-l",
+            "app.kubernetes.io/name=edge-gateway",
+            "--wait=true",
+            "--timeout=60s",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to replace {edge} edge pod: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        if let Ok(pod) = get_edge_pod_json(edge) {
+            let uid = pod
+                .pointer("/metadata/uid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let ready = pod
+                .pointer("/status/containerStatuses/0/ready")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let restart_count = pod
+                .pointer("/status/containerStatuses/0/restartCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let waiting_reason = pod
+                .pointer("/status/containerStatuses/0/state/waiting/reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if uid != previous_uid
+                && !ready
+                && (restart_count > 0 || matches!(waiting_reason, "CrashLoopBackOff" | "Error"))
+            {
+                return Ok(());
+            }
+        }
+        thread::sleep(DATA_PLANE_PROBE_INTERVAL);
+    }
+    Err(format!("{edge} replacement pod did not fail closed on the invalid envelope").into())
 }
 
 /// Read the operator-rendered overlay from an edge `ConfigMap`.
@@ -2783,6 +3328,77 @@ struct ProviderWithdrawal {
     original_replicas: u32,
     /// Edge reload count captured before withdrawal.
     reload_count_before: usize,
+}
+
+/// Return the declared operator replica count for an edge cluster.
+fn operator_replicas(edge: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let value = kubectl_jsonpath(
+        &kubectl_context(edge),
+        "deployment",
+        "grid-operator",
+        "{.spec.replicas}",
+    )?;
+    value
+        .parse()
+        .map_err(|e| format!("{edge} grid-operator has invalid replica count {value:?}: {e}").into())
+}
+
+/// Scale the grid-operator deployment on an edge cluster.
+///
+/// Used to prevent the operator from reconciling the overlay
+/// `ConfigMap` while the verifier holds it in an intentionally
+/// invalid state.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::too_many_lines,
+    reason = "synchronous polling in xtask validation"
+)]
+fn scale_operator(edge: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let target = format!("--replicas={replicas}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "-n",
+            GRID_SYSTEM_NS,
+            "scale",
+            "deployment/grid-operator",
+            &target,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to scale {edge} grid-operator: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
+        )
+        .into());
+    }
+    if replicas > 0 {
+        return kubectl::wait_for_rollout_ns(&kubectl_context(edge), "grid-operator", GRID_SYSTEM_NS, edge);
+    }
+    let ctx = kubectl_context(edge);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &ctx,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "pods",
+                "-l",
+                "app.kubernetes.io/name=grid-operator",
+                "--no-headers",
+            ])
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    Err(format!("{edge} grid-operator pods did not terminate within 90s").into())
 }
 
 /// Return the declared mock backend replica count.
@@ -3260,9 +3876,10 @@ clusters:
             .iter()
             .filter(|r| r.status == StepStatus::Blocked)
             .collect::<Vec<_>>();
-        assert_eq!(blocked.len(), 2, "dependent assertions should be blocked once");
+        assert_eq!(blocked.len(), 3, "dependent assertions should be blocked once");
         assert_eq!(blocked.first().map(|r| r.label), Some("routing after reload"));
         assert_eq!(blocked.get(1).map(|r| r.label), Some("edge pod stable"));
+        assert_eq!(blocked.get(2).map(|r| r.label), Some("invalid overlay protection"));
     }
 
     #[test]
@@ -3755,5 +4372,336 @@ clusters:
             headers: BTreeMap::new(),
         };
         assert!(extract_provider(&resp).is_err(), "missing header should return error");
+    }
+
+    #[test]
+    fn edge_deployment_projects_both_configmap_keys() {
+        let manifest = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap_or_else(|| std::process::abort())
+                .join("environments/grid-glb-demo/resources/edge-gateway-deployment.yaml"),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            manifest.contains("key: grid-config.json"),
+            "deployment must project legacy grid-config.json key"
+        );
+        assert!(
+            manifest.contains("path: grid-config.json"),
+            "deployment must mount legacy grid-config.json path"
+        );
+        assert!(
+            manifest.contains("key: grid-overlay.json"),
+            "deployment must project envelope grid-overlay.json key"
+        );
+        assert!(
+            manifest.contains("path: grid-overlay.json"),
+            "deployment must mount envelope grid-overlay.json path"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Annotation structural parse (fix for dotted-key JSONPath bug)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn annotation_parse_reads_dotted_keys() {
+        let annotations = serde_json::json!({
+            "grid.praxis-proxy.io/overlay-schema-version": "1.0.0",
+            "grid.praxis-proxy.io/overlay-revision": "abc123",
+            "grid.praxis-proxy.io/overlay-content-digest": "abc123",
+            "kubectl.kubernetes.io/last-applied-configuration": "{}"
+        });
+        let raw = serde_json::to_string(&annotations).unwrap_or_else(|_| std::process::abort());
+        let map: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            map.get(OVERLAY_ANNOTATION_SCHEMA).and_then(serde_json::Value::as_str),
+            Some("1.0.0"),
+            "dotted annotation key must be readable via structural parse"
+        );
+        assert_eq!(
+            map.get(OVERLAY_ANNOTATION_REVISION).and_then(serde_json::Value::as_str),
+            Some("abc123"),
+        );
+        assert_eq!(
+            map.get(OVERLAY_ANNOTATION_DIGEST).and_then(serde_json::Value::as_str),
+            Some("abc123"),
+        );
+    }
+
+    #[test]
+    fn annotation_parse_missing_key_detected() {
+        let annotations = serde_json::json!({
+            "unrelated/key": "value"
+        });
+        let raw = serde_json::to_string(&annotations).unwrap_or_else(|_| std::process::abort());
+        let map: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            map.get(OVERLAY_ANNOTATION_SCHEMA).is_none(),
+            "missing annotation key should return None"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Edge acceptance convergence barrier
+    // -----------------------------------------------------------------
+
+    fn fake_log(revision: &str) -> String {
+        format!(
+            "INFO grid_route: overlay reloaded candidate_count=2 \
+             accepted_revision=\"{revision}\" previous_serving_revision=old"
+        )
+    }
+
+    fn fake_initial_log(revision: &str) -> String {
+        format!(
+            "INFO grid_route: overlay snapshot initialized candidate_count=2 \
+             accepted_revision=\"{revision}\" serving_revision=\"{revision}\""
+        )
+    }
+
+    #[test]
+    fn acceptance_proof_matches_reload_log() {
+        let rev = "2b8478c84941fd57810b66f71efe9acafae8af330c8c5488cbecc7da6d0d96a1";
+        assert!(logs_prove_acceptance(&fake_log(rev), rev));
+    }
+
+    #[test]
+    fn acceptance_proof_matches_initial_snapshot_log() {
+        let rev = "2b8478c84941fd57810b66f71efe9acafae8af330c8c5488cbecc7da6d0d96a1";
+        assert!(logs_prove_acceptance(&fake_initial_log(rev), rev));
+    }
+
+    #[test]
+    fn acceptance_proof_matches_unquoted_reload_revision() {
+        let rev = "2b8478c84941fd57810b66f71efe9acafae8af330c8c5488cbecc7da6d0d96a1";
+        let log = format!("INFO grid_route: overlay reloaded accepted_revision={rev} candidate_count=2");
+        assert!(logs_prove_acceptance(&log, rev));
+    }
+
+    #[test]
+    fn acceptance_proof_rejects_wrong_revision() {
+        assert!(!logs_prove_acceptance(&fake_log("aaa111"), "bbb222"));
+    }
+
+    #[test]
+    fn acceptance_proof_rejects_missing_accepted_field() {
+        assert!(!logs_prove_acceptance("overlay reloaded candidate_count=2", "abc"));
+    }
+
+    #[test]
+    fn acceptance_proof_rejects_unrecognized_event() {
+        assert!(!logs_prove_acceptance(
+            "overlay parsed accepted_revision=\"abc\"",
+            "abc"
+        ));
+    }
+
+    #[test]
+    fn acceptance_rejects_event_and_revision_on_separate_lines() {
+        let logs = "overlay reloaded candidate_count=2\naccepted_revision=\"abc123\"";
+        assert!(
+            !logs_prove_acceptance(logs, "abc123"),
+            "event and accepted_revision on different lines must not match"
+        );
+    }
+
+    #[test]
+    fn acceptance_rejects_revision_in_unrelated_field() {
+        let line = "overlay reloaded previous_serving_revision=\"abc123\" accepted_revision=\"other\"";
+        assert!(
+            !logs_prove_acceptance(line, "abc123"),
+            "revision appearing only in a non-accepted field must not match"
+        );
+    }
+
+    #[test]
+    fn acceptance_rejects_previous_serving_revision_without_accepted_field() {
+        let line = "overlay reloaded previous_serving_revision=abc123";
+        assert!(
+            !logs_prove_acceptance(line, "abc123"),
+            "previous_serving_revision must not be parsed as accepted_revision"
+        );
+    }
+
+    #[test]
+    fn acceptance_rejects_prefix_or_longer_revision() {
+        let line = "overlay reloaded accepted_revision=\"abc123_extra_suffix\"";
+        assert!(
+            !logs_prove_acceptance(line, "abc123"),
+            "prefix of a longer accepted_revision value must not match"
+        );
+        let line2 = "overlay reloaded accepted_revision=\"abc12\"";
+        assert!(
+            !logs_prove_acceptance(line2, "abc123"),
+            "shorter accepted_revision must not match longer target"
+        );
+    }
+
+    #[test]
+    fn extract_last_accepted_finds_most_recent() {
+        let logs = "accepted_revision=\"rev1\"\naccepted_revision=rev2";
+        assert_eq!(
+            extract_last_accepted_revision(logs).as_deref(),
+            Some("rev2"),
+            "the most recent accepted_revision should be returned"
+        );
+    }
+
+    #[test]
+    fn convergence_succeeds_after_multiple_polls() {
+        let target = "abc123def456";
+        let attempt = std::cell::Cell::new(0_u32);
+        let result =
+            wait_for_edge_revision_acceptance("test-edge", target, Duration::from_secs(5), Duration::ZERO, |_edge| {
+                let n = attempt.get();
+                attempt.set(n + 1);
+                if n < 3 {
+                    Ok("overlay reloaded accepted_revision=\"old_rev\"".to_owned())
+                } else {
+                    Ok(fake_log(target))
+                }
+            });
+        assert!(result.is_ok(), "should succeed after polls: {result:?}");
+        assert!(attempt.get() >= 4, "should have polled at least 4 times");
+    }
+
+    #[test]
+    fn convergence_timeout_diagnostics_wrong_revision() {
+        let result = wait_for_edge_revision_acceptance(
+            "test-edge",
+            "target_rev",
+            Duration::from_millis(50),
+            Duration::ZERO,
+            |_| Ok("overlay reloaded accepted_revision=\"wrong_rev\"".to_owned()),
+        );
+        match result {
+            Ok(()) => std::process::abort(),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("did not accept overlay revision"),
+                    "error should describe the failure: {msg}"
+                );
+                assert!(
+                    msg.contains("last observed accepted_revision=wrong_rev"),
+                    "error should report the observed revision: {msg}"
+                );
+            },
+        }
+    }
+
+    #[test]
+    fn strip_csi_sgr_removes_styling_sequences() {
+        let raw = "\x1b[3maccepted_revision\x1b[0m\x1b[2m=\x1b[0m\"abc123\"";
+        assert_eq!(strip_csi_sgr(raw), "accepted_revision=\"abc123\"");
+    }
+
+    #[test]
+    fn strip_csi_sgr_preserves_plain_text() {
+        let plain = "overlay reloaded accepted_revision=\"abc\"";
+        assert_eq!(strip_csi_sgr(plain), plain);
+    }
+
+    #[test]
+    fn acceptance_proof_matches_after_csi_sgr_strip() {
+        let raw = "\x1b[2m2026-07-29T07:07:11Z\x1b[0m \x1b[32m INFO\x1b[0m grid_route: overlay reloaded \x1b[3maccepted_revision\x1b[0m\x1b[2m=\x1b[0m\"rev_abc\"";
+        let cleaned = strip_csi_sgr(raw);
+        assert!(logs_prove_acceptance(&cleaned, "rev_abc"));
+    }
+
+    #[test]
+    fn convergence_timeout_reports_no_accepted_revision() {
+        let result = wait_for_edge_revision_acceptance(
+            "test-edge",
+            "target_rev",
+            Duration::from_millis(50),
+            Duration::ZERO,
+            |_| Ok("some unrelated log output".to_owned()),
+        );
+        match result {
+            Ok(()) => std::process::abort(),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("accepted_revision=none"),
+                    "should report none when no revision was ever observed: {msg}"
+                );
+            },
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Restoration orchestration tests
+    // -------------------------------------------------------------------------
+
+    #[expect(clippy::unnecessary_wraps, reason = "must match PatchFn signature")]
+    fn ok_patch(_edge: &str, _envelope: &str) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "must match ScaleFn signature")]
+    fn ok_scale(_edge: &str, _replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    fn fail_patch(_edge: &str, _envelope: &str) -> Result<(), Box<dyn std::error::Error>> {
+        Err("patch failed".into())
+    }
+
+    fn fail_scale(_edge: &str, _replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+        Err("scale failed".into())
+    }
+
+    #[test]
+    fn restore_both_succeed() {
+        let result = restore_overlay_resources("test-edge", "{}", 1, ok_patch, ok_scale);
+        assert!(result.is_ok(), "both resources restored: {result:?}");
+    }
+
+    fn err_string(result: Result<(), Box<dyn std::error::Error>>) -> String {
+        match result {
+            Ok(()) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn restore_patch_fails_scale_still_attempted() {
+        let msg = err_string(restore_overlay_resources("test-edge", "{}", 1, fail_patch, ok_scale));
+        assert!(
+            msg.contains("envelope restore"),
+            "should report envelope failure: {msg}"
+        );
+        assert!(!msg.contains("operator restore"), "scale should have succeeded: {msg}");
+    }
+
+    #[test]
+    fn restore_scale_fails_reported() {
+        let msg = err_string(restore_overlay_resources("test-edge", "{}", 2, ok_patch, fail_scale));
+        assert!(
+            msg.contains("operator restore to 2"),
+            "should report operator scale failure with original count: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_both_fail_reports_both() {
+        let msg = err_string(restore_overlay_resources("test-edge", "{}", 3, fail_patch, fail_scale));
+        assert!(
+            msg.contains("envelope restore") && msg.contains("operator restore to 3"),
+            "should report both failures: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_preserves_original_replica_count() {
+        let msg = err_string(restore_overlay_resources("test-edge", "{}", 5, ok_patch, fail_scale));
+        assert!(
+            msg.contains("operator restore to 5"),
+            "should restore to original count 5, not hardcoded 1: {msg}"
+        );
     }
 }

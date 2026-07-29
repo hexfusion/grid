@@ -25,6 +25,8 @@ pub mod credentials;
 
 /// Bridge from operator routing overlays to Praxis `grid_route` filter config.
 pub mod overlay_bridge;
+/// Versioned overlay envelope for content-addressed revision tracking.
+pub mod overlay_envelope;
 /// Provider metrics collection for the [`GridNetwork`] overlay renderer.
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork

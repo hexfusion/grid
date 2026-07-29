@@ -15,11 +15,16 @@ filter_chains:
           - name: X-Grid-Demo-Edge-Gateway
             value: "{{ cluster.name }}"
       - filter: grid_route
-        overlay_file: /etc/grid/grid-config.json
+        overlay_file: /etc/grid/grid-overlay.json
         model_header: X-Model
         provider_hop_clusters:
           - sim-east-provider
           - sim-west-provider
+        expected_overlay_scope:
+          network: glb-demo
+          gateway: edge-gateway
+          namespace: grid-system
+          local_site: "{{ cluster.name }}"
         reload:
           enabled: true
           debounce_ms: 500

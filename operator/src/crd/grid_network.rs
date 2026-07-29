@@ -398,6 +398,15 @@ pub struct GridNetworkStatus {
     /// consumer `ConfigMap` for each opted-in gateway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumer_config_status: Vec<ConsumerConfigStatus>,
+
+    /// Per-gateway overlay revision status.
+    ///
+    /// Populated after each overlay reconcile attempt. Captures rendered and
+    /// distributed revisions so operators can verify propagation without
+    /// inspecting `ConfigMap` contents. A failed update retains evidence for
+    /// the last successfully distributed revision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlay_status: Vec<OverlayRevisionStatus>,
 }
 
 /// Phase of an operator-generated consumer Praxis `ConfigMap` for one gateway.
@@ -475,6 +484,88 @@ pub enum GridNetworkPhase {
 
     /// Grid is degraded (sites unreachable).
     Degraded,
+}
+
+/// Lifecycle phase of a per-gateway overlay status entry.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum OverlayPhase {
+    /// No overlay distribution result has been observed.
+    #[default]
+    Pending,
+    /// Overlay rendered and distributed through the `ConfigMap`.
+    Distributed,
+    /// Overlay render or apply failed.
+    Error,
+    /// Previous valid overlay retained (empty candidates or apply failure).
+    Retained,
+}
+
+/// Per-gateway overlay revision status for observability.
+///
+/// Reported in [`GridNetworkStatus::overlay_status`] for each gateway
+/// after each reconcile attempt.
+///
+/// # Security
+///
+/// `rendered_revision`, `distributed_revision`, and `content_digest` are
+/// SHA-256 hex digests — they do not contain credential token bytes.
+/// `message` must never contain credential bytes.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayRevisionStatus {
+    /// Name of the `GatewayRef` this status entry corresponds to.
+    pub gateway_name: String,
+
+    /// Namespace of the gateway (and the overlay `ConfigMap`).
+    pub namespace: String,
+
+    /// Name of the overlay `ConfigMap`.
+    pub config_map_name: String,
+
+    /// Envelope schema version.
+    pub schema_version: String,
+
+    /// Semantic revision (SHA-256 hex) of the last valid rendered overlay.
+    pub rendered_revision: String,
+
+    /// Semantic revision (SHA-256 hex) last distributed through the
+    /// `ConfigMap`.
+    pub distributed_revision: String,
+
+    /// Content digest (SHA-256 hex) of the rendered overlay.
+    pub content_digest: String,
+
+    /// Kubernetes `resourceVersion` of the distributed `ConfigMap`.
+    #[serde(default)]
+    pub config_map_resource_version: String,
+
+    /// RFC 3339 timestamp when the overlay was rendered.
+    #[serde(default)]
+    pub rendered_at: String,
+
+    /// Number of candidates in the rendered overlay.
+    #[serde(default)]
+    pub candidate_count: u32,
+
+    /// Current overlay lifecycle phase.
+    #[serde(default)]
+    pub phase: OverlayPhase,
+
+    /// Machine-readable reason for the current phase.
+    ///
+    /// Empty when `phase` is [`OverlayPhase::Distributed`].
+    #[serde(default)]
+    pub reason: String,
+
+    /// Human-readable diagnostic message.
+    ///
+    /// Never contains credential token bytes.
+    #[serde(default)]
+    pub message: String,
+
+    /// `GridNetwork` generation when this entry was last updated.
+    #[serde(default)]
+    pub observed_generation: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +996,102 @@ mod tests {
             mode_values.len(),
             2,
             "transport.mode enum must have exactly 2 values: {mode_values:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_phase_default() {
+        assert_eq!(OverlayPhase::default(), OverlayPhase::Pending);
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "full-field struct construction and assertion")]
+    fn overlay_status_distributed_serialization() {
+        let status = OverlayRevisionStatus {
+            gateway_name: "gw".to_owned(),
+            namespace: "ns".to_owned(),
+            config_map_name: "cm".to_owned(),
+            schema_version: "1.0.0".to_owned(),
+            rendered_revision: "a".repeat(64),
+            distributed_revision: "a".repeat(64),
+            content_digest: "a".repeat(64),
+            config_map_resource_version: "123".to_owned(),
+            rendered_at: "2026-07-29T00:00:00Z".to_owned(),
+            candidate_count: 2,
+            phase: OverlayPhase::Distributed,
+            reason: String::new(),
+            message: String::new(),
+            observed_generation: 1,
+        };
+        let json = serde_json::to_value(&status).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            json.get("phase").and_then(serde_json::Value::as_str),
+            Some("Distributed"),
+            "phase must be Distributed"
+        );
+        assert_eq!(
+            json.get("contentDigest").and_then(serde_json::Value::as_str),
+            Some("a".repeat(64)).as_deref(),
+            "contentDigest must match"
+        );
+        assert_eq!(
+            json.get("renderedAt").and_then(serde_json::Value::as_str),
+            Some("2026-07-29T00:00:00Z"),
+            "renderedAt must be present"
+        );
+        let deser: OverlayRevisionStatus = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(deser, status);
+    }
+
+    #[test]
+    fn overlay_status_error_serialization() {
+        let status = OverlayRevisionStatus {
+            gateway_name: "gw".to_owned(),
+            namespace: "ns".to_owned(),
+            config_map_name: "cm".to_owned(),
+            schema_version: String::new(),
+            rendered_revision: String::new(),
+            distributed_revision: String::new(),
+            content_digest: String::new(),
+            config_map_resource_version: String::new(),
+            rendered_at: "2026-07-29T00:00:00Z".to_owned(),
+            candidate_count: 0,
+            phase: OverlayPhase::Error,
+            reason: "ApplyFailed".to_owned(),
+            message: "failed to apply ConfigMap".to_owned(),
+            observed_generation: 1,
+        };
+        let json = serde_json::to_value(&status).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(json.get("phase").and_then(serde_json::Value::as_str), Some("Error"),);
+        assert_eq!(
+            json.get("reason").and_then(serde_json::Value::as_str),
+            Some("ApplyFailed"),
+        );
+    }
+
+    #[test]
+    fn overlay_status_retained_serialization() {
+        let status = OverlayRevisionStatus {
+            gateway_name: "gw".to_owned(),
+            namespace: "ns".to_owned(),
+            config_map_name: "cm".to_owned(),
+            schema_version: String::new(),
+            rendered_revision: String::new(),
+            distributed_revision: String::new(),
+            content_digest: String::new(),
+            config_map_resource_version: String::new(),
+            rendered_at: "2026-07-29T00:00:00Z".to_owned(),
+            candidate_count: 0,
+            phase: OverlayPhase::Retained,
+            reason: "EmptyCandidates".to_owned(),
+            message: "no candidates available; previous valid overlay retained".to_owned(),
+            observed_generation: 1,
+        };
+        let json = serde_json::to_value(&status).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(json.get("phase").and_then(serde_json::Value::as_str), Some("Retained"),);
+        assert_eq!(
+            json.get("reason").and_then(serde_json::Value::as_str),
+            Some("EmptyCandidates"),
         );
     }
 }

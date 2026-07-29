@@ -454,6 +454,102 @@ spec:
                   description: Last observed generation.
                   format: int64
                   type: integer
+                overlayStatus:
+                  description: |-
+                    Per-gateway overlay revision status.
+
+                    Populated after each overlay reconcile attempt. Captures rendered and
+                    distributed revisions so operators can verify propagation without
+                    inspecting `ConfigMap` contents. A failed update retains evidence for
+                    the last successfully distributed revision.
+                  items:
+                    description: |-
+                      Per-gateway overlay revision status for observability.
+
+                      Reported in [`GridNetworkStatus::overlay_status`] for each gateway
+                      after each reconcile attempt.
+
+                      # Security
+
+                      `rendered_revision`, `distributed_revision`, and `content_digest` are
+                      SHA-256 hex digests — they do not contain credential token bytes.
+                      `message` must never contain credential bytes.
+                    properties:
+                      candidateCount:
+                        default: 0
+                        description: Number of candidates in the rendered overlay.
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      configMapName:
+                        description: Name of the overlay `ConfigMap`.
+                        type: string
+                      configMapResourceVersion:
+                        default: ""
+                        description: Kubernetes `resourceVersion` of the distributed `ConfigMap`.
+                        type: string
+                      contentDigest:
+                        description: Content digest (SHA-256 hex) of the rendered overlay.
+                        type: string
+                      distributedRevision:
+                        description: |-
+                          Semantic revision (SHA-256 hex) last distributed through the
+                          `ConfigMap`.
+                        type: string
+                      gatewayName:
+                        description: Name of the `GatewayRef` this status entry corresponds to.
+                        type: string
+                      message:
+                        default: ""
+                        description: |-
+                          Human-readable diagnostic message.
+
+                          Never contains credential token bytes.
+                        type: string
+                      namespace:
+                        description: Namespace of the gateway (and the overlay `ConfigMap`).
+                        type: string
+                      observedGeneration:
+                        default: 0
+                        description: '`GridNetwork` generation when this entry was last updated.'
+                        format: int64
+                        type: integer
+                      phase:
+                        default: Pending
+                        description: Current overlay lifecycle phase.
+                        enum:
+                          - Pending
+                          - Distributed
+                          - Error
+                          - Retained
+                        type: string
+                      reason:
+                        default: ""
+                        description: |-
+                          Machine-readable reason for the current phase.
+
+                          Empty when `phase` is [`OverlayPhase::Distributed`].
+                        type: string
+                      renderedAt:
+                        default: ""
+                        description: RFC 3339 timestamp when the overlay was rendered.
+                        type: string
+                      renderedRevision:
+                        description: Semantic revision (SHA-256 hex) of the last valid rendered overlay.
+                        type: string
+                      schemaVersion:
+                        description: Envelope schema version.
+                        type: string
+                    required:
+                      - configMapName
+                      - contentDigest
+                      - distributedRevision
+                      - gatewayName
+                      - namespace
+                      - renderedRevision
+                      - schemaVersion
+                    type: object
+                  type: array
                 phase:
                   default: Pending
                   description: Current lifecycle phase.

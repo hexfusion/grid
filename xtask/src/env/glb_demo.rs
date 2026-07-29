@@ -395,6 +395,16 @@ fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrato
         result: "pass",
         evidence: "2 edges observed; independent Grid provider selection and failover verified".to_owned(),
     });
+    capabilities.push(CapabilityResult {
+        capability: "Observable overlay contract".to_owned(),
+        result: "pass",
+        evidence: if mode == DemoMode::Full {
+            "one revision matched rendered/distributed/accepted/serving evidence; invalid reload retained last-known-good; cold invalid startup failed closed"
+        } else {
+            "one revision matched rendered/distributed/accepted/serving evidence"
+        }
+        .to_owned(),
+    });
 
     // Scenario 2: Secure provider boundary (summarizes results from scenario 1).
     print_scenario(
@@ -603,7 +613,7 @@ fn print_boundaries(narrator: &mut Narrator) {
     narrator
         .narrate("- Proven: two Praxis edges, one verified HTTPS name, health withdrawal/recovery, edge stickiness.");
     narrator.narrate(
-        "- Proven: per-edge Grid overlays, metrics-driven provider drain, health-driven withdrawal, hot reload, provider mTLS and peer authorization."
+        "- Proven: versioned per-edge overlays with exact rendered/distributed/accepted/serving revision evidence, metrics-driven provider drain, health-driven withdrawal, hot reload, provider mTLS and peer authorization."
     );
     narrator
         .narrate("- Proven: provider-local credential replacement and NetworkPolicy-enforced private backend access.");

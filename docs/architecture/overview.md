@@ -28,8 +28,9 @@ route from cheaply:
 ```text
 Grid CRDs + local health + remote SWIM/CRDT state
   → scored routing candidates
-  → grid-config.json ConfigMap
-  → Praxis AI grid_route
+  → versioned routing overlay ConfigMap
+  → Praxis AI validates and accepts a routing snapshot
+  → grid_route serves requests from that snapshot
 ```
 
 The request hot path stays local.  A request should not call Kubernetes, SWIM,
@@ -78,9 +79,10 @@ Grid sits above the Praxis data plane:
 
 | Layer | Role |
 |---|---|
-| **Grid Operator** | Kubernetes control plane. Watches Grid CRDs, exchanges provider state, scores candidates, renders `grid-config.json`, and manages Grid trust material. |
-| **Praxis AI** | AI-aware gateway. Runs request parsing, `grid_route`, the AI-owned `X-Grid-Peer-*` provider-hop contract, exact `grid_provider_route`, optional `grid_credential_inject`, llm-d/ext_proc support, and AI-specific packaging. |
-| **Praxis Core** | Generic proxy/filter runtime. Owns listeners, filter pipelines, load balancing, `endpoint_selector`, `ext_proc`, `peer_identity_trust`, TLS integration, and request context. |
+| **Grid Operator** | Kubernetes control plane. Watches Grid CRDs, exchanges provider state, scores candidates, publishes versioned routing overlays, reports rendered and distributed revisions, and manages Grid trust material. |
+| **Praxis AI** | AI-aware gateway. Runs request parsing, `grid_route`, the AI-owned `X-Grid-Peer-*` provider-hop contract, exact `grid_provider_route`, optional `grid_credential_inject`, and AI-specific packaging. |
+| **Praxis ExtProc** | Envoy ExternalProcessor service that runs Praxis filter pipelines for deployments that retain Envoy in front of Praxis. |
+| **Praxis Core** | Generic proxy/filter runtime. Owns listeners, filter pipelines, load balancing, `endpoint_selector`, `peer_identity_trust`, TLS integration, and request context. |
 | **Pingora** | Low-level async proxy engine under Praxis. Handles TCP/TLS, HTTP codecs, connection pooling, and upstream I/O. |
 
 The split keeps Grid focused on state preparation and keeps request handling in
@@ -114,7 +116,7 @@ Provider site declares an InferenceProvider
   → SWIM carries that state to peer Grid operators
   → peers merge the CRDT state into their local view
   → each operator applies access policy and scoring for its own gateways
-  → each operator renders its own grid-config.json overlay
+  → each operator publishes a scoped, versioned overlay for its own gateways
 ```
 
 Each operator renders from its own local view of the world:
@@ -128,6 +130,12 @@ local Kubernetes CRDs
 
 Sites should converge, but they are not guaranteed to have identical views at
 every instant.  Overlay rendering is reconcile-driven, not request-driven.
+
+The rendered overlay has a content-addressed revision. The revision covers only
+routing-relevant content, so a timestamp or provenance update does not create a
+new routing revision. This lets operators correlate what Grid rendered, what
+Kubernetes distributed, what Praxis AI accepted, and what a request actually
+used.
 
 ## SWIM and CRDT State
 
@@ -159,9 +167,22 @@ that work is complete.
 ## Routing Overlays
 
 For each gateway reference on a `GridNetwork`, the operator writes a
-`ConfigMap` with a `grid-config.json` key.
+`ConfigMap` with two representations of the same routing state:
 
-The overlay contains:
+- `grid-overlay.json` is the versioned envelope consumed by gateways that
+  enforce the observable overlay contract.
+- `grid-config.json` is the bare routing payload retained for consumers that
+  have not enabled the envelope contract.
+
+The versioned envelope contains:
+
+- a schema version
+- a content-addressed semantic revision and matching SHA-256 content digest
+- scope binding for the network, gateway, namespace, and local site
+- bounded producer and `GridNetwork` provenance
+- the routing payload
+
+The routing payload contains:
 
 - the local site name for that gateway
 - candidate model/provider entries
@@ -178,7 +199,19 @@ strategy + Secret name + namespace + key
 Token bytes are never written into overlays, generated `ConfigMap`s, status, or
 logs.
 
-See [Routing](routing.md) for the overlay format and regeneration triggers.
+The Grid operator reports the rendered revision and last successfully
+distributed revision separately in `GridNetwork.status.overlayStatus`. If an
+apply fails, status preserves the last distributed revision while reporting the
+new render attempt. A `ConfigMap` annotation exposes the schema, revision, and
+digest without requiring an operator to parse its data.
+
+Praxis AI validates the schema, digest, scope, provenance, and candidate bounds
+before accepting an envelope. An invalid cold-start overlay prevents the
+gateway from becoming ready. An invalid replacement does not displace the
+in-memory last-known-good snapshot.
+
+See [Routing](routing.md) for the envelope format, revision semantics, and
+regeneration triggers.
 
 ## Scoring and Selection
 
@@ -275,10 +308,10 @@ The current handoff boundary is:
 
 | Owner | Responsibility |
 |---|---|
-| Grid operator | Render and apply the consumer `ConfigMap` |
+| Grid operator | Render a content-addressed envelope, apply the consumer `ConfigMap`, and report rendered and distributed revisions |
 | Kubernetes | Project the updated `ConfigMap` into the Praxis AI pod filesystem |
-| Praxis AI | Strictly validate the projected overlay and atomically replace the accepted in-memory routing snapshot |
-| Deployment owner | Mount the overlay, configure reload policy, and monitor loaded revision, rejection, and age |
+| Praxis AI | Strictly validate the projected envelope and atomically replace the accepted in-memory routing snapshot |
+| Deployment owner | Mount the overlay directory, configure reload policy and expected scope, and monitor accepted and serving revisions, rejection, and age |
 
 This keeps Grid outside the request path and outside the gateway deployment
 lifecycle. Grid updates desired routing configuration; Praxis AI can load a
@@ -286,6 +319,23 @@ valid update without a pod restart and retains its last-known-good snapshot
 when a replacement is invalid. Grid does not restart Praxis pods, and an
 applied `ConfigMap` alone is not proof that the gateway accepted its newest
 revision.
+
+The revision lifecycle uses four distinct terms:
+
+| Stage | Meaning |
+|---|---|
+| **Rendered** | Grid produced a valid envelope and semantic revision. |
+| **Distributed** | Kubernetes accepted the overlay `ConfigMap`; Grid records its `resourceVersion`. |
+| **Accepted** | Praxis AI validated the envelope and installed its immutable in-memory snapshot. |
+| **Serving** | A request selected a route from that exact accepted snapshot. |
+
+Praxis AI emits the accepted revision when it loads an overlay. For
+provider-bound requests, the edge also carries the serving revision in bounded
+provider-hop context. The provider gateway consumes and removes that edge-owned
+header, then writes a provider-owned revision header for backend telemetry.
+Neither revision header grants authority: mTLS peer identity and
+provider-local candidate, model, and path policy remain the authorization
+boundary.
 
 When transport configuration changes, such as changing a remote endpoint from
 `plaintext` to `mutual_tls` or updating `transport.sni`, the deployment owner
@@ -344,7 +394,8 @@ own different parts of the running gateway.
 The most important boundaries are:
 
 - `GridSite Active` is not the same as end-to-end gateway readiness.
-- A rendered overlay is not the same as a gateway running that overlay.
+- A rendered or distributed overlay is not the same as a gateway accepting or
+  serving that revision.
 - Credential references are not credential values.
 - SWIM membership is not authorization.
 - Inference is the primary routed path; MCP and A2A should be treated as

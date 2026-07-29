@@ -76,6 +76,8 @@ spec:
             items:
               - key: grid-config.json
                 path: grid-config.json
+              - key: grid-overlay.json
+                path: grid-overlay.json
         - name: edge-tls
           secret:
             secretName: edge-gateway-tls
