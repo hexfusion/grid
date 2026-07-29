@@ -24,7 +24,7 @@ const PUBLIC_PORT: u16 = 8443;
 const PUBLIC_CA: &str = ".forge/runtime/glb-tls/gtm/ca.crt";
 
 /// OpenAI-compatible request fixture.
-const REQUEST_FIXTURE: &str = "environments/grid-glb-demo/fixtures/requests/shared-model.json";
+const REQUEST_FIXTURE: &str = "demos/grid-glb-demo/fixtures/requests/shared-model.json";
 
 /// Customer-side fixture credential accepted by the current edge profile.
 const CUSTOMER_TOKEN: &str = "test-token";
@@ -508,10 +508,9 @@ mod tests {
 
     #[test]
     fn gtm_is_praxis_edge_steering_only() {
-        let config = std::fs::read_to_string(
-            workspace_root().join("environments/grid-glb-demo/configs/gtm-emulator/praxis.yaml"),
-        )
-        .unwrap_or_else(|_| std::process::abort());
+        let config =
+            std::fs::read_to_string(workspace_root().join("demos/grid-glb-demo/configs/gtm-emulator/praxis.yaml"))
+                .unwrap_or_else(|_| std::process::abort());
 
         assert!(config.contains("filter: router"));
         assert!(config.contains("filter: load_balancer"));
@@ -529,10 +528,9 @@ mod tests {
 
     #[test]
     fn gtm_registers_edge_health_at_praxis_top_level() {
-        let config = std::fs::read_to_string(
-            workspace_root().join("environments/grid-glb-demo/configs/gtm-emulator/praxis.yaml"),
-        )
-        .unwrap_or_else(|_| std::process::abort());
+        let config =
+            std::fs::read_to_string(workspace_root().join("demos/grid-glb-demo/configs/gtm-emulator/praxis.yaml"))
+                .unwrap_or_else(|_| std::process::abort());
         let document: serde_yaml::Value = serde_yaml::from_str(&config).unwrap_or_else(|_| std::process::abort());
         let clusters = document
             .get("clusters")
@@ -564,7 +562,7 @@ mod tests {
 
     #[test]
     fn all_praxis_workloads_are_kubernetes_deployments() {
-        let forge = std::fs::read_to_string(workspace_root().join("environments/grid-glb-demo/forge.yaml"))
+        let forge = std::fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
         assert!(!forge.contains("\n  services:"));
         assert!(forge.contains("- name: gtm-emulator"));
@@ -576,7 +574,7 @@ mod tests {
 
     #[test]
     fn edge_perspectives_have_distinct_sources_and_keys() {
-        let root = workspace_root().join("environments/grid-glb-demo");
+        let root = workspace_root().join("demos/grid-glb-demo");
         let forge = std::fs::read_to_string(root.join("forge.yaml")).unwrap_or_else(|_| std::process::abort());
         let west_network = std::fs::read_to_string(root.join("resources/gridnetwork-west-edge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
@@ -591,7 +589,7 @@ mod tests {
 
     #[test]
     fn providers_pin_both_edge_certificate_digests() {
-        let root = workspace_root().join("environments/grid-glb-demo/configs");
+        let root = workspace_root().join("demos/grid-glb-demo/configs");
         for site in ["east-provider", "west-provider"] {
             let config = std::fs::read_to_string(root.join(format!("{site}/praxis.yaml")))
                 .unwrap_or_else(|_| std::process::abort());

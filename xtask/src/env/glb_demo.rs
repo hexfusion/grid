@@ -223,13 +223,24 @@ fn prepare_setup(forge_config: &Path) -> Result<SetupContext, Box<dyn std::error
 /// Deploy the environment using prepared setup inputs.
 fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>> {
     glb::stage_provider_boundary()?;
+    eprintln!(
+        "glb-demo: creating five Kind clusters and their shared Docker network; \
+         Forge reports again when cluster creation completes..."
+    );
     run_forge(&context.forge_bin, &context.resolved_config, &["up"])?;
+    eprintln!("glb-demo: Kind clusters created; resolving runtime images...");
     load_local_images_if_required(&context.forge_bin, &context.resolved_config)?;
+    eprintln!("glb-demo: installing MetalLB, SWIM services, and Grid operators...");
     apply_foundation_stacks(&context.forge_bin, &context.resolved_config)?;
+    eprintln!("glb-demo: installing the provider trust and credential boundary...");
     glb::install_provider_boundary()?;
+    eprintln!("glb-demo: deploying provider sites, gateways, and mock inference backends...");
     apply_provider_stacks(&context.forge_bin, &context.resolved_config)?;
+    eprintln!("glb-demo: deploying edge sites and Praxis edge gateways...");
     apply_edge_stacks(&context.forge_bin, &context.resolved_config)?;
+    eprintln!("glb-demo: deploying the GTM emulator in front of both edges...");
     apply_gtm_emulator_stack(&context.forge_bin, &context.resolved_config)?;
+    eprintln!("glb-demo: waiting for both edge-local routing overlays to converge...");
     let overlay_evidence = glb::wait_for_edge_overlays_ready()?;
 
     eprintln!(
@@ -1226,7 +1237,7 @@ mod setup_tests {
 
         #[test]
         fn materialized_config_uses_glb_image_contract() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("environments/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
             let rendered = render_config(&fs::read_to_string(source)?)?;
             assert!(rendered.contains(&image_overrides::glb_gateway_image()));
             assert!(rendered.contains(&image_overrides::glb_operator_image()));
@@ -1238,7 +1249,7 @@ mod setup_tests {
 
         #[test]
         fn swim_service_stack_creates_its_namespace_first() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("environments/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
             let forge: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(source)?)?;
             let steps = forge
                 .get("spec")
@@ -1264,7 +1275,7 @@ mod setup_tests {
 
         #[test]
         fn operator_site_configuration_preserves_the_base_deployment() -> Result<(), Box<dyn std::error::Error>> {
-            let forge = fs::read_to_string(workspace_root().join("environments/grid-glb-demo/forge.yaml"))?;
+            let forge = fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))?;
             for site in ["east-edge", "east-provider", "west-edge", "west-provider"] {
                 let identity = format!("GRID_SWIM_SITE_NAME={site}");
                 let identity_index = forge
@@ -1295,7 +1306,7 @@ mod setup_tests {
 
         #[test]
         fn demo_workloads_use_restricted_container_defaults() -> Result<(), Box<dyn std::error::Error>> {
-            let resources = workspace_root().join("environments/grid-glb-demo/resources");
+            let resources = workspace_root().join("demos/grid-glb-demo/resources");
             for manifest in [
                 "edge-gateway-deployment.yaml",
                 "provider-gateway-deployment.yaml",

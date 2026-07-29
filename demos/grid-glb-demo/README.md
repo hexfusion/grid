@@ -48,6 +48,87 @@ The narrated demo is organized around five scenarios:
 Every reported `PASS` is based on a runtime assertion. A manifest expressing
 intent does not count as proof.
 
+## Client Inference And Workload Inference
+
+Grid supports two entry patterns. This demo focuses on **client inference**:
+requests originate outside the Grid, enter through a stable public endpoint,
+and pass through a Praxis edge before Grid selects a provider.
+
+### Client Inference: Demonstrated Here
+
+**User story:** As an application owner, I need one stable inference endpoint
+that can use healthy edge gateways and eligible providers across sites without
+exposing private provider gateways or backends.
+
+```mermaid
+flowchart LR
+    Client[External inference client]
+    GTM[Global traffic management]
+    EastEdge[East Praxis edge]
+    WestEdge[West Praxis edge]
+    Grid[Grid provider selection]
+    Providers[Eligible provider gateways]
+
+    Client --> GTM
+    GTM --> EastEdge
+    GTM --> WestEdge
+    EastEdge --> Grid
+    WestEdge --> Grid
+    Grid --> Providers
+```
+
+The local GTM emulator represents the global-ingress layer. It chooses a
+healthy edge and provides edge-session affinity. The selected edge then uses
+its Grid overlay to make a separate provider decision. The verifier exercises
+this complete path, including crossed routes, provider drain, edge withdrawal,
+and recovery.
+
+The `east` and `west` names make independent sites and failure domains easy to
+see. They do **not** mean that this demo performs geographic client steering,
+latency-based edge selection, same-region provider preference, or hard region
+locking. The GTM emulator uses health and a deterministic demo affinity key,
+and all four edge-to-provider combinations remain eligible.
+
+### Workload Inference: Supported Architecture, Not This Walkthrough
+
+**User story:** As a platform workload, I need to submit inference through my
+cluster's local Praxis gateway and let Grid select an eligible local or remote
+provider without first traversing public global ingress.
+
+```mermaid
+flowchart LR
+    Workload[In-cluster workload]
+    LocalGateway[Cluster-local Praxis consumer gateway]
+    Grid[Grid provider selection]
+    LocalProvider[Local provider gateway]
+    RemoteProvider[Remote provider gateway]
+
+    Workload --> LocalGateway
+    LocalGateway --> Grid
+    Grid --> LocalProvider
+    Grid --> RemoteProvider
+```
+
+This pattern reuses Grid discovery, admission, ranking, session affinity, and
+the authenticated provider boundary. It does not require the public GTM layer.
+The current automated walkthrough does not deploy a separate workload-facing
+consumer gateway or claim runtime proof for this ingress path.
+
+### Regional Policy Status
+
+- **Available as routing input:** `GridSite` carries region and zone metadata,
+  and Grid can render locality tiers such as `same_region` and `cross_region`.
+  Provider access policy can also limit which consumer sites may use a
+  provider.
+- **Not proved by this demo:** the verifier does not assert geographic edge
+  selection, locality-preferred provider selection, network latency steering,
+  or a regional failover policy.
+- **Not yet a route-level guarantee:** a request cannot currently declare or
+  inherit a trusted policy that means "never leave this region" and fail closed
+  when no provider in that region is eligible. That requires an authenticated
+  route, tenant, or workload policy contract and explicit allowed-region
+  enforcement at provider selection.
+
 ## Architecture At A Glance
 
 The demo creates five Kind clusters. Every Praxis process runs in Kubernetes.
@@ -911,7 +992,7 @@ export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 cargo build -p forge
 
 cargo xtask env run-grid-glb-demo \
-  --forge-config environments/grid-glb-demo/forge.yaml \
+  --forge-config demos/grid-glb-demo/forge.yaml \
   --quick \
   --teardown \
   2>&1 | tee grid-glb-demo-output.txt
@@ -933,7 +1014,7 @@ Rerun only the narration without recreating the environment:
 
 ```bash
 cargo xtask env demonstrate-grid-glb \
-  --forge-config environments/grid-glb-demo/.forge.resolved.yaml \
+  --forge-config demos/grid-glb-demo/.forge.resolved.yaml \
   --quick \
   2>&1 | tee grid-glb-demo-rerun.txt
 ```
@@ -942,7 +1023,7 @@ Remove the five clusters with `--teardown` (preferred) or manually:
 
 ```bash
 cargo run -p forge -- \
-  --config environments/grid-glb-demo/.forge.resolved.yaml \
+  --config demos/grid-glb-demo/.forge.resolved.yaml \
   --non-interactive down --force
 ```
 
@@ -960,7 +1041,7 @@ Validate the declarative environment:
 ```bash
 cargo run -p forge -- \
   config validate \
-  --config environments/grid-glb-demo/forge.yaml
+  --config demos/grid-glb-demo/forge.yaml
 ```
 
 ### Registry Images
@@ -1039,7 +1120,7 @@ Setup and narration can be run separately:
 cargo xtask env setup-grid-glb
 
 cargo xtask env demonstrate-grid-glb \
-  --forge-config environments/grid-glb-demo/.forge.resolved.yaml \
+  --forge-config demos/grid-glb-demo/.forge.resolved.yaml \
   --quick \
   2>&1 | tee grid-glb-demo-output.txt
 ```
@@ -1146,10 +1227,10 @@ Run the focused verifiers:
 
 ```bash
 cargo xtask env verify-grid-glb-routing \
-  --forge-config environments/grid-glb-demo/.forge.resolved.yaml
+  --forge-config demos/grid-glb-demo/.forge.resolved.yaml
 
 cargo xtask env verify-grid-glb-gtm-emulator \
-  --forge-config environments/grid-glb-demo/.forge.resolved.yaml
+  --forge-config demos/grid-glb-demo/.forge.resolved.yaml
 ```
 
 ## Evidence Output

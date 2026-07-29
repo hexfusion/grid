@@ -70,7 +70,7 @@ backend.
 
 See [External Client Ingress](external-ingress.md) for the complete production
 contract and the
-[Global Ingress Demo](../../environments/grid-glb-demo/README.md) for automated
+[Global Ingress Demo](../../demos/grid-glb-demo/README.md) for automated
 runtime proof of the principal flows and failure cases.
 
 ## The Stack

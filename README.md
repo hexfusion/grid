@@ -21,10 +21,11 @@ Praxis AI supplies the AI-specific routing and credential filters.
 
 ## Getting started
 
-Start with the [Global Ingress Demo](environments/grid-glb-demo/README.md).
-It provides a copy-and-paste deployment, explains the Grid and Praxis
-architecture, narrates each request and failure scenario, records runtime
-evidence, and tears the environment down when complete.
+Start with the [Global Ingress Demo](demos/grid-glb-demo/README.md).
+It provides a copy-and-paste deployment for external client inference through
+active Praxis edges, distinguishes that path from cluster-local workload
+inference, narrates each request and failure scenario, records runtime evidence,
+and tears the environment down when complete.
 
 ```bash
 git clone https://github.com/praxis-proxy/grid.git
@@ -37,7 +38,7 @@ export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
 cargo build -p forge
 cargo xtask env run-grid-glb-demo \
-  --forge-config environments/grid-glb-demo/forge.yaml \
+  --forge-config demos/grid-glb-demo/forge.yaml \
   --quick \
   --teardown \
   2>&1 | tee grid-glb-demo-output.txt

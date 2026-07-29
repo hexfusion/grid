@@ -278,7 +278,7 @@ pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn
 /// Render provider gateway configs with the edge certificate digest.
 fn stage_provider_configs(east_edge_digest: &str, west_edge_digest: &str) -> Result<(), Box<dyn std::error::Error>> {
     for provider in PROVIDER_CLUSTERS {
-        let source = Path::new("environments/grid-glb-demo/configs")
+        let source = Path::new("demos/grid-glb-demo/configs")
             .join(provider)
             .join("praxis.yaml");
         let template = fs::read_to_string(&source)?;
@@ -3953,7 +3953,7 @@ clusters:
     fn provider_configs_wire_secret_backed_credential_injection() {
         for provider in PROVIDER_CLUSTERS {
             let path = workspace_root()
-                .join("environments/grid-glb-demo/configs")
+                .join("demos/grid-glb-demo/configs")
                 .join(provider)
                 .join("praxis.yaml");
             let config = fs::read_to_string(&path).unwrap_or_else(|_| std::process::abort());
@@ -3983,10 +3983,9 @@ clusters:
 
     #[test]
     fn provider_deployment_mounts_credential_secret() {
-        let deployment = fs::read_to_string(
-            workspace_root().join("environments/grid-glb-demo/resources/provider-gateway-deployment.yaml"),
-        )
-        .unwrap_or_else(|_| std::process::abort());
+        let deployment =
+            fs::read_to_string(workspace_root().join("demos/grid-glb-demo/resources/provider-gateway-deployment.yaml"))
+                .unwrap_or_else(|_| std::process::abort());
         assert!(deployment.contains("mountPath: /etc/praxis/credentials/mock-inference"));
         assert!(deployment.contains("secretName: mock-inference-credential"));
         assert!(!deployment.contains(CLIENT_BEARER_TOKEN));
@@ -3995,7 +3994,7 @@ clusters:
     #[test]
     fn provider_drain_uses_declared_metrics_and_health_inputs() {
         let root = workspace_root();
-        let resources = root.join("environments/grid-glb-demo/resources");
+        let resources = root.join("demos/grid-glb-demo/resources");
         let workloads =
             fs::read_to_string(resources.join("provider-workloads.yaml")).unwrap_or_else(|_| std::process::abort());
         assert!(workloads.contains("name: MOCK_QUEUE_DEPTH"));
@@ -4020,7 +4019,7 @@ clusters:
 
     #[test]
     fn backend_network_policy_separates_data_and_health_access() {
-        let resources = workspace_root().join("environments/grid-glb-demo/resources");
+        let resources = workspace_root().join("demos/grid-glb-demo/resources");
         let policy =
             fs::read_to_string(resources.join("backend-network-policy.yaml")).unwrap_or_else(|_| std::process::abort());
         let gateway = fs::read_to_string(resources.join("provider-gateway-deployment.yaml"))
@@ -4051,7 +4050,7 @@ clusters:
 
     #[test]
     fn provider_configs_render_candidate_ids_from_identity_contract() {
-        let configs = workspace_root().join("environments/grid-glb-demo/configs");
+        let configs = workspace_root().join("demos/grid-glb-demo/configs");
         for provider in PROVIDER_CLUSTERS {
             let template = fs::read_to_string(configs.join(format!("{provider}/praxis.yaml")))
                 .unwrap_or_else(|_| std::process::abort());
@@ -4064,7 +4063,7 @@ clusters:
 
     #[test]
     fn providers_bind_only_to_their_explicit_local_sites() {
-        let resources = workspace_root().join("environments/grid-glb-demo/resources");
+        let resources = workspace_root().join("demos/grid-glb-demo/resources");
         for provider in PROVIDER_CLUSTERS {
             let inference = fs::read_to_string(resources.join(format!("inference-{provider}.yaml")))
                 .unwrap_or_else(|_| std::process::abort());
@@ -4084,7 +4083,7 @@ clusters:
 
     #[test]
     fn operator_sites_set_explicit_swim_identity_without_partial_deployments() {
-        let forge = fs::read_to_string(workspace_root().join("environments/grid-glb-demo/forge.yaml"))
+        let forge = fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
         for site in ["east-edge", "east-provider", "west-edge", "west-provider"] {
             assert!(
@@ -4380,7 +4379,7 @@ clusters:
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap_or_else(|| std::process::abort())
-                .join("environments/grid-glb-demo/resources/edge-gateway-deployment.yaml"),
+                .join("demos/grid-glb-demo/resources/edge-gateway-deployment.yaml"),
         )
         .unwrap_or_else(|_| std::process::abort());
 

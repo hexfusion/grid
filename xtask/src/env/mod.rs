@@ -776,7 +776,7 @@ pub(crate) enum Action {
     /// routing, provider affinity and drain, hot reload, and pod stability.
     VerifyGridGlbRouting {
         /// Path to the Forge environment config file.
-        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
     },
 
@@ -796,7 +796,7 @@ pub(crate) enum Action {
     /// changing the client URL. The edge is restored before this command exits.
     VerifyGridGlbGtmEmulator {
         /// Path to the Forge environment config file.
-        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
     },
 
@@ -807,7 +807,7 @@ pub(crate) enum Action {
     /// Kubernetes edge withdrawal and recovery through the GTM emulator.
     DemonstrateGridGlb {
         /// Path to the Forge environment config file.
-        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
         /// Demo mode.
         #[command(flatten)]
@@ -817,14 +817,14 @@ pub(crate) enum Action {
     /// Create the complete local GLB environment from image overrides.
     SetupGridGlb {
         /// Path to the source Forge environment config file.
-        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
     },
 
     /// Create the environment, then run the narrated GLB scenario collection.
     RunGridGlbDemo {
         /// Path to the source Forge environment config file.
-        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
         /// Demo mode and lifecycle options.
         #[command(flatten)]
