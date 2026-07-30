@@ -67,6 +67,9 @@ spec:
             - name: provider-credential
               mountPath: /etc/praxis/credentials/mock-inference
               readOnly: true
+            - name: provider-secondary-credential
+              mountPath: /etc/praxis/credentials/mock-inference-secondary
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -77,3 +80,7 @@ spec:
         - name: provider-credential
           secret:
             secretName: mock-inference-credential
+        - name: provider-secondary-credential
+          secret:
+            secretName: mock-inference-secondary-credential
+            optional: true

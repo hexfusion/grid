@@ -28,6 +28,11 @@ spec:
             transport:
               mode: mutual_tls
               sni: east-provider.grid.internal
+          - cluster: sim-east-provider-secondary
+            address: "{{ captures.east-provider.provider-gateway-ip }}:8443"
+            transport:
+              mode: mutual_tls
+              sni: east-provider.grid.internal
           - cluster: sim-west-provider
             address: "{{ captures.west-provider.provider-gateway-ip }}:8443"
             transport:

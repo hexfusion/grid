@@ -19,6 +19,7 @@ filter_chains:
         model_header: X-Model
         provider_hop_clusters:
           - sim-east-provider
+          - sim-east-provider-secondary
           - sim-west-provider
         expected_overlay_scope:
           network: glb-demo
@@ -35,6 +36,17 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: sim-east-provider
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: east-provider.grid.internal
+              verify: true
+            endpoints:
+              - "{{ captures.east-provider.provider-gateway-ip }}:8443"
+          - name: sim-east-provider-secondary
             tls:
               ca:
                 ca_path: /etc/praxis/tls/ca.crt

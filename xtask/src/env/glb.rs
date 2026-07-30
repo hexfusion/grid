@@ -106,6 +106,9 @@ const GTM_TLS_SECRET: &str = "gtm-emulator-tls";
 /// Kubernetes Secret containing the demo backend's final-hop credential.
 const PROVIDER_CREDENTIAL_SECRET: &str = "mock-inference-credential";
 
+/// Kubernetes Secret containing the second east provider's credential.
+const SECONDARY_PROVIDER_CREDENTIAL_SECRET: &str = "mock-inference-secondary-credential";
+
 /// Token replaced with the generated edge certificate digest.
 const EDGE_US_EAST_CERT_DIGEST_TOKEN: &str = "__EDGE_US_EAST_CERT_SHA256__";
 
@@ -115,11 +118,20 @@ const EDGE_US_WEST_CERT_DIGEST_TOKEN: &str = "__EDGE_US_WEST_CERT_SHA256__";
 /// Provider-config token replaced with the deterministic candidate ID.
 const PROVIDER_CANDIDATE_ID_TOKEN: &str = "__GRID_CANDIDATE_ID__";
 
+/// East provider-config token replaced with the second provider candidate ID.
+const SECONDARY_PROVIDER_CANDIDATE_ID_TOKEN: &str = "__GRID_SECONDARY_CANDIDATE_ID__";
+
 /// Candidate kind used by the GLB provider fixture.
 const DEMO_CANDIDATE_KIND: &str = "inference_model";
 
 /// Model name used by the GLB provider fixture.
 const DEMO_MODEL: &str = "sim-model-v1";
+
+/// Second provider hosted in the east provider cluster.
+const EAST_SECONDARY_PROVIDER: &str = "east-provider-secondary";
+
+/// Routing-cluster identity of the second east provider.
+const EAST_SECONDARY_CLUSTER: &str = "sim-east-provider-secondary";
 
 /// AI-owned candidate identity header on the authenticated provider hop.
 const GRID_PEER_SELECTED_CANDIDATE_HEADER: &str = "x-grid-peer-selected-candidate";
@@ -206,6 +218,14 @@ pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Erro
         apply_provider_config(provider)?;
         apply_provider_tls_secret(provider)?;
         apply_provider_credential_secret(provider, &provider_credential)?;
+        if *provider == "east-provider" {
+            let secondary_credential = generate_provider_credential()?;
+            apply_named_provider_credential_secret(
+                provider,
+                SECONDARY_PROVIDER_CREDENTIAL_SECRET,
+                &secondary_credential,
+            )?;
+        }
         restart_provider_deployments_if_present(provider)?;
     }
     eprintln!(
@@ -217,7 +237,7 @@ pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Erro
 /// Restart and await provider workloads when they have already been applied.
 fn restart_provider_deployments_if_present(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context = kubectl_context(provider);
-    for deployment in ["mock-inference", "provider-gateway"] {
+    for deployment in ["mock-inference", "mock-inference-secondary", "provider-gateway"] {
         if !deployment_exists(&context, deployment)? {
             continue;
         }
@@ -285,6 +305,7 @@ fn stage_provider_configs(east_edge_digest: &str, west_edge_digest: &str) -> Res
         if !template.contains(EDGE_US_EAST_CERT_DIGEST_TOKEN)
             || !template.contains(EDGE_US_WEST_CERT_DIGEST_TOKEN)
             || !template.contains(PROVIDER_CANDIDATE_ID_TOKEN)
+            || (*provider == "east-provider" && !template.contains(SECONDARY_PROVIDER_CANDIDATE_ID_TOKEN))
         {
             return Err(format!(
                 "provider config template is missing an identity token: {}",
@@ -295,7 +316,11 @@ fn stage_provider_configs(east_edge_digest: &str, west_edge_digest: &str) -> Res
         let rendered = template
             .replace(EDGE_US_EAST_CERT_DIGEST_TOKEN, east_edge_digest)
             .replace(EDGE_US_WEST_CERT_DIGEST_TOKEN, west_edge_digest)
-            .replace(PROVIDER_CANDIDATE_ID_TOKEN, &provider_candidate_id(provider)?);
+            .replace(PROVIDER_CANDIDATE_ID_TOKEN, &provider_candidate_id(provider)?)
+            .replace(
+                SECONDARY_PROVIDER_CANDIDATE_ID_TOKEN,
+                &provider_candidate_id(EAST_SECONDARY_PROVIDER)?,
+            );
         let target_dir = Path::new(".forge/runtime/glb-tls/provider-configs").join(provider);
         fs::create_dir_all(&target_dir)?;
         fs::write(target_dir.join("praxis.yaml"), rendered)?;
@@ -483,11 +508,20 @@ fn generate_provider_credential() -> Result<String, Box<dyn std::error::Error>> 
 
 /// Apply the provider-local credential consumed only on the backend hop.
 fn apply_provider_credential_secret(provider: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    apply_named_provider_credential_secret(provider, PROVIDER_CREDENTIAL_SECRET, token)
+}
+
+/// Apply one named provider-local credential consumed only on its backend hop.
+fn apply_named_provider_credential_secret(
+    provider: &str,
+    secret_name: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
-            "name": PROVIDER_CREDENTIAL_SECRET,
+            "name": secret_name,
             "namespace": GRID_SYSTEM_NS,
         },
         "type": "Opaque",
@@ -533,8 +567,8 @@ pub(crate) fn verify_grid_routing(forge_config: &Path) -> Result<(), Box<dyn std
 
 /// Run the Grid routing and provider-boundary proof with mode gating.
 ///
-/// In [`DemoMode::Quick`] mode, steps after "inference routed" (session
-/// affinity, drain, withdrawal, hot-reload, pod stability) are skipped.
+/// In [`DemoMode::Quick`] mode, the same-site multi-provider proof runs before
+/// session drain, withdrawal, hot reload, and pod-stability checks are skipped.
 ///
 /// # Errors
 ///
@@ -939,6 +973,17 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>)
         )
     });
 
+    // One site advertises two independent providers for the same model.
+    proof_banner("checking multiple providers in one site overlay");
+    record_step("same-site provider candidates", results, || {
+        wait_for_check(
+            "same-site provider candidates",
+            PROVIDER_STATE_WAIT,
+            DATA_PLANE_PROBE_INTERVAL,
+            check_same_site_provider_candidates,
+        )
+    });
+
     // Provider gateway self-discovery.
     proof_banner("checking provider gateway self-discovery");
     let provider_gateway_addrs = match load_provider_gateway_addresses() {
@@ -1035,7 +1080,14 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>)
     proof_banner("sending inference request");
     let routed_ok = record_step("inference routed", results, check_inference_routed);
     if !routed_ok {
-        block_remaining("session affinity bind", "initial inference failed", results);
+        block_remaining("same-site providers routed", "initial inference failed", results);
+        return;
+    }
+
+    proof_banner("routing to both providers hosted by the east site");
+    let multiple_providers_ok = record_step("same-site providers routed", results, check_same_site_provider_routing);
+    if !multiple_providers_ok {
+        block_remaining("session affinity bind", "same-site provider routing failed", results);
         return;
     }
 
@@ -1196,6 +1248,7 @@ const PROOF_LABELS: &[&str] = &[
     "swim advertise addr",
     "gridnetwork seeds",
     "overlay metadata",
+    "same-site provider candidates",
     "provider gateway addr",
     "remote gridsite egress",
     "provider service selector",
@@ -1209,6 +1262,7 @@ const PROOF_LABELS: &[&str] = &[
     "edge overlays mounted",
     "edge gateways running",
     "inference routed",
+    "same-site providers routed",
     "session affinity bind",
     "session affinity reuse",
     "session drain setup",
@@ -1265,11 +1319,18 @@ fn check_backend_private_service() -> Result<String, Box<dyn std::error::Error>>
     let mut evidence = Vec::new();
     for provider in PROVIDER_CLUSTERS {
         let ctx = kubectl_context(provider);
-        let svc_type = kubectl_jsonpath(&ctx, "svc", "mock-inference", "{.spec.type}")?;
-        if svc_type != "ClusterIP" {
-            return Err(format!("{provider}: backend type is {svc_type}, expected ClusterIP").into());
+        let services: &[&str] = if *provider == "east-provider" {
+            &["mock-inference", "mock-inference-secondary"]
+        } else {
+            &["mock-inference"]
+        };
+        for service in services {
+            let svc_type = kubectl_jsonpath(&ctx, "svc", service, "{.spec.type}")?;
+            if svc_type != "ClusterIP" {
+                return Err(format!("{provider}/{service}: backend type is {svc_type}, expected ClusterIP").into());
+            }
+            evidence.push(format!("{provider}/{service}: type={svc_type}"));
         }
-        evidence.push(format!("{provider}: type={svc_type}"));
     }
     Ok(evidence.join("; "))
 }
@@ -1280,79 +1341,101 @@ fn check_backend_private_service() -> Result<String, Box<dyn std::error::Error>>
 /// provider-gateway access label must connect, while an otherwise identical
 /// unlabeled pod must be denied. This detects actual enforcement rather than
 /// inferring support from the CNI name or the presence of a manifest.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential network probes for a single verification step"
-)]
 fn check_backend_network_policy() -> Result<String, Box<dyn std::error::Error>> {
     let mut evidence = Vec::new();
     for provider in PROVIDER_CLUSTERS {
         let context = kubectl_context(provider);
-        let target = "mock-inference.grid-system.svc.cluster.local:8080";
-        let allowed_name = "grid-netpol-allowed";
-        let denied_name = "grid-netpol-denied";
-
-        delete_probe_pod(&context, allowed_name);
-        delete_probe_pod(&context, denied_name);
-
-        let allowed = run_probe_pod(
-            &context,
-            allowed_name,
-            Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
-            &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
-        )?;
-        if allowed.phase != "Succeeded" || !allowed.logs.contains("tcp-probe=connected") {
-            return Err(format!(
-                "{provider}: allowed backend probe did not connect (phase={}, logs={})",
-                allowed.phase,
-                safe_truncate_str(&allowed.logs, 120)
-            )
-            .into());
-        }
-
-        let denied = run_probe_pod(
-            &context,
-            denied_name,
-            None,
-            &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
-        )?;
-        if denied.phase != "Failed"
-            || !(denied.logs.contains("tcp-probe=timeout") || denied.logs.contains("tcp-probe=connect-failed"))
-        {
-            return Err(format!(
-                "{provider}: unlabeled backend probe was not denied (phase={}, logs={})",
-                denied.phase,
-                safe_truncate_str(&denied.logs, 120)
-            )
-            .into());
-        }
-
-        let no_auth = run_probe_pod(
-            &context,
-            "grid-backend-no-auth",
-            Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
-            &["--http-probe", target],
-        )?;
-        require_http_probe_status(provider, "missing credential", &no_auth, 401)?;
-
-        let client_auth = run_probe_pod(
-            &context,
-            "grid-backend-client-auth",
-            Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
+        let backends: &[(&str, &str)] = if *provider == "east-provider" {
             &[
-                "--http-probe",
-                target,
-                "--http-probe-authorization",
-                "Bearer test-token",
-            ],
-        )?;
-        require_http_probe_status(provider, "client-supplied credential", &client_auth, 403)?;
-
-        evidence.push(format!(
-            "{provider}: allowed=connected, unlabeled=denied, no_auth=HTTP_401, client_auth=HTTP_403"
-        ));
+                ("primary", "mock-inference.grid-system.svc.cluster.local:8080"),
+                (
+                    "secondary",
+                    "mock-inference-secondary.grid-system.svc.cluster.local:8080",
+                ),
+            ]
+        } else {
+            &[("primary", "mock-inference.grid-system.svc.cluster.local:8080")]
+        };
+        for (instance, target) in backends {
+            check_one_backend_network_boundary(provider, &context, instance, target)?;
+            evidence.push(format!(
+                "{provider}/{instance}: allowed=connected, unlabeled=denied, no_auth=HTTP_401, client_auth=HTTP_403"
+            ));
+        }
     }
     Ok(evidence.join("; "))
+}
+
+/// Prove network and credential rejection behavior for one private backend.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential network probes for a single verification step"
+)]
+fn check_one_backend_network_boundary(
+    provider: &str,
+    context: &str,
+    instance: &str,
+    target: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let allowed_name = format!("grid-netpol-allowed-{instance}");
+    let denied_name = format!("grid-netpol-denied-{instance}");
+    delete_probe_pod(context, &allowed_name);
+    delete_probe_pod(context, &denied_name);
+
+    let allowed = run_probe_pod(
+        context,
+        &allowed_name,
+        Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
+        &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
+    )?;
+    if allowed.phase != "Succeeded" || !allowed.logs.contains("tcp-probe=connected") {
+        return Err(format!(
+            "{provider}/{instance}: allowed backend probe did not connect (phase={}, logs={})",
+            allowed.phase,
+            safe_truncate_str(&allowed.logs, 120)
+        )
+        .into());
+    }
+
+    let denied = run_probe_pod(
+        context,
+        &denied_name,
+        None,
+        &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
+    )?;
+    if denied.phase != "Failed"
+        || !(denied.logs.contains("tcp-probe=timeout") || denied.logs.contains("tcp-probe=connect-failed"))
+    {
+        return Err(format!(
+            "{provider}/{instance}: unlabeled backend probe was not denied (phase={}, logs={})",
+            denied.phase,
+            safe_truncate_str(&denied.logs, 120)
+        )
+        .into());
+    }
+
+    let no_auth_name = format!("grid-backend-no-auth-{instance}");
+    let no_auth = run_probe_pod(
+        context,
+        &no_auth_name,
+        Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
+        &["--http-probe", target],
+    )?;
+    require_http_probe_status(provider, "missing credential", &no_auth, 401)?;
+
+    let client_auth_name = format!("grid-backend-client-auth-{instance}");
+    let client_auth = run_probe_pod(
+        context,
+        &client_auth_name,
+        Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
+        &[
+            "--http-probe",
+            target,
+            "--http-probe-authorization",
+            "Bearer test-token",
+        ],
+    )?;
+    require_http_probe_status(provider, "client-supplied credential", &client_auth, 403)
 }
 
 /// Terminal evidence from one `NetworkPolicy` probe pod.
@@ -1677,14 +1760,12 @@ fn curl_mtls_probe_with_headers(args: &MtlsHeaderProbe<'_>) -> Result<u16, Box<d
     Ok(code)
 }
 
-/// Derive the stable candidate ID rendered for one provider demo site.
+/// Derive the stable candidate ID rendered for one demo provider identity.
 fn provider_candidate_id(provider: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if !PROVIDER_CLUSTERS.contains(&provider) {
-        return Err(format!("no provider candidate ID configured for {provider}").into());
-    }
-    let cluster = format!("sim-{provider}");
+    let site = provider_gateway_site(provider)?;
+    let cluster = provider_routing_cluster(provider)?;
     Ok(fnv1a_hex8(&format!(
-        "{DEMO_CANDIDATE_KIND}/{DEMO_MODEL}/{provider}/{cluster}"
+        "{DEMO_CANDIDATE_KIND}/{DEMO_MODEL}/{site}/{cluster}"
     )))
 }
 
@@ -2113,6 +2194,70 @@ fn validate_candidate_metadata(candidates: &[serde_json::Value]) -> Result<(), B
     Ok(())
 }
 
+/// Prove both edge overlays retain two distinct providers at the east site.
+fn check_same_site_provider_candidates() -> Result<String, Box<dyn std::error::Error>> {
+    let mut evidence = Vec::new();
+    for edge in EDGE_CLUSTERS {
+        let overlay: serde_json::Value = serde_json::from_str(&read_overlay(edge)?)?;
+        let candidates = overlay
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("{edge} overlay missing candidates array"))?;
+        let (primary_id, secondary_id) = validate_same_site_candidates(edge, candidates)?;
+        evidence.push(format!(
+            "{edge}: east-provider clusters=[sim-east-provider,{EAST_SECONDARY_CLUSTER}], stable_ids=[{primary_id},{secondary_id}]"
+        ));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Validate the exact provider identity contract for one edge overlay.
+fn validate_same_site_candidates<'a>(
+    edge: &str,
+    candidates: &'a [serde_json::Value],
+) -> Result<(&'a str, &'a str), Box<dyn std::error::Error>> {
+    let primary = find_overlay_candidate(candidates, "east-provider", "sim-east-provider")?;
+    let secondary = find_overlay_candidate(candidates, "east-provider", EAST_SECONDARY_CLUSTER)?;
+    find_overlay_candidate(candidates, "west-provider", "sim-west-provider")?;
+
+    let primary_id = candidate_stable_id(primary)?;
+    let secondary_id = candidate_stable_id(secondary)?;
+    if primary_id == secondary_id {
+        return Err(format!("{edge} overlay deduplicated the two east provider identities").into());
+    }
+    if primary_id != provider_candidate_id("east-provider")?
+        || secondary_id != provider_candidate_id(EAST_SECONDARY_PROVIDER)?
+    {
+        return Err(format!("{edge} overlay candidate stable IDs do not match their provider identities").into());
+    }
+    Ok((primary_id, secondary_id))
+}
+
+/// Find one exact site/routing-cluster pair in an overlay.
+fn find_overlay_candidate<'a>(
+    candidates: &'a [serde_json::Value],
+    site: &str,
+    cluster: &str,
+) -> Result<&'a serde_json::Value, Box<dyn std::error::Error>> {
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.get("site").and_then(serde_json::Value::as_str) == Some(site)
+                && candidate.get("cluster").and_then(serde_json::Value::as_str) == Some(cluster)
+                && candidate.get("name").and_then(serde_json::Value::as_str) == Some(DEMO_MODEL)
+        })
+        .ok_or_else(|| format!("overlay missing {site}/{cluster}/{DEMO_MODEL} candidate").into())
+}
+
+/// Read the stable identity from a validated overlay candidate.
+fn candidate_stable_id(candidate: &serde_json::Value) -> Result<&str, Box<dyn std::error::Error>> {
+    candidate
+        .get("stable_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "overlay candidate missing stable_id".into())
+}
+
 /// Verify provider gateway self-discovery.
 ///
 /// Proves the operator's self-discovery path works end-to-end:
@@ -2367,7 +2512,7 @@ fn check_edge_overlay_mounts() -> Result<String, Box<dyn std::error::Error>> {
     let mut revisions = Vec::new();
     for edge in EDGE_CLUSTERS {
         let revision = verify_single_edge_overlay(edge)?;
-        evidence.push(format!("{edge}=2 candidates, projected `ConfigMap`"));
+        evidence.push(format!("{edge}=3 candidates, projected `ConfigMap`"));
         revisions.push((edge, revision));
     }
     for (edge, revision) in revisions {
@@ -2380,7 +2525,7 @@ fn check_edge_overlay_mounts() -> Result<String, Box<dyn std::error::Error>> {
 ///
 /// # Errors
 ///
-/// Returns an error when both provider candidates and the overlay projection
+/// Returns an error when all provider candidates and the overlay projection
 /// do not become ready before the provider-state timeout.
 #[expect(
     clippy::disallowed_methods,
@@ -2413,7 +2558,7 @@ fn verify_single_edge_overlay(edge: &str) -> Result<String, Box<dyn std::error::
         .get("candidates")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| format!("{edge} overlay missing candidates"))?;
-    if local_site != edge || candidates.len() < 2 {
+    if local_site != edge || candidates.len() != 3 {
         return Err(format!(
             "{edge} overlay local_site={local_site:?}, candidates={}",
             candidates.len()
@@ -2665,9 +2810,10 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
         .headers
         .get(PROVIDER_GATEWAY_RESPONSE_HEADER)
         .ok_or("inference response missing X-Grid-Demo-Provider-Gateway header")?;
-    if provider_gateway != &provider {
+    let expected_gateway = provider_gateway_site(&provider)?;
+    if provider_gateway != expected_gateway {
         return Err(format!(
-            "backend provider attribution '{provider}' does not match provider gateway '{provider_gateway}'"
+            "backend provider '{provider}' expected gateway '{expected_gateway}', got '{provider_gateway}'"
         )
         .into());
     }
@@ -2712,6 +2858,77 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
         safe_truncate_str(backend_request_id, 16),
         safe_truncate_str(serving_revision, 16)
     ))
+}
+
+/// Prove Grid can select both independent providers hosted at the east site.
+fn check_same_site_provider_routing() -> Result<String, Box<dyn std::error::Error>> {
+    let first_session = format!("same-site-first-{}", unix_nanos());
+    let first_response = curl_edge_request(EDGE_PORT, Some(&first_session))?;
+    let first = validate_same_site_response(&first_response)?;
+
+    let drain = setup_session_drain(PRIMARY_EDGE, &first)?;
+    let proof = (|| {
+        let second_session = format!("same-site-second-{}", unix_nanos());
+        let second_response = curl_edge_request(EDGE_PORT, Some(&second_session))?;
+        let second = validate_same_site_response(&second_response)?;
+        if first == second {
+            return Err(format!("new session remained on drained same-site provider {first}").into());
+        }
+        Ok(second)
+    })();
+    let restore = restore_provider_admission(PRIMARY_EDGE, &first);
+
+    match (proof, restore) {
+        (Ok(second), Ok(restored)) => Ok(format!(
+            "east-provider gateway routed {DEMO_MODEL} to independent providers {first} and {second}; {drain}; {restored}"
+        )),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("same-site routing passed but {first} restoration failed: {error}").into()),
+        (Err(error), Err(restore_error)) => {
+            Err(format!("{error}; {first} restoration also failed: {restore_error}").into())
+        },
+    }
+}
+
+/// Validate one response came from a provider hosted behind the east gateway.
+fn validate_same_site_response(response: &verify::HttpResponse) -> Result<String, Box<dyn std::error::Error>> {
+    if response.status != 200 {
+        return Err(format!("same-site provider request returned HTTP {}", response.status).into());
+    }
+    let provider = extract_provider(response)?;
+    if !matches!(provider.as_str(), "east-provider" | EAST_SECONDARY_PROVIDER) {
+        return Err(format!("same-site provider proof unexpectedly selected {provider}").into());
+    }
+    let gateway = response
+        .headers
+        .get(PROVIDER_GATEWAY_RESPONSE_HEADER)
+        .ok_or("same-site response missing provider gateway attribution")?;
+    if gateway != "east-provider" {
+        return Err(format!("{provider} unexpectedly traversed provider gateway {gateway}").into());
+    }
+    response
+        .headers
+        .get(BACKEND_REQUEST_ID_CAPTURE_HEADER)
+        .filter(|value| !value.is_empty())
+        .ok_or("same-site response missing backend request ID")?;
+    Ok(provider)
+}
+
+/// Return a process-local unique suffix for demo affinity fixtures.
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+/// Return the provider-site gateway responsible for a backend identity.
+fn provider_gateway_site(provider: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
+    match provider {
+        "east-provider" | EAST_SECONDARY_PROVIDER => Ok("east-provider"),
+        "west-provider" => Ok("west-provider"),
+        _ => Err(format!("unknown demo provider identity {provider}").into()),
+    }
 }
 
 /// Retry a request assertion while a projected overlay reaches the data plane.
@@ -2774,19 +2991,19 @@ fn check_session_reuse(port: u16, expected_provider: &str) -> Result<String, Box
 }
 
 /// Drive a provider into `existing_only` through its exported queue metric.
-fn setup_session_drain(edge: &str, provider_site: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn setup_session_drain(edge: &str, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
     let reload_before = count_overlay_reload_logs(edge).unwrap_or(0);
     let result = (|| {
-        set_provider_queue_depth(provider_site, PROVIDER_QUEUE_DRAINING)?;
-        refresh_provider(provider_site)?;
-        let admission = wait_for_candidate_admission(edge, provider_site, "existing_only")?;
+        set_provider_queue_depth(provider, PROVIDER_QUEUE_DRAINING)?;
+        refresh_provider(provider)?;
+        let admission = wait_for_candidate_admission(edge, provider, "existing_only")?;
         let reload = check_hot_reload_observed(edge, reload_before)?;
         Ok(format!(
-            "site={provider_site}, queue_depth={PROVIDER_QUEUE_DRAINING}, {admission}; {reload}"
+            "provider={provider}, queue_depth={PROVIDER_QUEUE_DRAINING}, {admission}; {reload}"
         ))
     })();
     if let Err(error) = result {
-        return match restore_provider_admission_without_reload(edge, provider_site) {
+        return match restore_provider_admission_without_reload(edge, provider) {
             Ok(()) => Err(error),
             Err(restore) => Err(format!("{error}; admission restoration also failed: {restore}").into()),
         };
@@ -3167,7 +3384,8 @@ fn read_overlay(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 /// Return one provider candidate from the operator-rendered edge overlay.
-fn overlay_candidate(edge: &str, site: &str) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+fn overlay_candidate(edge: &str, provider: &str) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let cluster = provider_routing_cluster(provider)?;
     let overlay: serde_json::Value =
         serde_json::from_str(&read_overlay(edge)?).map_err(|e| format!("failed to parse {edge} overlay: {e}"))?;
     let candidates = overlay
@@ -3176,7 +3394,7 @@ fn overlay_candidate(edge: &str, site: &str) -> Result<Option<serde_json::Value>
         .ok_or_else(|| format!("{edge} overlay missing candidates array"))?;
     Ok(candidates
         .iter()
-        .find(|candidate| candidate.get("site").and_then(serde_json::Value::as_str) == Some(site))
+        .find(|candidate| candidate.get("cluster").and_then(serde_json::Value::as_str) == Some(cluster))
         .cloned())
 }
 
@@ -3185,11 +3403,15 @@ fn overlay_candidate(edge: &str, site: &str) -> Result<Option<serde_json::Value>
     clippy::disallowed_methods,
     reason = "synchronous polling in xtask; no async runtime is active"
 )]
-fn wait_for_candidate_admission(edge: &str, site: &str, expected: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn wait_for_candidate_admission(
+    edge: &str,
+    provider: &str,
+    expected: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + PROVIDER_STATE_WAIT;
     let mut observed = None;
     while Instant::now() < deadline {
-        observed = overlay_candidate(edge, site)?.and_then(|candidate| {
+        observed = overlay_candidate(edge, provider)?.and_then(|candidate| {
             candidate
                 .get("admission_state")
                 .and_then(serde_json::Value::as_str)
@@ -3200,7 +3422,7 @@ fn wait_for_candidate_admission(edge: &str, site: &str, expected: &str) -> Resul
         }
         thread::sleep(Duration::from_secs(1));
     }
-    Err(format!("timeout waiting for {site} admission_state={expected} on {edge}; observed={observed:?}").into())
+    Err(format!("timeout waiting for {provider} admission_state={expected} on {edge}; observed={observed:?}").into())
 }
 
 /// Wait until an unavailable provider is absent from the edge overlay.
@@ -3208,54 +3430,82 @@ fn wait_for_candidate_admission(edge: &str, site: &str, expected: &str) -> Resul
     clippy::disallowed_methods,
     reason = "synchronous polling in xtask; no async runtime is active"
 )]
-fn wait_for_candidate_absent(edge: &str, site: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn wait_for_candidate_absent(edge: &str, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + PROVIDER_STATE_WAIT;
     while Instant::now() < deadline {
-        if overlay_candidate(edge, site)?.is_none() {
-            return Ok(format!("site={site} absent from operator-rendered overlay"));
+        if overlay_candidate(edge, provider)?.is_none() {
+            return Ok(format!("provider={provider} absent from operator-rendered overlay"));
         }
         thread::sleep(Duration::from_secs(1));
     }
-    Err(format!("timeout waiting for {site} removal from {edge} overlay").into())
+    Err(format!("timeout waiting for {provider} removal from {edge} overlay").into())
 }
 
-/// Return the `InferenceProvider` resource for one demo provider site.
-fn provider_resource_name(site: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
-    match site {
+/// Return the `InferenceProvider` resource for one demo provider identity.
+fn provider_resource_name(provider: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
+    match provider {
         "east-provider" => Ok("sim-east-provider"),
+        EAST_SECONDARY_PROVIDER => Ok("sim-east-provider-secondary"),
         "west-provider" => Ok("sim-west-provider"),
-        _ => Err(format!("unknown demo provider site {site}").into()),
+        _ => Err(format!("unknown demo provider identity {provider}").into()),
+    }
+}
+
+/// Return the Kubernetes cluster hosting a demo provider.
+fn provider_host_cluster(provider: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
+    provider_gateway_site(provider)
+}
+
+/// Return the overlay routing-cluster identity for a demo provider.
+fn provider_routing_cluster(provider: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
+    match provider {
+        "east-provider" => Ok("sim-east-provider"),
+        EAST_SECONDARY_PROVIDER => Ok(EAST_SECONDARY_CLUSTER),
+        "west-provider" => Ok("sim-west-provider"),
+        _ => Err(format!("unknown demo provider identity {provider}").into()),
+    }
+}
+
+/// Return the backend Deployment for a demo provider.
+fn provider_backend_deployment(provider: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
+    match provider {
+        "east-provider" | "west-provider" => Ok("mock-inference"),
+        EAST_SECONDARY_PROVIDER => Ok("mock-inference-secondary"),
+        _ => Err(format!("unknown demo provider identity {provider}").into()),
     }
 }
 
 /// Set the mock backend's normalized queue metric and wait for its rollout.
-fn set_provider_queue_depth(site: &str, queue_depth: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn set_provider_queue_depth(provider: &str, queue_depth: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cluster = provider_host_cluster(provider)?;
+    let deployment = provider_backend_deployment(provider)?;
     let assignment = format!("MOCK_QUEUE_DEPTH={queue_depth}");
     let output = Command::new("kubectl")
         .args([
             "--context",
-            &kubectl_context(site),
+            &kubectl_context(cluster),
             "-n",
             GRID_SYSTEM_NS,
             "set",
             "env",
-            "deployment/mock-inference",
+            &format!("deployment/{deployment}"),
             &assignment,
         ])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "failed to set {site} queue depth: {}",
+            "failed to set {provider} queue depth: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
         )
         .into());
     }
-    kubectl::wait_for_rollout_ns(&kubectl_context(site), "mock-inference", GRID_SYSTEM_NS, site)
+    kubectl::wait_for_rollout_ns(&kubectl_context(cluster), deployment, GRID_SYSTEM_NS, cluster)
 }
 
 /// Trigger provider health, metrics, `GridNetwork`, and SWIM reconciliation.
-fn refresh_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = provider_resource_name(site)?;
+fn refresh_provider(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resource = provider_resource_name(provider)?;
+    let cluster = provider_host_cluster(provider)?;
     let revision = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3264,19 +3514,19 @@ fn refresh_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
             "--context",
-            &kubectl_context(site),
+            &kubectl_context(cluster),
             "-n",
             GRID_SYSTEM_NS,
             "annotate",
             "inferenceprovider",
-            provider,
+            resource,
             &annotation,
             "--overwrite",
         ])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "failed to refresh {site} provider reconciliation: {}",
+            "failed to refresh {provider} provider reconciliation: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
         )
         .into());
@@ -3285,23 +3535,24 @@ fn refresh_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Remove the verifier's transient reconcile annotation.
-fn clear_provider_refresh(site: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = provider_resource_name(site)?;
+fn clear_provider_refresh(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resource = provider_resource_name(provider)?;
+    let cluster = provider_host_cluster(provider)?;
     let output = Command::new("kubectl")
         .args([
             "--context",
-            &kubectl_context(site),
+            &kubectl_context(cluster),
             "-n",
             GRID_SYSTEM_NS,
             "annotate",
             "inferenceprovider",
-            provider,
+            resource,
             "grid.praxis-proxy.io/demo-refresh-",
         ])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "failed to clear {site} verifier annotation: {}",
+            "failed to clear {provider} verifier annotation: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
         )
         .into());
@@ -3330,8 +3581,8 @@ fn restore_provider_admission_without_reload(edge: &str, site: &str) -> Result<(
 
 /// Provider state captured before a health-driven hot-reload proof.
 struct ProviderWithdrawal {
-    /// Provider site being withdrawn.
-    site: String,
+    /// Provider identity being withdrawn.
+    provider: String,
     /// Desired backend replica count to restore.
     original_replicas: u32,
     /// Edge reload count captured before withdrawal.
@@ -3410,43 +3661,42 @@ fn scale_operator(edge: &str, replicas: u32) -> Result<(), Box<dyn std::error::E
 }
 
 /// Return the declared mock backend replica count.
-fn provider_backend_replicas(site: &str) -> Result<u32, Box<dyn std::error::Error>> {
-    let value = kubectl_jsonpath(
-        &kubectl_context(site),
-        "deployment",
-        "mock-inference",
-        "{.spec.replicas}",
-    )?;
+fn provider_backend_replicas(provider: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let cluster = provider_host_cluster(provider)?;
+    let deployment = provider_backend_deployment(provider)?;
+    let value = kubectl_jsonpath(&kubectl_context(cluster), "deployment", deployment, "{.spec.replicas}")?;
     value
         .parse()
-        .map_err(|e| format!("{site} mock-inference has invalid replica count {value:?}: {e}").into())
+        .map_err(|e| format!("{provider} {deployment} has invalid replica count {value:?}: {e}").into())
 }
 
 /// Scale the provider backend and wait for the desired availability.
-fn scale_provider_backend(site: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn scale_provider_backend(provider: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let cluster = provider_host_cluster(provider)?;
+    let deployment = provider_backend_deployment(provider)?;
     let target = format!("--replicas={replicas}");
     let output = Command::new("kubectl")
         .args([
             "--context",
-            &kubectl_context(site),
+            &kubectl_context(cluster),
             "-n",
             GRID_SYSTEM_NS,
             "scale",
-            "deployment/mock-inference",
+            &format!("deployment/{deployment}"),
             &target,
         ])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "failed to scale {site} mock-inference: {}",
+            "failed to scale {provider} {deployment}: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
         )
         .into());
     }
     if replicas > 0 {
-        return kubectl::wait_for_rollout_ns(&kubectl_context(site), "mock-inference", GRID_SYSTEM_NS, site);
+        return kubectl::wait_for_rollout_ns(&kubectl_context(cluster), deployment, GRID_SYSTEM_NS, cluster);
     }
-    wait_for_backend_scaled_to_zero(site)
+    wait_for_backend_scaled_to_zero(provider)
 }
 
 /// Wait until a scaled-down provider backend has no available replicas.
@@ -3454,14 +3704,16 @@ fn scale_provider_backend(site: &str, replicas: u32) -> Result<(), Box<dyn std::
     clippy::disallowed_methods,
     reason = "synchronous polling in xtask; no async runtime is active"
 )]
-fn wait_for_backend_scaled_to_zero(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_backend_scaled_to_zero(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cluster = provider_host_cluster(provider)?;
+    let deployment = provider_backend_deployment(provider)?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut observed = String::new();
     while Instant::now() < deadline {
         observed = kubectl_jsonpath(
-            &kubectl_context(site),
+            &kubectl_context(cluster),
             "deployment",
-            "mock-inference",
+            deployment,
             "{.status.availableReplicas}",
         )?;
         if observed.is_empty() || observed == "0" {
@@ -3469,7 +3721,7 @@ fn wait_for_backend_scaled_to_zero(site: &str) -> Result<(), Box<dyn std::error:
         }
         thread::sleep(Duration::from_secs(1));
     }
-    Err(format!("timeout scaling {site} mock-inference to zero; availableReplicas={observed:?}").into())
+    Err(format!("timeout scaling {provider} {deployment} to zero; availableReplicas={observed:?}").into())
 }
 
 /// Wait for an `InferenceProvider` phase produced by health reconciliation.
@@ -3477,36 +3729,42 @@ fn wait_for_backend_scaled_to_zero(site: &str) -> Result<(), Box<dyn std::error:
     clippy::disallowed_methods,
     reason = "synchronous polling in xtask; no async runtime is active"
 )]
-fn wait_for_provider_phase(site: &str, expected: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let provider = provider_resource_name(site)?;
+fn wait_for_provider_phase(provider: &str, expected: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let resource = provider_resource_name(provider)?;
+    let cluster = provider_host_cluster(provider)?;
     let deadline = Instant::now() + PROVIDER_STATE_WAIT;
     let mut observed = String::new();
     while Instant::now() < deadline {
-        observed = kubectl_jsonpath(&kubectl_context(site), "inferenceprovider", provider, "{.status.phase}")?;
+        observed = kubectl_jsonpath(
+            &kubectl_context(cluster),
+            "inferenceprovider",
+            resource,
+            "{.status.phase}",
+        )?;
         if observed == expected {
-            return Ok(format!("{provider} phase={expected}"));
+            return Ok(format!("{resource} phase={expected}"));
         }
         thread::sleep(Duration::from_secs(1));
     }
-    Err(format!("timeout waiting for {provider} phase={expected}; observed={observed:?}").into())
+    Err(format!("timeout waiting for {resource} phase={expected}; observed={observed:?}").into())
 }
 
 /// Withdraw a provider by making its declared backend unavailable.
-fn withdraw_provider(edge: &str, site: &str) -> Result<(String, ProviderWithdrawal), Box<dyn std::error::Error>> {
-    let original_replicas = provider_backend_replicas(site)?;
+fn withdraw_provider(edge: &str, provider: &str) -> Result<(String, ProviderWithdrawal), Box<dyn std::error::Error>> {
+    let original_replicas = provider_backend_replicas(provider)?;
     if original_replicas == 0 {
-        return Err(format!("{site} mock-inference already has zero replicas").into());
+        return Err(format!("{provider} backend already has zero replicas").into());
     }
     let state = ProviderWithdrawal {
-        site: site.to_owned(),
+        provider: provider.to_owned(),
         original_replicas,
         reload_count_before: count_overlay_reload_logs(edge)?,
     };
     let result = (|| {
-        scale_provider_backend(site, 0)?;
-        refresh_provider(site)?;
-        let phase = wait_for_provider_phase(site, "Unavailable")?;
-        let overlay = wait_for_candidate_absent(edge, site)?;
+        scale_provider_backend(provider, 0)?;
+        refresh_provider(provider)?;
+        let phase = wait_for_provider_phase(provider, "Unavailable")?;
+        let overlay = wait_for_candidate_absent(edge, provider)?;
         Ok(format!("{phase}; {overlay}"))
     })();
     match result {
@@ -3521,12 +3779,12 @@ fn withdraw_provider(edge: &str, site: &str) -> Result<(String, ProviderWithdraw
 /// Restore a health-withdrawn provider and its operator-generated overlay entry.
 fn restore_withdrawn_provider(edge: &str, state: &ProviderWithdrawal) -> Result<String, Box<dyn std::error::Error>> {
     let reload_before = count_overlay_reload_logs(edge)?;
-    scale_provider_backend(&state.site, state.original_replicas)?;
-    refresh_provider(&state.site)?;
-    let phase = wait_for_provider_phase(&state.site, "Available")?;
-    let admission = wait_for_candidate_admission(edge, &state.site, "new_and_existing")?;
+    scale_provider_backend(&state.provider, state.original_replicas)?;
+    refresh_provider(&state.provider)?;
+    let phase = wait_for_provider_phase(&state.provider, "Available")?;
+    let admission = wait_for_candidate_admission(edge, &state.provider, "new_and_existing")?;
     let reload = check_hot_reload_observed(edge, reload_before)?;
-    clear_provider_refresh(&state.site)?;
+    clear_provider_refresh(&state.provider)?;
     Ok(format!("{phase}; {admission}; {reload}"))
 }
 
@@ -3996,6 +4254,8 @@ clusters:
                 .unwrap_or_else(|_| std::process::abort());
         assert!(deployment.contains("mountPath: /etc/praxis/credentials/mock-inference"));
         assert!(deployment.contains("secretName: mock-inference-credential"));
+        assert!(deployment.contains("mountPath: /etc/praxis/credentials/mock-inference-secondary"));
+        assert!(deployment.contains("secretName: mock-inference-secondary-credential"));
         assert!(!deployment.contains(CLIENT_BEARER_TOKEN));
     }
 
@@ -4044,13 +4304,17 @@ clusters:
 
     #[test]
     fn provider_candidate_ids_cover_every_provider_cluster() {
-        for provider in PROVIDER_CLUSTERS {
+        for provider in ["east-provider", EAST_SECONDARY_PROVIDER, "west-provider"] {
             let id = provider_candidate_id(provider).unwrap_or_else(|_| std::process::abort());
             assert_eq!(id.len(), 8);
             assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
         }
         assert_ne!(
             provider_candidate_id("east-provider").unwrap_or_default(),
+            provider_candidate_id(EAST_SECONDARY_PROVIDER).unwrap_or_default()
+        );
+        assert_ne!(
+            provider_candidate_id(EAST_SECONDARY_PROVIDER).unwrap_or_default(),
             provider_candidate_id("west-provider").unwrap_or_default()
         );
         assert!(provider_candidate_id("unknown-provider").is_err());
@@ -4067,6 +4331,84 @@ clusters:
                 "{provider} must use the rendered candidate identity token"
             );
         }
+        let east =
+            fs::read_to_string(configs.join("east-provider/praxis.yaml")).unwrap_or_else(|_| std::process::abort());
+        assert!(east.contains(SECONDARY_PROVIDER_CANDIDATE_ID_TOKEN));
+        assert!(east.contains("cluster: mock-backend-secondary"));
+        assert!(east.contains("name: mock-inference-secondary-credential"));
+    }
+
+    #[test]
+    fn east_site_declares_two_independent_provider_candidates() {
+        let resources = workspace_root().join("demos/grid-glb-demo/resources");
+        let secondary = fs::read_to_string(resources.join("inference-east-provider-secondary.yaml"))
+            .unwrap_or_else(|_| std::process::abort());
+        let workload = fs::read_to_string(resources.join("provider-workload-east-secondary.yaml"))
+            .unwrap_or_else(|_| std::process::abort());
+        for expected in [
+            "name: sim-east-provider-secondary",
+            "routingClusterRef: sim-east-provider-secondary",
+            "grid.praxis-proxy.io/provider-site: east-provider",
+            "name: sim-model-v1",
+        ] {
+            assert!(secondary.contains(expected), "secondary provider missing {expected}");
+        }
+        assert!(workload.contains("name: mock-inference-secondary"));
+        assert!(workload.contains("value: \"east-provider-secondary\""));
+        assert!(workload.contains("name: mock-inference-secondary-credential"));
+
+        for edge in ["east", "west"] {
+            let network = fs::read_to_string(resources.join(format!("gridnetwork-{edge}-edge.yaml")))
+                .unwrap_or_else(|_| std::process::abort());
+            assert!(network.contains("cluster: sim-east-provider-secondary"));
+            assert!(network.contains("sni: east-provider.grid.internal"));
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "three-candidate overlay construction and differential assertion"
+    )]
+    fn overlay_keeps_same_site_providers_as_distinct_candidates() {
+        let candidate = |site: &str, cluster: &str, stable_id: String| {
+            serde_json::json!({
+                "kind": DEMO_CANDIDATE_KIND,
+                "name": DEMO_MODEL,
+                "site": site,
+                "cluster": cluster,
+                "stable_id": stable_id,
+            })
+        };
+        let candidates = vec![
+            candidate(
+                "east-provider",
+                "sim-east-provider",
+                provider_candidate_id("east-provider").unwrap_or_default(),
+            ),
+            candidate(
+                "east-provider",
+                EAST_SECONDARY_CLUSTER,
+                provider_candidate_id(EAST_SECONDARY_PROVIDER).unwrap_or_default(),
+            ),
+            candidate(
+                "west-provider",
+                "sim-west-provider",
+                provider_candidate_id("west-provider").unwrap_or_default(),
+            ),
+        ];
+        let result = validate_same_site_candidates("east-edge", &candidates);
+        assert!(
+            result.is_ok(),
+            "same-site provider identities must remain distinct: {result:?}"
+        );
+
+        let mut deduplicated = candidates;
+        deduplicated.remove(1);
+        assert!(
+            validate_same_site_candidates("east-edge", &deduplicated).is_err(),
+            "missing secondary provider must fail overlay validation"
+        );
     }
 
     #[test]

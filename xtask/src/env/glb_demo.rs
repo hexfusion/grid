@@ -260,6 +260,7 @@ fn prepare_setup(forge_config: &Path) -> Result<SetupContext, Box<dyn std::error
 }
 
 /// Deploy the environment using prepared setup inputs.
+#[expect(clippy::too_many_lines, reason = "sequential nine-phase environment deployment")]
 fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("{OUTPUT_RULE}");
@@ -276,7 +277,10 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
     apply_foundation_stacks(&context.forge_bin, &context.resolved_config)?;
     setup_phase(5, "Installing provider trust, credentials, and policy");
     glb::install_provider_boundary()?;
-    setup_phase(6, "Deploying provider gateways and private inference backends");
+    setup_phase(
+        6,
+        "Deploying two provider gateways and three private inference providers",
+    );
     apply_provider_stacks(&context.forge_bin, &context.resolved_config)?;
     setup_phase(7, "Configuring edge trust and deploying Praxis edge gateways");
     apply_edge_stacks(&context.forge_bin, &context.resolved_config)?;
@@ -460,7 +464,8 @@ fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrato
     capabilities.push(CapabilityResult {
         capability: "Active/active routing".to_owned(),
         result: "pass",
-        evidence: "2 edges observed; independent Grid provider selection and failover verified".to_owned(),
+        evidence: "2 edges observed; 3 provider candidates include 2 independently routed providers in one cluster"
+            .to_owned(),
     });
     capabilities.push(CapabilityResult {
         capability: "Observable overlay contract".to_owned(),
@@ -574,7 +579,7 @@ fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrato
         narrator.narrate("[SKIP] Demos 3-5 run only in full mode.");
     }
 
-    print_boundaries(narrator);
+    print_boundaries(narrator, mode);
 
     DemoOutcome {
         capabilities,
@@ -626,7 +631,10 @@ fn print_paths(narrator: &mut Narrator, paths: &ObservedPaths) {
     }
 
     for (edge, provider) in paths.keys() {
-        narrator.narrate(&format!("         client -> {edge} -> {provider} gateway -> backend"));
+        narrator.narrate(&format!(
+            "         client -> {edge} -> {} gateway -> {provider} backend",
+            provider_gateway_for_backend(provider)
+        ));
     }
 
     print_crossed_path(narrator, paths);
@@ -634,11 +642,12 @@ fn print_paths(narrator: &mut Narrator, paths: &ObservedPaths) {
 
 /// Print the crossed edge/provider path when one is observed.
 fn print_crossed_path(narrator: &mut Narrator, paths: &ObservedPaths) {
-    let crossed = paths
-        .iter()
-        .find(|((edge, provider), _)| edge.strip_suffix("-edge") != provider.strip_suffix("-provider"));
+    let crossed = paths.iter().find(|((edge, provider), _)| {
+        edge.strip_suffix("-edge") != provider_gateway_for_backend(provider).strip_suffix("-provider")
+    });
 
     if let Some(((edge, provider), fixture)) = crossed {
+        let provider_gateway = provider_gateway_for_backend(provider);
         narrator.narrate("");
         narrator.narrate(&format!(
             "CROSSED ROUTE PROOF (fixtures: {} / {})",
@@ -646,11 +655,20 @@ fn print_crossed_path(narrator: &mut Narrator, paths: &ObservedPaths) {
         ));
         narrator.narrate(&format!("  client -> {edge} public edge -> {edge} Grid overlay"));
         narrator.narrate(&format!(
-            "         -> {provider} private provider gateway -> {provider} backend"
+            "         -> {provider_gateway} private provider gateway -> {provider} backend"
         ));
         narrator.narrate(&format!(
-            "         -> {provider} provider gateway -> {edge} edge -> client"
+            "         -> {provider_gateway} provider gateway -> {edge} edge -> client"
         ));
+    }
+}
+
+/// Map a backend provider identity to its provider-site gateway.
+fn provider_gateway_for_backend(provider: &str) -> &str {
+    if provider == "east-provider-secondary" {
+        "east-provider"
+    } else {
+        provider
     }
 }
 
@@ -660,7 +678,7 @@ fn print_provider_boundary_proof(narrator: &mut Narrator) {
     narrator.wrapped(
         "[PASS] ",
         "       ",
-        "Both providers required mTLS, accepted both pinned edge identities, rejected missing or invalid TLS identities, and enforced exact candidate/model/path policy.",
+        "Both provider gateways required mTLS, accepted both pinned edge identities, rejected missing or invalid TLS identities, and enforced exact candidate/model/path policy for three provider candidates.",
     );
 }
 
@@ -670,24 +688,38 @@ fn print_credential_boundary_proof(narrator: &mut Narrator) {
     narrator.wrapped(
         "[PASS] ",
         "       ",
-        "Both private backends denied unlabeled network access, returned HTTP 401 without credentials and HTTP 403 for the client-supplied fixture, then returned HTTP 200 through provider-local credential replacement.",
+        "All three private provider paths are isolated by NetworkPolicy and provider-local credentials; the two east providers use distinct backends and credentials behind one site gateway.",
     );
 }
 
-/// Print explicit scope boundaries after all runtime proofs.
-fn print_boundaries(narrator: &mut Narrator) {
+/// Print explicit, mode-specific scope boundaries after all runtime proofs.
+#[expect(clippy::too_many_lines, reason = "mode-branched narration block")]
+fn print_boundaries(narrator: &mut Narrator, mode: DemoMode) {
     narrator.banner("DEMONSTRATED BOUNDARY");
     narrator.narrate("");
     narrator.wrapped(
         "[PROVEN] ",
         "         ",
-        "Two Praxis edges, one verified HTTPS name, health withdrawal/recovery, and edge stickiness.",
+        "Two Praxis edges served one verified HTTPS name, and Grid routed across three provider candidates.",
     );
     narrator.wrapped(
         "[PROVEN] ",
         "         ",
-        "Versioned per-edge overlays with exact rendered/distributed/accepted/serving revision evidence, metrics-driven provider drain, health-driven withdrawal, hot reload, provider mTLS, and peer authorization.",
+        "Versioned per-edge overlays with three candidates, including two independently routed providers in one cluster, plus exact rendered/distributed/accepted/serving revision evidence.",
     );
+    if mode == DemoMode::Full {
+        narrator.wrapped(
+            "[PROVEN] ",
+            "         ",
+            "Edge and provider session affinity, metrics-driven provider drain, health-driven edge withdrawal and recovery, operator restart recovery, sustained request soak, hot reload, provider mTLS, and peer authorization.",
+        );
+    } else {
+        narrator.wrapped(
+            "[PROVEN] ",
+            "         ",
+            "Metrics-driven same-site provider drain, hot reload, provider mTLS, and peer authorization.",
+        );
+    }
     narrator.wrapped(
         "[PROVEN] ",
         "         ",
@@ -733,7 +765,10 @@ fn build_observed_paths(paths: &ObservedPaths) -> Vec<ObservedPathEntry> {
         .map(|((edge, provider), _)| ObservedPathEntry {
             edge: edge.clone(),
             provider: provider.clone(),
-            path: format!("client -> {edge} -> {provider} gateway -> backend"),
+            path: format!(
+                "client -> {edge} -> {} gateway -> {provider} backend",
+                provider_gateway_for_backend(provider)
+            ),
         })
         .collect()
 }
@@ -1585,6 +1620,24 @@ mod setup_tests {
             assert!(narrator.lines.first().unwrap().starts_with("[PASS] "));
             assert!(narrator.lines.iter().skip(1).all(|line| line.starts_with("       ")));
             assert!(narrator.lines.iter().all(|line| line.chars().count() <= OUTPUT_WIDTH));
+        }
+
+        #[test]
+        fn demonstrated_boundary_matches_mode() {
+            let mut quick = Narrator::new();
+            print_boundaries(&mut quick, DemoMode::Quick);
+            let quick_text = quick.lines.join("\n");
+            assert!(quick_text.contains("same-site provider drain"));
+            assert!(!quick_text.contains("edge withdrawal"));
+            assert!(!quick_text.contains("restart recovery"));
+            assert!(!quick_text.contains("request soak"));
+
+            let mut full = Narrator::new();
+            print_boundaries(&mut full, DemoMode::Full);
+            let full_text = full.lines.join("\n");
+            assert!(full_text.contains("edge withdrawal"));
+            assert!(full_text.contains("restart recovery"));
+            assert!(full_text.contains("request soak"));
         }
 
         #[test]

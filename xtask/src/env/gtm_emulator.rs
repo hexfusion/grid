@@ -438,10 +438,18 @@ fn parse_provider_attribution(headers: &str) -> Result<(String, String, String),
         .filter(|value| matches!(*value, "east-provider" | "west-provider"))
         .ok_or("response missing valid provider-gateway attribution")?;
     let provider = parse_header(headers, "x-grid-demo-provider")
-        .filter(|value| matches!(*value, "east-provider" | "west-provider"))
+        .filter(|value| matches!(*value, "east-provider" | "east-provider-secondary" | "west-provider"))
         .ok_or("response missing valid backend-provider attribution")?;
-    if provider_gateway != provider {
-        return Err(format!("provider attribution mismatch: gateway={provider_gateway}, backend={provider}").into());
+    let expected_gateway = match provider {
+        "east-provider" | "east-provider-secondary" => "east-provider",
+        "west-provider" => "west-provider",
+        _ => return Err(format!("unknown backend provider attribution {provider}").into()),
+    };
+    if provider_gateway != expected_gateway {
+        return Err(format!(
+            "provider attribution mismatch: gateway={provider_gateway}, backend={provider}, expected gateway={expected_gateway}"
+        )
+        .into());
     }
     let backend_request_id = parse_header(headers, "x-grid-demo-backend-request-id")
         .filter(|value| !value.is_empty() && value.len() <= 128)
@@ -495,6 +503,20 @@ mod tests {
                 backend_request_id: "backend-123".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn parse_response_accepts_second_provider_behind_east_gateway() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "X-Grid-Demo-Edge-Gateway: west-edge\r\n",
+            "X-Grid-Demo-Provider-Gateway: east-provider\r\n",
+            "X-Grid-Demo-Provider: east-provider-secondary\r\n",
+            "X-Grid-Demo-Backend-Request-Id: backend-secondary\r\n\r\n{}"
+        );
+        let sample = parse_response(response).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(sample.provider_gateway, "east-provider");
+        assert_eq!(sample.provider, "east-provider-secondary");
     }
 
     #[test]

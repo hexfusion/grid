@@ -1,22 +1,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mock-inference
+  name: mock-inference-secondary
   namespace: grid-system
   labels:
     app.kubernetes.io/name: mock-inference
+    app.kubernetes.io/instance: secondary
     app.kubernetes.io/part-of: grid-glb-demo
 spec:
   replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: mock-inference
-      app.kubernetes.io/instance: primary
+      app.kubernetes.io/instance: secondary
   template:
     metadata:
       labels:
         app.kubernetes.io/name: mock-inference
-        app.kubernetes.io/instance: primary
+        app.kubernetes.io/instance: secondary
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -32,13 +33,13 @@ spec:
           args: ["--provider", "openai", "--port", "8080"]
           env:
             - name: MOCK_PROVIDER_SITE
-              value: "{{ cluster.name }}"
+              value: "east-provider-secondary"
             - name: MOCK_QUEUE_DEPTH
               value: "0.10"
             - name: MOCK_EXPECTED_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: mock-inference-credential
+                  name: mock-inference-secondary-credential
                   key: token
           ports:
             - name: http
@@ -67,16 +68,17 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mock-inference
+  name: mock-inference-secondary
   namespace: grid-system
   labels:
     app.kubernetes.io/name: mock-inference
+    app.kubernetes.io/instance: secondary
     app.kubernetes.io/part-of: grid-glb-demo
 spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: mock-inference
-    app.kubernetes.io/instance: primary
+    app.kubernetes.io/instance: secondary
   ports:
     - name: http
       port: 8080

@@ -41,6 +41,18 @@ filter_chains:
                 name: mock-inference-credential
                 namespace: grid-system
                 key: token
+          - candidate_id: __GRID_SECONDARY_CANDIDATE_ID__
+            model: sim-model-v1
+            paths:
+              - /v1/chat/completions
+              - /v1/responses
+            cluster: mock-backend-secondary
+            credential:
+              strategy: bearer_token
+              secretRef:
+                name: mock-inference-secondary-credential
+                namespace: grid-system
+                key: token
       - filter: grid_credential_inject
         credentials:
           - strategy: bearer_token
@@ -48,11 +60,19 @@ filter_chains:
             namespace: grid-system
             key: token
             file: /etc/praxis/credentials/mock-inference/token
+          - strategy: bearer_token
+            name: mock-inference-secondary-credential
+            namespace: grid-system
+            key: token
+            file: /etc/praxis/credentials/mock-inference-secondary/token
       - filter: load_balancer
         clusters:
           - name: mock-backend
             endpoints:
               - "mock-inference.grid-system.svc.cluster.local:8080"
+          - name: mock-backend-secondary
+            endpoints:
+              - "mock-inference-secondary.grid-system.svc.cluster.local:8080"
 
 admin:
   address: "127.0.0.1:9901"

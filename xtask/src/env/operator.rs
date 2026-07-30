@@ -5395,13 +5395,14 @@ pub(crate) fn wait_for_auto_gridsite(
                 "gridsites",
                 site_name,
                 "-o",
-                "jsonpath={.spec.gridNetworkRef}",
+                "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
                 "--ignore-not-found",
             ])
             .output()
             .unwrap_or_else(|_| std::process::abort());
-        let network = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if network == expected_network {
+        let raw = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let (network, address) = raw.split_once('/').unwrap_or((&raw, ""));
+        if network == expected_network && !address.is_empty() {
             eprintln!(
                 "  [OK] GridSite {site_name:?} auto-created by operator \
                  (gridNetworkRef={expected_network:?})"
@@ -5411,7 +5412,7 @@ pub(crate) fn wait_for_auto_gridsite(
         if Instant::now() >= deadline {
             return Err(format!(
                 "timeout waiting for auto-discovered GridSite {site_name:?} \
-                 in network {expected_network:?}; last observed network: {network:?}"
+                 in network {expected_network:?}; last observed: network={network:?}, address={address:?}"
             )
             .into());
         }

@@ -261,6 +261,15 @@ spec:
           path: resources/site-east-provider.yaml
         - type: manifest
           path: resources/inference-east-provider.yaml
+        - type: manifest
+          path: resources/inference-east-provider-secondary.yaml
+        - type: template-manifest
+          path: resources/provider-workload-east-secondary.yaml
+        - type: wait
+          resource: deployment/mock-inference-secondary
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
         - type: template-manifest
           path: resources/gridnetwork-east-provider.yaml
 
