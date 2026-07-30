@@ -8,6 +8,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable release tag to publish
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,15 +39,19 @@ jobs:
     permissions:
       contents: read
     outputs:
+      tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
-      short-sha: ${{ steps.version.outputs.short_sha }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
       - name: Validate tag and workspace version
         id: version
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Release tag must use the form vMAJOR.MINOR.PATCH"
@@ -60,8 +70,13 @@ jobs:
             echo "::error::Tag version (${TAG_VERSION}) does not match Cargo.toml (${CARGO_VERSION})"
             exit 1
           fi
-          echo "version=${TAG_VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "short_sha=${GITHUB_SHA::7}" >> "${GITHUB_OUTPUT}"
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          {
+            echo "tag=${TAG}"
+            echo "version=${TAG_VERSION}"
+            echo "source_sha=${SOURCE_SHA}"
+            echo "short_sha=${SOURCE_SHA::7}"
+          } >> "${GITHUB_OUTPUT}"
 
   # ----------------------------------------------------------------------------
   # Re-run release gates from the tagged source
@@ -74,6 +89,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
 
       - name: Install nightly rustfmt
         run: rustup toolchain install "$NIGHTLY_RUSTFMT" --profile minimal --component rustfmt
@@ -125,10 +142,12 @@ jobs:
       contents: read
       packages: write
     outputs:
-      operator-digest: ${{ steps.operator.outputs.digest }}
-      mock-providers-digest: ${{ steps.mock-providers.outputs.digest }}
+      operator_digest: ${{ steps.operator.outputs.digest }}
+      mock_providers_digest: ${{ steps.mock_providers.outputs.digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -151,11 +170,11 @@ jobs:
           file: deploy/operator/Containerfile
           push: true
           tags: |
-            ${{ env.OPERATOR_IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.OPERATOR_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short-sha }}
+            ${{ env.OPERATOR_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
+            ${{ env.OPERATOR_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
           cache-from: type=gha,scope=release-operator
           cache-to: type=gha,mode=max,scope=release-operator
@@ -163,18 +182,18 @@ jobs:
           sbom: true
 
       - name: Build and push mock providers
-        id: mock-providers
+        id: mock_providers
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: mock-providers/Containerfile
           push: true
           tags: |
-            ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short-sha }}
+            ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
+            ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
           cache-from: type=gha,scope=release-mock-providers
           cache-to: type=gha,mode=max,scope=release-mock-providers
@@ -192,11 +211,14 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
 
       - name: Write image manifest
         env:
-          OPERATOR_DIGEST: ${{ needs.container.outputs.operator-digest }}
-          MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock-providers-digest }}
+          OPERATOR_DIGEST: ${{ needs.container.outputs.operator_digest }}
+          MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
         run: |
           cat > release-images.md <<EOF
           ## Container Images
@@ -207,7 +229,7 @@ jobs:
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
           \`\`\`
 
-          The Grid images were built from \`${GITHUB_SHA}\`. The Praxis AI
+          The Grid images were built from \`${SOURCE_SHA}\`. The Praxis AI
           rollup was built from
           \`praxis-proxy/ai@5c60068aefbb2fec9d0c0c7a601a3f2b8e2299f6\`.
           Every reference above is immutable.
@@ -216,7 +238,7 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: >-
           gh release create "$TAG"
           --verify-tag
