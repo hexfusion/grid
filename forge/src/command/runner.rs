@@ -132,16 +132,25 @@ fn run_with_stdin(
     spec: &CommandSpec,
 ) -> Result<std::process::Output, ForgeError> {
     let mut child = cmd.spawn().map_err(|e| command_error(spec, &e))?;
-    pipe_stdin(&mut child, data, spec)?;
-    child.wait_with_output().map_err(|e| command_error(spec, &e))
+    let write_result = pipe_stdin(&mut child, data);
+    let output = child.wait_with_output().map_err(|e| command_error(spec, &e))?;
+
+    match write_result {
+        Ok(()) => Ok(output),
+        // A child can reject the command and close stdin before the parent
+        // finishes writing. Preserve its exit status and captured stderr so
+        // the caller reports the primary failure instead of a secondary EPIPE.
+        Err(_error) if !output.status.success() => Ok(output),
+        Err(error) => Err(command_error(spec, &error)),
+    }
 }
 
 /// Write data to a child process's stdin and close the handle.
-fn pipe_stdin(child: &mut std::process::Child, data: &[u8], spec: &CommandSpec) -> Result<(), ForgeError> {
+fn pipe_stdin(child: &mut std::process::Child, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(data).map_err(|e| command_error(spec, &e))?;
+        stdin.write_all(data)?;
     }
     Ok(())
 }
@@ -397,5 +406,38 @@ mod tests {
         assert_eq!(runner.call_count(), 1, "should have one call before clear");
         runner.clear_calls();
         assert_eq!(runner.call_count(), 0, "should have zero calls after clear");
+    }
+
+    #[test]
+    fn system_runner_preserves_child_error_when_stdin_closes_early() {
+        let spec = CommandSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "printf 'primary failure' >&2; exit 23".into()],
+            env: BTreeMap::new(),
+            stdin: Some(vec![b'x'; 1024 * 1024]),
+            redact: Vec::new(),
+        };
+
+        let output = SystemRunner.run(&spec).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(output.status, 23);
+        assert_eq!(output.stderr, "primary failure");
+    }
+
+    #[test]
+    fn system_runner_writes_stdin_to_successful_child() {
+        let spec = CommandSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "cat".into()],
+            env: BTreeMap::new(),
+            stdin: Some(b"manifest".to_vec()),
+            redact: Vec::new(),
+        };
+
+        let output = SystemRunner.run(&spec).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, "manifest");
+        assert!(output.stderr.is_empty());
     }
 }

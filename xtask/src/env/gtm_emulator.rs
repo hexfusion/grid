@@ -127,11 +127,13 @@ pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Erro
     });
 
     eprintln!();
-    eprintln!("## Two-Edge Praxis GTM Emulator Proof");
-    eprintln!();
+    eprintln!("GTM EDGE WITHDRAWAL AND RECOVERY PROOF");
+    eprintln!("-------------------------------------------------------------------------------");
     eprintln!(
-        "User story: As a reliability operator, I need one verified HTTPS name to use both active Praxis edges, preserve healthy affinity, withdraw a failed edge, and admit it after recovery."
+        "One verified HTTPS name must use both active Praxis edges, preserve healthy\n\
+         affinity, withdraw a failed edge, and admit it after recovery."
     );
+    eprintln!();
     print_validate_all_table(&results);
 
     if results.iter().any(|result| result.status != StepStatus::Pass) {
@@ -243,6 +245,7 @@ fn check_withdrawal_and_recovery(sessions: &BTreeMap<String, String>) -> Result<
         .get(stopped_edge)
         .ok_or("no session key mapped to the east edge")?;
 
+    eprintln!("[WITHDRAWAL 1/3] Stopping east-edge and waiting for its session to move to west-edge.");
     scale_edge(stopped_edge, 0)?;
     let mut restore = DeploymentRestore {
         cluster: stopped_edge,
@@ -250,9 +253,11 @@ fn check_withdrawal_and_recovery(sessions: &BTreeMap<String, String>) -> Result<
     };
 
     wait_for_edge(session, "west-edge", Duration::from_secs(30))?;
+    eprintln!("[WITHDRAWAL 2/3] West-edge is serving the session; restoring east-edge.");
     scale_edge(stopped_edge, 1)?;
     wait_for_deployment(stopped_edge, "edge-gateway", Duration::from_secs(60))?;
     restore.disarm();
+    eprintln!("[WITHDRAWAL 3/3] East-edge is ready; waiting for its original session path to recover.");
     wait_for_edge(session, stopped_edge, Duration::from_secs(30))?;
 
     Ok("east withdrawal routed to west; east recovered under the same URL and session key".to_owned())

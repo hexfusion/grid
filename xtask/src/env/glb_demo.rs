@@ -29,6 +29,9 @@ const FULL_SOAK_DURATION: Duration = Duration::from_secs(300);
 /// Delay between full-mode soak requests.
 const FULL_SOAK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Successful requests between full-mode soak progress updates.
+const FULL_SOAK_PROGRESS_SAMPLES: usize = 12;
+
 /// Resolved config emitted next to the source config to preserve relative paths.
 const RESOLVED_CONFIG_NAME: &str = ".forge.resolved.yaml";
 
@@ -50,6 +53,15 @@ const PROVIDER_CLUSTERS: &[&str] = &["east-provider", "west-provider"];
 /// Evidence JSON schema version.
 const EVIDENCE_SCHEMA_VERSION: &str = "1";
 
+/// Stable terminal separator that also remains readable in captured logs.
+const OUTPUT_RULE: &str = "===============================================================================";
+
+/// Preferred width for human-readable narration.
+const OUTPUT_WIDTH: usize = OUTPUT_RULE.len();
+
+/// Number of environment setup phases shown to the user.
+const SETUP_PHASES: usize = 9;
+
 // ---------------------------------------------------------------------------
 // Narrator
 // ---------------------------------------------------------------------------
@@ -70,6 +82,33 @@ impl Narrator {
     pub(crate) fn narrate(&mut self, line: &str) {
         eprintln!("{line}");
         self.lines.push(line.to_owned());
+    }
+
+    /// Emit a prominent top-level section.
+    fn banner(&mut self, title: &str) {
+        self.narrate("");
+        self.narrate(OUTPUT_RULE);
+        self.narrate(title);
+        self.narrate(OUTPUT_RULE);
+    }
+
+    /// Emit prose with stable indentation and bounded line length.
+    fn wrapped(&mut self, first_prefix: &str, continuation_prefix: &str, text: &str) {
+        let mut line = first_prefix.to_owned();
+        for word in text.split_whitespace() {
+            let separator = usize::from(line.chars().count() > first_prefix.chars().count());
+            if line.chars().count() + separator + word.chars().count() > OUTPUT_WIDTH
+                && line.chars().count() > first_prefix.chars().count()
+            {
+                self.narrate(&line);
+                continuation_prefix.clone_into(&mut line);
+            }
+            if line.chars().count() > continuation_prefix.chars().count() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        self.narrate(&line);
     }
 
     /// Write captured narration to a file.
@@ -222,32 +261,49 @@ fn prepare_setup(forge_config: &Path) -> Result<SetupContext, Box<dyn std::error
 
 /// Deploy the environment using prepared setup inputs.
 fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("{OUTPUT_RULE}");
+    eprintln!("ENVIRONMENT SETUP");
+    eprintln!("{OUTPUT_RULE}");
+    setup_phase(1, "Staging demo certificates and provider identities");
     glb::stage_provider_boundary()?;
-    eprintln!(
-        "glb-demo: creating five Kind clusters and their shared Docker network; \
-         Forge reports again when cluster creation completes..."
-    );
+    setup_phase(2, "Creating five Kind clusters on one shared cross-cluster network");
+    eprintln!("            Forge will report again after cluster creation completes.");
     run_forge(&context.forge_bin, &context.resolved_config, &["up"])?;
-    eprintln!("glb-demo: Kind clusters created; resolving runtime images...");
+    setup_phase(3, "Resolving and loading runtime images");
     load_local_images_if_required(&context.forge_bin, &context.resolved_config)?;
-    eprintln!("glb-demo: installing MetalLB, SWIM services, and Grid operators...");
+    setup_phase(4, "Installing MetalLB, SWIM services, and Grid operators");
     apply_foundation_stacks(&context.forge_bin, &context.resolved_config)?;
-    eprintln!("glb-demo: installing the provider trust and credential boundary...");
+    setup_phase(5, "Installing provider trust, credentials, and policy");
     glb::install_provider_boundary()?;
-    eprintln!("glb-demo: deploying provider sites, gateways, and mock inference backends...");
+    setup_phase(6, "Deploying provider gateways and private inference backends");
     apply_provider_stacks(&context.forge_bin, &context.resolved_config)?;
-    eprintln!("glb-demo: deploying edge sites and Praxis edge gateways...");
+    setup_phase(7, "Configuring edge trust and deploying Praxis edge gateways");
     apply_edge_stacks(&context.forge_bin, &context.resolved_config)?;
-    eprintln!("glb-demo: deploying the GTM emulator in front of both edges...");
+    setup_phase(8, "Deploying the GTM emulator in front of both edges");
     apply_gtm_emulator_stack(&context.forge_bin, &context.resolved_config)?;
-    eprintln!("glb-demo: waiting for both edge-local routing overlays to converge...");
+    setup_phase(9, "Waiting for both edge-local routing overlays to converge");
+    explain_overlay_convergence();
     let overlay_evidence = glb::wait_for_edge_overlays_ready()?;
 
+    eprintln!();
     eprintln!(
-        "glb-demo: environment is ready using {}; {overlay_evidence}",
+        "[READY] Environment deployed from {}\n        {overlay_evidence}",
         context.resolved_config.display()
     );
     Ok(())
+}
+
+/// Print one numbered setup phase.
+fn setup_phase(number: usize, description: &str) {
+    eprintln!();
+    eprintln!("[SETUP {number}/{SETUP_PHASES}] {description}");
+}
+
+/// Explain the control-plane milestone represented by overlay convergence.
+fn explain_overlay_convergence() {
+    eprintln!("            Each edge must receive one complete, versioned provider view.");
+    eprintln!("            This proves distribution; Praxis acceptance is verified next.");
 }
 
 /// Set up the environment and run every narrated proof.
@@ -289,18 +345,18 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
         let should_keep = options.keep_on_failure && outcome.error.is_some() && setup_ctx.is_ok();
         if should_keep {
             lifecycle.kept_on_failure = true;
-            narrator.narrate("glb-demo: retaining clusters for debugging (--keep-on-failure)");
+            narrator.narrate("[CLEANUP] Clusters retained for debugging (--keep-on-failure).");
         } else if let Ok(context) = &setup_ctx {
             lifecycle.teardown_performed = true;
             match teardown_clusters(&context.forge_bin, &context.resolved_config) {
                 Ok(()) => {
                     lifecycle.teardown_result = Some("success".to_owned());
-                    narrator.narrate("glb-demo: teardown complete");
+                    narrator.narrate("[CLEANUP] Teardown complete.");
                 },
                 Err(error) => {
                     let message = concise_error(error);
                     lifecycle.teardown_result = Some(format!("error: {message}"));
-                    narrator.narrate(&format!("glb-demo: teardown error: {message}"));
+                    narrator.narrate(&format!("[CLEANUP] FAIL: {message}"));
                     append_error(&mut outcome.error, format!("teardown failed: {message}"));
                 },
             }
@@ -379,7 +435,7 @@ pub(crate) fn demonstrate_with_options(
 fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrator) -> DemoOutcome {
     let mut capabilities = Vec::new();
 
-    print_introduction(narrator);
+    print_introduction(narrator, mode);
 
     // Scenario 1: Active/active routing.
     print_scenario(
@@ -515,7 +571,7 @@ fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrato
             evidence: "quick mode".to_owned(),
         });
         narrator.narrate("");
-        narrator.narrate("Scenarios 3-5 skipped in quick mode.");
+        narrator.narrate("[SKIP] Demos 3-5 run only in full mode.");
     }
 
     print_boundaries(narrator);
@@ -532,44 +588,45 @@ fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrato
 // ---------------------------------------------------------------------------
 
 /// Print the architecture and proof policy before executing scenarios.
-fn print_introduction(narrator: &mut Narrator) {
-    narrator.narrate("# Grid GLB Demo");
+fn print_introduction(narrator: &mut Narrator, mode: DemoMode) {
+    narrator.banner("PRAXIS GRID GLOBAL INGRESS DEMO");
     narrator.narrate("");
-    narrator.narrate("Every PASS below comes from a runtime assertion. Manifest intent is not counted as proof.");
+    narrator.narrate(&format!("Mode: {}", mode_label(mode).to_uppercase()));
+    narrator.wrapped(
+        "Proof policy: ",
+        "              ",
+        "Every PASS comes from a runtime assertion; manifest intent is not counted as proof.",
+    );
     narrator.narrate("");
-    narrator.narrate("Illustrative request path (not derived from a live response):");
+    narrator.narrate("EXPECTED PATH");
+    narrator.narrate("  client -> stable Praxis HTTPS -> selected Praxis edge");
+    narrator.narrate("         -> Grid-selected provider gateway -> private backend");
     narrator.narrate("");
-    narrator.narrate("```text");
-    narrator.narrate("client -> stable Praxis HTTPS -> selected Praxis edge");
-    narrator.narrate("       -> Grid-selected Praxis provider gateway -> private backend");
-    narrator.narrate("```");
+    narrator.narrate("Live edge/provider paths appear under OBSERVED ROUTES after Demo 1");
+    narrator.narrate("runtime validation completes.");
 }
 
 /// Print one scenario and its user story.
 fn print_scenario(narrator: &mut Narrator, number: usize, title: &str, user_story: &str) {
+    narrator.banner(&format!("DEMO {number} | {}", title.to_uppercase()));
     narrator.narrate("");
-    narrator.narrate(&format!("## Scenario {number}: {title}"));
-    narrator.narrate("");
-    narrator.narrate(&format!("User story: {user_story}"));
+    narrator.narrate("USER STORY");
+    narrator.wrapped("  ", "  ", user_story);
 }
 
 /// Print the path matrix observed from live responses.
 fn print_paths(narrator: &mut Narrator, paths: &ObservedPaths) {
     narrator.narrate("");
-    narrator.narrate("| GTM-selected edge | Grid-selected provider | Edge fixture | Provider fixture |");
-    narrator.narrate("|---|---|---|---|");
+    narrator.narrate("OBSERVED ROUTES");
     for ((edge, provider), fixture) in paths {
         narrator.narrate(&format!(
-            "| `{edge}` | `{provider}` | `{}` | `{}` |",
+            "  [PASS] {edge} -> {provider}  (fixtures: {} / {})",
             fixture.edge_session, fixture.provider_session
         ));
     }
 
     for (edge, provider) in paths.keys() {
-        narrator.narrate("");
-        narrator.narrate(&format!(
-            "Observed path: client -> {edge} -> {provider} gateway -> backend"
-        ));
+        narrator.narrate(&format!("         client -> {edge} -> {provider} gateway -> backend"));
     }
 
     print_crossed_path(narrator, paths);
@@ -584,52 +641,62 @@ fn print_crossed_path(narrator: &mut Narrator, paths: &ObservedPaths) {
     if let Some(((edge, provider), fixture)) = crossed {
         narrator.narrate("");
         narrator.narrate(&format!(
-            "Observed crossed path (`{}` / `{}`):",
+            "CROSSED ROUTE PROOF (fixtures: {} / {})",
             fixture.edge_session, fixture.provider_session
         ));
-        narrator.narrate("");
-        narrator.narrate("```text");
-        narrator.narrate(&format!("client -> {edge} public edge -> {edge} Grid overlay"));
+        narrator.narrate(&format!("  client -> {edge} public edge -> {edge} Grid overlay"));
         narrator.narrate(&format!(
-            "       -> {provider} private provider gateway -> {provider} backend"
+            "         -> {provider} private provider gateway -> {provider} backend"
         ));
         narrator.narrate(&format!(
-            "       -> {provider} provider gateway -> {edge} edge -> client"
+            "         -> {provider} provider gateway -> {edge} edge -> client"
         ));
-        narrator.narrate("```");
     }
 }
 
 /// Summarize the provider assertions completed by the preceding strict proof.
 fn print_provider_boundary_proof(narrator: &mut Narrator) {
     narrator.narrate("");
-    narrator.narrate(
-        "PASS: both providers required mTLS, accepted both pinned edge identities, rejected missing or invalid TLS identities, and enforced exact candidate/model/path policy."
+    narrator.wrapped(
+        "[PASS] ",
+        "       ",
+        "Both providers required mTLS, accepted both pinned edge identities, rejected missing or invalid TLS identities, and enforced exact candidate/model/path policy.",
     );
 }
 
 /// Summarize final-hop credential and private-backend runtime evidence.
 fn print_credential_boundary_proof(narrator: &mut Narrator) {
     narrator.narrate("");
-    narrator.narrate(
-        "PASS: both private backends denied unlabeled network access, returned HTTP 401 without credentials and HTTP 403 for the client-supplied fixture, then returned HTTP 200 through provider-local credential replacement."
+    narrator.wrapped(
+        "[PASS] ",
+        "       ",
+        "Both private backends denied unlabeled network access, returned HTTP 401 without credentials and HTTP 403 for the client-supplied fixture, then returned HTTP 200 through provider-local credential replacement.",
     );
 }
 
 /// Print explicit scope boundaries after all runtime proofs.
 fn print_boundaries(narrator: &mut Narrator) {
+    narrator.banner("DEMONSTRATED BOUNDARY");
     narrator.narrate("");
-    narrator.narrate("## Demonstrated Boundary");
-    narrator.narrate("");
-    narrator
-        .narrate("- Proven: two Praxis edges, one verified HTTPS name, health withdrawal/recovery, edge stickiness.");
-    narrator.narrate(
-        "- Proven: versioned per-edge overlays with exact rendered/distributed/accepted/serving revision evidence, metrics-driven provider drain, health-driven withdrawal, hot reload, provider mTLS and peer authorization."
+    narrator.wrapped(
+        "[PROVEN] ",
+        "         ",
+        "Two Praxis edges, one verified HTTPS name, health withdrawal/recovery, and edge stickiness.",
     );
-    narrator
-        .narrate("- Proven: provider-local credential replacement and NetworkPolicy-enforced private backend access.");
-    narrator.narrate(
-        "- Not claimed: managed DNS/Anycast, internet DDoS/WAF, geo-latency GTM steering, shared affinity storage, or in-flight stream migration."
+    narrator.wrapped(
+        "[PROVEN] ",
+        "         ",
+        "Versioned per-edge overlays with exact rendered/distributed/accepted/serving revision evidence, metrics-driven provider drain, health-driven withdrawal, hot reload, provider mTLS, and peer authorization.",
+    );
+    narrator.wrapped(
+        "[PROVEN] ",
+        "         ",
+        "Provider-local credential replacement and NetworkPolicy-enforced private backend access.",
+    );
+    narrator.wrapped(
+        "[OUT OF SCOPE] ",
+        "               ",
+        "Managed DNS/Anycast, internet DDoS/WAF, geo-latency GTM steering, shared affinity storage, or in-flight stream migration.",
     );
 }
 
@@ -689,10 +756,14 @@ fn prove_affinity(narrator: &mut Narrator, paths: &ObservedPaths) -> Result<(), 
     }
 
     narrator.narrate("");
-    narrator.narrate(&format!(
-        "PASS: edge fixture `{}` and provider fixture `{}` remained on edge `{expected_edge}` and provider `{expected_provider}` for {AFFINITY_REPEATS} repeated requests.",
-        fixture.edge_session, fixture.provider_session
-    ));
+    narrator.wrapped(
+        "[PASS] ",
+        "       ",
+        &format!(
+            "Edge fixture {} and provider fixture {} remained on edge {expected_edge} and provider {expected_provider} for {AFFINITY_REPEATS} repeated requests.",
+            fixture.edge_session, fixture.provider_session
+        ),
+    );
     Ok(())
 }
 
@@ -711,7 +782,7 @@ fn prove_restart_recovery_and_soak(
     let evidence = format!(
         "4 Grid operators restarted; {samples} soak requests passed across {edge_count} edges and {provider_count} provider(s)"
     );
-    narrator.narrate(&format!("PASS: {evidence}."));
+    narrator.narrate(&format!("[PASS] {evidence}."));
     Ok(evidence)
 }
 
@@ -720,7 +791,18 @@ fn prove_operator_restarts(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    narrator.narrate("");
+    narrator.wrapped(
+        "[RESTART] ",
+        "          ",
+        "Restarting each Grid operator one at a time. After every restart, both edge overlays must converge and one inference request must succeed.",
+    );
     for (index, cluster) in GRID_CLUSTERS.iter().enumerate() {
+        narrator.narrate(&format!(
+            "[RESTART {}/{}] {cluster}: waiting for operator rollout and routing recovery.",
+            index + 1,
+            GRID_CLUSTERS.len()
+        ));
         restart_grid_operator(cluster)?;
         let overlay_evidence = glb::wait_for_edge_overlays_ready()?;
         let fixture = fixtures
@@ -728,7 +810,7 @@ fn prove_operator_restarts(
             .ok_or("no affinity fixture available after Grid restart")?;
         let sample = gtm_emulator::request_path_with_affinity(&fixture.edge_session, &fixture.provider_session)?;
         narrator.narrate(&format!(
-            "PASS: restarted `{cluster}` Grid operator; routing recovered via `{}` -> `{}` ({overlay_evidence}).",
+            "[PASS] Restarted {cluster} Grid operator; routing recovered via {} -> {} ({overlay_evidence}).",
             sample.edge, sample.provider
         ));
     }
@@ -740,11 +822,7 @@ fn run_request_soak(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
 ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
-    narrator.narrate("");
-    narrator.narrate(&format!(
-        "Starting {}-second request soak through the stable HTTPS endpoint.",
-        FULL_SOAK_DURATION.as_secs()
-    ));
+    narrate_soak_start(narrator);
     let deadline = Instant::now() + FULL_SOAK_DURATION;
     let mut samples = 0_usize;
     let mut edges = BTreeSet::new();
@@ -757,6 +835,7 @@ fn run_request_soak(
         edges.insert(sample.edge);
         providers.insert(sample.provider);
         samples += 1;
+        narrate_soak_progress(narrator, samples, edges.len(), providers.len());
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
@@ -767,6 +846,29 @@ fn run_request_soak(
         return Err(format!("request soak reached {} of 2 Praxis edges", edges.len()).into());
     }
     Ok((samples, edges.len(), providers.len()))
+}
+
+/// Explain the full-mode soak contract before the bounded wait begins.
+fn narrate_soak_start(narrator: &mut Narrator) {
+    narrator.narrate("");
+    narrator.narrate(&format!(
+        "[SOAK] Sending requests through the stable HTTPS endpoint for {} seconds.",
+        FULL_SOAK_DURATION.as_secs()
+    ));
+    narrator.wrapped(
+        "       ",
+        "       ",
+        "Every request must succeed. Both edges must remain observable, and progress is reported after each 12 successful requests.",
+    );
+}
+
+/// Report bounded soak progress without logging every request.
+fn narrate_soak_progress(narrator: &mut Narrator, samples: usize, edge_count: usize, provider_count: usize) {
+    if samples.is_multiple_of(FULL_SOAK_PROGRESS_SAMPLES) {
+        narrator.narrate(&format!(
+            "[SOAK] {samples} requests passed; observed {edge_count} of 2 edges and {provider_count} provider(s)."
+        ));
+    }
 }
 
 /// Restart one Grid operator and wait for its replacement pod.
@@ -841,24 +943,16 @@ fn append_error(error: &mut Option<String>, additional: String) {
 
 /// Print a concise summary table after all scenarios.
 fn print_final_summary(narrator: &mut Narrator, report: &EvidenceReport, evidence_dir: &Path) {
-    narrator.narrate("");
-    narrator.narrate("## GLB Demo Summary");
-    narrator.narrate("");
-    narrator.narrate("| Capability | Result | Evidence |");
-    narrator.narrate("|---|---|---|");
+    narrator.banner("FINAL RESULT");
     for cap in &report.capabilities {
-        narrator.narrate(&format!(
-            "| {} | {} | {} |",
-            cap.capability,
-            cap.result.to_uppercase(),
-            cap.evidence
-        ));
+        narrator.narrate(&format!("[{:<7}] {}", cap.result.to_uppercase(), cap.capability));
+        narrator.wrapped("          ", "          ", &cap.evidence);
     }
     narrator.narrate("");
-    narrator.narrate(&format!("Mode: {}", report.mode));
-    narrator.narrate(&format!("Overall: {}", report.status.to_uppercase()));
-    narrator.narrate(&format!("Elapsed: {:.1}s", report.duration_secs));
-    narrator.narrate(&format!("Evidence: {}", evidence_dir.display()));
+    narrator.narrate(&format!("OVERALL   {}", report.status.to_uppercase()));
+    narrator.narrate(&format!("MODE      {}", report.mode.to_uppercase()));
+    narrator.narrate(&format!("ELAPSED   {:.1}s", report.duration_secs));
+    narrator.narrate(&format!("EVIDENCE  {}", evidence_dir.display()));
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +979,7 @@ fn write_evidence(
     let json = serde_json::to_string_pretty(report)?;
     fs::write(results_path, json)?;
     eprintln!(
-        "glb-demo: evidence written to {}",
+        "[EVIDENCE] Human narration and results.json written to {}",
         narration_path.parent().unwrap_or_else(|| Path::new(".")).display()
     );
     Ok(())
@@ -897,7 +991,8 @@ fn write_evidence(
 
 /// Delete all GLB demo clusters through Forge.
 fn teardown_clusters(forge: &str, config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("glb-demo: tearing down clusters...");
+    eprintln!();
+    eprintln!("[CLEANUP] Tearing down demo clusters...");
     run_forge(forge, config, &["down", "--force"])
 }
 
@@ -1071,10 +1166,12 @@ fn apply_provider_stacks(forge: &str, config: &Path) -> Result<(), Box<dyn std::
 fn apply_edge_stacks(forge: &str, config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for (cluster, site_stack) in [("east-edge", "east-edge-site"), ("west-edge", "west-edge-site")] {
         run_forge(forge, config, &["stack", "apply", cluster, site_stack])?;
+        eprintln!("  [OK] {cluster}: local edge site configured");
     }
     authorize_provider_sites_for_edges()?;
     for cluster in ["east-edge", "west-edge"] {
         run_forge(forge, config, &["stack", "apply", cluster, "edge-gateway"])?;
+        eprintln!("  [OK] {cluster}: Praxis edge gateway deployed");
     }
     Ok(())
 }
@@ -1091,6 +1188,8 @@ fn authorize_provider_sites_for_edges() -> Result<(), Box<dyn std::error::Error>
 
     for edge in ["east-edge", "west-edge"] {
         let context = format!("kind-grid-glb-{edge}");
+        eprintln!();
+        eprintln!("  {edge} trust view: authorizing providers discovered through Grid");
         for provider in PROVIDER_CLUSTERS {
             let site_name = format!("glb-demo-{provider}");
             operator::wait_for_auto_gridsite(&context, &site_name, "glb-demo", TRUST_TIMEOUT)?;
@@ -1475,6 +1574,29 @@ mod setup_tests {
             assert_eq!(narrator.lines.len(), 2);
             assert_eq!(narrator.lines[0], "line one");
             assert_eq!(narrator.lines[1], "line two");
+        }
+
+        #[test]
+        fn narrator_wraps_prose_with_stable_indentation() {
+            let mut narrator = Narrator::new();
+            narrator.wrapped("[PASS] ", "       ", &"word ".repeat(30));
+
+            assert!(narrator.lines.len() > 1);
+            assert!(narrator.lines.first().unwrap().starts_with("[PASS] "));
+            assert!(narrator.lines.iter().skip(1).all(|line| line.starts_with("       ")));
+            assert!(narrator.lines.iter().all(|line| line.chars().count() <= OUTPUT_WIDTH));
+        }
+
+        #[test]
+        fn soak_progress_is_bounded_to_sample_intervals() {
+            let mut narrator = Narrator::new();
+
+            narrate_soak_progress(&mut narrator, FULL_SOAK_PROGRESS_SAMPLES - 1, 2, 2);
+            assert!(narrator.lines.is_empty());
+
+            narrate_soak_progress(&mut narrator, FULL_SOAK_PROGRESS_SAMPLES, 2, 2);
+            assert_eq!(narrator.lines.len(), 1);
+            assert!(narrator.lines[0].contains("12 requests passed"));
         }
 
         #[test]

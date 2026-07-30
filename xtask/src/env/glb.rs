@@ -544,18 +544,22 @@ pub(crate) fn verify_grid_routing_with_mode(
     forge_config: &Path,
     mode: DemoMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("grid-routing: checking prerequisites...");
+    eprintln!();
+    eprintln!("DETAILED RUNTIME PROOF");
+    eprintln!("-------------------------------------------------------------------------------");
+    eprintln!("  [CHECK] Prerequisites");
     let ctx = check_prerequisites(forge_config)?;
 
     let mut results: Vec<StepResult> = Vec::new();
     run_steps(&ctx, mode, &mut results);
 
     eprintln!();
-    eprintln!("## Grid Routing And Provider-Boundary Proof");
-    eprintln!();
+    eprintln!("RUNTIME PROOF RESULTS");
+    eprintln!("-------------------------------------------------------------------------------");
     eprintln!(
-        "User story: As a Grid and provider operator, I need discovered provider changes to update live edge routing while authenticated provider gateways protect private backends."
+        "Grid must update live edge routing from discovered provider state while authenticated provider gateways protect private backends."
     );
+    eprintln!();
     print_validate_all_table(&results);
 
     let any_not_pass = results.iter().any(|r| r.status != StepStatus::Pass);
@@ -568,7 +572,7 @@ pub(crate) fn verify_grid_routing_with_mode(
         )
         .into())
     } else {
-        eprintln!("grid-routing: all proof points PASS");
+        eprintln!("[PASS] All routing and provider-boundary proof points passed.");
         Ok(())
     }
 }
@@ -1161,7 +1165,7 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>)
 
 /// Print a step progress banner.
 fn proof_banner(description: &str) {
-    eprintln!("grid-routing: {description}...");
+    eprintln!("  [CHECK] {description}");
 }
 
 /// Record a step result, returning whether it passed.
@@ -2360,9 +2364,14 @@ fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
 /// Require both edge overlays to exist and be projected at `/etc/grid`.
 fn check_edge_overlay_mounts() -> Result<String, Box<dyn std::error::Error>> {
     let mut evidence = Vec::new();
+    let mut revisions = Vec::new();
     for edge in EDGE_CLUSTERS {
-        verify_single_edge_overlay(edge)?;
+        let revision = verify_single_edge_overlay(edge)?;
         evidence.push(format!("{edge}=2 candidates, projected `ConfigMap`"));
+        revisions.push((edge, revision));
+    }
+    for (edge, revision) in revisions {
+        eprintln!("  distributed → {edge}: revision={}", safe_truncate_str(&revision, 16));
     }
     Ok(evidence.join(", "))
 }
@@ -2391,7 +2400,7 @@ pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::erro
 }
 
 /// Validate one edge cluster's overlay content and volume projection.
-fn verify_single_edge_overlay(edge: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_single_edge_overlay(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context(edge);
 
     let overlay = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-config\.json}")?;
@@ -2413,7 +2422,6 @@ fn verify_single_edge_overlay(edge: &str) -> Result<(), Box<dyn std::error::Erro
     }
 
     let revision = overlay_revision(edge)?;
-    eprintln!("  distributed → {edge}: revision={}", safe_truncate_str(&revision, 16));
 
     let mounted = kubectl_jsonpath(
         &context,
@@ -2424,7 +2432,7 @@ fn verify_single_edge_overlay(edge: &str) -> Result<(), Box<dyn std::error::Erro
     if mounted != OVERLAY_CONFIGMAP {
         return Err(format!("{edge} edge-gateway mounts overlay `ConfigMap` {mounted:?}").into());
     }
-    Ok(())
+    Ok(revision)
 }
 
 /// Read the semantic revision from one edge's distributed envelope.
