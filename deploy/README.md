@@ -77,21 +77,20 @@ kubectl create rolebinding grid-operator-resources \
 
 ## Image Configuration
 
-The checked-in operator `Deployment` currently references the reserved project
-image path:
+The checked-in operator `Deployment` references the published project image,
+pinned to an immutable digest:
 
-- `ghcr.io/praxis-proxy/grid-operator:latest`
+- `ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d`
 
-This is an unpublished placeholder until release images exist. Do not treat
-`latest` as the supported production installation contract. For production,
-patch the Deployment to a release tag or SHA tag once published.
+Release notes provide the immutable digest for each released version. Do not
+use `latest` as an installation contract.
 
 The local Kind validation path continues to use:
 
 - `grid-operator:latest`
 
 For Kind validation, the xtask harness builds and loads the image automatically.
-For production, use a versioned release tag or SHA tag when available.
+For production, use a versioned release tag or immutable digest.
 
 ## Praxis AI Gateway Deployment
 
@@ -116,7 +115,6 @@ See `deploy/examples/` and `config/samples/` for complete deployment examples.
 
 ## Remaining Blockers
 
-- **Operator image publishing**: `ghcr.io/praxis-proxy/grid-operator` is reserved but not yet published
 - **Praxis AI gateway packaging**: separate from Grid; requires upstream PRs to land
 - **Helm/OLM**: deferred unless demand materializes; current Kustomize/YAML paths are sufficient
 - **Forge dev environment**: multi-cluster orchestration is a separate future track (see [issue #2](https://github.com/praxis-proxy/grid/issues/2))

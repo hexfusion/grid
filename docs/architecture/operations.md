@@ -95,10 +95,8 @@ The intended project-owned operator image path is:
 ghcr.io/praxis-proxy/grid-operator
 ```
 
-The repository CI builds this image for validation. Registry publication
-requires package ownership and repository permissions for
-`ghcr.io/praxis-proxy`; until those are configured, deployments must supply an
-operator image through their environment configuration.
+Repository CI publishes source-SHA images, and the release workflow publishes
+versioned images with SBOM and provenance attestations.
 
 **Tag policy:**
 
@@ -107,10 +105,10 @@ operator image through their environment configuration.
 | `sha-<7-char-commit>` | Immutable | Used once publishing is enabled |
 | `v<version>` | Immutable release tag | Used once releases are cut |
 
-Once published, deployments should pin an immutable SHA tag:
+Deployments should pin an immutable digest:
 
 ```yaml
-image: ghcr.io/praxis-proxy/grid-operator:sha-4a4c064
+image: ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d
 ```
 
 **Override:** replace the `image:` field in
@@ -123,15 +121,12 @@ kubectl set image deployment/grid-operator \
   operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>
 ```
 
-**Registry namespace:** the image path is reserved under
-`ghcr.io/praxis-proxy/`.
+**Registry namespace:** the image is published under `ghcr.io/praxis-proxy/`.
 
 **CI publishing setup:** the
-`.github/workflows/operator-image.yaml` workflow builds
-the image without publishing it. Enable the GHCR login
-and push steps only when repository or organization
-package settings authorize the workflow to create and
-update `ghcr.io/praxis-proxy/grid-operator`.
+`.github/workflows/operator-image.yaml` publishes source-SHA images from
+`main`. `.github/workflows/release.yaml` publishes version and source-SHA tags
+after the tagged source passes release gates.
 
 **Security:** the operator image contains only the
 statically linked operator binary.  No secrets, tokens,

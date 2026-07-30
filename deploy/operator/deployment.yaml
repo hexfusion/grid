@@ -23,11 +23,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          # Project-owned image path (not yet published)
-          # For production, use an immutable SHA tag:
-          #   ghcr.io/praxis-proxy/grid-operator:sha-<commit>
+          # Project-owned image pinned to an immutable digest.
           # For Kind validation, xtask loads grid-operator:latest locally
-          image: ghcr.io/praxis-proxy/grid-operator:latest
+          image: ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsNonRoot: true
