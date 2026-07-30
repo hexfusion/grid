@@ -30,6 +30,9 @@ COPY xtask xtask
 RUN cargo build --release --package mock-providers
 
 FROM alpine:3.22
+LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
+    org.opencontainers.image.description="Mock inference providers for Grid executable demos" \
+    org.opencontainers.image.licenses="MIT"
 RUN adduser -D -u 1000 app
 COPY --from=builder /build/target/release/mock-providers /usr/local/bin/
 USER app

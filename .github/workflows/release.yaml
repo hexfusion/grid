@@ -1,0 +1,225 @@
+name: Release
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY_RUSTFMT: nightly-2026-03-28
+  AI_ROLLUP_IMAGE: >-
+    ghcr.io/praxis-proxy/grid-ai-rollup@sha256:1a6448789f5b0711d60c37dc68b89633b760fa6b438413a544f8e769bd32accc
+  OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
+  MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Validate release identity
+  # ----------------------------------------------------------------------------
+
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short-sha: ${{ steps.version.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Validate tag and workspace version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must use the form vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION="$(
+            perl -ne 'print $1 and exit if /^version\s*=\s*"(.+)"/' \
+              Cargo.toml
+          )"
+          if [ -z "${CARGO_VERSION}" ]; then
+            echo "::error::Unable to read workspace version from Cargo.toml"
+            exit 1
+          fi
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Tag version (${TAG_VERSION}) does not match Cargo.toml (${CARGO_VERSION})"
+            exit 1
+          fi
+          echo "version=${TAG_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${GITHUB_SHA::7}" >> "${GITHUB_OUTPUT}"
+
+  # ----------------------------------------------------------------------------
+  # Re-run release gates from the tagged source
+  # ----------------------------------------------------------------------------
+
+  test:
+    needs: [validate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install nightly rustfmt
+        run: rustup toolchain install "$NIGHTLY_RUSTFMT" --profile minimal --component rustfmt
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7c4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-1.96.0-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.96.0-release-
+          save-always: true
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test
+
+      - name: Documentation
+        run: make doc
+
+      - name: Validate GLB demo configuration
+        run: >-
+          cargo run -p forge --
+          --config demos/grid-glb-demo/forge.yaml
+          config validate
+
+  # ----------------------------------------------------------------------------
+  # Publish immutable Grid images
+  # ----------------------------------------------------------------------------
+
+  container:
+    needs: [validate, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      operator-digest: ${{ steps.operator.outputs.digest }}
+      mock-providers-digest: ${{ steps.mock-providers.outputs.digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Verify Praxis AI rollup
+        run: docker buildx imagetools inspect "${AI_ROLLUP_IMAGE}"
+
+      - name: Build and push operator
+        id: operator
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/operator/Containerfile
+          push: true
+          tags: |
+            ${{ env.OPERATOR_IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.OPERATOR_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short-sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          cache-from: type=gha,scope=release-operator
+          cache-to: type=gha,mode=max,scope=release-operator
+          provenance: mode=max
+          sbom: true
+
+      - name: Build and push mock providers
+        id: mock-providers
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: mock-providers/Containerfile
+          push: true
+          tags: |
+            ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short-sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          cache-from: type=gha,scope=release-mock-providers
+          cache-to: type=gha,mode=max,scope=release-mock-providers
+          provenance: mode=max
+          sbom: true
+
+  # ----------------------------------------------------------------------------
+  # Publish release notes with immutable image references
+  # ----------------------------------------------------------------------------
+
+  github-release:
+    needs: [validate, container]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Write image manifest
+        env:
+          OPERATOR_DIGEST: ${{ needs.container.outputs.operator-digest }}
+          MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock-providers-digest }}
+        run: |
+          cat > release-images.md <<EOF
+          ## Container Images
+
+          \`\`\`text
+          ${AI_ROLLUP_IMAGE}
+          ${OPERATOR_IMAGE_NAME}@${OPERATOR_DIGEST}
+          ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
+          \`\`\`
+
+          The Grid images were built from \`${GITHUB_SHA}\`. The Praxis AI
+          rollup was built from
+          \`praxis-proxy/ai@5c60068aefbb2fec9d0c0c7a601a3f2b8e2299f6\`.
+          Every reference above is immutable.
+          EOF
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$TAG"
+          --verify-tag
+          --title "Grid $TAG"
+          --generate-notes
+          --notes-file release-images.md
