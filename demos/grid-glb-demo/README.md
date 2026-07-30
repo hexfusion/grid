@@ -981,6 +981,12 @@ Clone Grid, select published immutable image references, and run the quick
 setup plus narration:
 
 ```bash
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+    sh -s -- -y
+  . "$HOME/.cargo/env"
+fi
+
 git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
