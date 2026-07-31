@@ -79,7 +79,7 @@ it is in place.
 **`xtask` commands that generate Kubernetes or Praxis
 config** should include unit tests asserting the shape
 of the generated config — for example, that
-`grid_route.local_site` is set correctly, that
+`intelligent_route.local_site` is set correctly, that
 `load_balancer` cluster names match the expected
 convention, or that required filters are present.  Full
 kind cluster runs complement these tests but are not a

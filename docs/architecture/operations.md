@@ -83,7 +83,7 @@ Praxis AI gateways, inference runtimes, load-balancer integrations, and DNS
 remain deployment-platform responsibilities.
 
 Praxis AI gateway deployment is separate and requires:
-1. Praxis AI image with required filters (`grid_route`, `grid_credential_inject`)
+1. Praxis AI image with required filters (`intelligent_route`, `credential_inject`)
 2. Consumer gateway configuration referencing Grid-generated ConfigMaps
 3. Provider gateway deployment with Grid-compatible endpoints
 
@@ -198,7 +198,7 @@ overlays, status fields, or logs.
 
 | `ConfigMap` | Naming | Data key | Namespace |
 |---|---|---|---|
-| Routing overlay | `grid-overlay-{network}-{gateway}` | `grid-config.json` | `GatewayRef.namespace` |
+| Routing overlay | `grid-overlay-{network}-{gateway}` | `routing-overlay.json`, `routing-config.json` | `GatewayRef.namespace` |
 | Consumer config | `consumerConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
 
 ### What is not granted
@@ -626,14 +626,17 @@ The `GridNetwork` controller renders routing overlay
 `GridNetwork`, it server-side applies a `ConfigMap`
 named `grid-overlay-{network}-{gateway}` containing:
 
-- **`grid-config.json`**: JSON-serialised
-  `RoutingOverlay` with one `RoutingCandidate` per
+- **`routing-overlay.json`**: the versioned, content-addressed envelope consumed
+  by Praxis AI. It includes scope, provenance, revision, digest, and the routing
+  payload.
+- **`routing-config.json`**: JSON-serialised
+  legacy `RoutingOverlay` payload with one `RoutingCandidate` per
   model per `InferenceProvider` in the network.  When
   `spec.auth.secretRef` is set, candidates carry only
   the credential reference, never token bytes.
 
 The overlay shape is compatible with the Praxis
-`grid_route` filter:
+`intelligent_route` filter:
 
 ```json
 {
@@ -679,9 +682,9 @@ injection transparently.
 For API-provider routes, the request-time path is:
 
 ```text
-grid_route
-  -> writes grid.route.credential.* metadata from the selected candidate
-grid_credential_inject
+intelligent_route
+  -> writes intelligent_route.credential.* metadata from the selected candidate
+credential_inject
   -> reads the matching token from a mounted Secret file
   -> injects Authorization: Bearer <token>
 load_balancer
@@ -701,7 +704,7 @@ configuration; it does not copy Secret values between
 clusters.
 
 The native path requires a Praxis AI image that includes the
-`grid_credential_inject` filter.  Grid can render the
+`credential_inject` filter.  Grid can render the
 file-backed filter config today, but runtime deployments must
 use an AI image with that filter merged and published.
 
@@ -1047,13 +1050,13 @@ Available commands:
 | `cargo xtask env load-gateway-images` | Loads locally-built images into kind cluster nodes |
 | `cargo xtask env deploy-provider-gateways` | Applies generated Praxis AI gateway resources to provider clusters |
 | `cargo xtask env verify-provider-gateways` | Runs end-to-end probes through the provider gateway request path |
-| `cargo xtask env deploy-consumer-gateway` | Deploys a consumer Praxis AI gateway with a generated static `grid_route` config |
-| `cargo xtask env deploy-consumer-gateway --overlay-config <path>` | Deploys the consumer gateway using a `grid-config.json` routing overlay file |
+| `cargo xtask env deploy-consumer-gateway` | Deploys a consumer Praxis AI gateway with a generated static `intelligent_route` config |
+| `cargo xtask env deploy-consumer-gateway --overlay-config <path>` | Deploys the consumer gateway using a `routing-config.json` routing overlay file |
 | `cargo xtask env verify-gateway-e2e` | Verifies consumer-to-provider routing end-to-end |
 | `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
-| `cargo xtask env verify-api-fallback-native` | Verifies native `grid_route` → `grid_credential_inject` credential injection with token bytes absent from overlay and consumer ConfigMap |
+| `cargo xtask env verify-api-fallback-native` | Verifies native `intelligent_route` → `credential_inject` credential injection with token bytes absent from overlay and consumer ConfigMap |
 | `cargo xtask env verify-stale-gc-ttl` | Verifies `GridNetwork.spec.staleCandidateTtlSeconds` evicts stale remote candidates from the rendered overlay |
-| `cargo xtask env verify-responses-routing` | Verifies `/v1/responses` request parsing and Grid overlay routing using `openai_responses_format` → `grid_route` filter chain |
+| `cargo xtask env verify-responses-routing` | Verifies `/v1/responses` request parsing and Grid overlay routing using `openai_responses_format` → `intelligent_route` filter chain |
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
 | `cargo xtask env verify-operator-install-rbac` | Applies install manifests, runs positive/negative RBAC checks, proves minimal reconcile succeeds |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
@@ -1246,7 +1249,7 @@ convenience layer, not a production orchestrator.
 ### Routing overlay file input
 
 `deploy-consumer-gateway --overlay-config <path>`
-accepts a `grid-config.json` routing overlay file. This
+accepts a `routing-config.json` routing overlay file. This
 allows local validation of the overlay wire format and
 consumer gateway config generation without running a
 full production operator reconcile loop. The overlay
@@ -1268,7 +1271,7 @@ file format is:
 }
 ```
 
-When an overlay is supplied, `grid_route.local_site`
+When an overlay is supplied, `intelligent_route.local_site`
 and candidates come from the overlay.  The
 `load_balancer` section is still generated from the
 provider endpoints in the environment config.

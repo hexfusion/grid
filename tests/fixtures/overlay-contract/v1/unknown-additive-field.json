@@ -38,9 +38,9 @@
     "network": "glb-demo"
   },
   "provenance": {
-    "grid_network_generation": 1,
-    "grid_network_name": "glb-demo",
-    "grid_network_uid": "fixture-uid",
+    "source_generation": 1,
+    "source_name": "glb-demo",
+    "source_uid": "fixture-uid",
     "producer": "grid-operator",
     "producer_version": "0.1.0",
     "rendered_at": "2026-07-29T00:00:00Z"

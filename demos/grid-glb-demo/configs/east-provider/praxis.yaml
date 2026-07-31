@@ -24,7 +24,7 @@ filter_chains:
       - filter: json_body_field
         field: model
         header: X-Model
-      - filter: grid_provider_route
+      - filter: provider_route
         provider_id: east-provider
         model_header: X-Model
         emit_demo_attribution: true
@@ -53,7 +53,7 @@ filter_chains:
                 name: mock-inference-secondary-credential
                 namespace: grid-system
                 key: token
-      - filter: grid_credential_inject
+      - filter: credential_inject
         credentials:
           - strategy: bearer_token
             name: mock-inference-credential

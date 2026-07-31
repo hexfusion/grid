@@ -97,7 +97,7 @@ pub struct GatewayRef {
     /// Gateway namespace.
     pub namespace: String,
 
-    /// Local site name for the `grid_route` overlay generated for this gateway.
+    /// Local site name for the `intelligent_route` overlay generated for this gateway.
     ///
     /// Identifies which [`GridSite`] this gateway's cluster represents.
     /// Praxis uses `local_site` to score candidates running on the same site
@@ -118,8 +118,8 @@ pub struct GatewayRef {
     /// When absent or `enabled: false`, this gateway behaves exactly as before —
     /// only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
     /// operator additionally renders a consumer Praxis `ConfigMap` containing the
-    /// `grid_route` candidates (with credential `secretRef` data), a
-    /// `grid_credential_inject` section for credential-bearing candidates, and a
+    /// `intelligent_route` candidates (with credential `secretRef` data), a
+    /// `credential_inject` section for credential-bearing candidates, and a
     /// `load_balancer` section with one cluster entry per unique candidate cluster.
     ///
     /// The generated `ConfigMap` contains no token bytes.
@@ -132,7 +132,7 @@ pub struct GatewayRef {
 /// When `enabled` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
-/// `grid_route` candidates, `grid_credential_inject` (when credential-bearing
+/// `intelligent_route` candidates, `credential_inject` (when credential-bearing
 /// candidates are present), and a `load_balancer` section.
 ///
 /// Every cluster referenced by a routing candidate must have a matching

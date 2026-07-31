@@ -362,8 +362,8 @@ mod tests {
             .uri("/v1/chat/completions")
             .header(auth_header().0, auth_header().1)
             .header(header::CONTENT_TYPE, "application/json")
-            .header("x-grid-provider-attribution", "site-us-west")
-            .header("x-grid-provider-request-id", "provider-request-1")
+            .header("x-ai-provider-attribution", "site-us-west")
+            .header("x-ai-provider-request-id", "provider-request-1")
             .body(Body::from(r#"{"model":"gpt-4o","stream":false}"#))
             .unwrap_or_default();
 

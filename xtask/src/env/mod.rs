@@ -186,21 +186,21 @@ pub(crate) enum Action {
 
     /// Deploy the consumer gateway.
     ///
-    /// Without `--overlay-config`, generates a static `grid_route` config from
+    /// Without `--overlay-config`, generates a static `intelligent_route` config from
     /// provider sites declared in the environment config file.
     ///
-    /// With `--overlay-config`, reads a routing overlay `grid-config.json`
+    /// With `--overlay-config`, reads a routing overlay `routing-config.json`
     /// from the given path. The overlay `local_site` and candidates
-    /// drive the `grid_route` stanza; the `load_balancer` section is still
+    /// drive the `intelligent_route` stanza; the `load_balancer` section is still
     /// generated from provider endpoints in the environment config.
     DeployConsumerGateway {
         /// Path to the environment config file.
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
 
-        /// Path to a `grid-config.json` routing overlay.
+        /// Path to a `routing-config.json` routing overlay.
         ///
-        /// When provided, `grid_route.local_site` and candidates are taken
+        /// When provided, `intelligent_route.local_site` and candidates are taken
         /// from the overlay file.  When absent, the static config derived from
         /// `config.toml` provider sites is used.
         #[arg(long)]
@@ -422,18 +422,18 @@ pub(crate) enum Action {
     /// Validate the native AI credential injection path.
     ///
     /// Proves the same API-provider fallback routing as `verify-api-fallback` but
-    /// uses `filter: grid_credential_inject` instead of `filter: headers` /
+    /// uses `filter: credential_inject` instead of `filter: headers` /
     /// `request_set` for bearer token injection.
     ///
     /// Key differences from `verify-api-fallback`:
     ///
-    /// - `grid_route` candidates include credential `secretRef` data from the overlay.
-    /// - `filter: grid_credential_inject` injects the bearer token, keyed by the credential secretRef `(name,
-    ///   namespace, key)` tuple.
+    /// - `intelligent_route` candidates include credential `secretRef` data from the overlay.
+    /// - `filter: credential_inject` injects the bearer token, keyed by the credential secretRef `(name, namespace,
+    ///   key)` tuple.
     /// - The old `filter: headers` / `request_set` static injection is absent.
     ///
     /// **Token placement:** the bearer token is mounted into the consumer pod from
-    /// a Kubernetes Secret and read through `grid_credential_inject.credentials[].file`.
+    /// a Kubernetes Secret and read through `credential_inject.credentials[].file`.
     /// It must not appear in the operator overlay or consumer Praxis `ConfigMap`.
     ///
     /// Requires: kind clusters (`grid-site-a` and `grid-consumer`) and gateway
@@ -533,7 +533,7 @@ pub(crate) enum Action {
     ///
     /// This is the minimal deterministic kind proof of:
     ///   `InferenceProvider (west k8s) → CRDT over SWIM → overlay candidate →
-    ///    consumer grid_route → provider gateway → HTTP 200`
+    ///    consumer intelligent_route → provider gateway → HTTP 200`
     ///
     /// Requires the two-provider kind environment.  Run
     /// `env up -c tests/env/operator-routing-two-provider.toml` and
@@ -616,11 +616,11 @@ pub(crate) enum Action {
     ///
     /// Proves that Responses API requests are correctly parsed and routed
     /// when the consumer filter chain uses `openai_responses_format` to extract
-    /// the model field, then `grid_route` for Grid overlay routing.
+    /// the model field, then `intelligent_route` for Grid overlay routing.
     ///
     /// 1. Deploy provider gateways (idempotent).
     /// 2. Operator reconcile + overlay export.
-    /// 3. Deploy consumer gateway with `openai_responses_format` → `grid_route` filter chain.
+    /// 3. Deploy consumer gateway with `openai_responses_format` → `intelligent_route` filter chain.
     /// 4. Send `/v1/responses` requests: each model returns HTTP 200 with valid Responses body, unknown model fails
     ///    closed.
     /// 5. Verify response model fields match the requested model.
@@ -1042,8 +1042,8 @@ fn env_probe_gateway_network(config: &Path) -> Result<(), Box<dyn std::error::Er
 
 /// Deploy the consumer gateway.
 ///
-/// When `overlay_config` is `Some`, reads a routing overlay `grid-config.json`
-/// and uses it to drive the `grid_route` stanza.
+/// When `overlay_config` is `Some`, reads a routing overlay `routing-config.json`
+/// and uses it to drive the `intelligent_route` stanza.
 /// When `overlay_config` is `None`, generates a static config from the
 /// environment config provider sites (existing behaviour).
 fn env_deploy_consumer_gateway(config: &Path, overlay_config: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1202,7 +1202,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 
 /// Validate the native AI credential injection path end-to-end.
 ///
-/// Same E2E chain as [`env_verify_api_fallback`] but uses `filter: grid_credential_inject`
+/// Same E2E chain as [`env_verify_api_fallback`] but uses `filter: credential_inject`
 /// instead of `filter: headers` / `request_set` for bearer token injection.
 ///
 /// Steps:
@@ -1317,13 +1317,13 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     // Read the credential reference from the operator-projected overlay.
     // The harness resolves the token from the K8s Secret only to prove the Secret is
     // accessible — it does NOT appear in the consumer ConfigMap, overlay JSON, or route
-    // candidates.  grid_credential_inject reads the token from the mounted Secret file.
+    // candidates.  credential_inject reads the token from the mounted Secret file.
     let cred_plan = operator::api_credential_plan_from_overlay(&overlay, TEST_PROVIDER_API).ok_or(
         "no bearer-token credential reference found in overlay; \
          verify InferenceProvider spec.auth.secretRef is set and operator reconciled",
     )?;
 
-    // Destructure the secretRef fields to pass to grid_credential_inject config.
+    // Destructure the secretRef fields to pass to credential_inject config.
     let operator::ApiCredentialPlan::BearerToken {
         secret_name,
         namespace,
@@ -1377,12 +1377,10 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     consumer::deploy_consumer_from_operator_yaml(&cfg, &operator_praxis_yaml, secret_name, key)?;
 
     // ── Step 6: verify routing + token-absence + native credential injection ──
-    eprintln!("verify-api-fallback-native: [6/8] verifying routing with grid_credential_inject...");
+    eprintln!("verify-api-fallback-native: [6/8] verifying routing with credential_inject...");
     eprintln!("  live consumer pod runs operator-generated config");
     eprintln!("  local ({provider_cluster}) → {provider_model} via provider gateway");
-    eprintln!(
-        "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (grid_credential_inject)"
-    );
+    eprintln!("  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (credential_inject)");
 
     let mock_port = verify::find_free_port()?;
     let mut mock_pf =
@@ -1678,7 +1676,7 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 /// Install CRDs, apply operator test fixtures, run the operator, verify the overlay,
 /// and export it to a temp file.
 ///
-/// Returns the path of the exported `grid-config.json` overlay file.
+/// Returns the path of the exported `routing-config.json` overlay file.
 /// The caller is responsible for killing the operator and port-forward processes
 /// before this function returns — both are wrapped in [`ProcGuard`] so they are
 /// stopped on drop even on early return.
@@ -3317,7 +3315,7 @@ fn responses_record_step(
 ///
 /// Port-forwards to the consumer gateway and sends a `/v1/responses` request
 /// per configured model. Verifies that the `openai_responses_format` request
-/// parsing and `grid_route` selection work correctly by checking response `model` fields.
+/// parsing and `intelligent_route` selection work correctly by checking response `model` fields.
 fn verify_responses_model_fields(
     cfg: &EnvConfig,
     results: &mut Vec<StepResult>,
@@ -3410,7 +3408,7 @@ fn verify_responses_pod_restarts(
 /// with Grid overlay routing:
 /// 1. Deploy provider gateways.
 /// 2. Operator reconcile + Grid overlay export.
-/// 3. Deploy consumer gateway with `openai_responses_format` → `grid_route` filter chain.
+/// 3. Deploy consumer gateway with `openai_responses_format` → `intelligent_route` filter chain.
 /// 4. Verify `/v1/responses` routing: each model returns 200, unknown fails.
 /// 5. Verify response model fields match the requested model.
 /// 6. Assert no unexpected pod restarts.
@@ -3460,11 +3458,11 @@ fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error:
         },
     };
 
-    // Step 3: Deploy consumer gateway with openai_responses_format → grid_route filter chain.
+    // Step 3: Deploy consumer gateway with openai_responses_format → intelligent_route filter chain.
     eprintln!("responses-routing: [3/6] deploying responses consumer gateway...");
     let consumer_ok = responses_record_step("consumer deploy", &mut results, || {
         consumer::deploy_consumer_for_responses(&cfg, Some(&overlay_path))?;
-        Ok("deployed with openai_responses_format → grid_route filter chain".to_owned())
+        Ok("deployed with openai_responses_format → intelligent_route filter chain".to_owned())
     });
     if !consumer_ok {
         print_validate_all_table(&results);

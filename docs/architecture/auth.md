@@ -7,9 +7,9 @@ Each serves a different trust boundary and must not be conflated.
 
 | Layer | What it authenticates | Where it is enforced |
 |---|---|---|
-| **External caller auth** | The end customer's identity (bearer token, JWT, API key). | At the Praxis edge or consumer gateway, before `grid_route`. |
+| **External caller auth** | The end customer's identity (bearer token, JWT, API key). | At the Praxis edge or consumer gateway, before `intelligent_route`. |
 | **Grid mTLS peer identity** | The edge or consumer gateway's Grid site certificate. | At the provider gateway, via `peer_identity_trust`. |
-| **Provider credential injection** | The final-hop gateway's credential for a SaaS/cloud provider API. | At the final-hop gateway, via `grid_credential_inject`. |
+| **Provider credential injection** | The final-hop gateway's credential for a SaaS/cloud provider API. | At the final-hop gateway, via `credential_inject`. |
 
 The customer's `Authorization` header must not be forwarded as a provider
 credential.  Public TLS certificates (for external endpoints) must be kept
@@ -39,18 +39,18 @@ The implemented native path is `bearer_token`:
 3. The Grid Operator validates the Secret reference.
 4. Grid writes only the Secret reference into the routing overlay.
 5. The final-hop gateway mounts the Secret as a file.
-6. After `grid_route` selects a provider candidate, Praxis AI runs
-   `grid_credential_inject`, reads the selected token file, and injects
+6. After `intelligent_route` selects a provider candidate, Praxis AI runs
+   `credential_inject`, reads the selected token file, and injects
    `Authorization: Bearer <token>` on the outbound provider request.
 
 Provider tokens are never written into Grid status, routing overlays, or
 consumer gateway `ConfigMap`s.
 
 **Implementation status:** the Grid-side contract is implemented: the operator
-validates `secretRef`, projects only the reference into `grid-config.json`, and
+validates `secretRef`, projects only the reference into `routing-config.json`, and
 can render consumer Praxis config with file-backed credential references.  The
-request-time filter is the Praxis AI `grid_credential_inject` filter.  Runtime
-deployments must use a Praxis AI image that includes `grid_credential_inject`.
+request-time filter is the Praxis AI `credential_inject` filter.  Runtime
+deployments must use a Praxis AI image that includes `credential_inject`.
 
 | Strategy | Status | Request-time behavior |
 |----------|--------|-----------------------|
@@ -73,7 +73,7 @@ The request path is:
    reference into the routing overlay.
 5. The final-hop gateway config maps that reference to a mounted Secret file
    at the deployment point allowed to call the backend.
-6. Praxis AI injects the provider credential at request time after `grid_route`
+6. Praxis AI injects the provider credential at request time after `intelligent_route`
    selects the credential-bearing candidate.
 
 Credential placement follows the final-hop rule:
@@ -113,7 +113,7 @@ The `InferenceProvider` controller validates credentials during every reconcile:
   operator includes a `credential` field in every routing candidate produced for
   that provider. The field carries `{ strategy, secretRef: { name, namespace, key } }` —
   only the Secret reference, never the token value. This appears in the
-  operator-produced `grid-config.json` ConfigMap.
+  operator-produced `routing-config.json` ConfigMap.
 
 The xtask `verify-api-fallback` and `verify-api-fallback-native` test suites
 prove the data-plane side for the direct API-provider fallback path:
@@ -126,10 +126,10 @@ prove the data-plane side for the direct API-provider fallback path:
 
 - **Native path (`verify-api-fallback-native`)**: xtask reads the credential
   reference from the operator overlay, resolves the token, then generates consumer
-  config using `grid_route` (with credential `secretRef` in candidates) +
-  `grid_credential_inject` filter with a `file:` source pointing at a mounted
+  config using `intelligent_route` (with credential `secretRef` in candidates) +
+  `credential_inject` filter with a `file:` source pointing at a mounted
   Kubernetes Secret.  The token does not appear in the operator overlay JSON,
-  in `grid_route` candidates, or in the consumer Praxis `ConfigMap`.
+  in `intelligent_route` candidates, or in the consumer Praxis `ConfigMap`.
 
 Both paths prove the operator-to-overlay-to-gateway routing chain for a direct
 API-provider route.  The native path is the target architecture; static header
@@ -187,7 +187,7 @@ ownership for credential Secret placement and rotation:
   automation, or an external secret manager.
 - **Operator-owned consumer config generation**: `GatewayRef.consumerConfig`
   can render the consumer Praxis `ConfigMap` from routing overlay data,
-  including `grid_credential_inject` file references for direct API-provider
+  including `credential_inject` file references for direct API-provider
   routes.
 - **Cross-cluster delivery**: Grid does not copy Secrets across clusters.
   GitOps, External Secrets, Vault, or another platform mechanism must place the
@@ -213,12 +213,12 @@ and the user manages authentication externally.
 
 For the current static `bearer_token` strategy, the
 credential value is mounted into the final-hop gateway or
-provider-side component as a Kubernetes Secret file.  `grid_credential_inject`
+provider-side component as a Kubernetes Secret file.  `credential_inject`
 reads that file at filter construction time and injects
-`Authorization: Bearer <token>` after `grid_route`
+`Authorization: Bearer <token>` after `intelligent_route`
 selects a credential-bearing candidate.
 
-The current tested Praxis AI `grid_credential_inject` implementation uses
+The current tested Praxis AI `credential_inject` implementation uses
 read-once/cache behavior: the mounted Secret file is read once during filter
 construction, the `Authorization` value is stored in an in-memory `HashMap`, and
 per-request injection is a metadata lookup plus header injection.  There is no
@@ -508,7 +508,7 @@ Active status.
 | Who | What |
 |-----|------|
 | **Grid Operator** | Validates provider credential `secretRef`; projects credential references (never token values) into routing overlays; can render opt-in consumer Praxis `ConfigMap`; generates local CA and site cert Secrets; marks `GridSite.status.phase = Active` when fingerprint trust policy is satisfied (control-plane eligibility only). |
-| **Gateway filters** | `grid_route` selects candidates and writes credential metadata; `grid_credential_inject` reads a mounted Secret file and injects credentials per request; `peer_identity_trust` verifies peer certificate identity on provider gateways. |
+| **Gateway filters** | `intelligent_route` selects candidates and writes credential metadata; `credential_inject` reads a mounted Secret file and injects credentials per request; `peer_identity_trust` verifies peer certificate identity on provider gateways. |
 | **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`; distributes the Grid CA cert to remote clusters where gateways need to verify peer identity; configures the provider gateway's peer identity filter; manages gateway rollout when trust material changes. |
 | **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials. |
 

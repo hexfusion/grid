@@ -14,8 +14,8 @@ filter_chains:
         response_set:
           - name: X-Grid-Demo-Edge-Gateway
             value: "{{ cluster.name }}"
-      - filter: grid_route
-        overlay_file: /etc/grid/grid-overlay.json
+      - filter: intelligent_route
+        overlay_file: /etc/praxis/routing/routing-overlay.json
         model_header: X-Model
         provider_hop_clusters:
           - sim-east-provider

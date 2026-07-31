@@ -51,6 +51,6 @@
       "reason": "missing_schema_version"
     }
   },
-  "source": "praxis-proxy/grid",
+  "source": "praxis-proxy/ai",
   "source_path": "tests/fixtures/overlay-contract/v1"
 }

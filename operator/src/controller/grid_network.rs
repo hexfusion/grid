@@ -763,7 +763,7 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        // Praxis grid_route rejects an empty candidates list at config load
+        // Praxis intelligent_route rejects an empty candidates list at config load
         // time, which would cause a hot-reload error rather than a clean
         // "no routes" state.  Skip the apply and warn so the previous
         // (non-empty) ConfigMap remains in place until a provider becomes
@@ -773,7 +773,7 @@ async fn reconcile_routing_overlay_inner(
                 network = network_name,
                 gateway = %gw_ref.name,
                 "routing overlay has no candidates; skipping ConfigMap apply \
-                 to prevent invalid Praxis grid_route config"
+                 to prevent invalid Praxis intelligent_route config"
             );
             overlay_statuses.push(retained_overlay_status(
                 network,
@@ -3410,9 +3410,9 @@ mod tests {
                 provenance: overlay_envelope::OverlayProvenance {
                     producer: "grid-operator".to_owned(),
                     producer_version: "0.1.0".to_owned(),
-                    grid_network_name: "net".to_owned(),
-                    grid_network_uid: "uid".to_owned(),
-                    grid_network_generation: 1,
+                    source_name: "net".to_owned(),
+                    source_uid: "uid".to_owned(),
+                    source_generation: 1,
                     rendered_at: "2026-07-29T01:00:00Z".to_owned(),
                 },
                 overlay: routing_overlay::RoutingOverlay {

@@ -30,7 +30,7 @@ Grid CRDs + local health + remote SWIM/CRDT state
   → scored routing candidates
   → versioned routing overlay ConfigMap
   → Praxis AI validates and accepts a routing snapshot
-  → grid_route serves requests from that snapshot
+  → intelligent_route serves requests from that snapshot
 ```
 
 The request hot path stays local.  A request should not call Kubernetes, SWIM,
@@ -44,7 +44,7 @@ External ingress uses two independent routing decisions:
 external client
   -> managed DNS / Anycast / global traffic manager selects an edge
   -> Praxis AI edge gateway authenticates and parses the request
-  -> grid_route selects an eligible provider from the local Grid overlay
+  -> intelligent_route selects an eligible provider from the local Grid overlay
   -> gateway-to-gateway mTLS
   -> Praxis AI provider gateway authenticates the edge
   -> provider-local route and credential policy
@@ -80,7 +80,7 @@ Grid sits above the Praxis data plane:
 | Layer | Role |
 |---|---|
 | **Grid Operator** | Kubernetes control plane. Watches Grid CRDs, exchanges provider state, scores candidates, publishes versioned routing overlays, reports rendered and distributed revisions, and manages Grid trust material. |
-| **Praxis AI** | AI-aware gateway. Runs request parsing, `grid_route`, the AI-owned `X-Grid-Peer-*` provider-hop contract, exact `grid_provider_route`, optional `grid_credential_inject`, and AI-specific packaging. |
+| **Praxis AI** | AI-aware gateway. Runs request parsing, `intelligent_route`, the AI-owned `X-AI-Routing-*` provider-hop contract, exact `provider_route`, optional `credential_inject`, and AI-specific packaging. |
 | **Praxis ExtProc** | Envoy ExternalProcessor service that runs Praxis filter pipelines for deployments that retain Envoy in front of Praxis. |
 | **Praxis Core** | Generic proxy/filter runtime. Owns listeners, filter pipelines, load balancing, `endpoint_selector`, `peer_identity_trust`, TLS integration, and request context. |
 | **Pingora** | Low-level async proxy engine under Praxis. Handles TCP/TLS, HTTP codecs, connection pooling, and upstream I/O. |
@@ -169,9 +169,9 @@ that work is complete.
 For each gateway reference on a `GridNetwork`, the operator writes a
 `ConfigMap` with two representations of the same routing state:
 
-- `grid-overlay.json` is the versioned envelope consumed by gateways that
+- `routing-overlay.json` is the versioned envelope consumed by gateways that
   enforce the observable overlay contract.
-- `grid-config.json` is the bare routing payload retained for consumers that
+- `routing-config.json` is the bare routing payload retained for consumers that
   have not enabled the envelope contract.
 
 The versioned envelope contains:
@@ -231,7 +231,7 @@ Higher-scored candidates sort earlier.  `Unavailable` providers are excluded.
 Stale or degraded candidates can remain in the overlay as lower-preference
 fallbacks.
 
-At request time, Praxis AI `grid_route` consumes the loaded overlay.  It does
+At request time, Praxis AI `intelligent_route` consumes the loaded overlay.  It does
 not recompute Grid's full scoring formula.  Its job is to match the requested
 model or MCP tool against the already-loaded candidate set and choose the best
 candidate under its request-time rules.
@@ -248,12 +248,12 @@ pipelines:
 client request
   → Praxis AI consumer or edge gateway
   → request-format filter extracts model/tool metadata
-  → grid_route selects a provider gateway from the loaded overlay
+  → intelligent_route selects a provider gateway from the loaded overlay
   → gateway-to-gateway mTLS
   → Praxis AI provider gateway
   → peer_identity_trust authenticates the calling Grid peer
-  → grid_provider_route validates the selected candidate and local route
-  → grid_credential_inject adds provider auth for the final backend hop
+  → provider_route validates the selected candidate and local route
+  → credential_inject adds provider auth for the final backend hop
   → load_balancer selects the authorized local backend
   → response returns to the client
 ```
@@ -265,7 +265,7 @@ credential remains at the provider site and is never sent to the edge.
 For Chat Completions-style requests, the parser is typically a generic body
 field extractor.  For `/v1/responses`, Praxis AI uses
 `openai_responses_format` to parse the Responses API shape and promote the model
-for `grid_route`.
+for `intelligent_route`.
 
 The selected `cluster` is a Praxis load-balancer cluster name.  The overlay can
 switch a request from `cluster-east` to `cluster-west` only if both clusters are
@@ -293,7 +293,7 @@ Examples:
 | mTLS-only provider | No HTTP token | None |
 
 Grid validates `InferenceProvider.spec.auth.secretRef` and projects only the
-reference into the overlay.  Praxis AI `grid_credential_inject` reads the
+reference into the overlay.  Praxis AI `credential_inject` reads the
 mounted Secret file in the gateway that is allowed to call the backend and
 injects the outbound header.
 
@@ -376,7 +376,7 @@ Grid's baseline path serves in-cluster workloads through a cluster-local
 Praxis consumer gateway. External client ingress extends this to clients
 outside the cluster: a stable public DNS name backed by global traffic
 management routes clients to a healthy Praxis AI edge-ingress gateway, which
-uses the same Grid overlay and `grid_route` filter to select a provider.
+uses the same Grid overlay and `intelligent_route` filter to select a provider.
 
 The edge tier is intended to be active-active behind platform-owned traffic
 management. Praxis AI is the L7 AI router and data-plane target, not the

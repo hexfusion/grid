@@ -4,16 +4,16 @@
 //! a [`RoutingOverlay`].  The generated config includes:
 //!
 //! - `json_body_field` filter (model field → `X-Model` header)
-//! - `grid_route` filter with candidates from the overlay
-//! - `grid_credential_inject` filter (only when credential-bearing candidates exist)
+//! - `intelligent_route` filter with candidates from the overlay
+//! - `credential_inject` filter (only when credential-bearing candidates exist)
 //! - `load_balancer` filter with one cluster entry per unique candidate cluster
 //!
 //! # Security invariants
 //!
 //! - Token values are **never** emitted.  Credential entries use `file:` sources under
 //!   `ConsumerConfig::credential_mount_base`.
-//! - The `credential.secretRef` locating information (name, namespace, key) is included in the `grid_route` candidate
-//!   block and in the `grid_credential_inject` entry.  This is reference data, not credential bytes.
+//! - The `credential.secretRef` locating information (name, namespace, key) is included in the `intelligent_route`
+//!   candidate block and in the `credential_inject` entry.  This is reference data, not credential bytes.
 //!
 //! [`RoutingOverlay`]: crate::resources::routing_overlay::RoutingOverlay
 //! [`ConsumerConfig`]: crate::crd::grid_network::ConsumerConfig
@@ -98,7 +98,7 @@ pub enum ConsumerConfigError {
 ///
 /// The rendered config is a complete, runnable Praxis config that includes
 /// `listeners:`, `filter_chains:`, `admin:`, and `shutdown_timeout_secs`.
-/// It is compatible with the Praxis `grid_route` and `grid_credential_inject`
+/// It is compatible with the Praxis `intelligent_route` and `credential_inject`
 /// filters.  It never contains credential token bytes.
 ///
 /// # Parameters
@@ -167,7 +167,7 @@ pub(crate) fn generate_consumer_praxis_config(
          \x20     - filter: json_body_field\n\
          \x20       field: model\n\
          \x20       header: X-Model\n\
-         \x20     - filter: grid_route\n\
+         \x20     - filter: intelligent_route\n\
          \x20       local_site: {local_site}\n\
          \x20       model_header: \"X-Model\"\n\
          \x20       candidates:\n\
@@ -221,7 +221,7 @@ pub(crate) fn build_consumer_config_map(
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
-/// Render `grid_route` candidates YAML block.
+/// Render `intelligent_route` candidates YAML block.
 ///
 /// Each candidate is indented and includes `credential.secretRef` when present.
 /// Token values are never included.
@@ -229,7 +229,7 @@ fn render_candidates(candidates: &[RoutingCandidate]) -> String {
     candidates.iter().map(render_candidate).collect::<Vec<_>>().join("\n")
 }
 
-/// Render one `grid_route` candidate.
+/// Render one `intelligent_route` candidate.
 fn render_candidate(c: &RoutingCandidate) -> String {
     let mut lines = vec![
         format!(
@@ -280,7 +280,7 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
     ]
 }
 
-/// Render the `grid_credential_inject` filter section.
+/// Render the `credential_inject` filter section.
 ///
 /// Returns `None` when no credential-bearing candidates exist.
 /// Each unique `(strategy, name, namespace, key)` tuple produces one entry.
@@ -330,7 +330,7 @@ fn render_credential_inject(candidates: &[RoutingCandidate], credential_mount_ba
 
     Some(format!(
         "\n\
-         \x20     - filter: grid_credential_inject\n\
+         \x20     - filter: credential_inject\n\
          \x20       credentials:\n\
          {}",
         entries.into_values().collect::<Vec<_>>().join("\n")
@@ -591,7 +591,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn plain_candidates_produce_grid_route_and_load_balancer() {
+    fn plain_candidates_produce_intelligent_route_and_load_balancer() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-a",
@@ -607,7 +607,10 @@ mod tests {
             8080,
         )
         .unwrap();
-        assert!(yaml.contains("filter: grid_route"), "must include grid_route");
+        assert!(
+            yaml.contains("filter: intelligent_route"),
+            "must include intelligent_route"
+        );
         assert!(yaml.contains("filter: load_balancer"), "must include load_balancer");
         assert!(yaml.contains("filter: json_body_field"), "must include json_body_field");
         assert!(
@@ -664,8 +667,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !yaml.contains("grid_credential_inject"),
-            "no credential candidates must produce no grid_credential_inject"
+            !yaml.contains("credential_inject"),
+            "no credential candidates must produce no credential_inject"
         );
     }
 
@@ -689,8 +692,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            yaml.contains("filter: grid_credential_inject"),
-            "credential candidate must produce grid_credential_inject"
+            yaml.contains("filter: credential_inject"),
+            "credential candidate must produce credential_inject"
         );
         assert!(
             yaml.contains("file: \"/run/secrets/grid-credentials/my-secret/token\""),
@@ -1009,8 +1012,8 @@ mod tests {
         .unwrap();
         // Search within the credential_inject section only (after the section header).
         let inject_start = yaml
-            .find("grid_credential_inject")
-            .expect("grid_credential_inject section must be present");
+            .find("credential_inject")
+            .expect("credential_inject section must be present");
         let inject_section = &yaml[inject_start..];
         let pos_aaa = inject_section.find("aaa-creds").unwrap();
         let pos_zzz = inject_section.find("zzz-creds").unwrap();
@@ -1534,7 +1537,7 @@ mod tests {
         // aaa-cluster should appear before zzz-cluster (BTreeSet ordering).
         let pos_aaa = yaml1.find("aaa-cluster").unwrap();
         let pos_zzz = yaml1.find("zzz-cluster").unwrap();
-        // Both appear in grid_route candidates AND load_balancer; check in load_balancer section.
+        // Both appear in intelligent_route candidates AND load_balancer; check in load_balancer section.
         let lb_section = &yaml1[yaml1.find("load_balancer").unwrap()..];
         let lb_aaa = lb_section.find("10.0.0.1:30080").unwrap_or(usize::MAX);
         let lb_zzz = lb_section.find("10.0.0.3:30080").unwrap_or(usize::MAX);

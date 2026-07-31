@@ -26,7 +26,7 @@ for the production routing and security contract.
   the operator on the request path.
 - **Edge selection and provider selection solve different problems.** A global
   traffic manager chooses a healthy public edge. After parsing the request,
-  `grid_route` chooses an eligible inference provider.
+  `intelligent_route` chooses an eligible inference provider.
 - **A cluster can host more than one provider.** The east provider cluster
   advertises two independent `InferenceProvider` resources for the same model.
   Each has its own routing identity, backend, metrics endpoint, and credential,
@@ -141,34 +141,48 @@ consumer gateway or claim runtime proof for this ingress path.
 The demo creates five Kind clusters. Every Praxis process runs in Kubernetes.
 
 ```text
-                              client
-                                |
-                     https://api.grid-glb.test
-                                |
-                    +-----------------------+
-                    | Praxis GTM emulator   |
-                    | cluster: gtm-emulator |
-                    +-----------+-----------+
-                                |
-                    +-----------+-----------+
-                    |                       |
-          +---------v---------+   +---------v---------+
-          | Praxis east edge  |   | Praxis west edge  |
-          | cluster: east-edge|   | cluster: west-edge|
-          +---------+---------+   +---------+---------+
-                    |                       |
-                    +-----------+-----------+
-                                |
-                    Grid selects a provider
-                                |
-                    +-----------+-----------+
-                    |                       |
-       +------------v------------+  +-------v-----------------+
-       | Praxis east provider    |  | Praxis west provider    |
-       | cluster: east-provider  |  | cluster: west-provider  |
-       +------------+------------+  +------------+-------------+
-                    |                            |
-             private backend              private backend
+Inference client
+  |
+  | HTTPS: api.grid-glb.test
+  v
++---------------------------------------------------------+
+| Praxis GTM emulator                                     |
+| Kind cluster: grid-glb-gtm-emulator                     |
+| Selects a healthy edge; it does not select providers.   |
++----------------------------+----------------------------+
+                             |
+                 +-----------+-----------+
+                 |                       |
+                 v                       v
++----------------------------+  +----------------------------+
+| Praxis east edge           |  | Praxis west edge           |
+| Kind cluster: east-edge    |  | Kind cluster: west-edge    |
+| intelligent_route          |  | intelligent_route          |
+| east-local Grid overlay    |  | west-local Grid overlay    |
++----------------------------+  +----------------------------+
+                 |                       |
+                 +-----------+-----------+
+                             |
+      Each edge prefers eligible local provider candidates,
+        but can select the remote gateway for failover.
+                             |
+                 +-----------+-----------+
+                 |                       |
+                 v                       v
++----------------------------+  +----------------------------+
+| Praxis east provider       |  | Praxis west provider       |
+| Kind cluster:              |  | Kind cluster:              |
+| east-provider              |  | west-provider              |
++-------------+--------------+  +-------------+--------------+
+
+Provider endpoint mappings:
+
+  east-provider gateway
+    +-- simulated provider A: sim-east-provider
+    `-- simulated provider B: sim-east-provider-secondary
+
+  west-provider gateway
+    `-- simulated provider A: sim-west-provider
 ```
 
 ### Praxis Roles In The Grid Path
@@ -176,7 +190,7 @@ The demo creates five Kind clusters. Every Praxis process runs in Kubernetes.
 | Praxis role | Request-path responsibility | Grid participation |
 |---|---|---|
 | GTM emulator | Terminates the demo's public TLS connection, checks edge health, and selects an edge using `X-Edge-Session-Id` | None; it selects edges rather than providers |
-| Edge gateway | Parses the inference request, applies edge policy, runs `grid_route`, and opens the authenticated provider hop | Consumes its edge-local overlay |
+| Edge gateway | Parses the inference request, applies edge policy, runs `intelligent_route`, and opens the authenticated provider hop | Consumes its edge-local overlay |
 | Provider gateway | Authenticates the edge, validates the candidate/model/path, injects the provider credential, and proxies to the private backend | Advertises provider capacity through its local operator |
 
 This role separation comes from configuration and deployment boundaries, not
@@ -273,7 +287,7 @@ Praxis edge origin.
 The outer traffic-management decision and the inner Grid decision are
 independent. In this example, the stable endpoint sends the client to the east
 edge because that edge is healthy and matches the client's edge-affinity key.
-After the request reaches that edge, `grid_route` independently matches the
+After the request reaches that edge, `intelligent_route` independently matches the
 requested model and selects from the eligible provider candidates and ranks in
 the east edge's loaded overlay.
 
@@ -368,7 +382,7 @@ flowchart TD
     GTM -->|Health and edge affinity select an edge| VIP[Selected edge MetalLB VIP:8080]
     VIP --> Service[Service/edge-gateway]
     Service -->|Kubernetes Service routing| Edge[Praxis edge pod]
-    Edge -->|grid_route reads the edge-local overlay| Provider[Provider gateway:8443 over verified mTLS]
+    Edge -->|intelligent_route reads the edge-local overlay| Provider[Provider gateway:8443 over verified mTLS]
 ```
 
 Forge captures the MetalLB addresses of the `edge-gateway` Services after both
@@ -420,16 +434,17 @@ distinct `localSiteName`. The operator creates:
 ```text
 ConfigMap/grid-overlay-glb-demo-edge-gateway
   data:
-    grid-config.json: <versioned routing overlay>
+    routing-overlay.json: <versioned routing envelope>
+    routing-config.json: <legacy bare routing payload>
 ```
 
 The local `edge-gateway` Deployment projects that ConfigMap at:
 
 ```text
-/etc/grid/grid-config.json
+/etc/praxis/routing/routing-overlay.json
 ```
 
-Praxis AI's `grid_route` filter watches that file and reloads eligible
+Praxis AI's `intelligent_route` filter watches that file and reloads eligible
 candidates after the configured debounce interval. Kubernetes' native
 ConfigMap projection is the distribution mechanism inside the cluster. No
 overlay sidecar, host process, or second operator is used.
@@ -442,7 +457,7 @@ provider facts
   -> edge-local Grid reconciliation
   -> edge-local routing overlay ConfigMap
   -> Kubernetes projected volume
-  -> Praxis grid_route hot reload
+  -> Praxis intelligent_route hot reload
 ```
 
 The overlay contains stable candidate identity, site, cluster, admission state,
@@ -526,14 +541,14 @@ The edge pipeline is:
 ```text
 OpenAI-compatible request parsing
   -> edge attribution
-  -> grid_route
+  -> intelligent_route
   -> mTLS load_balancer
   -> selected provider gateway
 ```
 
-`grid_route` selects from the local Grid overlay, applies admission state and
+`intelligent_route` selects from the local Grid overlay, applies admission state and
 rank, preserves provider session affinity, and emits authenticated
-`x-grid-peer-*` hop context for the selected provider. The following
+`x-ai-routing-*` hop context for the selected provider. The following
 `load_balancer` owns only transport to the selected cluster.
 
 The two east candidates advertise the same `sim-model-v1` model and the same
@@ -626,8 +641,8 @@ The provider pipeline is:
 required downstream mTLS
   -> peer_identity_trust
   -> model extraction
-  -> grid_provider_route
-  -> grid_credential_inject
+  -> provider_route
+  -> credential_inject
   -> local backend load_balancer
 ```
 
@@ -635,7 +650,7 @@ Each provider:
 
 - requires a client certificate signed by the demo CA;
 - pins both edge certificate digests and the `ai-grid` organization;
-- strips and validates the authenticated `x-grid-peer-*` context;
+- strips and validates the authenticated `x-ai-routing-*` context;
 - maps exact candidate, model, and path tuples to one local backend;
 - rejects unknown candidates, models, and paths;
 - removes the external client's `Authorization` value;
@@ -725,7 +740,7 @@ flowchart TD
     Admission --> SWIM[SWIM distributes provider state]
     SWIM --> Overlays[Edge operators render updated local overlays]
     Overlays --> Projection[Kubernetes projects ConfigMaps into edge pods]
-    Projection --> Reload[grid_route validates and hot reloads]
+    Projection --> Reload[intelligent_route validates and hot reloads]
     Reload --> Existing[Bound session stays on the draining provider]
     Reload --> New[New session selects the alternate provider]
     Recovery[Queue depth recovers] --> Admission
@@ -735,7 +750,7 @@ flowchart TD
 
 The two keys intentionally solve different problems. The GTM emulator uses
 consistent hashing on `X-Edge-Session-Id` to choose a healthy edge.
-`grid_route` uses `X-Session-Id` to bind a session to an eligible provider for
+`intelligent_route` uses `X-Session-Id` to bind a session to an eligible provider for
 up to the configured one-hour TTL. A crossed route can therefore keep the
 client on the east edge while keeping its provider session on the west
 provider.
@@ -756,12 +771,12 @@ mock backend exports queue metric
   -> SWIM distributes the provider fact
   -> each edge operator reconciles its local overlay ConfigMap
   -> Kubernetes updates the projected file in the edge pod
-  -> grid_route validates and reloads the new overlay
+  -> intelligent_route validates and reloads the new overlay
 ```
 
 The edge configuration watches the versioned
-`/etc/grid/grid-overlay.json` envelope with hot reload enabled and a 500 ms
-debounce. The same ConfigMap also carries the legacy `grid-config.json`
+`/etc/praxis/routing/routing-overlay.json` envelope with hot reload enabled and a 500 ms
+debounce. The same ConfigMap also carries the legacy `routing-config.json`
 payload during the compatibility transition. Requests continue using the last
 accepted in-memory view while the projected file settles; the request path
 does not parse the ConfigMap or call the operator.
@@ -1014,10 +1029,16 @@ fi
 git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/praxis-proxy/grid-ai-rollup@sha256:1a6448789f5b0711d60c37dc68b89633b760fa6b438413a544f8e769bd32accc
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/praxis-proxy/grid-mock-providers@sha256:f80aa0886a8d76ff3bde134fe0fdd0e013c780502b539bfcfbe4f74bcbf2eca8
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:9f6d6b8bc683c34263ddb76717cb740900edf1906f2f463155f6e0ae403bb818
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:c41ff91f20f6acd1db83f8906555427c5d8c8850047d88e7ff398433a63c03c1
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:4908d48061d39ad5747e698998e11b23d3ff76943f4dcca194cc16afab1a0c6f
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
+
+printf 'Gateway: %s\nOperator: %s\nMock provider: %s\nPull policy: %s\n' \
+  "$GRID_XTASK_GATEWAY_IMAGE" \
+  "$GRID_XTASK_OPERATOR_IMAGE" \
+  "$GRID_XTASK_MOCK_PROVIDER_IMAGE" \
+  "$GRID_XTASK_IMAGE_PULL_POLICY"
 
 cargo build -p forge
 
@@ -1028,15 +1049,18 @@ cargo xtask env run-grid-glb-demo \
   2>&1 | tee grid-glb-demo-output.txt
 ```
 
-These three project-owned digest references are a mutually compatible,
-validated set. The Praxis AI rollup remains separate from the standard Praxis
-AI package while its dependent changes are reviewed upstream. The explicit
-build makes `target/debug/praxis-forge` available to the xtask runner. The demo
-command then creates five single-node Kind clusters, pulls the declared images,
-deploys the environment, and runs the core routing and security displays. A
-non-zero exit means at least one runtime assertion failed; the complete
-narration remains in `grid-glb-demo-output.txt` and machine-readable results
-are written to the evidence directory (see
+These three digest references are a mutually compatible validation set. The
+Praxis AI image rolls up the open intelligent-routing PR stack while those
+changes are reviewed upstream. The explicit build makes
+`target/debug/praxis-forge` available to the xtask runner. The demo command
+prints the resolved image contract again before loading images, then creates
+five single-node Kind clusters, pulls the declared images, deploys the
+environment, and runs the core routing and security displays. If the printed
+references differ from the block above, stop and correct stale shell
+overrides before investigating a workload readiness timeout. A non-zero exit
+means at least one runtime assertion failed; the complete narration remains in
+`grid-glb-demo-output.txt` and machine-readable results are written to the
+evidence directory (see
 [Generated Artifacts](#generated-artifacts)).
 
 Rerun only the narration without recreating the environment:
@@ -1075,12 +1099,12 @@ cargo run -p forge -- \
 
 ### Registry Images
 
-Use published Praxis project images with immutable tags or digests:
+Use the published validation images by immutable digest:
 
 ```bash
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/praxis-proxy/grid-ai-rollup@sha256:1a6448789f5b0711d60c37dc68b89633b760fa6b438413a544f8e769bd32accc
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/praxis-proxy/grid-mock-providers@sha256:f80aa0886a8d76ff3bde134fe0fdd0e013c780502b539bfcfbe4f74bcbf2eca8
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:9f6d6b8bc683c34263ddb76717cb740900edf1906f2f463155f6e0ae403bb818
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:c41ff91f20f6acd1db83f8906555427c5d8c8850047d88e7ff398433a63c03c1
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:4908d48061d39ad5747e698998e11b23d3ff76943f4dcca194cc16afab1a0c6f
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 ```
 
@@ -1089,9 +1113,9 @@ image reference is local, set the policy to `Never`, pull any registry images
 into the local container engine first, and let the xtask load all three images
 into the Kind clusters.
 
-`GRID_XTASK_GATEWAY_IMAGE` must include `grid_route`, versioned overlay
-validation, accepted/serving revision evidence, `grid_provider_route`,
-`grid_credential_inject`, hot reload, downstream mTLS, upstream mTLS, and peer
+`GRID_XTASK_GATEWAY_IMAGE` must include `intelligent_route`, versioned overlay
+validation, accepted/serving revision evidence, `provider_route`,
+`credential_inject`, hot reload, downstream mTLS, upstream mTLS, and peer
 identity trust. The legacy mock-EPP image is not used by this demo.
 
 ### Local Images
@@ -1282,7 +1306,7 @@ The narrated output includes:
 
 The narrated proof uses three different header categories. Only the
 `X-Grid-Demo-*` response fields are client-visible test evidence. Session
-inputs drive configured affinity behavior, while `x-grid-peer-*` fields are
+inputs drive configured affinity behavior, while `x-ai-routing-*` fields are
 the authenticated edge-to-provider protocol and must not be treated as
 demo-only attribution.
 
@@ -1291,16 +1315,16 @@ demo-only attribution.
 | Header | Set by | Scope and purpose |
 |---|---|---|
 | `X-Edge-Session-Id` | Verifier client | Affinity input configured on the GTM emulator. Consistent hashing maps the value to a healthy edge so repeated requests can prove edge stability. A production GTM owns its own affinity contract. |
-| `X-Session-Id` | Verifier client | Affinity input configured on `grid_route`. It binds related requests to an eligible provider and allows the verifier to distinguish established sessions from new sessions during drain. The configured header name is deployment-specific. |
-| `X-Model` | `json_body_field` | Gateway-local routing signal extracted from the request body's `model` field. It lets `grid_route` and `grid_provider_route` match the requested model without reparsing the body. It is internal request metadata, not path-attribution evidence. |
+| `X-Session-Id` | Verifier client | Affinity input configured on `intelligent_route`. It binds related requests to an eligible provider and allows the verifier to distinguish established sessions from new sessions during drain. The configured header name is deployment-specific. |
+| `X-Model` | `json_body_field` | Gateway-local routing signal extracted from the request body's `model` field. It lets `intelligent_route` and `provider_route` match the requested model without reparsing the body. It is internal request metadata, not path-attribution evidence. |
 
 #### Authenticated Provider-Hop Protocol
 
 | Header | Set by | Scope and purpose |
 |---|---|---|
-| `x-grid-peer-selected-candidate` | Edge `grid_route` | Carries the stable candidate selected from the edge overlay. The provider validates it against provider-owned candidate, model, and path policy. |
-| `x-grid-peer-hop-request-id` | Edge `grid_route` | Bounded correlation identifier for the authenticated provider hop. |
-| `x-grid-peer-overlay-revision` | Edge `grid_route` | Carries the content-addressed revision from the exact overlay snapshot used to select the provider. The provider validates its bounded SHA-256 form and treats it as correlation evidence, not authorization. |
+| `x-ai-routing-candidate` | Edge `intelligent_route` | Carries the stable candidate selected from the edge overlay. The provider validates it against provider-owned candidate, model, and path policy. |
+| `x-ai-routing-request-id` | Edge `intelligent_route` | Bounded correlation identifier for the authenticated provider hop. |
+| `x-ai-routing-revision` | Edge `intelligent_route` | Carries the content-addressed revision from the exact overlay snapshot used to select the provider. The provider validates its bounded SHA-256 form and treats it as correlation evidence, not authorization. |
 
 The edge removes client-supplied copies before setting these fields. They are
 sent only for clusters explicitly configured as provider hops. The provider
@@ -1308,20 +1332,20 @@ consumes them only after downstream mTLS and `peer_identity_trust`, then removes
 them before the backend request. No credential reference or credential value
 crosses this boundary.
 
-For backend-side proof, `grid_provider_route` replaces any inbound
-`x-grid-provider-attribution`, `x-grid-provider-request-id`, and
-`x-grid-provider-overlay-revision` values with provider-owned identity,
+For backend-side proof, `provider_route` replaces any inbound
+`x-ai-provider-attribution`, `x-ai-provider-request-id`, and
+`x-ai-provider-routing-revision` values with provider-owned identity,
 correlation, and validated revision values. The strict mock backend reflects
 those bounded values under demo response names, proving that the request passed
 through the provider pipeline rather than reaching the backend directly. The
-edge-owned `x-grid-peer-*` fields never reach the backend.
+edge-owned `x-ai-routing-*` fields never reach the backend.
 
 #### Demo-Only Response Evidence
 
 | Header | Set by | Verifier assertion |
 |---|---|---|
 | `X-Grid-Demo-Edge-Gateway` | Edge `headers` configuration | Identifies the edge that handled the request and proves both edges serve traffic. |
-| `X-Grid-Demo-Provider-Gateway` | `grid_provider_route` when `emit_demo_attribution: true` | Identifies the provider gateway that accepted and authorized the provider hop. |
+| `X-AI-Demo-Provider-Gateway` | `provider_route` when `emit_demo_attribution: true` | Identifies the provider gateway that accepted and authorized the provider hop. |
 | `X-Grid-Demo-Provider` | Strict mock backend | Identifies the backend provider site that produced the response. |
 | `X-Grid-Demo-Backend-Provider-Attribution` | Strict mock backend | Reflects the provider-owned attribution received by the backend and must match the provider gateway. |
 | `X-Grid-Demo-Backend-Request-Id` | Strict mock backend | Reflects the provider-owned correlation ID and must be present and non-empty. |
@@ -1329,7 +1353,7 @@ edge-owned `x-grid-peer-*` fields never reach the backend.
 
 These response fields exist solely so the verifier can make runtime assertions
 about the observed path. The edge field uses ordinary demo configuration. The
-provider-gateway field is an opt-in mode of `grid_provider_route`; it is not
+provider-gateway field is an opt-in mode of `provider_route`; it is not
 emitted unless `emit_demo_attribution` is enabled. The remaining fields come
 from `mock-providers`, which is test infrastructure rather than a production
 backend.
@@ -1337,7 +1361,7 @@ backend.
 No authorization decision trusts a demo response field. A production
 deployment would normally disable demo attribution and use distributed
 tracing, metrics, or access logs for path evidence. The authenticated
-`x-grid-peer-*` provider-hop contract remains part of the real Grid data path.
+`x-ai-routing-*` provider-hop contract remains part of the real Grid data path.
 
 ## Repository Layout
 
@@ -1362,8 +1386,8 @@ The integration image used by this demo combines these AI changes:
 
 | Pull request | Scope | Relationship |
 |---|---|---|
-| [praxis-proxy/ai#339](https://github.com/praxis-proxy/ai/pull/339) | `grid_route`, provider-hop context, and selected-candidate routing | Base Grid routing capability |
-| [praxis-proxy/ai#540](https://github.com/praxis-proxy/ai/pull/540) | Overlay-file hot reload | Builds on `grid_route` |
+| [praxis-proxy/ai#339](https://github.com/praxis-proxy/ai/pull/339) | `intelligent_route`, provider-hop context, and selected-candidate routing | Base Grid routing capability |
+| [praxis-proxy/ai#540](https://github.com/praxis-proxy/ai/pull/540) | Overlay-file hot reload | Builds on `intelligent_route` |
 | [praxis-proxy/ai#386](https://github.com/praxis-proxy/ai/pull/386) | Provider-local route validation and credential injection | Consumes authenticated provider-hop context |
 
 The three PRs remain independently owned even when a temporary integration

@@ -6,7 +6,6 @@ members = [
     "forge",
     "mock-providers",
     "operator",
-    "overlay-sync",
     "scoring",
     "swim",
     "xtask",

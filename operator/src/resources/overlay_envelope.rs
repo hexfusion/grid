@@ -8,8 +8,8 @@
 //! `local_site`, `candidates`), so the revision changes only when routing
 //! behavior changes — timestamp and provenance changes are no-ops.
 //!
-//! The envelope is published as the `grid-overlay.json` key in the overlay
-//! `ConfigMap`, alongside the existing `grid-config.json` legacy key.
+//! The envelope is published as the `routing-overlay.json` key in the overlay
+//! `ConfigMap`, alongside the `routing-config.json` legacy key.
 //!
 //! [RFC 8785]: https://www.rfc-editor.org/rfc/rfc8785
 
@@ -28,7 +28,7 @@ use super::routing_overlay::RoutingOverlay;
 pub const SCHEMA_VERSION: &str = "1.0.0";
 
 /// `ConfigMap` data key for the versioned envelope.
-pub const ENVELOPE_KEY: &str = "grid-overlay.json";
+pub const ENVELOPE_KEY: &str = "routing-overlay.json";
 
 /// `ConfigMap` annotation: schema version.
 pub const ANNOTATION_SCHEMA_VERSION: &str = "grid.praxis-proxy.io/overlay-schema-version";
@@ -46,7 +46,7 @@ pub const ANNOTATION_CONTENT_DIGEST: &str = "grid.praxis-proxy.io/overlay-conten
 /// Versioned envelope wrapping a routing overlay.
 ///
 /// Published as JSON under the [`ENVELOPE_KEY`] key of the overlay
-/// `ConfigMap`.  The `grid-config.json` key contains the bare
+/// `ConfigMap`.  The `routing-config.json` key contains the bare
 /// [`RoutingOverlay`] for legacy consumers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OverlayEnvelope {
@@ -121,20 +121,22 @@ pub struct OverlayProvenance {
     /// Producer version from `CARGO_PKG_VERSION`.
     pub producer_version: String,
 
-    /// [`GridNetwork`] resource name.
+    /// Producer-defined source name. Grid uses the [`GridNetwork`] name,
+    /// matching `scope.network`.
     ///
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
-    pub grid_network_name: String,
+    pub source_name: String,
 
-    /// [`GridNetwork`] resource UID.
+    /// Producer-defined source UID. Grid uses the [`GridNetwork`] resource UID.
     ///
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
-    pub grid_network_uid: String,
+    pub source_uid: String,
 
-    /// [`GridNetwork`] observed generation.
+    /// Producer-defined source generation. Grid uses the [`GridNetwork`]
+    /// observed generation.
     ///
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
-    pub grid_network_generation: i64,
+    pub source_generation: i64,
 
     /// RFC 3339 timestamp when the overlay was rendered.
     pub rendered_at: String,
@@ -239,9 +241,9 @@ pub fn build_overlay_envelope(
         provenance: OverlayProvenance {
             producer: "grid-operator".to_owned(),
             producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-            grid_network_name: overlay.network.clone(),
-            grid_network_uid: network_uid.to_owned(),
-            grid_network_generation: network_generation,
+            source_name: overlay.network.clone(),
+            source_uid: network_uid.to_owned(),
+            source_generation: network_generation,
             rendered_at: rendered_at.to_owned(),
         },
         overlay: overlay.clone(),
@@ -458,9 +460,9 @@ mod tests {
         let overlay = minimal_overlay();
         let result = build_overlay_envelope(&overlay, "gw", "ns", "uid-42", 3, "2026-07-29T00:00:00Z").unwrap();
         assert_eq!(result.envelope.provenance.producer, "grid-operator");
-        assert_eq!(result.envelope.provenance.grid_network_name, "test-net");
-        assert_eq!(result.envelope.provenance.grid_network_uid, "uid-42");
-        assert_eq!(result.envelope.provenance.grid_network_generation, 3);
+        assert_eq!(result.envelope.provenance.source_name, "test-net");
+        assert_eq!(result.envelope.provenance.source_uid, "uid-42");
+        assert_eq!(result.envelope.provenance.source_generation, 3);
         assert_eq!(result.envelope.provenance.rendered_at, "2026-07-29T00:00:00Z");
         assert!(!result.envelope.provenance.producer_version.is_empty());
     }
@@ -535,7 +537,7 @@ mod tests {
         .unwrap();
 
         let data = cm.data.as_ref().unwrap();
-        assert!(data.contains_key("grid-config.json"), "legacy key must be present");
+        assert!(data.contains_key("routing-config.json"), "legacy key must be present");
         assert!(data.contains_key(ENVELOPE_KEY), "envelope key must be present");
     }
 
@@ -566,7 +568,7 @@ mod tests {
         let overlay = minimal_overlay();
         let cm = crate::resources::routing_overlay::build_overlay_configmap(&overlay, None, "net", "gw", "ns").unwrap();
         let data = cm.data.as_ref().unwrap();
-        assert!(data.contains_key("grid-config.json"));
+        assert!(data.contains_key("routing-config.json"));
         assert!(!data.contains_key(ENVELOPE_KEY));
         assert!(cm.metadata.annotations.is_none());
     }

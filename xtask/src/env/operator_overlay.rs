@@ -1,14 +1,14 @@
 //! Operator overlay wire-format parsing and routing config generation.
 //!
 //! This module is deliberately **self-contained**. It does not import from
-//! the `operator` crate — the `grid-config.json` JSON format is the contract
+//! the `operator` crate — the `routing-config.json` JSON format is the contract
 //! boundary between a routing overlay producer and the xtask test harness.
 //!
 //! # Wire format
 //!
 //! A routing overlay producer serialises a `RoutingOverlay` as JSON into the
-//! `grid-config.json` key of a Kubernetes `ConfigMap`. This module deserialises
-//! that JSON, validates it, and converts it into the Praxis `grid_route`
+//! `routing-config.json` key of a Kubernetes `ConfigMap`. This module deserialises
+//! that JSON, validates it, and converts it into the Praxis `intelligent_route`
 //! candidates YAML block.
 //!
 //! # Cluster-naming convention
@@ -16,7 +16,7 @@
 //! The `candidate.cluster` field is the overlay upstream cluster reference.
 //! The xtask `load_balancer` clusters are named `gateway-{site}`. The
 //! [`candidates_yaml`] function uses `gateway-{site}` as the cluster reference
-//! so that the `grid_route` and `load_balancer` sections stay consistent within
+//! so that the `intelligent_route` and `load_balancer` sections stay consistent within
 //! the generated Praxis config.
 //!
 //! This is a local validation bridge for xtask integration testing, not a
@@ -35,7 +35,7 @@ use thiserror::Error;
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// Routing overlay deserialized from a `grid-config.json` file.
+/// Routing overlay deserialized from a `routing-config.json` file.
 ///
 /// This struct mirrors the operator `RoutingOverlay` type but is defined here
 /// independently to avoid a path dependency on the `operator` crate.  JSON
@@ -150,7 +150,7 @@ pub(crate) enum OverlayError {
 // Parse
 // ---------------------------------------------------------------------------
 
-/// Parse the JSON content of a routing overlay `grid-config.json`.
+/// Parse the JSON content of a routing overlay `routing-config.json`.
 ///
 /// Validates the overlay before returning it.
 ///
@@ -203,7 +203,7 @@ fn validate_overlay(overlay: &RoutingOverlay) -> Result<(), OverlayError> {
 // YAML generation
 // ---------------------------------------------------------------------------
 
-/// Generate the `grid_route` candidates YAML block from a parsed overlay.
+/// Generate the `intelligent_route` candidates YAML block from a parsed overlay.
 ///
 /// Each candidate produces five YAML lines indented to match the surrounding
 /// Praxis config structure.  The cluster reference is `gateway-{site}` rather
@@ -214,23 +214,23 @@ pub(crate) fn candidates_yaml(overlay: &RoutingOverlay) -> String {
     candidates_yaml_impl(overlay, false)
 }
 
-/// Generate the `candidates:` YAML block for a `grid_route` filter config,
+/// Generate the `candidates:` YAML block for a `intelligent_route` filter config,
 /// **including credential secretRef fields** when candidates carry them.
 ///
 /// This is the native-injection-mode variant: the credential reference is
-/// emitted so that a downstream `grid_credential_inject` filter can read it
-/// from `grid.route.credential.*` filter metadata and inject the bearer token.
+/// emitted so that a downstream `credential_inject` filter can read it
+/// from `intelligent_route.credential.*` filter metadata and inject the bearer token.
 ///
 /// Token values are **never** emitted — only the secretRef `name`,
 /// `namespace`, and `key` fields that locate the Kubernetes Secret.
 ///
 /// # Intended config shape
 ///
-/// When `grid_credential_inject` is used, the consumer Praxis config should
+/// When `credential_inject` is used, the consumer Praxis config should
 /// look like:
 ///
 /// ```yaml
-/// - filter: grid_route
+/// - filter: intelligent_route
 ///   local_site: site-east
 ///   candidates:
 ///     - kind: inference_model
@@ -245,7 +245,7 @@ pub(crate) fn candidates_yaml(overlay: &RoutingOverlay) -> String {
 ///           namespace: grid-system
 ///           key: token
 ///
-/// - filter: grid_credential_inject
+/// - filter: credential_inject
 ///   credentials:
 ///     - name: my-api-token         # matches credential.secretRef.name
 ///       namespace: grid-system      # matches credential.secretRef.namespace
@@ -254,7 +254,7 @@ pub(crate) fn candidates_yaml(overlay: &RoutingOverlay) -> String {
 ///       value: "sk-abc123"          # token resolved by xtask from K8s Secret
 /// ```
 ///
-/// The `grid_credential_inject` section is generated separately by the xtask
+/// The `credential_inject` section is generated separately by the xtask
 /// credential bridge; it is never part of the overlay JSON.
 pub(crate) fn candidates_yaml_with_credentials(overlay: &RoutingOverlay) -> String {
     candidates_yaml_impl(overlay, true)
@@ -271,7 +271,7 @@ fn candidates_yaml_impl(overlay: &RoutingOverlay, emit_credential: bool) -> Stri
 }
 
 /// Render one [`RoutingCandidate`] as indented YAML lines for embedding in a
-/// `grid_route` filter config stanza.
+/// `intelligent_route` filter config stanza.
 fn candidate_yaml_lines(c: &RoutingCandidate, emit_credential: bool) -> String {
     let fresh_str = if c.fresh { "true" } else { "false" };
     let mut lines = vec![
@@ -504,7 +504,7 @@ mod tests {
     fn overlay_cluster_field_maps_to_gateway_site_convention() {
         // Proves the xtask naming convention: overlay cluster name is NOT used
         // verbatim.  The xtask bridge maps candidates to gateway-{site} so that
-        // grid_route and load_balancer cluster references stay consistent.
+        // intelligent_route and load_balancer cluster references stay consistent.
         let json = r#"{
             "network": "net",
             "local_site": "consumer-site",
@@ -535,8 +535,8 @@ mod tests {
     )]
     fn credential_bearing_candidate_parses_and_yaml_omits_credential() {
         // Regression guard: candidates_yaml() must strip credential data so that
-        // grid_route filter YAML never contains secret references or token values.
-        // The grid_route filter rejects unknown fields via deny_unknown_fields;
+        // intelligent_route filter YAML never contains secret references or token values.
+        // The intelligent_route filter rejects unknown fields via deny_unknown_fields;
         // writing credential: into YAML would cause parse failure in old images.
         let json = r#"{
             "network": "net",
@@ -574,19 +574,19 @@ mod tests {
         assert!(yaml.contains("site-b"), "candidate site must appear");
         assert!(
             !yaml.contains("credential"),
-            "credential field must not appear in grid_route YAML"
+            "credential field must not appear in intelligent_route YAML"
         );
         assert!(
             !yaml.contains("bearer_token"),
-            "credential strategy must not appear in grid_route YAML"
+            "credential strategy must not appear in intelligent_route YAML"
         );
         assert!(
             !yaml.contains("secretRef"),
-            "secretRef must not appear in grid_route YAML"
+            "secretRef must not appear in intelligent_route YAML"
         );
         assert!(
             !yaml.contains("api-token-secret"),
-            "secret name must not appear in grid_route YAML"
+            "secret name must not appear in intelligent_route YAML"
         );
     }
 

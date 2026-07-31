@@ -1,17 +1,17 @@
 //! Bridge from operator-produced [`RoutingOverlay`] values to Praxis
-//! `grid_route` filter configuration.
+//! `intelligent_route` filter configuration.
 //!
 //! The [`RoutingOverlay`] JSON is already shaped identically to the
-//! Praxis `grid_route` static candidate config; this module provides
+//! Praxis `intelligent_route` static candidate config; this module provides
 //! a thin conversion layer for validation and Praxis config generation.
 //!
 //! # Conversion contract
 //!
-//! Input: `RoutingOverlay` (from operator ConfigMap `grid-config.json`).
-//! Output: `serde_json::Value` representing the `grid_route` filter stanza.
+//! Input: `RoutingOverlay` (from operator ConfigMap `routing-config.json`).
+//! Output: `serde_json::Value` representing the `intelligent_route` filter stanza.
 //!
 //! The mapping is 1:1 because the overlay shape was designed to match
-//! `grid_route` config:
+//! `intelligent_route` config:
 //! - `overlay.local_site` → `local_site`
 //! - `overlay.candidates[].kind` → `candidates[].kind`
 //! - `overlay.candidates[].name` → `candidates[].name`
@@ -21,10 +21,10 @@
 //!
 //! # Local validation and config-generation path
 //!
-//! 1. Operator produces `ConfigMap` with `grid-config.json`.
-//! 2. A local validation or config-generation tool reads the ConfigMap and extracts `grid-config.json`.
+//! 1. Operator produces `ConfigMap` with `routing-config.json`.
+//! 2. A local validation or config-generation tool reads the ConfigMap and extracts `routing-config.json`.
 //! 3. Deserialise JSON into [`RoutingOverlay`] with `serde_json::from_str`.
-//! 4. Call `to_grid_route_value` to get the Praxis filter stanza as a `serde_json::Value`.
+//! 4. Call `to_intelligent_route_value` to get the Praxis filter stanza as a `serde_json::Value`.
 //! 5. Serialize to JSON or YAML for embedding in the Praxis config file.
 //!
 //! JSON is valid YAML, so the `serde_json::Value` can be serialised with
@@ -34,7 +34,7 @@
 
 use crate::resources::routing_overlay::{RoutingCandidate, RoutingOverlay};
 
-/// Convert a [`RoutingOverlay`] into a Praxis `grid_route` filter stanza
+/// Convert a [`RoutingOverlay`] into a Praxis `intelligent_route` filter stanza
 /// as a `serde_json::Value`.
 ///
 /// The returned value is suitable for serialising to JSON or YAML for
@@ -43,11 +43,11 @@ use crate::resources::routing_overlay::{RoutingCandidate, RoutingOverlay};
 /// are plain JSON-serialisable types.
 ///
 /// [`RoutingCandidate`]: crate::resources::routing_overlay::RoutingCandidate
-pub fn to_grid_route_value(overlay: &RoutingOverlay, model_header: &str) -> serde_json::Value {
+pub fn to_intelligent_route_value(overlay: &RoutingOverlay, model_header: &str) -> serde_json::Value {
     let candidates: Vec<serde_json::Value> = overlay.candidates.iter().map(candidate_to_value).collect();
 
     serde_json::json!({
-        "filter": "grid_route",
+        "filter": "intelligent_route",
         "local_site": overlay.local_site,
         "model_header": model_header,
         "candidates": candidates
@@ -105,11 +105,11 @@ mod tests {
     #[test]
     fn empty_overlay_produces_valid_value() {
         let overlay = make_overlay(vec![]);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         assert_eq!(
             value.get("filter").and_then(serde_json::Value::as_str),
-            Some("grid_route"),
-            "filter must be grid_route"
+            Some("intelligent_route"),
+            "filter must be intelligent_route"
         );
         assert_eq!(
             value.get("local_site").and_then(serde_json::Value::as_str),
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn single_candidate_appears_in_value() {
         let overlay = make_overlay(vec![("granite-3.3-8b", "site-a", "prov-a")]);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         let candidates = value
             .get("candidates")
             .and_then(serde_json::Value::as_array)
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_metadata_is_not_emitted_in_grid_route_filter_value() {
+    fn overlay_metadata_is_not_emitted_in_intelligent_route_filter_value() {
         let mut overlay = make_overlay(vec![("granite-3.3-8b", "site-a", "prov-a")]);
         overlay.generated_at = Some("2026-07-24T12:00:00Z".to_owned());
         let candidate = overlay.candidates.first_mut().unwrap_or_else(|| std::process::abort());
@@ -164,10 +164,10 @@ mod tests {
         candidate.selection_tier = Some(LocalityTier::SameSite);
         candidate.rank = Some(0);
 
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         assert!(
             value.get("generated_at").is_none(),
-            "operator overlay timestamp must not enter static grid_route filter config"
+            "operator overlay timestamp must not enter static intelligent_route filter config"
         );
         let candidate = value
             .get("candidates")
@@ -178,7 +178,7 @@ mod tests {
         for key in ["stable_id", "admission_state", "selection_tier", "rank"] {
             assert!(
                 !candidate.contains_key(key),
-                "operator-only metadata field {key} must not enter static grid_route filter config"
+                "operator-only metadata field {key} must not enter static intelligent_route filter config"
             );
         }
     }
@@ -189,7 +189,7 @@ mod tests {
             ("granite-3.3-8b", "site-a", "prov-a"),
             ("llama-3.2-8b", "site-b", "prov-b"),
         ]);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         let count = value
             .get("candidates")
             .and_then(serde_json::Value::as_array)
@@ -200,8 +200,8 @@ mod tests {
     #[test]
     fn model_header_is_configurable() {
         let overlay = make_overlay(vec![]);
-        let v1 = to_grid_route_value(&overlay, "X-Model");
-        let v2 = to_grid_route_value(&overlay, "X-Inference-Model");
+        let v1 = to_intelligent_route_value(&overlay, "X-Model");
+        let v2 = to_intelligent_route_value(&overlay, "X-Inference-Model");
         assert_eq!(
             v1.get("model_header").and_then(serde_json::Value::as_str),
             Some("X-Model")
@@ -215,9 +215,12 @@ mod tests {
     #[test]
     fn output_is_json_serializable() {
         let overlay = make_overlay(vec![("llama", "site-a", "prov-a")]);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         let json = serde_json::to_string_pretty(&value).unwrap_or_else(|_| std::process::abort());
-        assert!(json.contains("grid_route"), "serialised JSON must contain filter name");
+        assert!(
+            json.contains("intelligent_route"),
+            "serialised JSON must contain filter name"
+        );
         assert!(json.contains("llama"), "serialised JSON must contain model name");
     }
 
@@ -226,14 +229,14 @@ mod tests {
     //
     // These prove the complete local consumption path:
     //   operator ConfigMap JSON → RoutingOverlay deserialize
-    //                           → to_grid_route_value
+    //                           → to_intelligent_route_value
     //                           → Praxis filter stanza
     //
     // Each test uses a realistic JSON fixture that mirrors what
     // `build_overlay_configmap` produces.
     // -----------------------------------------------------------------------
 
-    /// Parse a realistic `grid-config.json` fixture as the xtask would.
+    /// Parse a realistic `routing-config.json` fixture as the xtask would.
     fn parse_overlay(json: &str) -> RoutingOverlay {
         serde_json::from_str(json).unwrap_or_else(|_| std::process::abort())
     }
@@ -275,7 +278,7 @@ mod tests {
     #[test]
     fn round_trip_local_site_appears_in_filter_stanza() {
         let overlay = parse_overlay(SAMPLE_OVERLAY_JSON);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         assert_eq!(
             value.get("local_site").and_then(serde_json::Value::as_str),
             Some("site-a"),
@@ -286,7 +289,7 @@ mod tests {
     #[test]
     fn round_trip_candidates_preserved() {
         let overlay = parse_overlay(SAMPLE_OVERLAY_JSON);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         let candidates = value
             .get("candidates")
             .and_then(serde_json::Value::as_array)
@@ -318,7 +321,7 @@ mod tests {
             }]
         }"#;
         let overlay = parse_overlay(json);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         let c = value
             .get("candidates")
             .and_then(serde_json::Value::as_array)
@@ -335,7 +338,7 @@ mod tests {
     fn round_trip_empty_candidates() {
         let json = r#"{"network": "net", "local_site": "site-a", "candidates": []}"#;
         let overlay = parse_overlay(json);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         assert_eq!(
             value
                 .get("candidates")
@@ -354,13 +357,13 @@ mod tests {
         // 3. Pass to bridge (xtask step)
         // 4. Verify Praxis filter stanza shape (validation)
         let overlay = parse_overlay(SAMPLE_OVERLAY_JSON);
-        let praxis_config = to_grid_route_value(&overlay, "X-Model");
+        let praxis_config = to_intelligent_route_value(&overlay, "X-Model");
 
-        // Shape invariants that Praxis grid_route requires
+        // Shape invariants that Praxis intelligent_route requires
         assert_eq!(
             praxis_config.get("filter").and_then(serde_json::Value::as_str),
-            Some("grid_route"),
-            "filter must be grid_route"
+            Some("intelligent_route"),
+            "filter must be intelligent_route"
         );
         assert!(praxis_config.get("local_site").is_some(), "local_site must be present");
         assert!(
@@ -386,8 +389,8 @@ mod tests {
         // serde_json::Value on every call.  The bridge has no mutable state
         // and no randomness; this test documents and enforces that contract.
         let overlay = make_overlay(vec![("model-a", "site-a", "provider-a")]);
-        let v1 = to_grid_route_value(&overlay, "X-Model");
-        let v2 = to_grid_route_value(&overlay, "X-Model");
+        let v1 = to_intelligent_route_value(&overlay, "X-Model");
+        let v2 = to_intelligent_route_value(&overlay, "X-Model");
         assert_eq!(v1, v2, "identical inputs must produce identical outputs");
     }
 
@@ -395,9 +398,9 @@ mod tests {
     fn network_field_not_in_filter_stanza() {
         // RoutingOverlay.network is operator metadata identifying the
         // GridNetwork the overlay belongs to.  It is not consumed by the
-        // Praxis grid_route filter and must not appear in the output value.
+        // Praxis intelligent_route filter and must not appear in the output value.
         let overlay = make_overlay(vec![]);
-        let value = to_grid_route_value(&overlay, "X-Model");
+        let value = to_intelligent_route_value(&overlay, "X-Model");
         assert!(
             value.get("network").is_none(),
             "network field must not be in the Praxis filter stanza (operator metadata only)"

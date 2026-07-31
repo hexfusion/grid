@@ -191,9 +191,9 @@ complete, runnable Praxis config containing:
 
 - `listeners:` — one public listener at `0.0.0.0:{listenerPort}`
 - `filter_chains:` — the consumer chain with:
-  - `grid_route` candidates from the routing overlay (with `credential.secretRef` for
+  - `intelligent_route` candidates from the routing overlay (with `credential.secretRef` for
     credential-bearing candidates)
-  - `grid_credential_inject` entries (one per unique credential reference) using
+  - `credential_inject` entries (one per unique credential reference) using
     `file:` sources — token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
     cluster must have a matching `clusterEndpoints[]` entry with endpoint address
@@ -208,7 +208,7 @@ cloud-provider fallback routes.  For remote provider sites, provider credentials
 should be mounted only in the remote site or provider-side component that makes
 the final backend call.
 
-The `grid_credential_inject` filter is a Praxis AI runtime dependency.  The Grid
+The `credential_inject` filter is a Praxis AI runtime dependency.  The Grid
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
@@ -500,10 +500,10 @@ credential bytes.  For the current native `bearer_token` path:
    }
    ```
 
-3. The consumer Praxis config uses `grid_credential_inject` with a `file:` source
+3. The consumer Praxis config uses `credential_inject` with a `file:` source
    pointing at a mounted Secret file.
 
-Token bytes do not appear in the overlay `ConfigMap`, `grid_route` candidates,
+Token bytes do not appear in the overlay `ConfigMap`, `intelligent_route` candidates,
 filter metadata, or the consumer Praxis `ConfigMap`.
 
 ### Metrics configuration

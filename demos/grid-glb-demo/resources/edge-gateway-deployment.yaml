@@ -61,7 +61,7 @@ spec:
               mountPath: /etc/praxis
               readOnly: true
             - name: overlay
-              mountPath: /etc/grid
+              mountPath: /etc/praxis/routing
               readOnly: true
             - name: edge-tls
               mountPath: /etc/praxis/tls
@@ -74,10 +74,10 @@ spec:
           configMap:
             name: grid-overlay-glb-demo-edge-gateway
             items:
-              - key: grid-config.json
-                path: grid-config.json
-              - key: grid-overlay.json
-                path: grid-overlay.json
+              - key: routing-config.json
+                path: routing-config.json
+              - key: routing-overlay.json
+                path: routing-overlay.json
         - name: edge-tls
           secret:
             secretName: edge-gateway-tls

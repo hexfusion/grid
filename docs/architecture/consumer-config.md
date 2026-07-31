@@ -60,9 +60,9 @@ The generated config is a complete, runnable Praxis config containing:
 
 - `listeners:` — one public listener at `0.0.0.0:{listenerPort}` (default 8080)
 - `filter_chains:` — the consumer filter chain:
-  - `grid_route` candidates from the overlay (with `credential.secretRef` for
+  - `intelligent_route` candidates from the overlay (with `credential.secretRef` for
     credential-bearing candidates)
-  - `grid_credential_inject` entries using `file:` sources when credential-bearing
+  - `credential_inject` entries using `file:` sources when credential-bearing
     candidates are present — token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
     cluster must have a matching `consumerConfig.clusterEndpoints[]` entry with
@@ -78,7 +78,7 @@ provider sites follow the same SecretRef contract, but the provider credential
 should be mounted only where the final backend call is made.
 
 The generated config requires a Praxis AI image that contains the
-`grid_credential_inject` filter.  Grid can render the config and project
+`credential_inject` filter.  Grid can render the config and project
 credential references today; deployments must ensure the selected Praxis AI image
 includes the matching request-time filter.
 
@@ -194,13 +194,13 @@ Praxis gateways do not automatically reload the complete generated Praxis
 configuration from a changed `ConfigMap` volume mount. A pod restart, rollout,
 or explicit gateway reload is required after the operator updates that static
 configuration. The versioned routing overlay is a separate projected file that
-`grid_route` can validate and hot-reload in process. See
+`intelligent_route` can validate and hot-reload in process. See
 [Reload and rollout](#reload-and-rollout) below.
 
 ## Edge-ingress deployments
 
 External edge-ingress gateways reuse the same consumer config contract: the
-operator renders a `ConfigMap` with static endpoint topology and `grid_route`
+operator renders a `ConfigMap` with static endpoint topology and `intelligent_route`
 candidates, and the edge gateway consumes it the same way a cluster-local
 consumer gateway does.
 
@@ -210,8 +210,8 @@ static endpoint/TLS topology.  The intended architecture separates these:
 
 - **Static topology** (listener config, endpoint addresses, TLS material,
   filter chain structure): changes require a gateway reload or restart.
-- **Dynamic overlay** (`grid-overlay.json` envelope): changes are consumable
-  without a full restart through `grid_route` overlay-file hot reload.
+- **Dynamic overlay** (`routing-overlay.json` envelope): changes are consumable
+  without a full restart through `intelligent_route` overlay-file hot reload.
 
 Praxis AI validates each projected envelope before atomically replacing the
 in-memory route snapshot. A malformed replacement retains the same-process

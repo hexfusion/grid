@@ -20,7 +20,7 @@ scoring::score_backends
 ordered RoutingOverlay candidates
         |
         v
-Praxis grid_route filter
+Praxis intelligent_route filter
 ```
 
 The scoring engine is implemented in `scoring/src/scoring.rs`. The operator
@@ -86,13 +86,13 @@ The overlay also carries a `fresh` flag:
 | `Degraded` | yes | `false` |
 | `Unavailable` | no | — |
 
-The `fresh` flag is consumed by `grid_route` as a request-time safety signal.
+The `fresh` flag is consumed by `intelligent_route` as a request-time safety signal.
 Unavailable providers are not emitted into the overlay.
 
 ## Request-time scoring
 
 Praxis does not currently recompute the full six-signal formula for each
-request. The `grid_route` filter consumes the operator-rendered overlay,
+request. The `intelligent_route` filter consumes the operator-rendered overlay,
 matches candidates by request attributes such as model name, and selects from
 the pre-sorted candidates. Per-request scoring remains an extension point for
 request-local inputs that are not available to the operator.

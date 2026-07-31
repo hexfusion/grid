@@ -1,9 +1,9 @@
-//! Pure overlay renderer for Praxis `grid_route` routing candidates.
+//! Pure overlay renderer for Praxis `intelligent_route` routing candidates.
 //!
 //! Converts [`GridNetwork`], [`GridSite`], and [`InferenceProvider`]
 //! CRDs into a `RoutingOverlay` that is serialised into a Kubernetes
 //! `ConfigMap`.  Praxis reads this `ConfigMap` to configure its
-//! `grid_route` filter with routing candidates.
+//! `intelligent_route` filter with routing candidates.
 //!
 //! This renderer is **pure**: it accepts already-fetched CRD data and
 //! produces structured output.  No Kubernetes API calls are made inside
@@ -35,7 +35,7 @@
 //!
 //! - Name: `grid-overlay-{network}-{gateway}` (≤ 63 chars). Long names receive a deterministic FNV-1a hash suffix to
 //!   avoid collisions.
-//! - Data keys: `grid-config.json` (legacy) + `grid-overlay.json` (versioned envelope)
+//! - Data keys: `routing-config.json` (legacy) + `routing-overlay.json` (versioned envelope)
 //! - Serialization failures are returned as errors, not silently defaulted.
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
@@ -749,7 +749,7 @@ enum SiteResolution {
 /// Contains only locating information — **never** the credential value itself.
 /// Safe to persist in a `ConfigMap`.  The xtask harness resolves the token
 /// from the referenced Secret; Praxis will eventually do this natively once
-/// native Secret-ref support lands in the `grid_route` filter.
+/// native Secret-ref support lands in the `intelligent_route` filter.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectedCredentialRef {
@@ -783,7 +783,7 @@ pub struct ProjectedCredential {
     pub secret_ref: ProjectedCredentialRef,
 }
 
-/// A single routing candidate for the Praxis `grid_route` filter.
+/// A single routing candidate for the Praxis `intelligent_route` filter.
 ///
 /// Each candidate represents one (model, site) pair offered by a provider.
 /// Praxis uses the candidate list to select a backend cluster for each
@@ -791,7 +791,7 @@ pub struct ProjectedCredential {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RoutingCandidate {
     /// Candidate kind.  `"inference_model"` for inference providers; other
-    /// variants (e.g. `"mcp_tool"`) are defined by Praxis `grid_route`.
+    /// variants (e.g. `"mcp_tool"`) are defined by Praxis `intelligent_route`.
     pub kind: String,
 
     /// Model name as declared in the [`InferenceProvider`] spec.
@@ -856,7 +856,7 @@ pub struct RoutingCandidate {
 
 /// The full routing overlay for a single [`GridNetwork`].
 ///
-/// Serialised as JSON under the `grid-config.json` key of the
+/// Serialised as JSON under the `routing-config.json` key of the
 /// overlay `ConfigMap`.
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
@@ -1436,7 +1436,7 @@ pub fn build_overlay_configmap(
     let legacy_json = serde_json::to_string_pretty(overlay)?;
     let name = overlay_configmap_name(network_name, gateway_name);
 
-    let mut data = BTreeMap::from([("grid-config.json".to_owned(), legacy_json)]);
+    let mut data = BTreeMap::from([("routing-config.json".to_owned(), legacy_json)]);
 
     let annotations = if let Some(env) = envelope {
         let envelope_json = serde_json::to_string_pretty(env)?;
@@ -1651,7 +1651,7 @@ mod tests {
         let json_str = cm
             .data
             .as_ref()
-            .and_then(|d| d.get("grid-config.json"))
+            .and_then(|d| d.get("routing-config.json"))
             .unwrap_or_else(|| std::process::abort());
         serde_json::from_str(json_str).unwrap_or_else(|_| std::process::abort())
     }
@@ -1994,7 +1994,7 @@ mod tests {
     // configurations: local + remote cross-site routing, unavailable/degraded
     // local with API fallback, and the full four-kind candidate set.
     //
-    // Praxis `grid_route` candidate contract (current wire format):
+    // Praxis `intelligent_route` candidate contract (current wire format):
     //   kind     — always "inference_model" for inference providers
     //   name     — model name (used for model-based routing)
     //   site     — site identifier (= provider name in Phase 1 no-site mode)
@@ -2251,7 +2251,7 @@ mod tests {
     #[test]
     fn cross_site_candidate_json_has_required_praxis_fields() {
         // Validate that the ConfigMap JSON payload exposes all fields the Praxis
-        // `grid_route` filter reads from each candidate entry.
+        // `intelligent_route` filter reads from each candidate entry.
         //
         // Current candidate wire format: kind, name, site, cluster, fresh.
         // `endpoint` is NOT in the candidate — Praxis looks up the backend
@@ -3026,8 +3026,8 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         assert!(
-            cm.data.as_ref().is_some_and(|d| d.contains_key("grid-config.json")),
-            "data key must be grid-config.json"
+            cm.data.as_ref().is_some_and(|d| d.contains_key("routing-config.json")),
+            "data key must be routing-config.json"
         );
     }
 

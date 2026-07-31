@@ -15,10 +15,10 @@ use crate::AppState;
 pub(crate) const PROVIDER_HEADER_NAME: &str = "x-grid-demo-provider";
 
 /// Provider-owned attribution received by the backend.
-const PROVIDER_ATTRIBUTION_INPUT: &str = "x-grid-provider-attribution";
+const PROVIDER_ATTRIBUTION_INPUT: &str = "x-ai-provider-attribution";
 
 /// Provider-owned request ID received by the backend.
-const PROVIDER_REQUEST_ID_INPUT: &str = "x-grid-provider-request-id";
+const PROVIDER_REQUEST_ID_INPUT: &str = "x-ai-provider-request-id";
 
 /// Safe backend-capture response field for provider attribution.
 pub(crate) const BACKEND_PROVIDER_CAPTURE_HEADER: &str = "x-grid-demo-backend-provider-attribution";
@@ -27,7 +27,7 @@ pub(crate) const BACKEND_PROVIDER_CAPTURE_HEADER: &str = "x-grid-demo-backend-pr
 pub(crate) const BACKEND_REQUEST_ID_CAPTURE_HEADER: &str = "x-grid-demo-backend-request-id";
 
 /// Provider-owned overlay revision received after peer-context validation.
-const OVERLAY_REVISION_INPUT: &str = "x-grid-provider-overlay-revision";
+const OVERLAY_REVISION_INPUT: &str = "x-ai-provider-routing-revision";
 
 /// Safe backend-capture response field for overlay revision.
 pub(crate) const BACKEND_OVERLAY_REVISION_CAPTURE: &str = "x-grid-demo-backend-overlay-revision";

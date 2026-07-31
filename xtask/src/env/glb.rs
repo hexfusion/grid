@@ -134,13 +134,13 @@ const EAST_SECONDARY_PROVIDER: &str = "east-provider-secondary";
 const EAST_SECONDARY_CLUSTER: &str = "sim-east-provider-secondary";
 
 /// AI-owned candidate identity header on the authenticated provider hop.
-const GRID_PEER_SELECTED_CANDIDATE_HEADER: &str = "x-grid-peer-selected-candidate";
+const AI_ROUTING_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 
 /// AI-owned request correlation header on the authenticated provider hop.
-const GRID_PEER_HOP_REQUEST_ID_HEADER: &str = "x-grid-peer-hop-request-id";
+const AI_ROUTING_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 
-/// Provider-owned response attribution emitted by `grid_provider_route`.
-const PROVIDER_GATEWAY_RESPONSE_HEADER: &str = "x-grid-demo-provider-gateway";
+/// Provider-owned response attribution emitted by `provider_route`.
+const PROVIDER_GATEWAY_RESPONSE_HEADER: &str = "x-ai-demo-provider-gateway";
 
 /// Safe backend capture of provider-owned attribution.
 const BACKEND_PROVIDER_CAPTURE_HEADER: &str = "x-grid-demo-backend-provider-attribution";
@@ -1658,8 +1658,8 @@ fn check_provider_request_boundary(addrs: &BTreeMap<String, String>) -> Result<S
             ca: &ca,
             path: "/v1/chat/completions",
             headers: &[
-                (GRID_PEER_SELECTED_CANDIDATE_HEADER, "spoofed"),
-                (GRID_PEER_HOP_REQUEST_ID_HEADER, "boundary-unknown-candidate"),
+                (AI_ROUTING_CANDIDATE_HEADER, "spoofed"),
+                (AI_ROUTING_REQUEST_ID_HEADER, "boundary-unknown-candidate"),
                 ("X-Model", "sim-model-v1"),
             ],
         })?;
@@ -1675,8 +1675,8 @@ fn check_provider_request_boundary(addrs: &BTreeMap<String, String>) -> Result<S
             ca: &ca,
             path: "/v1/unauthorized-path",
             headers: &[
-                (GRID_PEER_SELECTED_CANDIDATE_HEADER, &candidate),
-                (GRID_PEER_HOP_REQUEST_ID_HEADER, "boundary-wrong-path"),
+                (AI_ROUTING_CANDIDATE_HEADER, &candidate),
+                (AI_ROUTING_REQUEST_ID_HEADER, "boundary-wrong-path"),
                 ("X-Model", "sim-model-v1"),
             ],
         })?;
@@ -2033,8 +2033,8 @@ fn parse_seeds_count(raw: &str) -> usize {
 
 /// Verify the overlay [`ConfigMap`] candidate metadata and envelope.
 ///
-/// Checks both the legacy `grid-config.json` and the envelope
-/// `grid-overlay.json` keys, validates envelope structure, and verifies
+/// Checks both the legacy `routing-config.json` and the envelope
+/// `routing-overlay.json` keys, validates envelope structure, and verifies
 /// `ConfigMap` annotations match the envelope revision and digest.
 ///
 /// [`ConfigMap`]: https://kubernetes.io/docs/concepts/configuration/configmap/
@@ -2042,15 +2042,25 @@ fn parse_seeds_count(raw: &str) -> usize {
 fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context(PRIMARY_EDGE);
 
-    let legacy_raw = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-config\.json}")?;
+    let legacy_raw = kubectl_jsonpath(
+        &context,
+        "configmap",
+        OVERLAY_CONFIGMAP,
+        r"{.data.routing-config\.json}",
+    )?;
     if legacy_raw.trim().is_empty() {
-        return Err("overlay ConfigMap legacy key grid-config.json is empty".into());
+        return Err("overlay ConfigMap legacy key routing-config.json is empty".into());
     }
     let legacy_evidence = validate_overlay_json(&legacy_raw)?;
 
-    let envelope_raw = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-overlay\.json}")?;
+    let envelope_raw = kubectl_jsonpath(
+        &context,
+        "configmap",
+        OVERLAY_CONFIGMAP,
+        r"{.data.routing-overlay\.json}",
+    )?;
     if envelope_raw.trim().is_empty() {
-        return Err("overlay ConfigMap envelope key grid-overlay.json is missing or empty".into());
+        return Err("overlay ConfigMap envelope key routing-overlay.json is missing or empty".into());
     }
     let envelope: serde_json::Value = serde_json::from_str(&envelope_raw)?;
     let schema_version = envelope
@@ -2506,7 +2516,8 @@ fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
     ))
 }
 
-/// Require both edge overlays to exist and be projected at `/etc/grid`.
+/// Require both edge overlays to exist and be projected at
+/// `/etc/praxis/routing`.
 fn check_edge_overlay_mounts() -> Result<String, Box<dyn std::error::Error>> {
     let mut evidence = Vec::new();
     let mut revisions = Vec::new();
@@ -2545,10 +2556,19 @@ pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::erro
 }
 
 /// Validate one edge cluster's overlay content and volume projection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear validation sequence, splitting hurts readability"
+)]
 fn verify_single_edge_overlay(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context(edge);
 
-    let overlay = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-config\.json}")?;
+    let overlay = kubectl_jsonpath(
+        &context,
+        "configmap",
+        OVERLAY_CONFIGMAP,
+        r"{.data.routing-config\.json}",
+    )?;
     let document: serde_json::Value = serde_json::from_str(&overlay)?;
     let local_site = document
         .get("local_site")
@@ -2586,10 +2606,10 @@ fn overlay_revision(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
         &kubectl_context(edge),
         "configmap",
         OVERLAY_CONFIGMAP,
-        r"{.data.grid-overlay\.json}",
+        r"{.data.routing-overlay\.json}",
     )?;
     if envelope_raw.trim().is_empty() {
-        return Err(format!("{edge} overlay ConfigMap missing grid-overlay.json key").into());
+        return Err(format!("{edge} overlay ConfigMap missing routing-overlay.json key").into());
     }
     let envelope: serde_json::Value =
         serde_json::from_str(&envelope_raw).map_err(|e| format!("{edge} envelope JSON parse failed: {e}"))?;
@@ -2809,7 +2829,7 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
     let provider_gateway = resp
         .headers
         .get(PROVIDER_GATEWAY_RESPONSE_HEADER)
-        .ok_or("inference response missing X-Grid-Demo-Provider-Gateway header")?;
+        .ok_or("inference response missing X-AI-Demo-Provider-Gateway header")?;
     let expected_gateway = provider_gateway_site(&provider)?;
     if provider_gateway != expected_gateway {
         return Err(format!(
@@ -3165,7 +3185,7 @@ fn check_invalid_overlay_protection(edge: &str) -> Result<String, Box<dyn std::e
         &kubectl_context(edge),
         "configmap",
         OVERLAY_CONFIGMAP,
-        r"{.data.grid-overlay\.json}",
+        r"{.data.routing-overlay\.json}",
     )?;
     let valid_document: serde_json::Value = serde_json::from_str(&valid_envelope)?;
     let valid_revision = valid_document
@@ -3262,7 +3282,7 @@ fn restore_overlay_resources(
 fn patch_overlay_envelope(edge: &str, envelope: &str) -> Result<(), Box<dyn std::error::Error>> {
     let patch = serde_json::json!({
         "data": {
-            "grid-overlay.json": envelope,
+            "routing-overlay.json": envelope,
         }
     });
     let output = Command::new("kubectl")
@@ -3379,7 +3399,7 @@ fn read_overlay(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
         &kubectl_context(edge),
         "configmap",
         OVERLAY_CONFIGMAP,
-        r"{.data.grid-config\.json}",
+        r"{.data.routing-config\.json}",
     )
 }
 
@@ -4200,9 +4220,9 @@ clusters:
 
     #[test]
     fn provider_boundary_headers_match_ai_contract() {
-        assert_eq!(GRID_PEER_SELECTED_CANDIDATE_HEADER, "x-grid-peer-selected-candidate");
-        assert_eq!(GRID_PEER_HOP_REQUEST_ID_HEADER, "x-grid-peer-hop-request-id");
-        for header in [GRID_PEER_SELECTED_CANDIDATE_HEADER, GRID_PEER_HOP_REQUEST_ID_HEADER] {
+        assert_eq!(AI_ROUTING_CANDIDATE_HEADER, "x-ai-routing-candidate");
+        assert_eq!(AI_ROUTING_REQUEST_ID_HEADER, "x-ai-routing-request-id");
+        for header in [AI_ROUTING_CANDIDATE_HEADER, AI_ROUTING_REQUEST_ID_HEADER] {
             assert!(!header.starts_with("x-praxis-"), "{header} would be stripped by Praxis");
         }
     }
@@ -4224,10 +4244,10 @@ clusters:
                 .join("praxis.yaml");
             let config = fs::read_to_string(&path).unwrap_or_else(|_| std::process::abort());
             let route_index = config
-                .find("filter: grid_provider_route")
+                .find("filter: provider_route")
                 .unwrap_or_else(|| std::process::abort());
             let inject_index = config
-                .find("filter: grid_credential_inject")
+                .find("filter: credential_inject")
                 .unwrap_or_else(|| std::process::abort());
             let load_balancer_index = config
                 .find("filter: load_balancer")
@@ -4734,20 +4754,20 @@ clusters:
         .unwrap_or_else(|_| std::process::abort());
 
         assert!(
-            manifest.contains("key: grid-config.json"),
-            "deployment must project legacy grid-config.json key"
+            manifest.contains("key: routing-config.json"),
+            "deployment must project legacy routing-config.json key"
         );
         assert!(
-            manifest.contains("path: grid-config.json"),
-            "deployment must mount legacy grid-config.json path"
+            manifest.contains("path: routing-config.json"),
+            "deployment must mount legacy routing-config.json path"
         );
         assert!(
-            manifest.contains("key: grid-overlay.json"),
-            "deployment must project envelope grid-overlay.json key"
+            manifest.contains("key: routing-overlay.json"),
+            "deployment must project envelope routing-overlay.json key"
         );
         assert!(
-            manifest.contains("path: grid-overlay.json"),
-            "deployment must mount envelope grid-overlay.json path"
+            manifest.contains("path: routing-overlay.json"),
+            "deployment must mount envelope routing-overlay.json path"
         );
     }
 
@@ -4799,14 +4819,14 @@ clusters:
 
     fn fake_log(revision: &str) -> String {
         format!(
-            "INFO grid_route: overlay reloaded candidate_count=2 \
+            "INFO intelligent_route: overlay reloaded candidate_count=2 \
              accepted_revision=\"{revision}\" previous_serving_revision=old"
         )
     }
 
     fn fake_initial_log(revision: &str) -> String {
         format!(
-            "INFO grid_route: overlay snapshot initialized candidate_count=2 \
+            "INFO intelligent_route: overlay snapshot initialized candidate_count=2 \
              accepted_revision=\"{revision}\" serving_revision=\"{revision}\""
         )
     }
@@ -4826,7 +4846,7 @@ clusters:
     #[test]
     fn acceptance_proof_matches_unquoted_reload_revision() {
         let rev = "2b8478c84941fd57810b66f71efe9acafae8af330c8c5488cbecc7da6d0d96a1";
-        let log = format!("INFO grid_route: overlay reloaded accepted_revision={rev} candidate_count=2");
+        let log = format!("INFO intelligent_route: overlay reloaded accepted_revision={rev} candidate_count=2");
         assert!(logs_prove_acceptance(&log, rev));
     }
 
@@ -4956,7 +4976,7 @@ clusters:
 
     #[test]
     fn acceptance_proof_matches_after_csi_sgr_strip() {
-        let raw = "\x1b[2m2026-07-29T07:07:11Z\x1b[0m \x1b[32m INFO\x1b[0m grid_route: overlay reloaded \x1b[3maccepted_revision\x1b[0m\x1b[2m=\x1b[0m\"rev_abc\"";
+        let raw = "\x1b[2m2026-07-29T07:07:11Z\x1b[0m \x1b[32m INFO\x1b[0m intelligent_route: overlay reloaded \x1b[3maccepted_revision\x1b[0m\x1b[2m=\x1b[0m\"rev_abc\"";
         let cleaned = strip_csi_sgr(raw);
         assert!(logs_prove_acceptance(&cleaned, "rev_abc"));
     }

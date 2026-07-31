@@ -37,9 +37,9 @@ fi
 git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/praxis-proxy/grid-ai-rollup@sha256:1a6448789f5b0711d60c37dc68b89633b760fa6b438413a544f8e769bd32accc
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/praxis-proxy/grid-mock-providers@sha256:f80aa0886a8d76ff3bde134fe0fdd0e013c780502b539bfcfbe4f74bcbf2eca8
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:9f6d6b8bc683c34263ddb76717cb740900edf1906f2f463155f6e0ae403bb818
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:c41ff91f20f6acd1db83f8906555427c5d8c8850047d88e7ff398433a63c03c1
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:4908d48061d39ad5747e698998e11b23d3ff76943f4dcca194cc16afab1a0c6f
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
 cargo build -p forge
@@ -50,8 +50,9 @@ cargo xtask env run-grid-glb-demo \
   2>&1 | tee grid-glb-demo-output.txt
 ```
 
-These immutable project images form one tested demo set. The detailed demo
-guide documents prerequisites, full validation mode, evidence, and
+These immutable validation images form one compatible demo set. The Praxis AI
+image rolls up the open intelligent-routing PR stack for review. The detailed
+demo guide documents prerequisites, full validation mode, evidence, and
 troubleshooting.
 
 The development guide documents focused test and validation commands for

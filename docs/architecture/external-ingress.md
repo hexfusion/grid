@@ -58,7 +58,7 @@ process or a single Grid controller.
 | Global traffic manager | Public DNS/Anycast, client-to-edge proximity and latency steering, edge health withdrawal, controlled failback, public-edge DDoS/WAF integration. |
 | Grid operator | Site/provider discovery, policy eligibility, provider and metric state, edge-perspective scoring, admission state, ordered overlay generation. |
 | Overlay distribution | Delivery of a versioned local snapshot to the edge without entering the request path. |
-| Praxis AI edge | External identity/policy filters, model extraction, `grid_route`, session binding, selected-cluster metadata, provider credential injection when the edge is the final hop. |
+| Praxis AI edge | External identity/policy filters, model extraction, `intelligent_route`, session binding, selected-cluster metadata, provider credential injection when the edge is the final hop. |
 | Praxis provider gateway | Edge-peer authentication, destination-side authorization, provider-local limits/policy, and private backend forwarding. |
 | Praxis core / Pingora | Listener TLS, mTLS, peer identity extraction, connection pooling, health checks, load balancing, timeouts, graceful drain, and upstream I/O. |
 
@@ -202,7 +202,7 @@ Grid carries a Secret reference, never credential bytes.
 | Direct API fallback from the external edge | Edge, because it is the final hop |
 | mTLS-only backend | No HTTP provider credential |
 
-Praxis AI `grid_credential_inject` maps an authorized selected candidate to a
+Praxis AI `credential_inject` maps an authorized selected candidate to a
 mounted Secret file at the final hop.
 
 ## Edge Health and GTM
@@ -333,8 +333,8 @@ Praxis core implements the generic primitives used by the completed path:
 upstream mTLS, downstream mTLS identity, `peer_identity_trust`, listeners,
 load balancing, health checks, configuration reload, and connection handling.
 
-Praxis AI owns `grid_route`, provider credential injection, AI request parsing,
-`grid_provider_route`, and the Grid-specific request-time selection contract.
+Praxis AI owns `intelligent_route`, provider credential injection, AI request
+parsing, `provider_route`, and the generic request-time routing contract.
 A compatible Praxis AI build provides overlay-file reload and the configured
 session-affinity behavior.
 
@@ -350,19 +350,19 @@ listeners require an edge certificate, validate the authorized edge identity
 with `peer_identity_trust` as the first unconditional filter, parse the
 inference model, and use an exact provider-local candidate/model/path map
 before forwarding to a private backend. That map selects a provider-local
-Secret reference; `grid_credential_inject` reads the mounted Secret and
+Secret reference; `credential_inject` reads the mounted Secret and
 replaces the external-client credential only on the final backend hop. The edge
 presents its client identity and verifies the provider CA and site-specific
 SNI.
 
-`grid_route.provider_hop_clusters` defines the AI-owned serialization
-boundary. The filter always removes client-supplied `X-Grid-Peer-*` fields and
+`intelligent_route.provider_hop_clusters` defines the AI-owned serialization
+boundary. The filter always removes client-supplied `X-AI-Routing-*` fields and
 reconstructs the selected stable candidate and hop request ID only when the
 selected cluster is explicitly allowlisted as a provider hop. Direct backend
 and API clusters remain absent from that allowlist. Praxis does not interpret
 these fields. The provider consumes them only after mTLS and
 `peer_identity_trust`;
-`grid_provider_route` then removes them, performs an exact local lookup, and
+`provider_route` then removes them, performs an exact local lookup, and
 writes provider-owned backend attribution. `X-Praxis-*` is not used for this
 wire contract because Praxis strips its reserved namespace before upstream
 requests.

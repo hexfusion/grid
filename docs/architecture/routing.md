@@ -21,7 +21,7 @@ Versioned routing overlay ConfigMap
 Praxis validates and accepts a routing snapshot
         |
         v
-grid_route serves from that exact snapshot
+intelligent_route serves from that exact snapshot
         |
         v
 Praxis provider gateway
@@ -49,8 +49,8 @@ The `ConfigMap` contains:
 
 | Key | Purpose |
 |---|---|
-| `grid-overlay.json` | Versioned envelope with scope, provenance, digest, and routing payload. |
-| `grid-config.json` | Bare routing payload for consumers that have not enabled the envelope contract. |
+| `routing-overlay.json` | Versioned envelope with scope, provenance, digest, and routing payload. |
+| `routing-config.json` | Bare routing payload for consumers that have not enabled the envelope contract. |
 
 Both keys describe the same routing state.
 
@@ -79,9 +79,9 @@ The envelope is the authoritative observable contract consumed by Praxis AI:
   "provenance": {
     "producer": "grid-operator",
     "producer_version": "0.1.0",
-    "grid_network_name": "production",
-    "grid_network_uid": "00000000-0000-0000-0000-000000000000",
-    "grid_network_generation": 12,
+    "source_name": "production",
+    "source_uid": "00000000-0000-0000-0000-000000000000",
+    "source_generation": 12,
     "rendered_at": "2026-07-29T00:00:00Z"
   },
   "overlay": {
@@ -183,11 +183,11 @@ revision does not cause a replacement. The request path reads the immutable
 accepted snapshot from memory and does not read Kubernetes, the filesystem,
 SWIM, or Grid APIs.
 
-For a provider hop, `grid_route` removes any caller-supplied revision context
-and sets `x-grid-peer-overlay-revision` from the exact snapshot that served the
+For a provider hop, `intelligent_route` removes any caller-supplied revision context
+and sets `x-ai-routing-revision` from the exact snapshot that served the
 selection. The provider gateway validates its syntax, consumes it after peer
 authentication, removes it from the forwarded request, and sets
-`x-grid-provider-overlay-revision` for backend telemetry. These headers provide
+`x-ai-provider-routing-revision` for backend telemetry. These headers provide
 correlation; they do not replace mTLS identity or provider-local route policy.
 
 Candidate fields:
@@ -211,11 +211,12 @@ Overlay-level fields:
 |-------|---------|
 | `generated_at` | Optional. RFC 3339 timestamp of when the overlay was rendered. |
 
-The metadata fields above belong to the Grid overlay contract. The generated
-Praxis static `grid_route` configuration intentionally strips
+The metadata fields above belong to the generic Praxis AI routing contract.
+Grid supplies Grid-specific values through that contract. The generated Praxis
+static `intelligent_route` configuration intentionally strips
 `stable_id`, `admission_state`, `selection_tier`, `rank`, and `generated_at`
-because current static `grid_route` candidate config rejects unknown fields.
-Praxis overlay-file hot reload consumes the raw Grid overlay and must remain
+because current static `intelligent_route` candidate config rejects unknown fields.
+Praxis overlay-file hot reload consumes the producer's raw overlay and must remain
 forward-compatible with unknown overlay metadata fields.
 
 ### Credential field security contract
@@ -224,7 +225,7 @@ When `credential` is present on a candidate, the field contains only:
 - `strategy`: the authentication mechanism (currently `"bearer_token"`)
 - `secretRef.name` / `secretRef.namespace` / `secretRef.key`: Kubernetes Secret locating information
 
-The token value is **never written into the overlay ConfigMap**. The `grid_route`
+The token value is **never written into the overlay ConfigMap**. The `intelligent_route`
 filter parses the field and makes it available to downstream filters, but does
 not perform Kubernetes API calls or inject credentials itself.
 
@@ -236,7 +237,7 @@ Grid sites, provider backend credentials stay in the remote provider site or
 provider-side component; the consumer gateway should not receive those provider
 tokens.
 
-Native file-backed injection requires the Praxis AI `grid_credential_inject`
+Native file-backed injection requires the Praxis AI `credential_inject`
 filter.  Grid can render the overlay and generated config for that path today,
 but runtime deployments must use a Praxis AI image that includes the filter.
 
@@ -309,7 +310,7 @@ backward compatibility with deployments that predate geography fields.
 overlay with `fresh: false`. Providers with no live metrics use neutral metric
 scores.
 
-At request time, `grid_route` selects from this pre-sorted candidate list rather
+At request time, `intelligent_route` selects from this pre-sorted candidate list rather
 than recomputing the full scoring formula.
 
 ## Stale candidate retention and expiry
@@ -454,7 +455,7 @@ The difference is the backend category and credential handling:
    candidate can become the selected route.
 
 The fallback decision is therefore still local to the consumer gateway at
-request time: `grid_route` selects from the pre-rendered candidate list, and the
+request time: `intelligent_route` selects from the pre-rendered candidate list, and the
 Praxis AI filter chain handles credential injection and upstream forwarding.
 
 Grid overlay and credential-injection validation is distinct from
@@ -490,25 +491,25 @@ token value — into the routing overlay candidate:
 
 The native injection path uses two gateway filters in sequence:
 
-1. **`grid_route`** selects the candidate and writes the secretRef fields to
-   in-process filter metadata: `grid.route.credential.strategy`,
-   `grid.route.credential.name`, `grid.route.credential.namespace`,
-   `grid.route.credential.key`.  No token value is written.
+1. **`intelligent_route`** selects the candidate and writes the secretRef fields to
+   in-process filter metadata: `intelligent_route.credential.strategy`,
+   `intelligent_route.credential.name`, `intelligent_route.credential.namespace`,
+   `intelligent_route.credential.key`.  No token value is written.
 
-2. **`grid_credential_inject`** reads those metadata keys, looks up the
+2. **`credential_inject`** reads those metadata keys, looks up the
    matching token in its configured credential map, and injects
    `Authorization: Bearer <token>` into the upstream request.
 
 Consumer config filter chain ordering:
 
 ```text
-grid_route              → selects candidate; writes credential metadata
-grid_credential_inject  → reads credential metadata; injects Authorization
+intelligent_route              → selects candidate; writes credential metadata
+credential_inject  → reads credential metadata; injects Authorization
 load_balancer           → upstream cluster selection with injected headers
 ```
 
 This filter chain requires a Praxis AI image that includes
-`grid_credential_inject`.  Grid renders the overlay and generated config shape;
+`credential_inject`.  Grid renders the overlay and generated config shape;
 the runtime image must provide the filter implementation.
 
 ### File-backed token source
@@ -516,7 +517,7 @@ the runtime image must provide the filter implementation.
 In the current xtask validation mode for direct API-provider fallback, the token
 value is resolved from a Kubernetes Secret by the xtask harness and written into
 a Kubernetes Secret in the consumer cluster.  The consumer pod mounts that
-Secret as a file, and `grid_credential_inject` reads the token from its
+Secret as a file, and `credential_inject` reads the token from its
 configured `file:` path at filter construction time.
 
 In production, the same rule applies at the final-hop point: mount the Secret
@@ -526,21 +527,21 @@ backend call. Grid does not copy Secret values across clusters.
 The token does NOT appear in:
 
 - The Grid operator overlay `ConfigMap` (JSON).
-- The `grid_route` filter candidates YAML.
+- The `intelligent_route` filter candidates YAML.
 - The consumer Praxis `ConfigMap`.
-- The `grid.route.*` in-process filter metadata.
+- The `intelligent_route.*` in-process filter metadata.
 - Tracing spans or log lines.
 - HTTP error response bodies.
 
 ### Deployment ownership
 
-The operator generates the consumer Praxis config including the `grid_credential_inject`
+The operator generates the consumer Praxis config including the `credential_inject`
 section for direct API-provider routes.  Secret provisioning — creating,
 rotating, and synchronizing the mounted credential Secret in the final-hop
 cluster — is the responsibility of platform automation or an external Secret
 manager.
 
-The `grid_route` → `grid_credential_inject` filter chain interface is the same
+The `intelligent_route` → `credential_inject` filter chain interface is the same
 regardless of how the final-hop Secret is provisioned.
 
 ## Routing eligibility
@@ -594,13 +595,13 @@ correct-network overlay.
 
 ## Consumer gateway selection
 
-At request time, `grid_route` matches the requested model against the
+At request time, `intelligent_route` matches the requested model against the
 already-loaded overlay candidates, then chooses from Grid's pre-rendered
 candidate order.  It does not call Kubernetes, SWIM, or the operator, and it
 does not recompute the full scoring formula per request.
 
 The Praxis consumer gateway extracts request facts such as the requested model
-and runs `grid_route` against the overlay. For model inference, the filter scans
+and runs `intelligent_route` against the overlay. For model inference, the filter scans
 for matching `inference_model` candidates and sets the selected Praxis upstream
 cluster.
 
@@ -611,10 +612,10 @@ an unrelated backend.
 
 External client ingress uses the same overlay consumption path. A Praxis AI
 edge-ingress gateway loads a Grid overlay rendered for that edge's routing
-perspective and runs `grid_route` identically to a cluster-local consumer
+perspective and runs `intelligent_route` identically to a cluster-local consumer
 gateway.
 
-The difference is upstream of `grid_route`: the external edge sits behind a
+The difference is upstream of `intelligent_route`: the external edge sits behind a
 global traffic manager that selects a healthy edge before the request body or
 model is known.  The edge then parses the OpenAI-compatible request, extracts
 the model, and runs the loaded overlay selection.  Two-stage routing separates
@@ -643,27 +644,27 @@ authorize an arbitrary candidate, model, or backend.
 ## Provider-side request forwarding
 
 After site selection, the edge AI filter removes inbound copies of the fixed
-`X-Grid-Peer-*` contract and reconstructs the selected stable candidate and hop
+`X-AI-Routing-*` contract and reconstructs the selected stable candidate and hop
 request ID. The provider consumes those fields only after mTLS and
-`peer_identity_trust`. `grid_provider_route` removes them, validates an exact
+`peer_identity_trust`. `provider_route` removes them, validates an exact
 provider-local candidate/model/path map, and selects the local backend cluster.
 It performs no discovery, scoring, affinity, or hot reload.
 
 Praxis AI rejects provider pipelines at startup unless the listener requires
 client certificates and an unconditional, fail-closed `peer_identity_trust` is
-the first filter before the top-level `grid_provider_route`. First position
+the first filter before the top-level `provider_route`. First position
 prevents an earlier branch from bypassing peer authorization. The validation
 cannot be downgraded with the generic pipeline-validation skip options.
 
 The provider inference path is:
 
 ```text
-grid_route
+intelligent_route
   -> mTLS provider hop
   -> peer_identity_trust
   -> inference parser
-  -> grid_provider_route
-  -> optional grid_credential_inject
+  -> provider_route
+  -> optional credential_inject
   -> load_balancer
   -> private backend
 ```
@@ -794,7 +795,7 @@ operator's next reconciliation loop observes the new SWIM/member/provider state
 and re-renders.
 
 Rendering or distributing a new `ConfigMap` does not mean the gateway accepted
-it. Praxis AI `grid_route` can watch a projected `grid-overlay.json`, validate
+it. Praxis AI `intelligent_route` can watch a projected `routing-overlay.json`, validate
 the replacement, and atomically install a new snapshot without a pod restart.
 The deployment must mount the full projected directory rather than a
 `subPath`, enable overlay-file reload, and configure its expected scope.

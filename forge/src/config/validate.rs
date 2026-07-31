@@ -1573,15 +1573,6 @@ spec:
     }
 
     #[test]
-    fn service_with_placeholder_image_valid() {
-        let mut config = base_config();
-        let mut svc = test_service("sync");
-        svc.image = "ghcr.io/praxis-proxy/grid-overlay-sync:sha-PLACEHOLDER".to_owned();
-        config.spec.services = vec![svc];
-        validate(&config).unwrap_or_else(|_| std::process::abort());
-    }
-
-    #[test]
     fn service_env_key_empty_rejected() {
         let mut config = base_config();
         let mut svc = test_service("web");

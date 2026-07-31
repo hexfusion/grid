@@ -52,7 +52,7 @@ pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
 
 /// The model name served by the API-provider fallback fixture.
 ///
-/// Distinct from the self-hosted models so the consumer `grid_route` can route
+/// Distinct from the self-hosted models so the consumer `intelligent_route` can route
 /// it to the API-provider cluster without ambiguity.
 pub(crate) const API_FALLBACK_MODEL: &str = "model-z";
 
@@ -1899,7 +1899,7 @@ pub(crate) fn wait_for_overlay_configmap(
 // Overlay verification
 // ---------------------------------------------------------------------------
 
-/// Read the overlay `ConfigMap` and return the parsed `grid-config.json` value.
+/// Read the overlay `ConfigMap` and return the parsed `routing-config.json` value.
 pub(crate) fn read_overlay_configmap(
     context: &str,
     network: &str,
@@ -1907,7 +1907,7 @@ pub(crate) fn read_overlay_configmap(
     namespace: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let cm_name = format!("grid-overlay-{network}-{gateway}");
-    let json_str = kubectl_jsonpath_ns(context, namespace, &cm_name, r"{.data.grid-config\.json}")?;
+    let json_str = kubectl_jsonpath_ns(context, namespace, &cm_name, r"{.data.routing-config\.json}")?;
     let overlay: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| format!("overlay JSON parse error: {e}"))?;
     Ok(overlay)
@@ -2827,8 +2827,8 @@ pub(crate) fn verify_operator_consumer_configmap(
 ///
 /// # Invariants checked
 ///
-/// **Must be present:** `listeners:`, `admin:`, `filter: grid_route`,
-/// `filter: grid_credential_inject`, `filter: load_balancer`, `credential:`,
+/// **Must be present:** `listeners:`, `admin:`, `filter: intelligent_route`,
+/// `filter: credential_inject`, `filter: load_balancer`, `credential:`,
 /// `secretRef:`, `file: …/{secret_name}/{secret_key}`, `endpoints:`.
 ///
 /// **Must be absent:** token value, `value:`, `filter: headers`, `request_set:`.
@@ -2847,8 +2847,8 @@ pub(crate) fn verify_consumer_praxis_yaml(
     for required in &[
         "listeners:",
         "admin:",
-        "filter: grid_route",
-        "filter: grid_credential_inject",
+        "filter: intelligent_route",
+        "filter: credential_inject",
         "filter: load_balancer",
         "credential:",
         "secretRef:",
@@ -2872,7 +2872,7 @@ pub(crate) fn verify_consumer_praxis_yaml(
     }
     eprintln!(
         "  [PASS] operator-generated consumer ConfigMap shape: listeners + filter_chains \
-         (grid_route + grid_credential_inject (file:{expected_file_path}) + load_balancer \
+         (intelligent_route + credential_inject (file:{expected_file_path}) + load_balancer \
          endpoints) + admin; token absent; no static header injection"
     );
     Ok(())
@@ -3361,7 +3361,7 @@ pub(crate) fn verify_full_grid_overlay(
     Ok(())
 }
 
-/// Export the overlay `ConfigMap` `grid-config.json` value to a temp file.
+/// Export the overlay `ConfigMap` `routing-config.json` value to a temp file.
 ///
 /// Returns the path of the written file.  The caller may pass this file to
 /// `cargo xtask env deploy-consumer-gateway --overlay-config <path>` to validate
@@ -7570,7 +7570,7 @@ mod tests {
              \x20     - filter: json_body_field\n\
              \x20       field: model\n\
              \x20       header: X-Model\n\
-             \x20     - filter: grid_route\n\
+             \x20     - filter: intelligent_route\n\
              \x20       local_site: site-a\n\
              \x20       model_header: X-Model\n\
              \x20       candidates:\n\
@@ -7585,7 +7585,7 @@ mod tests {
              \x20               name: {secret_name}\n\
              \x20               namespace: default\n\
              \x20               key: {secret_key}\n\
-             \x20     - filter: grid_credential_inject\n\
+             \x20     - filter: credential_inject\n\
              \x20       credentials:\n\
              \x20         - name: {secret_name}\n\
              \x20           namespace: default\n\
@@ -7613,13 +7613,13 @@ mod tests {
     }
 
     #[test]
-    fn verify_consumer_praxis_yaml_rejects_missing_grid_route() {
-        // Include listeners: and admin: so the checker reaches the grid_route check.
-        let yaml = "listeners:\nadmin:\nfilter: load_balancer\nfilter: grid_credential_inject\ncredential:\nsecretRef:\nfile: /run/secrets/grid-credentials/creds/token\nendpoints:\n";
+    fn verify_consumer_praxis_yaml_rejects_missing_intelligent_route() {
+        // Include listeners: and admin: so the checker reaches the intelligent_route check.
+        let yaml = "listeners:\nadmin:\nfilter: load_balancer\nfilter: credential_inject\ncredential:\nsecretRef:\nfile: /run/secrets/grid-credentials/creds/token\nendpoints:\n";
         let err = verify_consumer_praxis_yaml(yaml, "tok", "creds", "token").unwrap_err();
         assert!(
-            err.to_string().contains("grid_route"),
-            "must report missing grid_route: {err}"
+            err.to_string().contains("intelligent_route"),
+            "must report missing intelligent_route: {err}"
         );
     }
 
@@ -7667,9 +7667,9 @@ mod tests {
 
     #[test]
     fn verify_consumer_praxis_yaml_rejects_missing_file_path() {
-        // YAML with grid_credential_inject but no file: path for the secret.
+        // YAML with credential_inject but no file: path for the secret.
         // Includes listeners: and admin: so the checker reaches the file-path check.
-        let yaml = "listeners:\nadmin:\nfilter: grid_route\nfilter: grid_credential_inject\nfilter: load_balancer\ncredential:\nsecretRef:\nendpoints:\n";
+        let yaml = "listeners:\nadmin:\nfilter: intelligent_route\nfilter: credential_inject\nfilter: load_balancer\ncredential:\nsecretRef:\nendpoints:\n";
         let err = verify_consumer_praxis_yaml(yaml, "tok", "my-creds", "token").unwrap_err();
         assert!(
             err.to_string().contains("/run/secrets/grid-credentials/my-creds/token"),

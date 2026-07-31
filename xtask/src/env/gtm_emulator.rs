@@ -32,7 +32,7 @@ const CUSTOMER_TOKEN: &str = "test-token";
 /// Demo affinity key used only by the GTM edge-selection layer.
 const EDGE_SESSION_HEADER: &str = "X-Edge-Session-Id";
 
-/// Demo affinity key used by `grid_route` for provider selection.
+/// Demo affinity key used by `intelligent_route` for provider selection.
 const PROVIDER_SESSION_HEADER: &str = "X-Session-Id";
 
 /// Kubernetes clusters and Praxis Deployments in the complete path.
@@ -51,7 +51,7 @@ pub(crate) struct EdgeSample {
     status: u16,
     /// Edge attribution set by the selected Praxis edge.
     pub(crate) edge: String,
-    /// Provider gateway attribution set by `grid_provider_route`.
+    /// Provider gateway attribution set by `provider_route`.
     pub(crate) provider_gateway: String,
     /// Backend site attribution set by the strict mock provider.
     pub(crate) provider: String,
@@ -194,7 +194,7 @@ fn overlay_local_site(cluster: &str) -> Result<String, Box<dyn std::error::Error
     let raw = kubectl_jsonpath(
         cluster,
         "configmap/grid-overlay-glb-demo-edge-gateway",
-        r"{.data.grid-config\.json}",
+        r"{.data.routing-config\.json}",
     )?;
     let document: serde_json::Value = serde_json::from_str(&raw)?;
     let candidates = document
@@ -434,7 +434,7 @@ fn parse_response(response: &str) -> Result<EdgeSample, Box<dyn std::error::Erro
 
 /// Validate the provider gateway, backend site, and final-hop request evidence.
 fn parse_provider_attribution(headers: &str) -> Result<(String, String, String), Box<dyn std::error::Error>> {
-    let provider_gateway = parse_header(headers, "x-grid-demo-provider-gateway")
+    let provider_gateway = parse_header(headers, "x-ai-demo-provider-gateway")
         .filter(|value| matches!(*value, "east-provider" | "west-provider"))
         .ok_or("response missing valid provider-gateway attribution")?;
     let provider = parse_header(headers, "x-grid-demo-provider")
@@ -487,7 +487,7 @@ mod tests {
         let response = concat!(
             "HTTP/1.1 200 OK\r\n",
             "X-Grid-Demo-Edge-Gateway: west-edge\r\n",
-            "X-Grid-Demo-Provider-Gateway: east-provider\r\n",
+            "X-AI-Demo-Provider-Gateway: east-provider\r\n",
             "X-Grid-Demo-Provider: east-provider\r\n",
             "X-Grid-Demo-Backend-Request-Id: backend-123\r\n",
             "Content-Type: application/json\r\n\r\n{}"
@@ -510,7 +510,7 @@ mod tests {
         let response = concat!(
             "HTTP/1.1 200 OK\r\n",
             "X-Grid-Demo-Edge-Gateway: west-edge\r\n",
-            "X-Grid-Demo-Provider-Gateway: east-provider\r\n",
+            "X-AI-Demo-Provider-Gateway: east-provider\r\n",
             "X-Grid-Demo-Provider: east-provider-secondary\r\n",
             "X-Grid-Demo-Backend-Request-Id: backend-secondary\r\n\r\n{}"
         );
@@ -544,9 +544,9 @@ mod tests {
         assert!(config.contains("header: X-Edge-Session-Id"));
         assert!(config.contains("type: tcp"));
         for forbidden in [
-            "grid_route",
-            "grid_provider_route",
-            "grid_credential_inject",
+            "intelligent_route",
+            "provider_route",
+            "credential_inject",
             "peer_identity_trust",
         ] {
             assert!(!config.contains(forbidden), "GTM must not own {forbidden}");
@@ -611,7 +611,7 @@ mod tests {
         assert!(!forge.contains("overlay-sync"));
         assert!(west_network.contains("localSiteName: west-edge"));
         assert!(edge_deployment.contains("name: grid-overlay-glb-demo-edge-gateway"));
-        assert!(edge_deployment.contains("mountPath: /etc/grid"));
+        assert!(edge_deployment.contains("mountPath: /etc/praxis/routing"));
     }
 
     #[test]

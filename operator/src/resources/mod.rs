@@ -23,7 +23,7 @@ pub(crate) mod consumer_config;
 /// [`verify_credential_accessible`]: credentials::verify_credential_accessible
 pub mod credentials;
 
-/// Bridge from operator routing overlays to Praxis `grid_route` filter config.
+/// Bridge from operator routing overlays to Praxis `intelligent_route` filter config.
 pub mod overlay_bridge;
 /// Versioned overlay envelope for content-addressed revision tracking.
 pub mod overlay_envelope;
@@ -31,7 +31,7 @@ pub mod overlay_envelope;
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 pub(crate) mod provider_metrics;
-/// Pure overlay renderer for Praxis `grid_route` routing candidates.
+/// Pure overlay renderer for Praxis `intelligent_route` routing candidates.
 pub mod routing_overlay;
 /// Secret builders for grid TLS certificates.
 pub mod secret;

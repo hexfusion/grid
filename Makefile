@@ -17,7 +17,7 @@ endif
 	test test-unit lint fmt doc audit \
 	coverage coverage-check \
 	require-container-engine \
-	images container operator-image overlay-sync-image \
+	images container operator-image \
 	mock-providers-image glb-demo-images \
 	kind-up kind-down \
 	dev-env dev-push dev-integration \
@@ -104,9 +104,6 @@ images: | require-container-engine
 operator-image: | require-container-engine
 	$(CONTAINER_ENGINE) build -f deploy/operator/Containerfile -t grid-operator:latest .
 
-overlay-sync-image: | require-container-engine
-	$(CONTAINER_ENGINE) build -f deploy/overlay-sync/Containerfile -t grid-overlay-sync:latest .
-
 mock-providers-image: | require-container-engine
 	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:latest .
 
@@ -187,7 +184,6 @@ help:
 	@echo "  container            build container image"
 	@echo "  images               build container image"
 	@echo "  operator-image       build operator container image"
-	@echo "  overlay-sync-image   build overlay-sync container image"
 	@echo "  mock-providers-image build mock-providers container image"
 	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"
 	@echo ""

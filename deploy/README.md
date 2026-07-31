@@ -96,7 +96,7 @@ For production, use a versioned release tag or immutable digest.
 
 **Important**: Grid only deploys the operator and CRDs. Praxis AI gateway deployment is separate and requires:
 
-1. Praxis AI image with required filters (`grid_route`, `grid_credential_inject`)
+1. Praxis AI image with required filters (`intelligent_route`, `credential_inject`)
 2. Consumer gateway configuration referencing Grid-generated ConfigMaps
 3. Provider gateway deployment with Grid-compatible endpoints
 

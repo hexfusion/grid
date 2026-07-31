@@ -272,6 +272,7 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
     eprintln!("            Forge will report again after cluster creation completes.");
     run_forge(&context.forge_bin, &context.resolved_config, &["up"])?;
     setup_phase(3, "Resolving and loading runtime images");
+    print_runtime_images();
     load_local_images_if_required(&context.forge_bin, &context.resolved_config)?;
     setup_phase(4, "Installing MetalLB, SWIM services, and Grid operators");
     apply_foundation_stacks(&context.forge_bin, &context.resolved_config)?;
@@ -302,6 +303,14 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
 fn setup_phase(number: usize, description: &str) {
     eprintln!();
     eprintln!("[SETUP {number}/{SETUP_PHASES}] {description}");
+}
+
+/// Print the exact image contract selected by environment overrides.
+fn print_runtime_images() {
+    eprintln!("  gateway:       {}", image_overrides::glb_gateway_image());
+    eprintln!("  operator:      {}", image_overrides::glb_operator_image());
+    eprintln!("  mock provider: {}", image_overrides::glb_mock_provider_image());
+    eprintln!("  pull policy:   {}", image_overrides::image_pull_policy());
 }
 
 /// Explain the control-plane milestone represented by overlay convergence.

@@ -13,8 +13,8 @@ Grid-generated ConfigMap.
 
 1. Grid operator installed (see `../../README.md`)
 2. Praxis AI gateway deployment with:
-   - `grid_route` filter
-   - `grid_credential_inject` filter  
+   - `intelligent_route` filter
+   - `credential_inject` filter
    - Consumer configuration referencing generated ConfigMaps
 
 ## Installation
