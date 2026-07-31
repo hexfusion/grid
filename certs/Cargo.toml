@@ -10,6 +10,7 @@ publish = false
 pem = "3"
 rcgen = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 
 [lints]
 workspace = true

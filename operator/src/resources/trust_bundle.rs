@@ -10,6 +10,10 @@ use std::collections::BTreeMap;
 use k8s_openapi::ByteString;
 use sha2::{Digest as _, Sha256};
 
+/// Maximum public certificate PEM size accepted for SWIM distribution,
+/// `GridSite` status, or trust-bundle storage.
+pub(crate) const MAX_PUBLIC_CERT_PEM_BYTES: usize = 65_536;
+
 // ---------------------------------------------------------------------------
 // PEM structure validation
 // ---------------------------------------------------------------------------
@@ -43,6 +47,12 @@ pub enum CertPemStatus {
     /// This covers garbage input, empty strings, and valid PEM of a different
     /// type (e.g. a CSR or public key).
     NotACertificate,
+
+    /// Input exceeds `MAX_PUBLIC_CERT_PEM_BYTES`.
+    ///
+    /// Oversized public identity material is rejected before it can enter
+    /// SWIM state, Kubernetes status, or a trust bundle.
+    TooLarge,
 }
 
 /// Compute the SHA-256 fingerprint of a PEM string.
@@ -77,10 +87,11 @@ pub fn sha256_fingerprint(pem_str: &str) -> String {
 ///
 /// This is a **marker-based structural check**, not cryptographic verification.
 /// The function:
-/// 1. Rejects any input that contains `"PRIVATE KEY"` — private key material must never appear in public-facing cert
+/// 1. Rejects input larger than `MAX_PUBLIC_CERT_PEM_BYTES`.
+/// 2. Rejects any input that contains `"PRIVATE KEY"` — private key material must never appear in public-facing cert
 ///    fields.
-/// 2. Accepts input that contains `"-----BEGIN CERTIFICATE-----"` as structurally valid.
-/// 3. Rejects everything else as not a certificate.
+/// 3. Accepts input that contains `"-----BEGIN CERTIFICATE-----"` as structurally valid.
+/// 4. Rejects everything else as not a certificate.
 ///
 /// A [`CertPemStatus::ValidStructure`] result does **not** mean:
 /// - The certificate was parsed as X.509.
@@ -92,6 +103,9 @@ pub fn sha256_fingerprint(pem_str: &str) -> String {
 /// treat [`CertPemStatus::ValidStructure`] as structural validity only — never as trust or authorization.
 #[must_use]
 pub fn check_cert_pem(pem_str: &str) -> CertPemStatus {
+    if pem_str.len() > MAX_PUBLIC_CERT_PEM_BYTES {
+        return CertPemStatus::TooLarge;
+    }
     // Security invariant: private key markers must be rejected immediately.
     // A misconfigured or malicious peer might send private key PEM; do not store it.
     if pem_str.contains("PRIVATE KEY") {
@@ -236,6 +250,30 @@ mod tests {
             CertPemStatus::NotACertificate,
             "public key PEM (not a cert) must not be accepted as ValidStructure"
         );
+    }
+
+    #[test]
+    fn check_cert_pem_rejects_oversized_input() {
+        let oversized = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
+            "A".repeat(MAX_PUBLIC_CERT_PEM_BYTES)
+        );
+        assert_eq!(
+            check_cert_pem(&oversized),
+            CertPemStatus::TooLarge,
+            "oversized public certificate material must be rejected"
+        );
+    }
+
+    #[test]
+    fn append_rejects_oversized_certificate() {
+        let mut data = BTreeMap::new();
+        let oversized = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
+            "A".repeat(MAX_PUBLIC_CERT_PEM_BYTES)
+        );
+        assert_eq!(append_cert(&mut data, "cluster-a", &oversized), CertPemStatus::TooLarge);
+        assert!(data.is_empty(), "oversized certificate must not enter the trust bundle");
     }
 
     #[test]

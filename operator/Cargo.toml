@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+axum = { workspace = true }
 bytes = { workspace = true }
 certs = { path = "../certs" }
 crdt = { path = "../crdt" }
@@ -20,7 +21,9 @@ hyper-util = { workspace = true }
 scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+prometheus = { workspace = true }
 schemars = { workspace = true }
+rustls = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,9 +31,11 @@ serde_json_canonicalizer = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

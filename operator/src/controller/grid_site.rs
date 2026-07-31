@@ -8,21 +8,36 @@
 
 use std::sync::Arc;
 
+use k8s_openapi::api::core::v1::ObjectReference;
 use kube::{
-    Client,
+    Client, Resource as _,
     api::{Api, Patch, PatchParams},
-    runtime::controller::Action,
+    runtime::{
+        controller::Action,
+        events::{Event, EventType, Recorder, Reporter},
+    },
 };
+use rustls::pki_types::ServerName;
 use tokio::time::Duration;
 use tracing::info;
+use zeroize::Zeroizing;
 
 use crate::{
     crd::{
         grid_network::GridNetwork,
-        grid_site::{GridSite, GridSitePhase, GridSiteStatus},
+        grid_site::{EgressTlsMode, GridSite, GridSitePhase, GridSiteStatus},
     },
     error::OperatorError,
-    resources::trust_bundle::{CertPemStatus, check_cert_pem, sha256_fingerprint},
+    resources::{
+        gateway_probe::{
+            CanonicalFingerprint, GatewayProbeOutcome, probe_transition, validate_canonical_pins, validate_server_name,
+        },
+        secret::read_secret_bytes,
+        tls_probe::{
+            build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs, parse_private_key,
+            probe_gateway,
+        },
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -30,12 +45,12 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Requeue interval after a successful reconciliation.
-const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
+///
+/// Kept at 60 s so that Secret or trust-policy rotation is observed
+/// within one minute without requiring a dedicated Secret watch.
+const REQUEUE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Field manager name for server-side apply.
-const FIELD_MANAGER: &str = "grid-operator";
-
-/// TCP connect timeout for data-plane gateway reachability probes.
+/// TCP connect timeout for plaintext gateway reachability probes.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -47,17 +62,54 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// # Errors
 ///
 /// Returns [`OperatorError`] on Kubernetes API failures.
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    reason = "TLS material loading + event recording requires intermediaries; \
+              splitting hides the reconciliation flow"
+)]
 pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Action, OperatorError> {
     let name = site.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
 
+    let reporter = Reporter {
+        controller: "grid-site-controller".into(),
+        instance: None,
+    };
+    let object_ref = site.object_ref(&());
+    let recorder = Recorder::new(client.as_ref().clone(), reporter);
+
     info!(name, "reconciling GridSite");
 
-    validate_network_ref(&site, client.as_ref()).await?;
-
+    let network = fetch_network(&site, client.as_ref()).await?;
     let current_phase = site.status.as_ref().map_or(&GridSitePhase::Pending, |s| &s.phase);
 
-    let (next_phase, reason, message) = site_phase_next(current_phase, &site).await;
-    update_status(&site, client.as_ref(), &next_phase, &reason, &message).await?;
+    let outcome = if needs_probe(current_phase) {
+        let start = std::time::Instant::now();
+        let result = evaluate_gateway(&site, client.as_ref(), &network).await;
+        let tls_mode = if is_plaintext_transport(&site) {
+            "Plaintext"
+        } else {
+            "Mutual"
+        };
+        crate::metrics::record_probe(result.as_reason(), tls_mode, start.elapsed());
+        Some(result)
+    } else {
+        None
+    };
+
+    let probed = outcome.is_some();
+    let (next_phase, reason, message) = site_phase_next(current_phase, &site, outcome.as_ref());
+    Box::pin(update_status(
+        &site,
+        client.as_ref(),
+        &next_phase,
+        &reason,
+        &message,
+        probed,
+        &recorder,
+        &object_ref,
+    ))
+    .await?;
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
 }
@@ -69,18 +121,25 @@ pub fn error_policy(_site: Arc<GridSite>, error: &OperatorError, _ctx: Arc<Clien
 }
 
 // ---------------------------------------------------------------------------
-// Validation
+// Network lookup
 // ---------------------------------------------------------------------------
 
-/// Validate that the referenced `GridNetwork` exists.
-async fn validate_network_ref(site: &GridSite, client: &Client) -> Result<(), OperatorError> {
+/// Fetch the referenced [`GridNetwork`].
+async fn fetch_network(site: &GridSite, client: &Client) -> Result<GridNetwork, OperatorError> {
     let api: Api<GridNetwork> = Api::all(client.clone());
     let network_name = &site.spec.grid_network_ref;
     api.get(network_name).await.map_err(|e| {
         tracing::warn!(error = %e, network = %network_name, "lookup failed");
         OperatorError::NotFound(format!("GridNetwork {network_name}"))
-    })?;
-    Ok(())
+    })
+}
+
+/// Whether the current phase requires a gateway probe.
+fn needs_probe(phase: &GridSitePhase) -> bool {
+    matches!(
+        phase,
+        GridSitePhase::Connecting | GridSitePhase::Active | GridSitePhase::Unreachable
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -89,37 +148,22 @@ async fn validate_network_ref(site: &GridSite, client: &Client) -> Result<(), Op
 
 /// Determine the next lifecycle phase for a [`GridSite`].
 ///
-/// Returns `(next_phase, reason, message)`.  `reason` is machine-readable;
-/// `message` is human-readable and never contains token bytes.
+/// Pure function: the caller supplies the probe `outcome` (from
+/// [`evaluate_gateway`]) for phases that require it.  Phases that do
+/// not need a probe (`Pending`, `Discovered`, `Left`) ignore `outcome`.
 ///
-/// Transitions:
-/// - Pending → stays Pending (`GridNetwork` controller writes Discovered on SWIM Alive).
-/// - Discovered + gateway address → Connecting (gateway address known; control-plane eligibility assessment begins).
-/// - Discovered, no gateway address → stays Discovered.
-/// - Connecting → Active when the TCP probe succeeds and either: (a) the egress transport is plaintext, or (b) the
-///   configured fingerprint trust policy matches the received public certificate. Active indicates control-plane
-///   eligibility for overlay inclusion.
-/// - Connecting → stays Connecting when the gateway is unreachable, trust material is missing or invalid, or the
-///   fingerprint policy is missing or mismatched (TLS transport only).
-/// - Active → stays Active if gateway is reachable and either plaintext transport or the fingerprint trust policy still
-///   matches; otherwise demotes to Connecting or Unreachable.
-/// - Unreachable → recovers to Active when gateway becomes reachable and trust is satisfied (plaintext or fingerprint
-///   match); moves to Connecting when probe succeeds but trust is incomplete; stays Unreachable while gateway is
-///   missing or unreachable.
-/// - Left → preserved.
+/// Returns `(next_phase, reason, message)`.  `reason` is machine-readable;
+/// `message` is human-readable and never contains private material.
 #[expect(
     clippy::too_many_lines,
-    reason = "exhaustive match over all six phases with per-phase reason/message; splitting obscures the contract"
+    reason = "match arms are individually trivial; splitting would fragment the state machine"
 )]
-pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) -> (GridSitePhase, String, String) {
-    let probe_addr = site.spec.egress.as_ref().and_then(|e| {
-        if e.address.trim().is_empty() {
-            None
-        } else {
-            Some(e.address.as_str())
-        }
-    });
-    let has_egress = probe_addr.is_some();
+pub(crate) fn site_phase_next(
+    current: &GridSitePhase,
+    site: &GridSite,
+    outcome: Option<&GatewayProbeOutcome>,
+) -> (GridSitePhase, String, String) {
+    let has_egress_address = site.spec.egress.as_ref().is_some_and(|e| !e.address.trim().is_empty());
 
     match current {
         GridSitePhase::Pending => (
@@ -128,7 +172,7 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
             "site record created; waiting for SWIM discovery to advance to Discovered".to_owned(),
         ),
         GridSitePhase::Discovered => {
-            if has_egress {
+            if has_egress_address {
                 (
                     GridSitePhase::Connecting,
                     "GatewayAddressKnown".to_owned(),
@@ -142,233 +186,181 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
                 )
             }
         },
-        GridSitePhase::Connecting => probe_and_evaluate_trust(site, probe_addr, &GridSitePhase::Connecting).await,
-        GridSitePhase::Active if is_plaintext_transport(site) => {
-            if let Some(addr) = probe_addr {
-                if tcp_probe(addr).await {
-                    (
-                        GridSitePhase::Active,
-                        "PlaintextTransportReachable".to_owned(),
-                        String::new(),
-                    )
-                } else {
-                    (
-                        GridSitePhase::Unreachable,
-                        "GatewayUnreachable".to_owned(),
-                        "gateway not reachable via TCP probe; site marked Unreachable".to_owned(),
-                    )
-                }
-            } else {
-                (
-                    GridSitePhase::Unreachable,
-                    "GatewayAddressMissing".to_owned(),
-                    "gateway address not available; site marked Unreachable".to_owned(),
-                )
-            }
-        },
-        GridSitePhase::Active => {
-            if let Some(addr) = probe_addr {
-                if tcp_probe(addr).await {
-                    // Re-check trust policy while Active to detect cert rotation or
-                    // policy changes that should revoke Active status.
-                    let active_cert_status = site
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.public_cert_pem.as_ref())
-                        .filter(|p| !p.trim().is_empty())
-                        .map(|p| check_cert_pem(p));
-                    let fp_policy = site.spec.trust.as_ref().and_then(|t| t.cert_fingerprint.as_deref());
-
-                    match (fp_policy, active_cert_status) {
-                        // Trust policy was removed while Active.  TCP reachability
-                        // alone must not keep a remote site routable.
-                        (None, _) => (
-                            GridSitePhase::Connecting,
-                            "TrustPolicyMissing".to_owned(),
-                            "trust fingerprint policy no longer configured; \
-                             site reverted to Connecting pending trust re-verification"
-                                .to_owned(),
-                        ),
-                        // Policy configured, cert present and valid — re-verify fingerprint.
-                        (Some(expected), Some(CertPemStatus::ValidStructure)) => {
-                            let actual = site
-                                .status
-                                .as_ref()
-                                .and_then(|s| s.public_cert_pem.as_ref())
-                                .map(|p| sha256_fingerprint(p));
-                            if actual.as_deref() == Some(expected) {
-                                (GridSitePhase::Active, "TrustPolicyVerified".to_owned(), String::new())
-                            } else {
-                                // Fingerprint mismatch — cert rotated or policy updated.
-                                (
-                                    GridSitePhase::Connecting,
-                                    "TrustPolicyMismatch".to_owned(),
-                                    "certificate fingerprint no longer matches trust policy; \
-                                     site reverted to Connecting pending trust re-verification"
-                                        .to_owned(),
-                                )
-                            }
-                        },
-                        // Policy configured, cert contains private key — security violation.
-                        (Some(_), Some(CertPemStatus::ContainsPrivateKey)) => (
-                            GridSitePhase::Connecting,
-                            "TrustMaterialInvalid".to_owned(),
-                            "received material contains private key markers; \
-                             site reverted to Connecting"
-                                .to_owned(),
-                        ),
-                        // Policy configured, cert is not a certificate.
-                        (Some(_), Some(CertPemStatus::NotACertificate)) => (
-                            GridSitePhase::Connecting,
-                            "TrustMaterialInvalid".to_owned(),
-                            "received PEM is not a certificate; site reverted to Connecting".to_owned(),
-                        ),
-                        // Policy configured but no cert — cert may have been removed.
-                        (Some(_), None) => (
-                            GridSitePhase::Connecting,
-                            "TrustMaterialMissing".to_owned(),
-                            "public certificate no longer available; \
-                             site reverted to Connecting pending cert re-receipt"
-                                .to_owned(),
-                        ),
-                    }
-                } else {
-                    (
-                        GridSitePhase::Unreachable,
-                        "GatewayUnreachable".to_owned(),
-                        "gateway not reachable via TCP probe; site marked Unreachable".to_owned(),
-                    )
-                }
-            } else {
-                (
-                    GridSitePhase::Unreachable,
-                    "GatewayAddressMissing".to_owned(),
-                    "gateway address not available; site marked Unreachable".to_owned(),
-                )
-            }
-        },
-        GridSitePhase::Unreachable => probe_and_evaluate_trust(site, probe_addr, &GridSitePhase::Unreachable).await,
         GridSitePhase::Left => (
             GridSitePhase::Left,
             "Left".to_owned(),
             "site has left the grid".to_owned(),
         ),
+        _ => {
+            let outcome = outcome.unwrap_or(&GatewayProbeOutcome::AddressMissing);
+            let t = probe_transition(current, outcome);
+            (t.phase, t.reason.to_owned(), t.message)
+        },
     }
 }
 
-/// Evaluate gateway reachability and trust policy for a site.
+// ---------------------------------------------------------------------------
+// Gateway evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluate the gateway health of a [`GridSite`].
 ///
-/// Shared by `Connecting` and `Unreachable` phases.  On probe failure or
-/// missing address the site stays at `stay_phase`.  On probe success the
-/// site advances to `Active` (plaintext or fingerprint match) or
-/// `Connecting` (trust incomplete).
-#[expect(
-    clippy::too_many_lines,
-    reason = "trust evaluation has many branches; splitting would scatter the contract"
-)]
-async fn probe_and_evaluate_trust(
-    site: &GridSite,
-    probe_addr: Option<&str>,
-    stay_phase: &GridSitePhase,
-) -> (GridSitePhase, String, String) {
+/// For plaintext transport, performs a bounded TCP probe for diagnostics.
+/// Plaintext reachability never makes a site routing-eligible.
+/// For TLS transport, loads trust material from Kubernetes Secrets
+/// and performs a bounded TLS handshake with certificate verification.
+///
+/// Never leaks private key material in the returned outcome.
+async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwork) -> GatewayProbeOutcome {
+    let probe_addr = site.spec.egress.as_ref().and_then(|e| {
+        if e.address.trim().is_empty() {
+            None
+        } else {
+            Some(e.address.as_str())
+        }
+    });
+
+    let Some(addr) = probe_addr else {
+        return GatewayProbeOutcome::AddressMissing;
+    };
+
     if is_plaintext_transport(site) {
-        return match probe_addr {
-            Some(addr) if tcp_probe(addr).await => (
-                GridSitePhase::Active,
-                "PlaintextTransportReachable".to_owned(),
-                "gateway reachable; plaintext transport requires no certificate verification".to_owned(),
-            ),
-            Some(_) => (
-                stay_phase.clone(),
-                "GatewayUnreachable".to_owned(),
-                "gateway not reachable via TCP probe; retrying".to_owned(),
-            ),
-            None => (
-                stay_phase.clone(),
-                "GatewayAddressMissing".to_owned(),
-                "gateway address not available; awaiting configuration".to_owned(),
-            ),
+        return if tcp_probe(addr).await {
+            GatewayProbeOutcome::PlaintextReachable
+        } else {
+            GatewayProbeOutcome::PlaintextUnreachable
         };
     }
 
-    let cert_status = site
+    match build_probe_config_from_secrets(site, addr, client, network).await {
+        Ok(config) => probe_gateway(&config).await,
+        Err(outcome) => outcome,
+    }
+}
+
+/// Build a `ProbeConfig` by loading trust material from Kubernetes
+/// Secrets referenced by the `GridNetwork`.
+///
+/// Returns a `GatewayProbeOutcome` on failure so the caller can
+/// report the precise failure mode.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear secret-loading sequence; splitting would fragment error provenance"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "TLS material parsing requires several Vec<u8> intermediaries"
+)]
+async fn build_probe_config_from_secrets(
+    site: &GridSite,
+    addr: &str,
+    client: &Client,
+    network: &GridNetwork,
+) -> Result<crate::resources::tls_probe::ProbeConfig, GatewayProbeOutcome> {
+    use GatewayProbeOutcome as O;
+
+    let ca_ref = network.spec.tls.ca_secret_ref.as_ref().ok_or(O::TrustMaterialMissing)?;
+    let ca_bytes = read_secret_bytes(client, ca_ref, "ca.crt")
+        .await
+        .map_err(|_err| O::TrustMaterialMissing)?
+        .ok_or(O::TrustMaterialMissing)?;
+    let roots = parse_ca_roots(&ca_bytes).map_err(|_err| O::TrustMaterialInvalid)?;
+
+    let secret_ref = network
+        .spec
+        .tls
+        .site_secret_ref
+        .as_ref()
+        .ok_or(O::TrustMaterialMissing)?;
+    let cert_bytes = read_secret_bytes(client, secret_ref, "tls.crt")
+        .await
+        .map_err(|_err| O::TrustMaterialMissing)?
+        .ok_or(O::TrustMaterialMissing)?;
+    let key_bytes = Zeroizing::new(
+        read_secret_bytes(client, secret_ref, "tls.key")
+            .await
+            .map_err(|_err| O::TrustMaterialMissing)?
+            .ok_or(O::TrustMaterialMissing)?,
+    );
+    let client_certs = parse_client_certs(&cert_bytes).map_err(|_err| O::TrustMaterialInvalid)?;
+    let client_key = parse_private_key(&key_bytes).map_err(|_err| O::TrustMaterialInvalid)?;
+
+    let tls_config =
+        build_tls_config(roots, Some(client_certs), Some(client_key)).map_err(|_err| O::TrustMaterialInvalid)?;
+
+    let server_name_str = site
+        .spec
+        .egress
+        .as_ref()
+        .and_then(|e| e.tls.server_name.as_deref())
+        .ok_or(O::TrustMaterialMissing)?;
+    validate_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
+    let server_name = ServerName::try_from(server_name_str.to_owned()).map_err(|_err| O::TrustMaterialInvalid)?;
+
+    let pins = resolve_pins(site)?;
+
+    let advertised_leaf_der = site
         .status
         .as_ref()
         .and_then(|s| s.public_cert_pem.as_ref())
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| check_cert_pem(p));
+        .map(|pem| first_cert_der_from_pem(pem).map_err(|_err| O::TrustMaterialInvalid))
+        .transpose()?;
 
-    let Some(addr) = probe_addr else {
-        return (
-            stay_phase.clone(),
-            "GatewayAddressMissing".to_owned(),
-            "gateway address not available; awaiting configuration".to_owned(),
-        );
+    Ok(crate::resources::tls_probe::ProbeConfig {
+        address: addr.to_owned(),
+        tls_config,
+        server_name,
+        pins,
+        advertised_leaf_der,
+    })
+}
+
+/// Resolve the canonical fingerprint pins from the [`GridSite`] trust policy.
+///
+/// Enforces mutual exclusion between `certFingerprint` (legacy) and
+/// `canonicalFingerprints` (canonical).  When only the legacy field is set,
+/// the probe fails closed — migration to canonical format is required.
+///
+/// Missing pin policy is reported separately from malformed pin policy so
+/// operators can distinguish incomplete bootstrap from invalid configuration.
+fn resolve_pins(site: &GridSite) -> Result<Vec<CanonicalFingerprint>, GatewayProbeOutcome> {
+    use GatewayProbeOutcome as O;
+
+    let Some(trust) = site.spec.trust.as_ref() else {
+        return Err(O::TrustMaterialMissing);
     };
 
-    if !tcp_probe(addr).await {
-        return (
-            stay_phase.clone(),
-            "GatewayUnreachable".to_owned(),
-            "gateway not reachable via TCP probe; retrying".to_owned(),
-        );
+    let has_legacy = trust.cert_fingerprint.is_some();
+    let has_canonical = trust.canonical_fingerprints.as_ref().is_some_and(|v| !v.is_empty());
+
+    if has_legacy && has_canonical {
+        tracing::warn!("certFingerprint and canonicalFingerprints are mutually exclusive");
+        return Err(O::TrustMaterialInvalid);
     }
 
-    match cert_status {
-        Some(CertPemStatus::ValidStructure) => {
-            let configured_fp = site.spec.trust.as_ref().and_then(|t| t.cert_fingerprint.as_deref());
-            let actual_fp = site
-                .status
-                .as_ref()
-                .and_then(|s| s.public_cert_pem.as_ref())
-                .map(|p| sha256_fingerprint(p));
-            match (configured_fp, actual_fp) {
-                (Some(expected), Some(actual)) if actual == expected => (
-                    GridSitePhase::Active,
-                    "TrustPolicyVerified".to_owned(),
-                    "gateway reachable; certificate fingerprint verified against \
-                     configured trust policy"
-                        .to_owned(),
-                ),
-                (Some(_), Some(_)) => (
-                    GridSitePhase::Connecting,
-                    "TrustPolicyMismatch".to_owned(),
-                    "gateway reachable; certificate fingerprint does not match \
-                     spec.trust.certFingerprint; verify the remote site's certificate"
-                        .to_owned(),
-                ),
-                (None, _) => (
-                    GridSitePhase::Connecting,
-                    "TrustPolicyMissing".to_owned(),
-                    "gateway reachable; public certificate received; set \
-                     spec.trust.certFingerprint to the certificate SHA-256 fingerprint \
-                     to authorize this site"
-                        .to_owned(),
-                ),
-                (Some(_), None) => (
-                    GridSitePhase::Connecting,
-                    "TrustMaterialMissing".to_owned(),
-                    "gateway reachable; awaiting public trust material from remote site".to_owned(),
-                ),
-            }
-        },
-        Some(CertPemStatus::ContainsPrivateKey) => (
-            GridSitePhase::Connecting,
-            "TrustMaterialInvalid".to_owned(),
-            "received material contains private key markers and was discarded; \
-             check remote operator TLS configuration"
-                .to_owned(),
-        ),
-        Some(CertPemStatus::NotACertificate) => (
-            GridSitePhase::Connecting,
-            "TrustMaterialInvalid".to_owned(),
-            "received PEM is not a certificate; check remote operator TLS configuration".to_owned(),
-        ),
-        None => (
-            GridSitePhase::Connecting,
-            "TrustMaterialMissing".to_owned(),
-            "gateway reachable; awaiting public trust material from remote site".to_owned(),
-        ),
+    if has_legacy {
+        tracing::warn!("certFingerprint is deprecated; migrate to canonicalFingerprints");
+        return Err(O::TrustMaterialInvalid);
+    }
+
+    match trust.canonical_fingerprints.as_ref() {
+        Some(fps) => validate_canonical_pins(fps).map_err(|e| {
+            tracing::warn!(error = %e, "canonical pin validation failed");
+            O::TrustMaterialInvalid
+        }),
+        None => Err(O::TrustMaterialMissing),
+    }
+}
+
+/// Bounded label for a [`GridSitePhase`] value in metrics.
+fn phase_label(phase: &GridSitePhase) -> &'static str {
+    match phase {
+        GridSitePhase::Pending => "Pending",
+        GridSitePhase::Discovered => "Discovered",
+        GridSitePhase::Connecting => "Connecting",
+        GridSitePhase::Active => "Active",
+        GridSitePhase::Unreachable => "Unreachable",
+        GridSitePhase::Left => "Left",
     }
 }
 
@@ -377,13 +369,13 @@ fn is_plaintext_transport(site: &GridSite) -> bool {
     site.spec
         .egress
         .as_ref()
-        .is_some_and(|e| e.tls.mode.eq_ignore_ascii_case("plaintext"))
+        .is_some_and(|e| e.tls.mode == EgressTlsMode::Plaintext)
 }
 
 /// Attempt a TCP connection to `addr` with [`PROBE_TIMEOUT`].
 ///
 /// Returns `true` if the connection succeeds within the timeout, `false`
-/// otherwise.  Connection errors are silently treated as unreachable.
+/// otherwise.  Used only for plaintext transport probes.
 async fn tcp_probe(addr: &str) -> bool {
     tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr))
         .await
@@ -396,20 +388,48 @@ async fn tcp_probe(addr: &str) -> bool {
 
 /// Patch the `GridSite` status subresource.
 ///
-/// Preserves existing `capabilities`, `last_probe_time`, `public_cert_pem`,
-/// and `last_transition_time` from the current status rather than zeroing them
-/// with `Default`.  Only `phase`, `reason`, `message`, and `observed_generation`
-/// are overwritten.
+/// Patches only fields owned by this controller. `capabilities` and
+/// `public_cert_pem` are owned by SWIM reconciliation and are deliberately
+/// omitted. Updates `last_probe_time` when a probe was executed and
+/// `last_transition_time` when the phase changes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear status-patching sequence; splitting would fragment field ownership"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity,
+    reason = "status patch requires phase, reason, message, and probe flag from the reconcile caller; \
+              CAS conflict handling + mutation detection adds branches"
+)]
 async fn update_status(
     site: &GridSite,
     client: &Client,
     phase: &GridSitePhase,
     reason: &str,
     message: &str,
+    probed: bool,
+    recorder: &Recorder,
+    object_ref: &ObjectReference,
 ) -> Result<(), OperatorError> {
     let name = site.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
 
     let existing = site.status.as_ref();
+    let current_phase = existing.map(|s| &s.phase);
+    let phase_changed = current_phase != Some(phase);
+
+    let now = rfc3339_now();
+    let probe_time = if probed {
+        now.clone()
+    } else {
+        existing.and_then(|s| s.last_probe_time.clone())
+    };
+    let transition_time = if phase_changed {
+        now
+    } else {
+        existing.and_then(|s| s.last_transition_time.clone())
+    };
 
     let api: Api<GridSite> = Api::all(client.clone());
     let status = GridSiteStatus {
@@ -417,10 +437,9 @@ async fn update_status(
         observed_generation: site.metadata.generation.unwrap_or(0),
         reason: reason.to_owned(),
         message: message.to_owned(),
-        // Preserve existing fields that the GridSite controller does not own.
         capabilities: existing.map_or_else(Default::default, |s| s.capabilities.clone()),
-        last_probe_time: existing.and_then(|s| s.last_probe_time.clone()),
-        last_transition_time: existing.and_then(|s| s.last_transition_time.clone()),
+        last_probe_time: probe_time,
+        last_transition_time: transition_time,
         public_cert_pem: existing.and_then(|s| s.public_cert_pem.clone()),
     };
 
@@ -428,21 +447,134 @@ async fn update_status(
         return Ok(());
     }
 
-    let patch = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-        "kind": "GridSite",
-        "status": status
-    });
+    // Patch only fields owned by this controller. The GridNetwork controller
+    // updates capabilities and publicCertPem independently; replacing the
+    // complete status object here could overwrite a newer SWIM observation.
+    //
+    // Include metadata.resourceVersion as a CAS precondition so the API
+    // server returns 409 Conflict if another replica already wrote a newer
+    // version. On conflict we yield silently — the informer will deliver
+    // the updated object on the next reconcile.
+    let rv = site.metadata.resource_version.as_deref();
+    let patch = grid_site_owned_status_patch(&status, rv);
 
-    api.patch_status(name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(patch))
-        .await?;
+    let patched = match api
+        .patch_status(name, &PatchParams::default(), &Patch::Merge(patch))
+        .await
+    {
+        Ok(p) => p,
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            tracing::debug!(
+                grid_site = name,
+                "status patch conflict — another replica won the CAS race"
+            );
+            return Ok(());
+        },
+        Err(e) => return Err(e.into()),
+    };
+
+    // Mutation detection: compare resourceVersion before/after to gate
+    // Event emission and metric recording.
+    let patched_rv = patched.metadata.resource_version.as_deref();
+    let patch_caused_mutation = rv != patched_rv;
+
+    let reason_changed = existing.is_none_or(|current| current.reason != reason);
+    if patch_caused_mutation && (phase_changed || reason_changed) {
+        tracing::info!(
+            grid_site = name,
+            previous_phase = ?current_phase,
+            phase = ?phase,
+            reason,
+            "GridSite gateway health state changed"
+        );
+
+        let event_type = event_type_for_reason(reason);
+        let event_note = truncate_event_note(message);
+        if let Err(e) = recorder
+            .publish(
+                &Event {
+                    type_: event_type,
+                    reason: reason.to_owned(),
+                    note: Some(event_note),
+                    action: "GatewayProbe".to_owned(),
+                    secondary: None,
+                },
+                object_ref,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to publish GridSite event");
+        }
+
+        let from_label = current_phase.map_or("None", phase_label);
+        crate::metrics::record_phase_transition(from_label, phase_label(phase), reason);
+    }
 
     Ok(())
+}
+
+/// Map a status reason to a Kubernetes [`EventType`].
+///
+/// [`Normal`] for successful lifecycle progressions and expected states;
+/// [`Warning`] for trust, identity, and connectivity failures.
+///
+/// [`Normal`]: EventType::Normal
+/// [`Warning`]: EventType::Warning
+fn event_type_for_reason(reason: &str) -> EventType {
+    match reason {
+        "TlsVerified" | "AwaitingDiscovery" | "GatewayAddressKnown" | "Left" => EventType::Normal,
+        _ => EventType::Warning,
+    }
+}
+
+/// Truncate an event note to a bounded length.
+///
+/// Reuses [`MAX_STATUS_MESSAGE_LEN`] from [`gateway_probe`] to keep
+/// Event notes well within the Kubernetes soft 1 KB limit and prevent
+/// accidental PEM or key leakage.
+///
+/// [`gateway_probe`]: crate::resources::gateway_probe
+fn truncate_event_note(message: &str) -> String {
+    use crate::resources::gateway_probe::MAX_STATUS_MESSAGE_LEN;
+    if message.chars().count() <= MAX_STATUS_MESSAGE_LEN {
+        message.to_owned()
+    } else {
+        let mut s: String = message.chars().take(MAX_STATUS_MESSAGE_LEN - 3).collect();
+        s.push_str("...");
+        s
+    }
 }
 
 /// Return whether the status subresource differs from the desired status.
 fn grid_site_status_needs_update(current: Option<&GridSiteStatus>, desired: &GridSiteStatus) -> bool {
     current != Some(desired)
+}
+
+/// Build a merge patch containing only fields owned by the `GridSite`
+/// controller, with `metadata.resourceVersion` as a CAS precondition.
+fn grid_site_owned_status_patch(status: &GridSiteStatus, resource_version: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version
+        },
+        "status": {
+            "phase": status.phase,
+            "observedGeneration": status.observed_generation,
+            "reason": status.reason,
+            "message": status.message,
+            "lastProbeTime": status.last_probe_time,
+            "lastTransitionTime": status.last_transition_time
+        }
+    })
+}
+
+/// Current UTC time as an RFC 3339 string.
+///
+/// Returns `None` on format failure rather than panicking.
+fn rfc3339_now() -> Option<String> {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +602,53 @@ mod tests {
         };
         assert!(grid_site_status_needs_update(Some(&baseline), &changed));
         assert!(grid_site_status_needs_update(None, &baseline));
+    }
+
+    #[test]
+    fn status_patch_does_not_claim_swim_owned_fields() {
+        let status = GridSiteStatus {
+            capabilities: crate::crd::grid_site::SiteCapabilities {
+                inference: true,
+                ..Default::default()
+            },
+            public_cert_pem: Some("sentinel-public-cert".to_owned()),
+            phase: GridSitePhase::Active,
+            reason: "TlsVerified".to_owned(),
+            ..Default::default()
+        };
+        let patch = grid_site_owned_status_patch(&status, Some("12345"));
+        let owned = patch
+            .get("status")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(!owned.contains_key("capabilities"));
+        assert!(!owned.contains_key("publicCertPem"));
+    }
+
+    #[test]
+    fn status_patch_includes_resource_version_as_cas_precondition() {
+        let status = GridSiteStatus {
+            phase: GridSitePhase::Connecting,
+            reason: "PinMismatch".to_owned(),
+            ..Default::default()
+        };
+        let patch = grid_site_owned_status_patch(&status, Some("99887"));
+        let rv = patch
+            .get("metadata")
+            .and_then(|m| m.get("resourceVersion"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(rv, Some("99887"), "patch must carry resourceVersion for CAS");
+    }
+
+    #[test]
+    fn status_patch_carries_null_resource_version_when_absent() {
+        let status = GridSiteStatus::default();
+        let patch = grid_site_owned_status_patch(&status, None);
+        let rv = patch.get("metadata").and_then(|m| m.get("resourceVersion"));
+        assert!(
+            rv.is_some_and(serde_json::Value::is_null),
+            "patch should carry null resourceVersion when not set"
+        );
     }
     use crate::crd::grid_site::{EgressConfig, EgressTls, GridSiteSpec};
 
@@ -521,21 +700,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // site_phase_next
+    // site_phase_next — non-probe phases (outcome = None)
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn pending_stays_pending_even_with_egress() {
+    #[test]
+    fn pending_stays_pending_even_with_egress() {
         let site = site_with_egress(Some(GridSitePhase::Pending), "10.0.0.1:8443");
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Pending, &site).await;
+        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Pending, &site, None);
         assert_eq!(next, GridSitePhase::Pending);
         assert_eq!(reason, "AwaitingDiscovery");
     }
 
-    #[tokio::test]
-    async fn discovered_with_egress_advances_to_connecting() {
+    #[test]
+    fn discovered_with_egress_advances_to_connecting() {
         let site = site_with_egress(Some(GridSitePhase::Discovered), "10.0.0.1:7946");
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site).await;
+        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site, None);
         assert_eq!(
             next,
             GridSitePhase::Connecting,
@@ -544,10 +723,10 @@ mod tests {
         assert_eq!(reason, "GatewayAddressKnown");
     }
 
-    #[tokio::test]
-    async fn discovered_without_egress_stays_discovered() {
+    #[test]
+    fn discovered_without_egress_stays_discovered() {
         let site = site_no_egress(Some(GridSitePhase::Discovered));
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site).await;
+        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site, None);
         assert_eq!(
             next,
             GridSitePhase::Discovered,
@@ -556,519 +735,260 @@ mod tests {
         assert_eq!(reason, "GatewayAddressMissing");
     }
 
-    #[tokio::test]
-    async fn discovered_with_empty_egress_stays_discovered() {
+    #[test]
+    fn discovered_with_empty_egress_stays_discovered() {
         let site = site_with_egress(Some(GridSitePhase::Discovered), "");
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site).await;
+        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site, None);
         assert_eq!(next, GridSitePhase::Discovered);
         assert_eq!(reason, "GatewayAddressMissing");
     }
 
-    #[tokio::test]
-    async fn connecting_stays_connecting() {
+    #[test]
+    fn left_is_preserved() {
+        let site = site_no_egress(Some(GridSitePhase::Left));
+        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Left, &site, None);
+        assert_eq!(next, GridSitePhase::Left, "Left must be preserved");
+        assert_eq!(reason, "Left");
+    }
+
+    #[test]
+    fn left_remains_terminal() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Left), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Left, &site, None);
+        assert_eq!(phase, GridSitePhase::Left, "Left must remain terminal");
+        assert_eq!(reason, "Left");
+    }
+
+    #[test]
+    fn discovered_with_gateway_address_advances_to_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Discovered), "10.0.0.1:19080");
+        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site, None);
+        assert_eq!(next, GridSitePhase::Connecting);
+        assert_eq!(reason, "GatewayAddressKnown");
+    }
+
+    #[test]
+    fn discovered_without_gateway_address_stays_discovered() {
+        let site = site_no_egress(Some(GridSitePhase::Discovered));
+        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site, None);
+        assert_eq!(next, GridSitePhase::Discovered);
+        assert_eq!(reason, "GatewayAddressMissing");
+    }
+
+    #[test]
+    fn phase_reason_codes_are_deterministic() {
+        let site = site_with_egress(Some(GridSitePhase::Discovered), "10.0.0.1:8443");
+        let (_, r1, _) = site_phase_next(&GridSitePhase::Discovered, &site, None);
+        let (_, r2, _) = site_phase_next(&GridSitePhase::Discovered, &site, None);
+        assert_eq!(r1, r2, "reason must be deterministic for the same inputs");
+    }
+
+    // -----------------------------------------------------------------------
+    // site_phase_next — probe outcome transitions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn connecting_with_connection_failure_stays_connecting() {
         let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
-        let (next, _reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+        let (next, reason, _msg) = site_phase_next(
+            &GridSitePhase::Connecting,
+            &site,
+            Some(&GatewayProbeOutcome::ConnectionFailed),
+        );
         assert_eq!(
             next,
             GridSitePhase::Connecting,
-            "Connecting must stay Connecting (probe runs but Active requires trust)"
+            "Connecting must stay on connection failure"
         );
+        assert_eq!(reason, "ConnectionFailed");
     }
 
-    #[tokio::test]
-    async fn active_with_unreachable_gateway_transitions_to_unreachable() {
-        let site = site_with_egress(Some(GridSitePhase::Active), "192.0.2.1:1");
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+    #[test]
+    fn connecting_with_verified_outcome_promotes_to_active() {
+        let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        let (next, reason, _msg) =
+            site_phase_next(&GridSitePhase::Connecting, &site, Some(&GatewayProbeOutcome::Verified));
+        assert_eq!(next, GridSitePhase::Active, "Verified must promote to Active");
+        assert_eq!(reason, "TlsVerified");
+    }
+
+    #[test]
+    fn active_with_connection_failure_demotes_to_unreachable() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (next, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::ConnectionFailed),
+        );
         assert_eq!(
             next,
             GridSitePhase::Unreachable,
-            "Active with unreachable gateway must become Unreachable"
+            "Active with connection failure must become Unreachable"
         );
-        assert_eq!(reason, "GatewayUnreachable");
+        assert_eq!(reason, "ConnectionFailed");
     }
 
-    #[tokio::test]
-    async fn active_without_egress_transitions_to_unreachable() {
+    #[test]
+    fn active_with_address_missing_demotes_to_unreachable() {
         let site = site_no_egress(Some(GridSitePhase::Active));
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+        let (next, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::AddressMissing),
+        );
         assert_eq!(
             next,
             GridSitePhase::Unreachable,
             "Active without egress cannot remain Active"
         );
-        assert_eq!(reason, "GatewayAddressMissing");
+        assert_eq!(reason, "EgressMissing");
     }
 
-    #[tokio::test]
-    async fn unreachable_with_failed_probe_stays_unreachable() {
-        let site = site_with_egress(Some(GridSitePhase::Unreachable), "192.0.2.1:1");
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Unreachable, &site).await;
+    #[test]
+    fn active_with_verified_stays_active() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) =
+            site_phase_next(&GridSitePhase::Active, &site, Some(&GatewayProbeOutcome::Verified));
+        assert_eq!(phase, GridSitePhase::Active);
+        assert_eq!(reason, "TlsVerified");
+    }
+
+    #[test]
+    fn unreachable_with_connection_failure_stays_unreachable() {
+        let site = site_with_egress(Some(GridSitePhase::Unreachable), "10.0.0.1:8443");
+        let (next, reason, _msg) = site_phase_next(
+            &GridSitePhase::Unreachable,
+            &site,
+            Some(&GatewayProbeOutcome::ConnectionFailed),
+        );
         assert_eq!(
             next,
             GridSitePhase::Unreachable,
             "Unreachable with failed probe must stay Unreachable"
         );
-        assert_eq!(reason, "GatewayUnreachable");
+        assert_eq!(reason, "ConnectionFailed");
     }
 
-    #[tokio::test]
-    async fn unreachable_without_gateway_stays_unreachable() {
+    #[test]
+    fn unreachable_with_address_missing_stays_unreachable() {
         let site = site_no_egress(Some(GridSitePhase::Unreachable));
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Unreachable, &site).await;
+        let (next, reason, _msg) = site_phase_next(
+            &GridSitePhase::Unreachable,
+            &site,
+            Some(&GatewayProbeOutcome::AddressMissing),
+        );
         assert_eq!(
             next,
             GridSitePhase::Unreachable,
             "Unreachable without gateway must stay Unreachable"
         );
-        assert_eq!(reason, "GatewayAddressMissing");
+        assert_eq!(reason, "EgressMissing");
     }
 
-    #[tokio::test]
-    async fn left_is_preserved() {
-        let site = site_no_egress(Some(GridSitePhase::Left));
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Left, &site).await;
-        assert_eq!(next, GridSitePhase::Left, "Left must be preserved");
-        assert_eq!(reason, "Left");
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase messages must not contain sentinel token bytes
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn phase_messages_do_not_contain_sentinel_token() {
-        let sentinel = "sk-super-secret-token-do-not-emit";
-        let phases = [
-            GridSitePhase::Pending,
-            GridSitePhase::Discovered,
-            GridSitePhase::Connecting,
+    #[test]
+    fn unreachable_with_verified_recovers_to_active() {
+        let site = site_with_egress(Some(GridSitePhase::Unreachable), "10.0.0.1:8443");
+        let (phase, reason, _msg) =
+            site_phase_next(&GridSitePhase::Unreachable, &site, Some(&GatewayProbeOutcome::Verified));
+        assert_eq!(
+            phase,
             GridSitePhase::Active,
-            GridSitePhase::Unreachable,
-            GridSitePhase::Left,
-        ];
-        for phase in &phases {
-            let site = site_with_egress(Some(phase.clone()), "10.0.0.1:8443");
-            let (_, reason, message) = site_phase_next(phase, &site).await;
-            assert!(
-                !reason.contains(sentinel),
-                "reason for {phase:?} must not contain sentinel token: {reason}"
-            );
-            assert!(
-                !message.contains(sentinel),
-                "message for {phase:?} must not contain sentinel token: {message}"
-            );
-        }
-    }
-
-    fn site_with_cert(phase: Option<GridSitePhase>, egress: &str, cert_pem: &str) -> GridSite {
-        use crate::crd::grid_site::GridSiteStatus;
-        let mut site = site_with_egress(phase, egress);
-        site.status = Some(GridSiteStatus {
-            public_cert_pem: Some(cert_pem.to_owned()),
-            ..Default::default()
-        });
-        site
-    }
-
-    fn site_with_cert_and_trust(
-        phase: Option<GridSitePhase>,
-        egress: &str,
-        cert_pem: &str,
-        fingerprint: Option<&str>,
-    ) -> GridSite {
-        use crate::crd::grid_site::GridSiteTrustPolicy;
-        let mut site = site_with_cert(phase, egress, cert_pem);
-        site.spec.trust = fingerprint.map(|fp| GridSiteTrustPolicy {
-            cert_fingerprint: Some(fp.to_owned()),
-        });
-        site
-    }
-
-    fn reachable_probe_addr() -> (std::net::TcpListener, String) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|_| std::process::abort());
-        let addr = listener
-            .local_addr()
-            .unwrap_or_else(|_| std::process::abort())
-            .to_string();
-        (listener, addr)
+            "Unreachable + verified must recover to Active"
+        );
+        assert_eq!(reason, "TlsVerified");
     }
 
     // -----------------------------------------------------------------------
-    // Gateway address discovery tests
+    // Trust failure outcomes — always demote to Connecting
     // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn discovered_with_gateway_address_advances_to_connecting() {
-        let site = site_with_egress(Some(GridSitePhase::Discovered), "10.0.0.1:19080");
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site).await;
-        assert_eq!(next, GridSitePhase::Connecting);
-        assert_eq!(reason, "GatewayAddressKnown");
-    }
-
-    #[tokio::test]
-    async fn discovered_without_gateway_address_stays_discovered() {
-        let site = site_no_egress(Some(GridSitePhase::Discovered));
-        let (next, reason, _msg) = site_phase_next(&GridSitePhase::Discovered, &site).await;
-        assert_eq!(next, GridSitePhase::Discovered);
-        assert_eq!(reason, "GatewayAddressMissing");
-    }
-
-    #[tokio::test]
-    async fn phase_reason_codes_are_deterministic() {
-        let site = site_with_egress(Some(GridSitePhase::Discovered), "10.0.0.1:8443");
-        let (_, r1, _) = site_phase_next(&GridSitePhase::Discovered, &site).await;
-        let (_, r2, _) = site_phase_next(&GridSitePhase::Discovered, &site).await;
-        assert_eq!(r1, r2, "reason must be deterministic for the same inputs");
-    }
-
-    // -----------------------------------------------------------------------
-    // Trust material status tests (no TCP probe — phase stays Connecting)
-    // -----------------------------------------------------------------------
-
-    const VALID_CERT_PEM: &str =
-        "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOC\n-----END CERTIFICATE-----\n";
-    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n-----END PRIVATE KEY-----\n";
-
-    #[tokio::test]
-    async fn valid_cert_pem_reports_valid_structure() {
-        // No real TCP probe in unit tests (no running server at 127.0.0.1:19080).
-        // The gateway probe fails → GatewayUnreachable regardless of cert.
-        // Test valid-cert path requires a running listener, so we test the cert
-        // check logic via trust_bundle::check_cert_pem directly.
-        let status = check_cert_pem(VALID_CERT_PEM);
-        assert_eq!(
-            status,
-            CertPemStatus::ValidStructure,
-            "valid cert PEM must be accepted as ValidStructure"
-        );
-        // Without a running listener, the phase logic sees GatewayUnreachable
-        // before it evaluates trust material. This test validates the
-        // cert-checking helper separately.
-    }
-
-    #[tokio::test]
-    async fn connecting_with_private_key_reports_invalid() {
-        let status = check_cert_pem(PRIVATE_KEY_PEM);
-        assert_eq!(
-            status,
-            CertPemStatus::ContainsPrivateKey,
-            "private key material must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn connecting_no_cert_reports_trust_material_missing() {
-        // With no running server, probe fails → GatewayUnreachable.
-        // Test the missing-cert path: site with egress but no publicCertPem.
-        let site = site_with_egress(Some(GridSitePhase::Connecting), "127.0.0.1:19080");
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
-        assert_eq!(phase, GridSitePhase::Connecting, "no cert must stay Connecting");
-        // TCP probe to 127.0.0.1:19080 with nothing listening → GatewayUnreachable.
-        assert_eq!(
-            reason, "GatewayUnreachable",
-            "unreachable gateway takes precedence over cert check"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_message_never_contains_full_pem() {
-        let site = site_with_cert(Some(GridSitePhase::Connecting), "127.0.0.1:19080", VALID_CERT_PEM);
-        let (_, _, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
-        assert!(
-            !message.contains("BEGIN CERTIFICATE"),
-            "status message must not include the full PEM: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_message_never_contains_private_key_marker() {
-        let site = site_with_cert(
-            Some(GridSitePhase::Connecting),
-            "127.0.0.1:19080",
-            "-----BEGIN PRIVATE KEY-----\nABC\n-----END PRIVATE KEY-----\n",
-        );
-        let (_, _, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
-        assert!(
-            !message.contains("BEGIN PRIVATE KEY") && !message.contains("PRIVATE KEY"),
-            "status message must not echo private key markers: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn valid_structure_never_advances_to_active_without_policy() {
-        // Even with a valid cert, the lifecycle must stay at most Connecting.
-        // Active requires explicit trust policy, not cert presence alone.
-        let status = check_cert_pem(VALID_CERT_PEM);
-        assert_eq!(status, CertPemStatus::ValidStructure);
-        // The phase logic: Connecting + valid cert (probe succeeds) → TrustPolicyMissing, stays Connecting.
-        // Connecting never advances to Active on cert presence alone — fingerprint trust policy required.
-        // This test proves the CertPemStatus enum name is not "Trusted" or "Active".
-        assert_ne!(format!("{status:?}"), "Trusted");
-        assert_ne!(format!("{status:?}"), "Active");
-        assert_ne!(format!("{status:?}"), "Authorized");
-    }
-
-    #[tokio::test]
-    async fn trust_material_invalid_reason_for_non_cert_pem() {
-        // Verify that a non-cert PEM (e.g., public key) maps to NotACertificate,
-        // which the controller records as TrustMaterialInvalid.
-        let pub_key = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq\n-----END PUBLIC KEY-----\n";
-        let status = check_cert_pem(pub_key);
-        assert_eq!(
-            status,
-            CertPemStatus::NotACertificate,
-            "public key PEM must not be accepted as a certificate"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Trust policy — fingerprint pinning (Connecting → Active gate)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn trust_material_present_without_policy_reports_policy_missing() {
-        let (_listener, addr) = reachable_probe_addr();
-        let site = site_with_cert(Some(GridSitePhase::Connecting), &addr, VALID_CERT_PEM);
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
-        assert_eq!(
-            phase,
-            GridSitePhase::Connecting,
-            "missing trust policy must not promote"
-        );
-        assert_eq!(reason, "TrustPolicyMissing");
-    }
-
-    #[tokio::test]
-    async fn fingerprint_match_promotes_to_active_when_gateway_reachable() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        let (_listener, addr) = reachable_probe_addr();
-        let expected_fp = sha256_fingerprint(VALID_CERT_PEM);
-        let site = site_with_cert_and_trust(
-            Some(GridSitePhase::Connecting),
-            &addr,
-            VALID_CERT_PEM,
-            Some(&expected_fp),
-        );
-        let (phase, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
-        assert_eq!(phase, GridSitePhase::Active);
-        assert_eq!(reason, "TrustPolicyVerified");
-        assert!(!message.contains(VALID_CERT_PEM), "status message must not include PEM");
-        assert!(
-            !message.contains(&expected_fp),
-            "status message must not include fingerprint"
-        );
-    }
-
-    #[tokio::test]
-    async fn fingerprint_mismatch_stays_connecting_when_gateway_reachable() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        let (_listener, addr) = reachable_probe_addr();
-        let wrong_fp = sha256_fingerprint("-----BEGIN CERTIFICATE-----\nwrong\n-----END CERTIFICATE-----\n");
-        let site = site_with_cert_and_trust(Some(GridSitePhase::Connecting), &addr, VALID_CERT_PEM, Some(&wrong_fp));
-        let (phase, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
-        assert_eq!(phase, GridSitePhase::Connecting, "wrong fingerprint must not promote");
-        assert_eq!(reason, "TrustPolicyMismatch");
-        assert!(!message.contains(VALID_CERT_PEM), "status message must not include PEM");
-        assert!(
-            !message.contains(&wrong_fp),
-            "status message must not include configured fingerprint"
-        );
-    }
 
     #[test]
-    fn private_key_pem_cannot_influence_trust_policy() {
-        use crate::resources::trust_bundle::{CertPemStatus, check_cert_pem, sha256_fingerprint};
-        // Private key PEM is rejected structurally before any fingerprint comparison.
-        let pem = PRIVATE_KEY_PEM;
-        let status = check_cert_pem(pem);
-        assert_eq!(
-            status,
-            CertPemStatus::ContainsPrivateKey,
-            "private key must be rejected before fingerprint comparison"
+    fn trust_material_missing_stays_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Connecting,
+            &site,
+            Some(&GatewayProbeOutcome::TrustMaterialMissing),
         );
-        // Even if someone attempted to compute a fingerprint of the private key PEM,
-        // the structural check rejects it first — so this code path never runs.
-        // We include this assertion to document the invariant.
-        let fp = sha256_fingerprint(pem); // fingerprint computation itself is safe
-        assert!(
-            !fp.is_empty(),
-            "fingerprint computation on any string is safe (but structural check blocks it first)"
-        );
-    }
-
-    #[test]
-    fn status_message_does_not_contain_pem_or_fingerprint_data() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        let fp = sha256_fingerprint(VALID_CERT_PEM);
-        // Messages that reference trust policy must not embed raw PEM or raw fingerprint.
-        let policy_missing_msg = "gateway reachable; public certificate received; set spec.trust.certFingerprint \
-             to the certificate SHA-256 fingerprint to authorize this site";
-        assert!(!policy_missing_msg.contains("BEGIN CERTIFICATE"), "no PEM in message");
-        assert!(!policy_missing_msg.contains(&fp), "no fingerprint data in message");
-
-        let mismatch_msg = "gateway reachable; certificate fingerprint does not match \
-             spec.trust.certFingerprint; verify the remote site's certificate";
-        assert!(
-            !mismatch_msg.contains("BEGIN CERTIFICATE"),
-            "no PEM in mismatch message"
-        );
-    }
-
-    #[tokio::test]
-    async fn active_is_preserved_while_probe_succeeds() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        let (_listener, addr) = reachable_probe_addr();
-        let fp = sha256_fingerprint(VALID_CERT_PEM);
-        let site = site_with_cert_and_trust(Some(GridSitePhase::Active), &addr, VALID_CERT_PEM, Some(&fp));
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
-        assert_eq!(phase, GridSitePhase::Active);
-        assert_eq!(reason, "TrustPolicyVerified");
-    }
-
-    #[tokio::test]
-    async fn active_with_removed_trust_policy_demotes_to_connecting() {
-        let (_listener, addr) = reachable_probe_addr();
-        let site = site_with_cert(Some(GridSitePhase::Active), &addr, VALID_CERT_PEM);
-        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
-        assert_eq!(phase, GridSitePhase::Connecting);
-        assert_eq!(reason, "TrustPolicyMissing");
-        assert!(!message.contains(VALID_CERT_PEM), "status message must not include PEM");
-    }
-
-    #[tokio::test]
-    async fn active_is_demoted_when_probe_fails() {
-        let site = site_with_egress(Some(GridSitePhase::Active), "127.0.0.1:19080");
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
-        assert_eq!(
-            phase,
-            GridSitePhase::Unreachable,
-            "failed probe must demote Active to Unreachable"
-        );
-        assert_eq!(reason, "GatewayUnreachable");
-    }
-
-    #[tokio::test]
-    async fn invalid_cert_with_matching_private_key_fingerprint_stays_connecting() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        let (_listener, addr) = reachable_probe_addr();
-        let private_key_fp = sha256_fingerprint(PRIVATE_KEY_PEM);
-        let site = site_with_cert_and_trust(
-            Some(GridSitePhase::Connecting),
-            &addr,
-            PRIVATE_KEY_PEM,
-            Some(&private_key_fp),
-        );
-        let (phase, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
-        assert_eq!(phase, GridSitePhase::Connecting);
-        assert_eq!(reason, "TrustMaterialInvalid");
-        assert!(
-            !message.contains("BEGIN PRIVATE KEY") && !message.contains(PRIVATE_KEY_PEM),
-            "status message must not include private key material"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Active phase — certificate rotation behavior
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn active_without_trust_policy_demotes_unreachable_when_probe_fails() {
-        // No trust policy → TCP probe failure → Unreachable (unchanged behavior).
-        let site = site_with_egress(Some(GridSitePhase::Active), "127.0.0.1:19080");
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
-        assert_eq!(phase, GridSitePhase::Unreachable);
-        assert_eq!(reason, "GatewayUnreachable");
-    }
-
-    #[tokio::test]
-    async fn active_cert_rotation_mismatch_demotes_to_connecting() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        // Simulate the post-rotation state: Active has cert A configured,
-        // but publicCertPem now contains cert B (different bytes).
-        let (_listener, addr) = reachable_probe_addr();
-        let cert_a = VALID_CERT_PEM;
-        let cert_b = "-----BEGIN CERTIFICATE-----\nDifferentBytes\n-----END CERTIFICATE-----\n";
-        let fp_a = sha256_fingerprint(cert_a);
-        let site = site_with_cert_and_trust(Some(GridSitePhase::Active), &addr, cert_b, Some(&fp_a));
-        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
-        assert_eq!(phase, GridSitePhase::Connecting);
-        assert_eq!(reason, "TrustPolicyMismatch");
-        assert!(!message.contains(cert_b), "status message must not include PEM");
-        assert!(!message.contains(&fp_a), "status message must not include fingerprint");
-    }
-
-    #[tokio::test]
-    async fn active_cert_rotation_match_stays_active() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        // Active with matching fingerprint → stays Active.
-        let (_listener, addr) = reachable_probe_addr();
-        let cert = VALID_CERT_PEM;
-        let fp = sha256_fingerprint(cert);
-        let site = site_with_cert_and_trust(Some(GridSitePhase::Active), &addr, cert, Some(&fp));
-        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
-        assert_eq!(phase, GridSitePhase::Active);
-        assert_eq!(reason, "TrustPolicyVerified");
-        assert!(message.is_empty());
-    }
-
-    #[tokio::test]
-    async fn active_with_missing_cert_and_policy_demotes_to_connecting() {
-        use crate::{crd::grid_site::GridSiteTrustPolicy, resources::trust_bundle::sha256_fingerprint};
-        // Policy configured but no cert in status → None case for cert_status.
-        let (_listener, addr) = reachable_probe_addr();
-        let fp = sha256_fingerprint(VALID_CERT_PEM);
-        let mut site = site_with_egress(Some(GridSitePhase::Active), &addr);
-        site.spec.trust = Some(GridSiteTrustPolicy {
-            cert_fingerprint: Some(fp),
-        });
-        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
         assert_eq!(phase, GridSitePhase::Connecting);
         assert_eq!(reason, "TrustMaterialMissing");
-        assert!(
-            !message.contains("BEGIN CERTIFICATE"),
-            "status message must not include PEM"
-        );
     }
 
     #[test]
-    fn active_status_message_never_contains_raw_pem() {
-        // Messages from the Active arm rotation branch must not contain raw cert data.
-        let mismatch_msg = "certificate fingerprint no longer matches trust policy; \
-             site reverted to Connecting pending trust re-verification";
-        assert!(!mismatch_msg.contains("BEGIN CERTIFICATE"), "no PEM header in message");
-        assert!(!mismatch_msg.contains("PRIVATE KEY"), "no private key in message");
-
-        let missing_msg = "public certificate no longer available; \
-             site reverted to Connecting pending cert re-receipt";
-        assert!(!missing_msg.contains("BEGIN CERTIFICATE"), "no PEM in missing message");
+    fn trust_material_invalid_stays_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Connecting,
+            &site,
+            Some(&GatewayProbeOutcome::TrustMaterialInvalid),
+        );
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "TrustMaterialInvalid");
     }
 
     #[test]
-    fn site_with_cert_and_trust_helper_sets_fields() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        // Exercise site_with_cert_and_trust to suppress dead-code warning and
-        // verify that the helper sets spec.trust correctly.
-        let fp = sha256_fingerprint(VALID_CERT_PEM);
-        let site = site_with_cert_and_trust(
-            Some(GridSitePhase::Connecting),
-            "10.0.0.1:8080",
-            VALID_CERT_PEM,
-            Some(&fp),
+    fn untrusted_issuer_demotes_active_to_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::UntrustedIssuer),
         );
         assert_eq!(
-            site.spec.trust.as_ref().and_then(|t| t.cert_fingerprint.as_deref()),
-            Some(fp.as_str()),
-            "trust.certFingerprint must be set"
+            phase,
+            GridSitePhase::Connecting,
+            "trust failure must demote to Connecting"
         );
-        assert_eq!(
-            site.status.as_ref().and_then(|s| s.public_cert_pem.as_deref()),
-            Some(VALID_CERT_PEM),
-            "publicCertPem must be set"
+        assert_eq!(reason, "UntrustedIssuer");
+    }
+
+    #[test]
+    fn identity_mismatch_demotes_active_to_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::IdentityMismatch),
         );
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "IdentityMismatch");
+    }
+
+    #[test]
+    fn certificate_expired_demotes_active_to_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::CertificateExpired),
+        );
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "CertificateExpired");
+    }
+
+    #[test]
+    fn pin_mismatch_demotes_active_to_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) =
+            site_phase_next(&GridSitePhase::Active, &site, Some(&GatewayProbeOutcome::PinMismatch));
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "PinMismatch");
+    }
+
+    #[test]
+    fn advertised_cert_mismatch_demotes_active_to_connecting() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::AdvertisedCertificateMismatch),
+        );
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "AdvertisedCertMismatch");
     }
 
     // -----------------------------------------------------------------------
-    // Plaintext transport — cert verification bypass
+    // Plaintext probe outcomes
     // -----------------------------------------------------------------------
 
     fn site_with_plaintext_egress(phase: Option<GridSitePhase>, egress: &str) -> GridSite {
@@ -1083,7 +1003,8 @@ mod tests {
                 egress: Some(EgressConfig {
                     address: egress.to_owned(),
                     tls: EgressTls {
-                        mode: "Plaintext".to_owned(),
+                        mode: EgressTlsMode::Plaintext,
+                        server_name: None,
                     },
                 }),
                 region: None,
@@ -1098,55 +1019,161 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn plaintext_connecting_promotes_to_active_when_reachable() {
-        let (_listener, addr) = reachable_probe_addr();
-        let site = site_with_plaintext_egress(Some(GridSitePhase::Connecting), &addr);
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+    #[test]
+    fn plaintext_connecting_remains_ineligible_when_reachable() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Connecting,
+            &site,
+            Some(&GatewayProbeOutcome::PlaintextReachable),
+        );
         assert_eq!(
             phase,
-            GridSitePhase::Active,
-            "plaintext + reachable must promote to Active"
+            GridSitePhase::Connecting,
+            "TCP reachability without verified identity must not promote to Active"
         );
-        assert_eq!(reason, "PlaintextTransportReachable");
+        assert_eq!(reason, "IdentityVerificationRequired");
     }
 
-    #[tokio::test]
-    async fn plaintext_connecting_stays_connecting_when_unreachable() {
-        let site = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "127.0.0.1:19080");
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+    #[test]
+    fn plaintext_connecting_stays_connecting_when_unreachable() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Connecting,
+            &site,
+            Some(&GatewayProbeOutcome::PlaintextUnreachable),
+        );
         assert_eq!(
             phase,
             GridSitePhase::Connecting,
             "plaintext + unreachable must stay Connecting"
         );
-        assert_eq!(reason, "GatewayUnreachable");
+        assert_eq!(reason, "PlaintextUnreachable");
     }
 
-    #[tokio::test]
-    async fn plaintext_active_stays_active_when_reachable() {
-        let (_listener, addr) = reachable_probe_addr();
-        let site = site_with_plaintext_egress(Some(GridSitePhase::Active), &addr);
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+    #[test]
+    fn plaintext_active_demotes_when_reachable_without_identity() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::PlaintextReachable),
+        );
         assert_eq!(
             phase,
-            GridSitePhase::Active,
-            "plaintext Active + reachable must stay Active"
+            GridSitePhase::Connecting,
+            "changing an Active site to plaintext must revoke routing eligibility"
         );
-        assert_eq!(reason, "PlaintextTransportReachable");
+        assert_eq!(reason, "IdentityVerificationRequired");
     }
 
-    #[tokio::test]
-    async fn plaintext_active_demotes_when_unreachable() {
-        let site = site_with_plaintext_egress(Some(GridSitePhase::Active), "127.0.0.1:19080");
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+    #[test]
+    fn plaintext_active_demotes_when_unreachable() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Active,
+            &site,
+            Some(&GatewayProbeOutcome::PlaintextUnreachable),
+        );
         assert_eq!(
             phase,
             GridSitePhase::Unreachable,
             "plaintext Active + unreachable must demote"
         );
-        assert_eq!(reason, "GatewayUnreachable");
+        assert_eq!(reason, "PlaintextUnreachable");
     }
+
+    #[test]
+    fn plaintext_unreachable_moves_to_connecting_when_reachable() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Unreachable), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Unreachable,
+            &site,
+            Some(&GatewayProbeOutcome::PlaintextReachable),
+        );
+        assert_eq!(
+            phase,
+            GridSitePhase::Connecting,
+            "reachable plaintext cannot recover directly to Active"
+        );
+        assert_eq!(reason, "IdentityVerificationRequired");
+    }
+
+    // -----------------------------------------------------------------------
+    // Message safety — no private material in probe transition messages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn phase_messages_do_not_contain_sentinel_token() {
+        let sentinel = "sk-super-secret-token-do-not-emit";
+        let non_probe = [GridSitePhase::Pending, GridSitePhase::Discovered, GridSitePhase::Left];
+        for phase in &non_probe {
+            let site = site_with_egress(Some(phase.clone()), "10.0.0.1:8443");
+            let (_, reason, message) = site_phase_next(phase, &site, None);
+            assert!(
+                !reason.contains(sentinel),
+                "reason for {phase:?} must not contain sentinel: {reason}"
+            );
+            assert!(
+                !message.contains(sentinel),
+                "message for {phase:?} must not contain sentinel: {message}"
+            );
+        }
+        let outcomes = [
+            GatewayProbeOutcome::Verified,
+            GatewayProbeOutcome::ConnectionFailed,
+            GatewayProbeOutcome::TrustMaterialMissing,
+            GatewayProbeOutcome::PinMismatch,
+            GatewayProbeOutcome::PlaintextReachable,
+        ];
+        for outcome in &outcomes {
+            let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+            let (_, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site, Some(outcome));
+            assert!(!reason.contains(sentinel), "reason must not contain sentinel: {reason}");
+            assert!(
+                !message.contains(sentinel),
+                "message must not contain sentinel: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_outcome_messages_never_contain_pem_or_key_markers() {
+        let outcomes = [
+            GatewayProbeOutcome::Verified,
+            GatewayProbeOutcome::ConnectionFailed,
+            GatewayProbeOutcome::ConnectTimeout,
+            GatewayProbeOutcome::HandshakeTimeout,
+            GatewayProbeOutcome::TrustMaterialMissing,
+            GatewayProbeOutcome::TrustMaterialInvalid,
+            GatewayProbeOutcome::UntrustedIssuer,
+            GatewayProbeOutcome::IdentityMismatch,
+            GatewayProbeOutcome::CertificateExpired,
+            GatewayProbeOutcome::CertificateNotYetValid,
+            GatewayProbeOutcome::PinMismatch,
+            GatewayProbeOutcome::AdvertisedCertificateMismatch,
+            GatewayProbeOutcome::PlaintextReachable,
+            GatewayProbeOutcome::PlaintextUnreachable,
+            GatewayProbeOutcome::AddressMissing,
+            GatewayProbeOutcome::TlsProtocolError,
+        ];
+        for outcome in &outcomes {
+            let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
+            let (_, _, message) = site_phase_next(&GridSitePhase::Active, &site, Some(outcome));
+            assert!(
+                !message.contains("BEGIN CERTIFICATE"),
+                "message must not include PEM: {message}"
+            );
+            assert!(
+                !message.contains("PRIVATE KEY"),
+                "message must not include key marker: {message}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn is_plaintext_transport_detects_mode() {
@@ -1160,62 +1187,236 @@ mod tests {
         assert!(!is_plaintext_transport(&no_egress), "no egress must not be plaintext");
     }
 
+    #[test]
+    fn needs_probe_for_active_phases() {
+        assert!(needs_probe(&GridSitePhase::Connecting), "Connecting needs probe");
+        assert!(needs_probe(&GridSitePhase::Active), "Active needs probe");
+        assert!(needs_probe(&GridSitePhase::Unreachable), "Unreachable needs probe");
+        assert!(!needs_probe(&GridSitePhase::Pending), "Pending does not need probe");
+        assert!(
+            !needs_probe(&GridSitePhase::Discovered),
+            "Discovered does not need probe"
+        );
+        assert!(!needs_probe(&GridSitePhase::Left), "Left does not need probe");
+    }
+
     // -----------------------------------------------------------------------
-    // Unreachable recovery
+    // Pin resolution — rotation and legacy compatibility
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn plaintext_unreachable_promotes_to_active_when_reachable() {
-        let (_listener, addr) = reachable_probe_addr();
-        let site = site_with_plaintext_egress(Some(GridSitePhase::Unreachable), &addr);
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Unreachable, &site).await;
-        assert_eq!(
-            phase,
-            GridSitePhase::Active,
-            "plaintext Unreachable + reachable must recover to Active"
-        );
-        assert_eq!(reason, "PlaintextTransportReachable");
+    use crate::crd::grid_site::GridSiteTrustPolicy;
+
+    fn site_with_trust(phase: Option<GridSitePhase>, egress: &str, trust: Option<GridSiteTrustPolicy>) -> GridSite {
+        GridSite {
+            metadata: kube::api::ObjectMeta {
+                name: Some("test-site".to_owned()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: GridSiteSpec {
+                grid_network_ref: "test-net".to_owned(),
+                egress: Some(EgressConfig {
+                    address: egress.to_owned(),
+                    tls: EgressTls::default(),
+                }),
+                region: None,
+                sovereignty_zone: None,
+                zone: None,
+                trust,
+            },
+            status: phase.map(|p| GridSiteStatus {
+                phase: p,
+                ..Default::default()
+            }),
+        }
     }
 
-    #[tokio::test]
-    async fn mutual_tls_unreachable_with_matching_fingerprint_promotes_to_active() {
-        use crate::resources::trust_bundle::sha256_fingerprint;
-        let (_listener, addr) = reachable_probe_addr();
-        let expected_fp = sha256_fingerprint(VALID_CERT_PEM);
-        let site = site_with_cert_and_trust(
-            Some(GridSitePhase::Unreachable),
-            &addr,
-            VALID_CERT_PEM,
-            Some(&expected_fp),
-        );
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Unreachable, &site).await;
-        assert_eq!(
-            phase,
-            GridSitePhase::Active,
-            "Unreachable + reachable + matching fingerprint must recover to Active"
-        );
-        assert_eq!(reason, "TrustPolicyVerified");
+    fn valid_pin() -> String {
+        "a".repeat(64)
     }
 
-    #[tokio::test]
-    async fn mutual_tls_unreachable_with_missing_trust_moves_to_connecting() {
-        let (_listener, addr) = reachable_probe_addr();
-        let site = site_with_cert(Some(GridSitePhase::Unreachable), &addr, VALID_CERT_PEM);
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Unreachable, &site).await;
-        assert_eq!(
-            phase,
-            GridSitePhase::Connecting,
-            "Unreachable + reachable + no trust policy must move to Connecting"
-        );
-        assert_eq!(reason, "TrustPolicyMissing");
+    fn valid_pin_2() -> String {
+        "b".repeat(64)
     }
 
-    #[tokio::test]
-    async fn left_remains_terminal() {
-        let (_listener, addr) = reachable_probe_addr();
-        let site = site_with_plaintext_egress(Some(GridSitePhase::Left), &addr);
-        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Left, &site).await;
-        assert_eq!(phase, GridSitePhase::Left, "Left must remain terminal");
-        assert_eq!(reason, "Left");
+    #[test]
+    fn resolve_pins_no_trust_policy_fails_closed() {
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", None);
+        assert_eq!(
+            resolve_pins(&site),
+            Err(GatewayProbeOutcome::TrustMaterialMissing),
+            "no trust policy must remain in bootstrap"
+        );
+    }
+
+    #[test]
+    fn resolve_pins_single_canonical_pin() {
+        let trust = GridSiteTrustPolicy {
+            cert_fingerprint: None,
+            canonical_fingerprints: Some(vec![valid_pin()]),
+        };
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
+        let pins = resolve_pins(&site).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(pins.len(), 1, "single canonical pin");
+    }
+
+    #[test]
+    fn resolve_pins_two_canonical_pins_for_rotation() {
+        let trust = GridSiteTrustPolicy {
+            cert_fingerprint: None,
+            canonical_fingerprints: Some(vec![valid_pin(), valid_pin_2()]),
+        };
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
+        let pins = resolve_pins(&site).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(pins.len(), 2, "two canonical pins for rotation overlap");
+    }
+
+    #[test]
+    fn resolve_pins_three_pins_rejected() {
+        let trust = GridSiteTrustPolicy {
+            cert_fingerprint: None,
+            canonical_fingerprints: Some(vec![valid_pin(), valid_pin_2(), "c".repeat(64)]),
+        };
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
+        let result = resolve_pins(&site);
+        assert_eq!(
+            result,
+            Err(GatewayProbeOutcome::TrustMaterialInvalid),
+            "three pins must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_pins_empty_pin_list_rejected() {
+        let trust = GridSiteTrustPolicy {
+            cert_fingerprint: None,
+            canonical_fingerprints: Some(Vec::new()),
+        };
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
+        assert_eq!(
+            resolve_pins(&site),
+            Err(GatewayProbeOutcome::TrustMaterialInvalid),
+            "present but empty pin policy is invalid"
+        );
+    }
+
+    #[test]
+    fn resolve_pins_invalid_pin_format_rejected() {
+        let trust = GridSiteTrustPolicy {
+            cert_fingerprint: None,
+            canonical_fingerprints: Some(vec!["not-a-valid-hex-fingerprint".to_owned()]),
+        };
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
+        let result = resolve_pins(&site);
+        assert_eq!(
+            result,
+            Err(GatewayProbeOutcome::TrustMaterialInvalid),
+            "invalid pin format must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_pins_legacy_fingerprint_only_rejected() {
+        let trust = GridSiteTrustPolicy {
+            cert_fingerprint: Some("ab:cd:ef:01:23".to_owned()),
+            canonical_fingerprints: None,
+        };
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
+        let result = resolve_pins(&site);
+        assert_eq!(
+            result,
+            Err(GatewayProbeOutcome::TrustMaterialInvalid),
+            "legacy-only fingerprint must be rejected (migration required)"
+        );
+    }
+
+    #[test]
+    fn resolve_pins_both_legacy_and_canonical_rejected() {
+        let trust = GridSiteTrustPolicy {
+            cert_fingerprint: Some("ab:cd:ef:01:23".to_owned()),
+            canonical_fingerprints: Some(vec![valid_pin()]),
+        };
+        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
+        let result = resolve_pins(&site);
+        assert_eq!(
+            result,
+            Err(GatewayProbeOutcome::TrustMaterialInvalid),
+            "both legacy and canonical must be rejected (mutually exclusive)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Event helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn event_type_tls_verified_is_normal() {
+        assert!(matches!(event_type_for_reason("TlsVerified"), EventType::Normal));
+    }
+
+    #[test]
+    fn event_type_awaiting_discovery_is_normal() {
+        assert!(matches!(event_type_for_reason("AwaitingDiscovery"), EventType::Normal));
+    }
+
+    #[test]
+    fn event_type_gateway_address_known_is_normal() {
+        assert!(matches!(
+            event_type_for_reason("GatewayAddressKnown"),
+            EventType::Normal
+        ));
+    }
+
+    #[test]
+    fn event_type_left_is_normal() {
+        assert!(matches!(event_type_for_reason("Left"), EventType::Normal));
+    }
+
+    #[test]
+    fn event_type_pin_mismatch_is_warning() {
+        assert!(matches!(event_type_for_reason("PinMismatch"), EventType::Warning));
+    }
+
+    #[test]
+    fn event_type_connection_failed_is_warning() {
+        assert!(matches!(event_type_for_reason("ConnectionFailed"), EventType::Warning));
+    }
+
+    #[test]
+    fn event_type_certificate_expired_is_warning() {
+        assert!(matches!(
+            event_type_for_reason("CertificateExpired"),
+            EventType::Warning
+        ));
+    }
+
+    #[test]
+    fn event_type_trust_material_missing_is_warning() {
+        assert!(matches!(
+            event_type_for_reason("TrustMaterialMissing"),
+            EventType::Warning
+        ));
+    }
+
+    #[test]
+    fn event_type_identity_mismatch_is_warning() {
+        assert!(matches!(event_type_for_reason("IdentityMismatch"), EventType::Warning));
+    }
+
+    #[test]
+    fn truncate_event_note_short_message_unchanged() {
+        let msg = "TLS handshake verified";
+        assert_eq!(truncate_event_note(msg), msg);
+    }
+
+    #[test]
+    fn truncate_event_note_long_message_truncated() {
+        let msg = "a".repeat(300);
+        let result = truncate_event_note(&msg);
+        assert!(result.ends_with("..."), "long message should end with ...");
+        assert!(
+            result.chars().count() <= crate::resources::gateway_probe::MAX_STATUS_MESSAGE_LEN,
+            "truncated message must not exceed MAX_STATUS_MESSAGE_LEN"
+        );
     }
 }

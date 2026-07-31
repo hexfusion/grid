@@ -426,10 +426,7 @@ configured.  Before storage, the receiving operator runs a structural check:
 - Input without a `-----BEGIN CERTIFICATE-----` header is rejected and recorded
   as `TrustMaterialInvalid` in `GridSite.status.reason`.
 - Input with a valid `CERTIFICATE` header passes the structural check and is
-  stored in `GridSite.status.publicCertPem`.  The `GridSite` controller then
-  sets `status.reason` based on trust policy evaluation (e.g., `TrustPolicyMissing`
-  if no fingerprint is configured, or `TrustPolicyMismatch` if the fingerprint does
-  not match).
+  stored in `GridSite.status.publicCertPem`.
 
 This structural check is **not** cryptographic verification.  It does not parse
 DER bytes as X.509, check the issuer or validity period, or validate the signature
@@ -445,69 +442,63 @@ A non-empty `publicCertPem` with no private-key rejection indicates:
 - The remote site is authenticated or authorized for routing.
 - The mTLS handshake has succeeded.
 
-**Trust policy — fingerprint pinning:** The operator supports explicit control-plane trust
-verification through `GridSite.spec.trust.certFingerprint`.  When configured, the operator
-computes the SHA-256 fingerprint of the received `publicCertPem` and promotes the site from
-`Connecting` to `Active` when the fingerprint matches and the TCP probe succeeds.
+**Identity-aware gateway verification:** For `spec.egress.tls.mode: Mutual`,
+the operator performs an mTLS handshake with the advertised gateway. It verifies
+the server chain against `GridNetwork.spec.tls.caSecretRef`, verifies the DNS SAN
+against `spec.egress.tls.serverName`, proves possession of the server private key
+through the handshake, and checks the live leaf certificate against
+`spec.trust.canonicalFingerprints`.
 
 GridSite Active is a control-plane eligibility signal. It means Grid has enough
-site/trust information to consider the site for overlay generation. It does not
-currently prove that a Praxis gateway has completed an mTLS handshake, accepted
-client identity, loaded the latest routing config, or authorized provider-side
-traffic.
+site and gateway identity information to consider the site for overlay
+generation. It does not prove that Praxis has loaded the latest routing config
+or authorized a particular request.
 
 ```yaml
 spec:
+  egress:
+    address: provider.example.com:8443
+    tls:
+      mode: Mutual
+      serverName: provider.example.com
   trust:
-    certFingerprint: "ab:cd:ef:..."   # sha256 of publicCertPem PEM bytes
+    canonicalFingerprints:
+      - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
-To compute the fingerprint from the received certificate:
+Pins are lowercase SHA-256 digests of the leaf certificate's canonical DER
+bytes, with no separators. Verify them through an independent trust channel
+before configuration. The demo's tooling derives the canonical value from the
+staged certificate; production certificate tooling should expose the same
+DER-based digest.
 
-```bash
-kubectl get gridsite <name> -o jsonpath='{.status.publicCertPem}' | \
-  tr -d '\n' | sha256sum
-# Then convert to colon-separated format and patch spec.trust.certFingerprint.
-```
-
-When `spec.trust.certFingerprint` is absent, the site remains `Connecting` with
-reason `TrustPolicyMissing`, regardless of cert material.  When the fingerprint is
-configured but does not match, the reason is `TrustPolicyMismatch`.
-
-X.509 chain verification against a CA is not yet implemented.  The fingerprint
-is a direct comparison of the received certificate content — it verifies that the
-certificate is exactly the one expected, but does not validate its chain or
-issuer.  Obtain and verify the fingerprint out-of-band before configuring it.
-
-**Certificate rotation:** When `spec.trust.certFingerprint` is configured and the
-`Active` `GridSite` controller detects that the received `publicCertPem` no longer
-matches the fingerprint, the site is demoted from `Active` to `Connecting` with
-reason `TrustPolicyMismatch`.  Update `spec.trust.certFingerprint` to the new
-certificate's fingerprint to re-authorize the site.  Until the policy is updated,
-the site remains `Connecting` and its CRDT providers are excluded from routing.
+**Certificate rotation:** `canonicalFingerprints` accepts one current pin and
+one next pin. Add the next pin before deploying the new gateway certificate,
+wait for the live and SWIM-advertised certificate state to converge, then remove
+the old pin. An unexpected third identity is rejected. Trust failures demote an
+Active site to `Connecting`, while connection failures demote it to
+`Unreachable`; both phases exclude its CRDT providers from routing.
 
 Private keys are never broadcast.  The operator reads only the `tls.crt` key from
 the site certificate Secret — the `tls.key` key is never accessed for broadcast
-purposes.  The gateway enforces mTLS identity on every request independently of
-the control-plane `publicCertPem` field.
+purposes. The local operator reads its own `tls.key` only to authenticate the
+bounded mTLS health probe. The provider gateway separately enforces peer identity
+on every request.
 
 **Routing eligibility:** Remote CRDT provider records are included in the routing overlay
 only when the source `GridSite.status.phase == Active`.  Records from peers in any other
 phase (`Discovered`, `Connecting`, `Unreachable`, or missing) are excluded at the
 control-plane overlay level.
 
-Active phase indicates the control plane has verified the remote site's certificate
-fingerprint and TCP connectivity. Data-plane readiness requires additional steps:
-provider gateway mTLS handshake verification, client certificate validation, routing
-configuration propagation, and provider-side authorization. These readiness conditions
-are enforced at request time by the data-plane gateway filters, not by the control-plane
-Active status.
+Active phase indicates the control plane completed the configured gateway probe.
+Request readiness still requires routing configuration propagation and
+provider-side authorization, which are enforced separately by the data plane.
 
 ## Separation of Concerns
 
 | Who | What |
 |-----|------|
-| **Grid Operator** | Validates provider credential `secretRef`; projects credential references (never token values) into routing overlays; can render opt-in consumer Praxis `ConfigMap`; generates local CA and site cert Secrets; marks `GridSite.status.phase = Active` when fingerprint trust policy is satisfied (control-plane eligibility only). |
+| **Grid Operator** | Validates provider credential `secretRef`; projects credential references (never token values) into routing overlays; can render opt-in consumer Praxis `ConfigMap`; generates local CA and site cert Secrets; marks `GridSite.status.phase = Active` after the configured identity-aware gateway probe succeeds. |
 | **Gateway filters** | `intelligent_route` selects candidates and writes credential metadata; `credential_inject` reads a mounted Secret file and injects credentials per request; `peer_identity_trust` verifies peer certificate identity on provider gateways. |
 | **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`; distributes the Grid CA cert to remote clusters where gateways need to verify peer identity; configures the provider gateway's peer identity filter; manages gateway rollout when trust material changes. |
 | **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials. |
@@ -519,4 +510,4 @@ trust information to include the site in routing decisions.
 Secure data-plane traffic readiness requires additional steps beyond Active status: gateway
 trust material provisioning (CA cert or cert bundle), peer identity filter configuration,
 routing configuration loading, and provider authorization. These are deployment prerequisites
-and runtime readiness checks, not automatic outputs of Grid's fingerprint verification.
+and runtime readiness checks, not automatic outputs of Grid's gateway health evaluation.

@@ -148,6 +148,76 @@ pub fn generate_dns_cert(ca: &CaCert, common_name: &str, dns_name: &str) -> Resu
     })
 }
 
+/// Generate a certificate that has already expired, signed by the given CA.
+///
+/// Sets `notBefore` to 2 days before now and `notAfter` to 1 day before now,
+/// producing a certificate that will always fail validity checks.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if certificate generation fails.
+pub fn generate_expired_dns_cert(
+    ca: &CaCert,
+    common_name: &str,
+    dns_name: &str,
+) -> Result<SiteCertOutput, GenerateError> {
+    let now = time::OffsetDateTime::now_utc();
+    generate_validity_bounded_dns_cert(
+        ca,
+        common_name,
+        dns_name,
+        now - time::Duration::days(2),
+        now - time::Duration::days(1),
+    )
+}
+
+/// Generate a certificate that is not yet valid, signed by the given CA.
+///
+/// Sets `notBefore` to 1 day from now and `notAfter` to 2 days from now,
+/// producing a certificate that will always fail validity checks.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if certificate generation fails.
+pub fn generate_not_yet_valid_dns_cert(
+    ca: &CaCert,
+    common_name: &str,
+    dns_name: &str,
+) -> Result<SiteCertOutput, GenerateError> {
+    let now = time::OffsetDateTime::now_utc();
+    generate_validity_bounded_dns_cert(
+        ca,
+        common_name,
+        dns_name,
+        now + time::Duration::days(1),
+        now + time::Duration::days(2),
+    )
+}
+
+/// Generate a certificate with explicit validity bounds, signed by the given CA.
+fn generate_validity_bounded_dns_cert(
+    ca: &CaCert,
+    common_name: &str,
+    dns_name: &str,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+) -> Result<SiteCertOutput, GenerateError> {
+    let mut params = build_site_params(common_name, dns_name)?;
+    params.not_before = not_before;
+    params.not_after = not_after;
+
+    let site_key = KeyPair::generate()?;
+    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
+    let cert = params.signed_by(&site_key, &issuer)?;
+
+    Ok(SiteCertOutput {
+        cert_pem: cert.pem(),
+        key_pem: site_key.serialize_pem(),
+        organization: DEFAULT_ORGANIZATION.to_owned(),
+        sans: vec![dns_name.to_owned()],
+    })
+}
+
 /// Generate a certificate signed by the given CA with a specific organization.
 ///
 /// Identical to [`generate_site_cert`] except `OrganizationName` is set to
@@ -375,6 +445,34 @@ mod tests {
         let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
         let result = load_ca("Test CA", "not a valid pem key", &ca.cert_pem);
         assert!(result.is_err(), "load_ca must fail when key PEM is malformed");
+    }
+
+    #[test]
+    fn generate_expired_dns_cert_produces_valid_pem() {
+        let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
+        let cert = generate_expired_dns_cert(&ca, "expired-site", "expired.grid.internal")
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(cert.cert_pem.contains("BEGIN CERTIFICATE"), "should be PEM cert");
+        assert!(cert.key_pem.contains("BEGIN PRIVATE KEY"), "should be PEM key");
+        assert_eq!(
+            cert.sans,
+            ["expired.grid.internal"],
+            "DNS SAN must match the requested dns_name"
+        );
+    }
+
+    #[test]
+    fn generate_not_yet_valid_dns_cert_produces_valid_pem() {
+        let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
+        let cert = generate_not_yet_valid_dns_cert(&ca, "future-site", "future.grid.internal")
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(cert.cert_pem.contains("BEGIN CERTIFICATE"), "should be PEM cert");
+        assert!(cert.key_pem.contains("BEGIN PRIVATE KEY"), "should be PEM key");
+        assert_eq!(
+            cert.sans,
+            ["future.grid.internal"],
+            "DNS SAN must match the requested dns_name"
+        );
     }
 
     #[test]

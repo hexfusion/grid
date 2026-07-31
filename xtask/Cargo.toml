@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 clap = { workspace = true }
 certs = { path = "../certs" }
+pem = "3"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -545,17 +545,15 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
-    /// Prove the full fingerprint trust-promotion lifecycle for a `GridSite`.
+    /// Prove that TCP reachability without an authenticated gateway identity
+    /// remains ineligible for routing.
     ///
-    /// Spawns two SWIM-enabled operators.  Node B has TLS configured so it
-    /// broadcasts its public certificate.  The test proves:
+    /// Spawns two SWIM-enabled operators. The test proves:
     ///
-    /// 1. B reaches `Connecting` with gateway reachable.
-    /// 2. `status.reason` is `TrustPolicyMissing` (cert present, no fingerprint configured).
-    /// 3. With a wrong fingerprint: `TrustPolicyMismatch`.
-    /// 4. With the correct fingerprint: operator promotes to `Active` (`TrustPolicyVerified`).
-    /// 5. Before `Active`: B's CRDT provider absent from A's overlay.
-    /// 6. After `Active`: B's CRDT provider present in A's overlay.
+    /// 1. B reaches `Connecting` with a TCP listener reachable.
+    /// 2. `status.reason` is `IdentityVerificationRequired`.
+    /// 3. B never reaches `Active` through a plaintext probe.
+    /// 4. B's CRDT provider remains absent from A's routing overlay.
     ///
     /// Requires the multisite kind environment.  Safe to rerun.
     VerifyGridsiteTrustFingerprint {
@@ -703,6 +701,45 @@ pub(crate) enum Action {
         /// Path to the multisite environment config file.
         #[arg(short, long, default_value = "tests/env/operator-routing-multisite.toml")]
         config: PathBuf,
+    },
+
+    /// Verify runtime certificate rotation through the full lifecycle.
+    ///
+    /// 10-step deterministic sequence exercising pin match, pin mismatch,
+    /// dual-pin overlap, pin removal, expired certificate, and recovery.
+    /// Single operator, single `GridSite` — no SWIM gossip required.
+    ///
+    /// Requires a kind cluster with Grid CRDs.  Safe to rerun.
+    VerifyGridsiteRotation {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Verify multi-replica convergence: two operator replicas converge to stable state.
+    ///
+    /// Deploys two operator instances pointing at the same cluster, creates a
+    /// `GridSite` with valid TLS identity, causes a pin mismatch, restores
+    /// identity, and asserts the final state is stable (no oscillation over
+    /// a 30-second observation window).
+    ///
+    /// Proves idempotent reconciliation: same inputs → same status patch,
+    /// `grid_site_status_needs_update` prevents redundant patches, and two
+    /// replicas do not conflict on status ownership.
+    ///
+    /// Requires a kind cluster with Grid CRDs.  Safe to rerun.
+    VerifyGridsiteConvergence {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
     },
 
     /// Verify lost-peer staleness: remote provider marked stale when SWIM peer is killed.
@@ -885,6 +922,8 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
         Action::VerifyMetricsRouting { config } => env_verify_metrics_routing(config),
         Action::VerifySiteJoinDiscovery { config } => env_verify_site_join_discovery(config),
+        Action::VerifyGridsiteRotation { config, site } => env_verify_gridsite_rotation(config, site.as_deref()),
+        Action::VerifyGridsiteConvergence { config, site } => env_verify_gridsite_convergence(config, site.as_deref()),
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
         Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
         Action::VerifyOperatorInstallRbac { config, site } => env_verify_operator_install_rbac(config, site.as_deref()),
@@ -2579,34 +2618,21 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         )
     });
 
-    // Step 9: Configure trust for the secondary site so the controller promotes it to Active.
-    // The GridSite name is the deterministic auto-discovered name for the secondary's SWIM site.
-    // Bind a TCP listener so the controller's probe succeeds, then configure cert + fingerprint
-    // so the controller promotes Connecting → Active naturally (TrustPolicyVerified).
+    // Step 9: Configure identity-aware TLS trust for the secondary site so the controller
+    // promotes it to Active/TlsVerified. Spawns a local mTLS probe server and configures
+    // the full identity trust chain (CA, client cert, canonical DER pin).
     let secondary_k8s_name = operator::auto_discovered_gridsite_name(SWIM_OVERLAY_NETWORK, SWIM_NODE_SECONDARY_NAME);
-    let secondary_listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("failed to bind secondary site probe listener: {e}"))?;
-    let secondary_probe_addr = secondary_listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .map_err(|e| format!("listener has no local addr: {e}"))?;
-    let after_result = before_result.and_then(|()| {
-        eprintln!("  configuring trust for GridSite {secondary_k8s_name:?} for secondary SWIM site...");
-        operator::apply_active_gridsite_for_eligibility(
-            &context,
-            &secondary_k8s_name,
-            SWIM_OVERLAY_NETWORK,
-            &secondary_probe_addr,
-        )
+    let tls_fixture_result = before_result.and_then(|()| {
+        eprintln!("  configuring TLS identity trust for GridSite {secondary_k8s_name:?}...");
+        operator::setup_tls_verified_gridsite(&context, &secondary_k8s_name, SWIM_OVERLAY_NETWORK)
     });
 
-    // Step 10: ROUTING ELIGIBILITY PROOF (after Active) — poll until the secondary's CRDT
-    // provider candidate appears in the overlay.  The controller must:
-    //   (a) probe the TCP listener at secondary_probe_addr (succeeds — listener is held above)
-    //   (b) verify the fingerprint matches → promote Connecting → Active (TrustPolicyVerified)
+    // Step 10: ROUTING ELIGIBILITY PROOF (after Active/TlsVerified) — poll until the
+    // secondary's CRDT provider candidate appears in the overlay. The controller must:
+    //   (a) probe the mTLS server (succeeds — TLS fixture guard holds the process)
+    //   (b) verify CA chain + DNS SAN + canonical pin → promote Connecting → Active (TlsVerified)
     //   (c) re-render the overlay to include secondary CRDT providers
-    // wait_for_site_candidate_in_overlay bumps GridNetwork each cycle, triggering (b) and (c).
-    let verify_result = after_result.and_then(|()| {
+    let verify_result = tls_fixture_result.and_then(|_guard| {
         operator::wait_for_site_candidate_in_overlay(
             &context,
             SWIM_OVERLAY_NETWORK,
@@ -2938,41 +2964,27 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
         )
     });
 
-    // ── Step 10: Apply Active GridSite for C and verify C's candidate appears ──
-    // Bind a real TCP listener so the GridSite controller's probe succeeds and the
-    // GridSite stays in Active phase (rather than being demoted to Unreachable).
+    // ── Step 10: Apply Active GridSite for C via identity-aware TLS and verify candidate ──
+    // Spawn a local mTLS probe server and configure the full identity trust chain so the
+    // controller promotes C to Active/TlsVerified naturally.
     let c_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_MESH_NETWORK, SWIM_MESH_SITE_C);
-    let listener_result = isolation_result.and_then(|()| {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("failed to bind TCP listener for C probe: {e}").into())
-    });
-
-    let after_result = listener_result.and_then(|listener| {
-        let local_addr = match listener.local_addr() {
-            Ok(a) => a.to_string(),
-            Err(_) => "127.0.0.1:0".to_owned(),
-        };
+    let tls_fixture_result = isolation_result.and_then(|()| {
         eprintln!(
-            "verify-swim-mesh-three-node: [10] configuring trust for GridSite {c_site_k8s_name:?} \
-             (C) → waiting for Active (probe addr={local_addr})..."
+            "verify-swim-mesh-three-node: [10] configuring TLS identity trust for GridSite \
+             {c_site_k8s_name:?} (C) → waiting for Active/TlsVerified..."
         );
-        let result =
-            operator::apply_active_gridsite_for_eligibility(&context, &c_site_k8s_name, SWIM_MESH_NETWORK, &local_addr);
-        // Keep listener alive so the GridSite TCP probe succeeds, then poll.
-        let verify = result.and_then(|()| {
-            operator::wait_for_site_candidate_in_overlay(
-                &context,
-                SWIM_MESH_NETWORK,
-                SWIM_MESH_GW,
-                SWIM_MESH_SITE_C,
-                SWIM_STATUS_POLL_TIMEOUT,
-            )
-        });
-        drop(listener); // release port after verification
-        verify
+        operator::setup_tls_verified_gridsite(&context, &c_site_k8s_name, SWIM_MESH_NETWORK)
     });
 
-    let verify_c_result = after_result;
+    let verify_c_result = tls_fixture_result.and_then(|_guard| {
+        operator::wait_for_site_candidate_in_overlay(
+            &context,
+            SWIM_MESH_NETWORK,
+            SWIM_MESH_GW,
+            SWIM_MESH_SITE_C,
+            SWIM_STATUS_POLL_TIMEOUT,
+        )
+    });
 
     // ── Step 10: Cleanup — always stop operators and remove fixtures ───────────
     if let Some(c) = op_a_guard.0.take() {
@@ -4178,26 +4190,20 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
          (Discovered→Connecting driven by GridSite controller; egress address present)"
     );
 
-    // Advance to Active via fingerprint trust policy.  The TCP listener at joining_gw_addr
-    // is already bound above so the controller's probe will succeed.  Configure a test cert
-    // + matching fingerprint at the same egress address and wait for the operator to promote
-    // Connecting → Active (TrustPolicyVerified).  This proves Active is only reached when
-    // the trust policy is satisfied — reachability alone is not sufficient.
-    operator::apply_active_gridsite_for_eligibility(
-        &east_ctx,
-        SITE_JOIN_JOINING_SITE,
-        SITE_JOIN_NETWORK,
-        &joining_gw_addr,
-    )?;
+    // Advance to Active via identity-aware TLS probe. Spawn a local mTLS probe server and
+    // configure the full identity trust chain (CA, client cert, canonical DER pin, serverName)
+    // so the controller promotes Connecting → Active (TlsVerified). This proves Active is only
+    // reached when identity verification succeeds — TCP reachability alone is not sufficient.
+    let _tls_guard = operator::setup_tls_verified_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK)?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
     operator::wait_for_gridsite_reason_in_network(
         &east_ctx,
         SITE_JOIN_JOINING_SITE,
         SITE_JOIN_NETWORK,
-        "TrustPolicyVerified",
+        "TlsVerified",
         SITE_JOIN_PHASE_POLL_TIMEOUT,
     )?;
-    eprintln!("  [OK] joining site: Active (TrustPolicyVerified — fingerprint matched, lifecycle complete)");
+    eprintln!("  [OK] joining site: Active (TlsVerified — mTLS + canonical pin matched, lifecycle complete)");
 
     // ── Step 5: Routing readiness ─────────────────────────────────────────────
     eprintln!("verify-site-join-discovery: [6/8] verifying join routing readiness...");
@@ -5765,38 +5771,798 @@ mod validate_all_tests {
 // Fingerprint trust promotion E2E
 // ---------------------------------------------------------------------------
 
-/// Print the SHA-256 fingerprint of a `GridSite.status.publicCertPem`.
+/// Print the canonical DER-based SHA-256 fingerprint of a `GridSite.status.publicCertPem`.
 fn env_gridsite_fingerprint(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pem = operator::read_gridsite_public_cert_pem(context, site_name)
         .ok_or_else(|| format!("GridSite {site_name:?} has no publicCertPem in status"))?;
-    let fp = operator::sha256_fingerprint(&pem);
+    let fp = glb::pem_to_canonical_fingerprint(&pem);
+    if fp.is_empty() {
+        return Err(
+            format!("GridSite {site_name:?}: failed to compute canonical fingerprint from publicCertPem").into(),
+        );
+    }
     eprintln!("GridSite: {site_name:?}  context: {context}");
     println!("{fp}");
     Ok(())
 }
 
-/// Prove the complete fingerprint-pinning trust promotion lifecycle.
+// ---------------------------------------------------------------------------
+// Certificate rotation verifier
+// ---------------------------------------------------------------------------
+
+/// Verify runtime certificate rotation through the full lifecycle.
 ///
-/// Steps:
-/// 1. Spawn operators A (no TLS) and B (TLS via `GridNetwork` spec).
-/// 2. Wait for SWIM convergence.
-/// 3. Apply `GridNetwork` with TLS references so B broadcasts its cert.
-/// 4. Wait for B's cert to appear in auto-discovered `GridSite` for B.
-/// 5. Bind TCP listener so `GridSite` probe succeeds.
-/// 6. Apply egress to B's `GridSite` so controller advances to `Connecting`.
-/// 7. Assert reason = `TrustPolicyMissing` (no fingerprint yet).
-/// 8. Patch wrong fingerprint → assert `TrustPolicyMismatch`.
-/// 9. Patch correct fingerprint → wait for `Active` (`TrustPolicyVerified`).
-/// 10. Assert B's CRDT provider appears in overlay.
-/// 11. Rotation proof: patch wrong fingerprint on `Active` site → observe `Connecting TrustPolicyMismatch`.
+/// 10-step deterministic sequence exercising pin match, pin mismatch,
+/// dual-pin overlap, pin removal, expired certificate, and recovery.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential fingerprint lifecycle proof: 11 steps covering promotion, mismatch, and rotation"
+    reason = "10-step sequential rotation lifecycle — splitting obscures the test narrative"
+)]
+fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        ROTATION_DNS_SAN, ROTATION_GW, ROTATION_NETWORK, ROTATION_POLL_TIMEOUT, ROTATION_REMOTE_SWIM_ID, ROTATION_SITE,
+        ROTATION_SWIM_ID, SWIM_CONVERGENCE_WAIT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-gridsite-rotation: context={context}");
+
+    // ── Step 1: CRDs, cleanup, generate certificates ─────────────────────────
+    eprintln!("verify-gridsite-rotation: [1] setup");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_rotation_test_resources(&context)?;
+
+    let ca = ::certs::generate_ca("rotation-test-ca").map_err(|e| format!("CA gen failed: {e}"))?;
+    let cert_a = ::certs::generate_dns_cert(&ca, "rotation-a", ROTATION_DNS_SAN)
+        .map_err(|e| format!("cert-A gen failed: {e}"))?;
+    let cert_b = ::certs::generate_dns_cert(&ca, "rotation-b", ROTATION_DNS_SAN)
+        .map_err(|e| format!("cert-B gen failed: {e}"))?;
+    let cert_c = ::certs::generate_dns_cert(&ca, "rotation-c", ROTATION_DNS_SAN)
+        .map_err(|e| format!("cert-C gen failed: {e}"))?;
+    let cert_expired = ::certs::generate_expired_dns_cert(&ca, "rotation-expired", ROTATION_DNS_SAN)
+        .map_err(|e| format!("expired cert gen failed: {e}"))?;
+    let cert_nyv = ::certs::generate_not_yet_valid_dns_cert(&ca, "rotation-nyv", ROTATION_DNS_SAN)
+        .map_err(|e| format!("not-yet-valid cert gen failed: {e}"))?;
+
+    let fp_a = operator::pem_fingerprint(&cert_a.cert_pem)?;
+    let fp_b = operator::pem_fingerprint(&cert_b.cert_pem)?;
+    let fp_c = operator::pem_fingerprint(&cert_c.cert_pem)?;
+    eprintln!("  fp-A={fp_a}");
+    eprintln!("  fp-B={fp_b}");
+    eprintln!("  fp-C={fp_c}");
+
+    // ── Step 2: Secrets, network, provider fixtures ──────────────────────────
+    eprintln!("verify-gridsite-rotation: [2] create secrets + fixtures");
+    let temp_dir = tempfile::tempdir()?;
+    let temp = temp_dir.path();
+    operator::create_tls_secret_from_pem(
+        &context,
+        "default",
+        &format!("{ROTATION_SITE}-ca"),
+        &ca.cert_pem,
+        &cert_a.cert_pem,
+        &cert_a.key_pem,
+        temp,
+    )?;
+    operator::create_tls_secret_from_pem(
+        &context,
+        "default",
+        &format!("{ROTATION_SITE}-tls"),
+        &ca.cert_pem,
+        &cert_a.cert_pem,
+        &cert_a.key_pem,
+        temp,
+    )?;
+    operator::apply_rotation_test_fixtures(&context, ROTATION_SWIM_ID)?;
+    operator::patch_gridnetwork_tls_refs(
+        &context,
+        ROTATION_NETWORK,
+        &format!("{ROTATION_SITE}-ca"),
+        &format!("{ROTATION_SITE}-tls"),
+        "default",
+    )?;
+
+    // ── Step 3: Spawn TLS probe server serving cert-A ────────────────────────
+    eprintln!("verify-gridsite-rotation: [3] spawn TLS probe server (cert-A)");
+    let cert_a_path = temp.join("cert-a.pem");
+    let key_a_path = temp.join("key-a.pem");
+    let cert_b_path = temp.join("cert-b.pem");
+    let key_b_path = temp.join("key-b.pem");
+    let cert_c_path = temp.join("cert-c.pem");
+    let key_c_path = temp.join("key-c.pem");
+    let cert_exp_path = temp.join("cert-expired.pem");
+    let key_exp_path = temp.join("key-expired.pem");
+    let cert_nyv_path = temp.join("cert-nyv.pem");
+    let key_nyv_path = temp.join("key-nyv.pem");
+    let ca_path = temp.join("ca.pem");
+    std::fs::write(&cert_a_path, &cert_a.cert_pem)?;
+    std::fs::write(&key_a_path, &cert_a.key_pem)?;
+    std::fs::write(&cert_b_path, &cert_b.cert_pem)?;
+    std::fs::write(&key_b_path, &cert_b.key_pem)?;
+    std::fs::write(&cert_c_path, &cert_c.cert_pem)?;
+    std::fs::write(&key_c_path, &cert_c.key_pem)?;
+    std::fs::write(&cert_exp_path, &cert_expired.cert_pem)?;
+    std::fs::write(&key_exp_path, &cert_expired.key_pem)?;
+    std::fs::write(&cert_nyv_path, &cert_nyv.cert_pem)?;
+    std::fs::write(&key_nyv_path, &cert_nyv.key_pem)?;
+    std::fs::write(&ca_path, &ca.cert_pem)?;
+
+    let mut probe_child = operator::spawn_tls_probe_server(0, &cert_a_path, &key_a_path, &ca_path)?;
+    let probe_addr = operator::wait_for_tls_server_ready(&mut probe_child)?;
+    let mut server_child: Option<std::process::Child> = Some(probe_child);
+    eprintln!("  TLS probe server (cert-A) at {probe_addr}");
+
+    // Spawn the primary operator (tracked for metrics) and a remote SWIM peer.
+    let bind_addr = reserve_single_bind_addr()?;
+    let bind_remote = reserve_single_bind_addr()?;
+    let spawned =
+        operator::spawn_operator_with_swim_tracked(&context, &bind_addr, &bind_addr, ROTATION_SWIM_ID, "", None)?;
+    let metrics_addr = spawned.metrics_addr.clone();
+    let mut op_guard = ProcGuard(Some(spawned.child), "rotation-op");
+    let op_remote = operator::spawn_operator_with_swim(
+        &context,
+        &bind_remote,
+        &bind_remote,
+        ROTATION_REMOTE_SWIM_ID,
+        &bind_addr,
+        Some(&probe_addr),
+    )?;
+    let mut op_remote_guard = ProcGuard(Some(op_remote), "rotation-op-remote");
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+
+    let remote_site_name = operator::auto_discovered_gridsite_name(ROTATION_NETWORK, ROTATION_REMOTE_SWIM_ID);
+    operator::apply_rotation_remote_provider(&context)?;
+
+    // ── Step 4: Apply GridSite with [fp-A] → Active/TlsVerified ─────────────
+    eprintln!("verify-gridsite-rotation: [4] apply GridSite with fp-A");
+
+    operator::apply_tls_verified_gridsite_for_eligibility(
+        &context,
+        ROTATION_SITE,
+        ROTATION_NETWORK,
+        &probe_addr,
+        &fp_a,
+        ROTATION_DNS_SAN,
+    )?;
+
+    let probe_port: u16 = probe_addr
+        .split(':')
+        .next_back()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 4: Active/TlsVerified with cert-A");
+
+        let metrics_baseline = operator::scrape_metrics(&metrics_addr)?;
+
+        // ── Step 4b: Routing eligibility — configure remote GridSite with all
+        //    fingerprints so it stays Active for any valid cert and only goes
+        //    Connecting for expired/not-yet-valid certs.
+        eprintln!("verify-gridsite-rotation: [4b] configure remote GridSite for eligibility");
+        operator::apply_tls_verified_gridsite_for_eligibility(
+            &context,
+            &remote_site_name,
+            ROTATION_NETWORK,
+            &probe_addr,
+            &fp_a,
+            ROTATION_DNS_SAN,
+        )?;
+        operator::patch_gridsite_fingerprints(&context, &remote_site_name, &[&fp_a, &fp_b])?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            &remote_site_name,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        operator::wait_for_site_candidate_in_overlay(
+            &context,
+            ROTATION_NETWORK,
+            ROTATION_GW,
+            ROTATION_REMOTE_SWIM_ID,
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!(
+            "  [PASS] step 4b: remote CRDT candidate present in overlay \
+             (remote GridSite Active → routing eligible)"
+        );
+
+        // ── Step 5: Restart with cert-B, fp-A still configured → PinMismatch ──
+        eprintln!("verify-gridsite-rotation: [5] restart server with cert-B (fp-A configured)");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_b_path,
+            &key_b_path,
+            &ca_path,
+        )?);
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Connecting",
+            "PinMismatch",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 5: Connecting/PinMismatch after cert swap");
+
+        // ── Step 6: Patch [fp-A, fp-B] → Active/TlsVerified (cert-B matches fp-B) ──
+        eprintln!("verify-gridsite-rotation: [6] dual-pin overlap [fp-A, fp-B]");
+        operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_a, &fp_b])?;
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 6: Active/TlsVerified with dual-pin overlap");
+
+        // ── Step 6a: Partial rollout — server reverts to cert-A, dual-pin still set ──
+        eprintln!("verify-gridsite-rotation: [6a] partial rollout (cert-A, pins=[fp-A, fp-B])");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_a_path,
+            &key_a_path,
+            &ca_path,
+        )?);
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 6a: TlsVerified — cert-A still matches fp-A in dual-pin");
+
+        // ── Step 6b: Convergence on B — server back to cert-B, dual-pin ──
+        eprintln!("verify-gridsite-rotation: [6b] convergence on B (cert-B, pins=[fp-A, fp-B])");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_b_path,
+            &key_b_path,
+            &ca_path,
+        )?);
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 6b: TlsVerified — cert-B matches fp-B in dual-pin");
+        // NOTE: AdvertisedCertificateMismatch (SWIM-advertised cert vs configured
+        // pins) requires modifying the remote operator's TLS broadcast secret
+        // independently of the probe server cert.  This pathway has unit test
+        // coverage (advertised_cert_mismatch_demotes_active_to_connecting,
+        // advertised_cert_mismatch_stays_connecting) but no xtask verifier
+        // intentionally creates that runtime state.  The rotation verifier
+        // focuses on the live TLS handshake lifecycle.
+
+        // ── Step 7: Patch [fp-B] only → still Active/TlsVerified ────────────
+        eprintln!("verify-gridsite-rotation: [7] single pin [fp-B]");
+        operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 7: Active/TlsVerified with single fp-B");
+
+        // ── Step 7a: Rollback to A — server=cert-A, pin=[fp-A] ──
+        eprintln!("verify-gridsite-rotation: [7a] rollback to A (cert-A, pin=[fp-A])");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_a_path,
+            &key_a_path,
+            &ca_path,
+        )?);
+        operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_a])?;
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 7a: TlsVerified — rollback to cert-A/fp-A succeeded");
+
+        // ── Step 7b: Reject unexpected C during overlap — pins=[fp-A, fp-B], server=cert-C ──
+        eprintln!("verify-gridsite-rotation: [7b] reject unexpected C (cert-C, pins=[fp-A, fp-B])");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_c_path,
+            &key_c_path,
+            &ca_path,
+        )?);
+        operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_a, &fp_b])?;
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Connecting",
+            "PinMismatch",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 7b: PinMismatch — cert-C (fp={fp_c}) rejected by [fp-A, fp-B]");
+
+        // ── Step 7c: Restore B after reject — server=cert-B, pins=[fp-A, fp-B] ──
+        eprintln!("verify-gridsite-rotation: [7c] restore B after reject");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_b_path,
+            &key_b_path,
+            &ca_path,
+        )?);
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 7c: TlsVerified — cert-B restored after C rejection");
+
+        // ── Step 8: Restart with expired cert → CertificateExpired ──────────
+        eprintln!("verify-gridsite-rotation: [8] restart with expired cert");
+        operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_exp_path,
+            &key_exp_path,
+            &ca_path,
+        )?);
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Connecting",
+            "CertificateExpired",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 8: Connecting/CertificateExpired");
+
+        // Routing eligibility: expired cert → remote GridSite also Connecting → excluded.
+        operator::wait_for_no_site_candidate_in_overlay(
+            &context,
+            ROTATION_NETWORK,
+            ROTATION_GW,
+            ROTATION_REMOTE_SWIM_ID,
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!(
+            "  [PASS] step 8 eligibility: remote CRDT candidate excluded from overlay \
+             (remote GridSite Connecting → routing ineligible)"
+        );
+
+        // ── Step 8a: Not-yet-valid cert → CertificateNotYetValid ────────────
+        eprintln!("verify-gridsite-rotation: [8a] restart with not-yet-valid cert");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_nyv_path,
+            &key_nyv_path,
+            &ca_path,
+        )?);
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Connecting",
+            "CertificateNotYetValid",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 8a: Connecting/CertificateNotYetValid");
+
+        // ── Step 9: Restore cert-B with [fp-B] → Active/TlsVerified ────────
+        eprintln!("verify-gridsite-rotation: [9] restore cert-B");
+        server_child = Some(operator::restart_tls_probe_server(
+            &mut server_child,
+            probe_port,
+            &cert_b_path,
+            &key_b_path,
+            &ca_path,
+        )?);
+        operator::bump_gridsite(&context, ROTATION_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            ROTATION_SITE,
+            ROTATION_NETWORK,
+            "Active",
+            "TlsVerified",
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 9: Active/TlsVerified recovered after full rotation matrix");
+
+        // Routing eligibility: recovery → remote GridSite also Active → included.
+        operator::wait_for_site_candidate_in_overlay(
+            &context,
+            ROTATION_NETWORK,
+            ROTATION_GW,
+            ROTATION_REMOTE_SWIM_ID,
+            ROTATION_POLL_TIMEOUT,
+        )?;
+        eprintln!(
+            "  [PASS] step 9 eligibility: remote CRDT candidate returned to overlay \
+             (remote GridSite Active → routing eligible again)"
+        );
+
+        // ── Event validation ────────────────────────────────────────────────
+        operator::validate_gridsite_events(
+            &context,
+            ROTATION_SITE,
+            &[
+                "TlsVerified",
+                "PinMismatch",
+                "CertificateExpired",
+                "CertificateNotYetValid",
+            ],
+        )?;
+        eprintln!("  [PASS] event validation: all expected reasons present, no duplicates");
+
+        // ── Metrics validation ──────────────────────────────────────────────
+        let metrics_final = operator::scrape_metrics(&metrics_addr)?;
+        operator::assert_metrics_safe(&metrics_final)?;
+        operator::assert_probe_counter_increased(&metrics_baseline, &metrics_final, "Verified")?;
+        operator::assert_transition_counter_increased(&metrics_baseline, &metrics_final, "Active", "TlsVerified")?;
+        eprintln!("  [PASS] metrics: counters increased, no secrets in output");
+
+        Ok(())
+    })();
+
+    // ── Step 10: Cleanup ─────────────────────────────────────────────────────
+    eprintln!("verify-gridsite-rotation: [10] cleanup");
+    if let Some(mut c) = server_child.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    if let Some(c) = op_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_remote_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_rotation_test_resources(&context)?;
+
+    result?;
+
+    eprintln!(
+        "verify-gridsite-rotation: PASS — \
+         rotation matrix verified with routing eligibility: initial → mismatch → dual-pin → \
+         partial rollout → convergence-B → single-pin → rollback-A → \
+         reject-C → restore-B → expired → not-yet-valid → recovery"
+    );
+    Ok(())
+}
+
+/// Reserve a single SWIM bind address (port 0 → OS-assigned).
+fn reserve_single_bind_addr() -> Result<String, Box<dyn std::error::Error>> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?.to_string();
+    drop(listener);
+    Ok(addr)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-replica convergence verifier
+// ---------------------------------------------------------------------------
+
+/// Verify that two operator replicas converge to stable state without
+/// oscillation on a shared `GridSite`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential convergence test: setup → verify → destabilize → recover → observe stability"
+)]
+fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONVERGENCE_DNS_SAN, CONVERGENCE_NETWORK, CONVERGENCE_POLL_TIMEOUT, CONVERGENCE_SITE,
+        CONVERGENCE_STABILITY_WINDOW,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-gridsite-convergence: context={context}");
+
+    // ── Step 1: Setup ────────────────────────────────────────────────────────
+    eprintln!("verify-gridsite-convergence: [1] setup");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_convergence_test_resources(&context)?;
+
+    let ca = ::certs::generate_ca("convergence-test-ca").map_err(|e| format!("CA gen failed: {e}"))?;
+    let cert_a = ::certs::generate_dns_cert(&ca, "conv-cert-a", CONVERGENCE_DNS_SAN)
+        .map_err(|e| format!("cert-A gen failed: {e}"))?;
+    let cert_b = ::certs::generate_dns_cert(&ca, "conv-cert-b", CONVERGENCE_DNS_SAN)
+        .map_err(|e| format!("cert-B gen failed: {e}"))?;
+    let fp_a = operator::pem_fingerprint(&cert_a.cert_pem)?;
+    let fp_b = operator::pem_fingerprint(&cert_b.cert_pem)?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let temp = temp_dir.path();
+    operator::create_tls_secret_from_pem(
+        &context,
+        "default",
+        &format!("{CONVERGENCE_SITE}-ca"),
+        &ca.cert_pem,
+        &cert_a.cert_pem,
+        &cert_a.key_pem,
+        temp,
+    )?;
+    operator::create_tls_secret_from_pem(
+        &context,
+        "default",
+        &format!("{CONVERGENCE_SITE}-tls"),
+        &ca.cert_pem,
+        &cert_a.cert_pem,
+        &cert_a.key_pem,
+        temp,
+    )?;
+    operator::apply_convergence_test_fixtures(&context, CONVERGENCE_SITE)?;
+    operator::patch_gridnetwork_tls_refs(
+        &context,
+        CONVERGENCE_NETWORK,
+        &format!("{CONVERGENCE_SITE}-ca"),
+        &format!("{CONVERGENCE_SITE}-tls"),
+        "default",
+    )?;
+
+    // ── Step 2: Spawn TLS probe server + two equivalent operator replicas ────
+    eprintln!("verify-gridsite-convergence: [2] spawn TLS server + 2 operator replicas");
+    let cert_a_path = temp.join("cert-a.pem");
+    let key_a_path = temp.join("key-a.pem");
+    let cert_b_path = temp.join("cert-b.pem");
+    let key_b_path = temp.join("key-b.pem");
+    let ca_path = temp.join("ca.pem");
+    std::fs::write(&cert_a_path, &cert_a.cert_pem)?;
+    std::fs::write(&key_a_path, &cert_a.key_pem)?;
+    std::fs::write(&cert_b_path, &cert_b.cert_pem)?;
+    std::fs::write(&key_b_path, &cert_b.key_pem)?;
+    std::fs::write(&ca_path, &ca.cert_pem)?;
+
+    let mut probe_child = operator::spawn_tls_probe_server(0, &cert_a_path, &key_a_path, &ca_path)?;
+    let probe_addr = operator::wait_for_tls_server_ready(&mut probe_child)?;
+    let mut server_child: Option<std::process::Child> = Some(probe_child);
+    eprintln!("  TLS probe server at {probe_addr}");
+
+    let (bind_a, bind_b) = reserve_swim_bind_addrs()?;
+    let spawned_a = operator::spawn_operator_with_swim_tracked(&context, &bind_a, &bind_a, CONVERGENCE_SITE, "", None)?;
+    let pid_a = spawned_a.child.id();
+    let convergence_metrics_addr = spawned_a.metrics_addr.clone();
+    let mut op_a_guard = ProcGuard(Some(spawned_a.child), "convergence-op-a");
+    let op_b = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, CONVERGENCE_SITE, "", None)?;
+    let pid_b = op_b.id();
+    let mut op_b_guard = ProcGuard(Some(op_b), "convergence-op-b");
+    eprintln!("  operator-A pid={pid_a}, operator-B pid={pid_b}");
+
+    operator::assert_operator_alive(op_a_guard.0.as_mut().ok_or("operator-A missing after spawn")?)?;
+    operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing after spawn")?)?;
+    eprintln!("  [OK] both operator replicas alive after startup");
+
+    // ── Step 3: Apply GridSite with [fp-A] → Active/TlsVerified ─────────────
+    eprintln!("verify-gridsite-convergence: [3] apply GridSite with fp-A");
+    operator::apply_tls_verified_gridsite_for_eligibility(
+        &context,
+        CONVERGENCE_SITE,
+        CONVERGENCE_NETWORK,
+        &probe_addr,
+        &fp_a,
+        CONVERGENCE_DNS_SAN,
+    )?;
+
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            CONVERGENCE_SITE,
+            CONVERGENCE_NETWORK,
+            "Active",
+            "TlsVerified",
+            CONVERGENCE_POLL_TIMEOUT,
+        )?;
+        operator::assert_operator_alive(op_a_guard.0.as_mut().ok_or("operator-A missing")?)?;
+        operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing")?)?;
+        eprintln!("  [PASS] step 3: Active/TlsVerified — both replicas alive");
+
+        let conv_metrics_baseline = operator::scrape_metrics(&convergence_metrics_addr)?;
+
+        // ── Step 4: Cause pin mismatch → Connecting/PinMismatch ─────────────
+        eprintln!("verify-gridsite-convergence: [4] restart with cert-B (fp-A configured)");
+        let port = probe_addr
+            .split(':')
+            .next_back()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        let new_child =
+            operator::restart_tls_probe_server(&mut server_child, port, &cert_b_path, &key_b_path, &ca_path)?;
+        server_child = Some(new_child);
+        operator::bump_gridsite(&context, CONVERGENCE_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            CONVERGENCE_SITE,
+            CONVERGENCE_NETWORK,
+            "Connecting",
+            "PinMismatch",
+            CONVERGENCE_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 4: Connecting/PinMismatch with two replicas");
+
+        // ── Step 5: Restore identity → Active/TlsVerified ───────────────────
+        eprintln!("verify-gridsite-convergence: [5] restore identity [fp-A, fp-B]");
+        operator::patch_gridsite_fingerprints(&context, CONVERGENCE_SITE, &[&fp_a, &fp_b])?;
+        operator::bump_gridsite(&context, CONVERGENCE_SITE)?;
+        operator::wait_for_gridsite_phase_and_reason_in_network(
+            &context,
+            CONVERGENCE_SITE,
+            CONVERGENCE_NETWORK,
+            "Active",
+            "TlsVerified",
+            CONVERGENCE_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] step 5: Active/TlsVerified restored");
+
+        // ── Step 6: Kill operator-B, verify stability ───────────────────────
+        eprintln!("verify-gridsite-convergence: [6] kill operator-B, verify A sustains state");
+        if let Some(c) = op_b_guard.0.take() {
+            operator::kill_operator(c);
+        }
+        #[expect(clippy::disallowed_methods, reason = "brief settle after kill")]
+        std::thread::sleep(Duration::from_secs(5));
+        operator::assert_operator_alive(op_a_guard.0.as_mut().ok_or("operator-A missing")?)?;
+        let reason_after_kill = operator::read_gridsite_reason(&context, CONVERGENCE_SITE);
+        if reason_after_kill != "TlsVerified" {
+            return Err(format!("GridSite degraded after killing replica-B: {reason_after_kill:?}").into());
+        }
+        eprintln!("  [PASS] step 6: operator-A alone sustains TlsVerified");
+
+        // ── Step 7: Restart operator-B, verify reconvergence ────────────────
+        eprintln!("verify-gridsite-convergence: [7] restart operator-B, prove reconvergence");
+        let op_b_new = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, CONVERGENCE_SITE, "", None)?;
+        let pid_b_new = op_b_new.id();
+        op_b_guard = ProcGuard(Some(op_b_new), "convergence-op-b");
+        eprintln!("  operator-B restarted with pid={pid_b_new}");
+        operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing after restart")?)?;
+        #[expect(clippy::disallowed_methods, reason = "settle after restart")]
+        std::thread::sleep(Duration::from_secs(5));
+        let reason_after_restart = operator::read_gridsite_reason(&context, CONVERGENCE_SITE);
+        let phase_after_restart = operator::read_gridsite_phase(&context, CONVERGENCE_SITE).unwrap_or_default();
+        if phase_after_restart != "Active" || reason_after_restart != "TlsVerified" {
+            return Err(
+                format!("reconvergence failed: phase={phase_after_restart:?} reason={reason_after_restart:?}").into(),
+            );
+        }
+        eprintln!("  [PASS] step 7: reconverged to Active/TlsVerified after restart");
+
+        // ── Step 8: Observe stability (no oscillation) ──────────────────────
+        eprintln!(
+            "verify-gridsite-convergence: [8] observing stability for {}s...",
+            CONVERGENCE_STABILITY_WINDOW.as_secs()
+        );
+        let start = std::time::Instant::now();
+        let mut last_reason = operator::read_gridsite_reason(&context, CONVERGENCE_SITE);
+        let mut transitions = 0_u32;
+        while start.elapsed() < CONVERGENCE_STABILITY_WINDOW {
+            #[expect(clippy::disallowed_methods, reason = "polling during stability observation")]
+            std::thread::sleep(Duration::from_secs(3));
+            let reason = operator::read_gridsite_reason(&context, CONVERGENCE_SITE);
+            if reason != last_reason {
+                transitions += 1;
+                eprintln!("  [WARN] unexpected transition: {last_reason:?} → {reason:?}");
+                last_reason = reason;
+            }
+        }
+        if transitions > 0 {
+            return Err(format!(
+                "convergence failure: {transitions} unexpected state transitions \
+                 during {CONVERGENCE_STABILITY_WINDOW:?} observation window"
+            )
+            .into());
+        }
+        operator::assert_operator_alive(op_a_guard.0.as_mut().ok_or("operator-A missing")?)?;
+        operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing")?)?;
+        eprintln!(
+            "  [PASS] step 8: stable at {last_reason:?} for {CONVERGENCE_STABILITY_WINDOW:?} \
+             — no oscillation, both replicas alive"
+        );
+
+        // ── Step 9: Validate transition Events ───────────────────────────
+        eprintln!("verify-gridsite-convergence: [9] validating Events");
+        operator::validate_gridsite_events(&context, CONVERGENCE_SITE, &["TlsVerified"])?;
+        eprintln!("  [PASS] step 9: events validated — no duplicates, bounded notes, correct types");
+
+        // ── Step 10: Metrics validation ─────────────────────────────────────
+        let conv_metrics_final = operator::scrape_metrics(&convergence_metrics_addr)?;
+        operator::assert_metrics_safe(&conv_metrics_final)?;
+        operator::assert_probe_counter_increased(&conv_metrics_baseline, &conv_metrics_final, "Verified")?;
+        eprintln!("  [PASS] step 10: metrics counters increased, no secrets");
+
+        Ok(())
+    })();
+
+    // ── Cleanup ──────────────────────────────────────────────────────────────
+    eprintln!("verify-gridsite-convergence: cleanup");
+    if let Some(mut c) = server_child.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    if let Some(c) = op_a_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_b_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_convergence_test_resources(&context)?;
+
+    result?;
+
+    eprintln!(
+        "verify-gridsite-convergence: PASS — \
+         equivalent replicas converged, survived restart, \
+         reconverged, no oscillation, no duplicate Events"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint trust promotion validation
+// ---------------------------------------------------------------------------
+
+/// Prove the routing-eligibility pipeline fails closed when only a TCP
+/// listener is available.
+///
+/// Identity-aware TLS probing (fingerprint pinning, SNI verification,
+/// certificate chain validation, and rotation) is covered by focused operator
+/// tests and the GLB demo. This E2E test proves that SWIM discovery plus TCP
+/// reachability cannot make a remote provider routing-eligible.
+///
+/// Steps:
+/// 1. Spawn operators A and B.
+/// 2. Wait for SWIM convergence.
+/// 3. Apply `GridNetwork` fixtures so B broadcasts its CRDT state.
+/// 4. Wait for B's CRDT to appear via SWIM.
+/// 5. Bind TCP listener and apply plaintext egress to B's `GridSite`.
+/// 6. Wait for `IdentityVerificationRequired` while B remains `Connecting`.
+/// 7. Assert B's CRDT provider remains absent from the overlay.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential routing-eligibility proof: 7 steps covering SWIM → overlay"
 )]
 fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_STATUS_POLL_TIMEOUT, SWIM_TRUST_GW, SWIM_TRUST_NETWORK,
-        SWIM_TRUST_SITE_A, SWIM_TRUST_SITE_B, sha256_fingerprint,
+        SWIM_TRUST_SITE_A, SWIM_TRUST_SITE_B,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -5808,10 +6574,9 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
     operator::cleanup_swim_trust_test_resources(&context)?;
 
     let (bind_a, bind_b) = reserve_swim_bind_addrs()?;
-    eprintln!("  A={bind_a} (no TLS)  B={bind_b} (TLS — cert will be broadcast)");
+    eprintln!("  A={bind_a}  B={bind_b}");
 
     // ── Step 2: Spawn operators ───────────────────────────────────────────────
-    // A renders overlay; B has TLS so it broadcasts a cert that A receives.
     let op_a = operator::spawn_operator_with_swim(&context, &bind_a, &bind_a, SWIM_TRUST_SITE_A, "", None)?;
     let mut op_a_guard = ProcGuard(Some(op_a), "trust-op-a");
     let op_b = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, SWIM_TRUST_SITE_B, &bind_a, None)?;
@@ -5820,19 +6585,15 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
     // ── Step 3: SWIM convergence + apply fixtures ─────────────────────────────
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     operator::apply_swim_trust_test_fixtures(&context, SWIM_TRUST_SITE_A)?;
-    eprintln!("  fixtures applied; waiting for B's TLS cert to broadcast via SWIM...");
+    eprintln!("  fixtures applied; waiting for B's CRDT state via SWIM...");
 
-    // ── Step 4: Wait for distributedProviderCount > 0 and B's publicCertPem ──
+    // ── Step 4: Wait for distributedProviderCount > 0 ─────────────────────────
     let b_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_TRUST_NETWORK, SWIM_TRUST_SITE_B);
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
         operator::wait_for_distributed_state_count(&context, SWIM_TRUST_NETWORK, 1, SWIM_STATUS_POLL_TIMEOUT)?;
         eprintln!("  [OK] CRDT from B received by A (distributedProviderCount >= 1)");
 
-        let cert_pem =
-            operator::wait_for_gridsite_public_cert_pem(&context, &b_site_k8s_name, SWIM_STATUS_POLL_TIMEOUT)?;
-        eprintln!("  [OK] publicCertPem received on GridSite {b_site_k8s_name:?}");
-
-        // ── Step 5: Bind TCP listener for probe ───────────────────────────────
+        // ── Step 5: Bind TCP listener and apply plaintext egress ──────────────
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("TCP listener bind failed: {e}"))?;
         let egress_addr = match listener.local_addr() {
@@ -5841,34 +6602,21 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
         };
         eprintln!("  TCP listener bound at {egress_addr} for GridSite probe");
 
-        // ── Step 6: Apply egress so controller advances Discovered → Connecting ─
-        // We deliberately do NOT patch status=Active here.  The controller will
-        // advance phase naturally once TCP probe + cert + fingerprint policy align.
-        operator::apply_gridsite_egress(&context, &b_site_k8s_name, SWIM_TRUST_NETWORK, &egress_addr)?;
+        operator::apply_gridsite_egress(&context, &b_site_k8s_name, SWIM_TRUST_NETWORK, &egress_addr, None)?;
 
-        // ── Step 7: Assert TrustPolicyMissing (cert present, no fingerprint) ──
-        eprintln!("verify-gridsite-trust-fingerprint: [7] asserting TrustPolicyMissing...");
+        // ── Step 6: Prove TCP reachability does not establish identity ───────
+        eprintln!("verify-gridsite-trust-fingerprint: [6] waiting for IdentityVerificationRequired...");
         operator::wait_for_gridsite_reason(
             &context,
             &b_site_k8s_name,
-            "TrustPolicyMissing",
+            "IdentityVerificationRequired",
             SWIM_STATUS_POLL_TIMEOUT,
         )?;
-        eprintln!("  [PASS] Connecting with TrustPolicyMissing (cert present, no fingerprint configured)");
+        operator::wait_for_gridsite_phase(&context, &b_site_k8s_name, "Connecting", SWIM_STATUS_POLL_TIMEOUT)?;
+        eprintln!("  [PASS] reachable TCP-only endpoint remained Connecting");
 
-        // ── Step 8: Wrong fingerprint → TrustPolicyMismatch ──────────────────
-        eprintln!("verify-gridsite-trust-fingerprint: [8] patching wrong fingerprint...");
-        let wrong_fp = sha256_fingerprint("-----BEGIN CERTIFICATE-----\nwrong\n-----END CERTIFICATE-----\n");
-        operator::patch_gridsite_cert_fingerprint(&context, &b_site_k8s_name, &wrong_fp)?;
-        operator::wait_for_gridsite_reason(
-            &context,
-            &b_site_k8s_name,
-            "TrustPolicyMismatch",
-            SWIM_STATUS_POLL_TIMEOUT,
-        )?;
-        eprintln!("  [PASS] TrustPolicyMismatch — wrong fingerprint correctly rejected");
-
-        // Assert B's CRDT provider absent before Active.
+        // ── Step 7: Assert B's CRDT provider remains excluded ────────────────
+        eprintln!("verify-gridsite-trust-fingerprint: [7] verifying overlay excludes B...");
         operator::wait_for_overlay_configmap(
             &context,
             SWIM_TRUST_NETWORK,
@@ -5877,47 +6625,9 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
             CONFIGMAP_POLL_TIMEOUT,
         )?;
         operator::assert_no_crdt_candidates_for_site(&context, SWIM_TRUST_NETWORK, SWIM_TRUST_GW, SWIM_TRUST_SITE_B)?;
-        eprintln!("  [PASS] B absent from overlay before Active");
+        eprintln!("  [PASS] unverified B provider remains absent from overlay");
 
-        // ── Step 9: Correct fingerprint → Active (TrustPolicyVerified) ────────
-        eprintln!("verify-gridsite-trust-fingerprint: [9] patching correct fingerprint...");
-        let correct_fp = sha256_fingerprint(&cert_pem);
-        operator::patch_gridsite_cert_fingerprint(&context, &b_site_k8s_name, &correct_fp)?;
-        operator::wait_for_gridsite_reason(
-            &context,
-            &b_site_k8s_name,
-            "TrustPolicyVerified",
-            SWIM_STATUS_POLL_TIMEOUT,
-        )?;
-        eprintln!("  [PASS] TrustPolicyVerified — correct fingerprint promoted site to Active");
-
-        // ── Step 10: Assert B's CRDT provider appears in overlay ──────────────
-        eprintln!("verify-gridsite-trust-fingerprint: [10] verifying overlay includes B...");
-        operator::wait_for_site_candidate_in_overlay(
-            &context,
-            SWIM_TRUST_NETWORK,
-            SWIM_TRUST_GW,
-            SWIM_TRUST_SITE_B,
-            SWIM_STATUS_POLL_TIMEOUT,
-        )?;
-        eprintln!("  [PASS] B's CRDT provider appears in overlay after Active");
-
-        // ── Step 11: Rotation proof — patch wrong fingerprint on Active site ───
-        eprintln!("verify-gridsite-trust-fingerprint: [11] rotation proof...");
-        operator::patch_gridsite_cert_fingerprint(&context, &b_site_k8s_name, &wrong_fp)?;
-        operator::wait_for_gridsite_reason(
-            &context,
-            &b_site_k8s_name,
-            "TrustPolicyMismatch",
-            SWIM_STATUS_POLL_TIMEOUT,
-        )?;
-        eprintln!("  [PASS] rotation: cert fingerprint changed → site left Active (TrustPolicyMismatch)");
-
-        // Verify B absent from overlay after rotation mismatch.
-        operator::assert_no_crdt_candidates_for_site(&context, SWIM_TRUST_NETWORK, SWIM_TRUST_GW, SWIM_TRUST_SITE_B)?;
-        eprintln!("  [PASS] B absent from overlay after fingerprint rotation mismatch");
-
-        drop(listener); // release probe port
+        drop(listener);
         Ok(())
     })();
 
@@ -5936,11 +6646,8 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
 
     eprintln!(
         "verify-gridsite-trust-fingerprint: PASS — \
-         TrustPolicyMissing without fingerprint; \
-         TrustPolicyMismatch with wrong fingerprint; \
-         TrustPolicyVerified + Active with correct fingerprint; \
-         B present in overlay after Active; \
-         B absent after rotation mismatch"
+         reachable plaintext B remained Connecting; \
+         B absent from overlay without verified identity"
     );
     Ok(())
 }

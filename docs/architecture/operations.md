@@ -162,6 +162,12 @@ granted for `secrets` and `configmaps`.  `delete` and
 | `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch; site-selector matching |
 | `inferenceproviders/status` | `get`, `patch` | Phase, matchingSites, observedGeneration |
 
+**Events (`events.k8s.io`, `grid-operator-resources`):**
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `events` | `create`, `patch` | Published on `GridSite` phase/reason transitions with action `GatewayProbe` |
+
 **Core resources (namespaced, `grid-operator-resources`):**
 
 | Resource | Verbs | Why |
@@ -181,7 +187,7 @@ across namespaces or list `Secrets`.
 
 | Secret path | Keys read | Keys written |
 |---|---|---|
-| `spec.tls.siteSecretRef` | `tls.crt` only (`tls.key` is never read) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
+| `spec.tls.siteSecretRef` | `tls.crt`, `tls.key` (client cert + private key for mTLS gateway probes; key bytes wrapped in `Zeroizing`) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
 | `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt`, `ca.key` (create-if-absent via SSA patch) |
 | `spec.tls.swimKeyRef` | `key` (or custom key field) | — |
 | `spec.auth.secretRef` | existence + UTF-8 validation | — |
@@ -205,7 +211,6 @@ overlays, status fields, or logs.
 
 Neither `ClusterRole` grants:
 
-- `events` — the operator does not emit Kubernetes Events
 - `pods`, `pods/exec`, `pods/log`, `pods/portforward`
 - `deployments`, `services`, `ingresses`
 - `secrets` `delete`, `list`, `watch`
@@ -476,31 +481,32 @@ The trust bootstrap for a remote site progresses through these steps:
 3. **Public cert material received** — the remote operator broadcasts its public site
    certificate PEM.  The operator validates the PEM structure (rejects private-key markers;
    checks for `CERTIFICATE` header) and stores it in `GridSite.status.publicCertPem`.
-   Reason: `TrustPolicyMissing` (cert received but no fingerprint policy configured).
 
-4. **TCP gateway probe passes** — the `GridSite` controller can reach the gateway
-   address.  Phase stays `Connecting` until a trust policy is configured.
+4. **Identity policy configured** — set `spec.egress.tls.serverName` to the
+   expected DNS SAN and set `spec.trust.canonicalFingerprints` to one or two
+   independently verified DER-certificate SHA-256 pins. Configure
+   `GridNetwork.spec.tls.caSecretRef` and `siteSecretRef` for server and client
+   authentication.
 
-5. **Control-plane fingerprint policy verified** — configure
-   `spec.trust.certFingerprint` with the SHA-256 fingerprint of the remote
-   site's advertised `publicCertPem`. When the fingerprint matches and the TCP
-   probe succeeds, the operator promotes the site to `Active` with reason
-   `TrustPolicyVerified`.
+5. **Identity-aware gateway probe passes** — the `GridSite` controller performs
+   a bounded mTLS handshake. It verifies the CA chain, DNS SAN, client
+   authentication, canonical pin, and agreement with the SWIM-advertised leaf
+   certificate. Success promotes the site to `Active` with reason
+   `TlsVerified`.
 
-   ```bash
-   # Read the received certificate fingerprint
-   FP=$(kubectl get gridsite <name> -o jsonpath='{.status.publicCertPem}' | \
-        sha256sum | awk '{print $1}' | sed 's/\(..\)/\1:/g;s/:$//')
-   # Configure the fingerprint trust policy
-   kubectl patch gridsite <name> --type=merge \
-     -p '{"spec":{"trust":{"certFingerprint":"'"$FP"'"}}}'
+   ```yaml
+   spec:
+     egress:
+       address: provider.example.com:8443
+       tls:
+         mode: Mutual
+         serverName: provider.example.com
+     trust:
+       canonicalFingerprints:
+         - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    ```
 
    See [Authentication and Access Policy](auth.md) for the trust contract.
-
-   This comparison pins advertised control-plane material. It does not perform
-   a TLS handshake with the endpoint or prove possession of the corresponding
-   private key.
 
 6. **Data-plane mTLS enforced** — a provider Praxis gateway validates peer
    identity over mTLS on every request, independent of the control-plane
@@ -511,7 +517,7 @@ The trust bootstrap for a remote site progresses through these steps:
 
 | Concept | Question it answers | Grid mechanism |
 |---|---|---|
-| Authentication | "Is this peer really the site it claims to be?" | Gateway mTLS peer identity and certificate validation in the data plane |
+| Authentication | "Is this peer really the site it claims to be?" | Identity-aware Grid health probe plus gateway mTLS peer validation on each request |
 | Authorization | "Is this authenticated peer allowed to participate in this Grid or receive/send this traffic?" | Local Grid policy plus destination gateway enforcement |
 
 A peer must satisfy both.  A SWIM peer must never become routable solely because
@@ -537,33 +543,29 @@ Provider records advertised by a SWIM peer are included in the routing overlay o
 the corresponding `GridSite` is `Active`.  Peers in `Discovered`, `Connecting`, or any
 other phase are excluded.  Peers with no matching `GridSite` are also excluded (fail-closed).
 
-GridSite Active is a control-plane eligibility signal. It means Grid has enough
-site/trust information to consider the site for overlay generation. It does not
-currently prove that a Praxis gateway has completed an mTLS handshake, accepted
-client identity, loaded the latest routing config, or authorized provider-side
-traffic.
+GridSite Active is a control-plane eligibility signal. It proves the configured
+gateway health probe succeeded. It does not prove that Praxis loaded the latest
+routing config or authorized a particular request.
 
-Setting `Active` requires an explicit control-plane fingerprint policy. For the
-current operator, that policy is `GridSite.spec.trust.certFingerprint`: when
-the configured fingerprint matches the advertised public certificate and the
-TCP probe succeeds, the operator promotes the site to `Active`. A production
-provider gateway independently enforces peer identity on every data-plane
-request. `Active` alone is not evidence that this enforcement exists.
+Setting `Active` in Mutual mode requires the configured CA, client identity,
+server name, canonical pin, and live gateway certificate to agree. A provider
+gateway independently authorizes peer identity on every data-plane request.
+`Active` alone is not evidence that request authorization succeeded.
 
 ## 5. Connectivity Verification
 
-The current `GridSite` controller verifies gateway reachability with a TCP probe
-against `spec.egress.address`.
+The `GridSite` controller verifies gateway reachability and identity against
+`spec.egress.address`.
 
 | Condition | Current check |
 |-----------|---------------|
 | `SWIMReachable` | SWIM membership reports the peer Alive |
 | `GatewayAddressKnown` | `spec.egress.address` is non-empty |
-| `GatewayReachable` | TCP connect to `spec.egress.address` succeeds |
+| `TlsVerified` | Mutual TLS handshake, chain, SAN, pin, and advertised leaf all verify |
+| `IdentityVerificationRequired` | Plaintext endpoint accepts TCP, but remains ineligible because its identity is not verified |
 
-mTLS trust verification and request-time authorization are enforced by the
-gateway data plane.  Advancing a site to `Active` requires the deployment
-workflow to establish trust and data-plane readiness.
+Request-time authorization remains enforced by the provider gateway after the
+control-plane health evaluation succeeds.
 
 ## 6. Capability Negotiation
 
@@ -726,13 +728,15 @@ To verify that a remote site's public certificate has been received:
 kubectl get gridsite <site-name> -o jsonpath='{.status.publicCertPem}'
 ```
 
-A non-empty value means the remote operator is advertising its site certificate.
-A `Connecting` site with a non-empty `publicCertPem` and a reachable gateway
-(TCP probe succeeded) is ready for fingerprint trust verification.  Configure
-`spec.trust.certFingerprint` to advance it to `Active`.
+A non-empty value means the remote operator is advertising structurally valid
+public certificate material. To advance a Mutual TLS site to `Active`, configure
+the CA and local client identity on the `GridNetwork`, then configure the
+expected `serverName` and `canonicalFingerprints` on the `GridSite`.
 
-A site in `TrustMaterialMissing` has a reachable gateway but no certificate.
-Configure `spec.tls.siteSecretRef` on the remote `GridNetwork` to enable certificate advertisement.
+A site in `TrustMaterialMissing` lacks at least one required CA, client
+certificate, client key, server name, or canonical pin. Configure
+`spec.tls.siteSecretRef` on the remote `GridNetwork` to enable certificate
+advertisement, but do not derive trust solely from the advertised value.
 
 ### Security rules
 
@@ -783,15 +787,16 @@ for the local MetalLB environment. A production endpoint is represented and
 validated by host, named port, protocol, SNI, address scope, and generation;
 arbitrary or ambiguous advertised strings do not become routable endpoints.
 
-**Probe behavior:** The `GridSite` controller probes `spec.egress.address` with a
-TCP connect (5-second timeout) on each reconcile.  A successful probe reports
-`reason: GatewayReachable`.  A failed probe reports `reason: GatewayUnreachable`.
-An Active site is demoted to Unreachable when its probe fails.
+**Probe behavior:** In Mutual mode, the `GridSite` controller performs a bounded
+mTLS connection to `spec.egress.address`. It verifies the configured CA,
+`serverName`, canonical live-certificate pin, and that any SWIM-advertised
+certificate matches one of the configured rotation pins. A successful probe
+reports `reason: TlsVerified`. Connection failures move an Active site to
+`Unreachable`; identity or trust failures move it to `Connecting`.
 
-**Trust behavior:** The TCP probe is not an authentication or authorization
-check.  `GatewayReachable` means the address is reachable; it does not prove the
-remote peer identity.  Use gateway mTLS peer identity enforcement and Grid trust
-policy before treating a site as authorized for traffic.
+Explicit `Plaintext` mode performs only a bounded TCP connection for
+diagnostics. It never promotes a site to `Active` and is never selected as a
+fallback when Mutual TLS configuration is incomplete or invalid.
 
 ## GridSite Lifecycle Diagnostics
 
@@ -821,7 +826,9 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.sta
 | (new) | Pending | Resource created |
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
 | Discovered | Connecting | `GridSite` controller: `spec.egress.address` non-empty |
-| Connecting | Active | `GridSite` controller: TCP probe succeeds and `spec.trust.certFingerprint` matches `status.publicCertPem` |
+| Connecting | Active | `GridSite` controller: configured Mutual TLS identity probe succeeds |
+| Active | Connecting | TLS identity or trust verification fails, or the endpoint is changed to plaintext |
+| Active | Unreachable | Gateway address is missing, times out, or refuses the connection |
 
 Security invariant: a SWIM peer must never become routable solely because it
 gossiped successfully.  Discovery, authentication, and authorization are
@@ -846,23 +853,25 @@ separate steps.
 **Phase stays Connecting**
 
 - Check `status.reason`:
-  - `TrustPolicyMissing`: the TCP probe succeeded and public certificate material was received, but
-    `spec.trust.certFingerprint` is not configured.
-  - `TrustPolicyMismatch`: the TCP probe succeeded and public certificate material was received, but
-    the configured fingerprint does not match the received certificate.
-  - `TrustMaterialMissing`: the TCP probe succeeded, but no public certificate has been received.
-  - `TrustMaterialInvalid`: received trust material failed the structural PEM check.
-  - `GatewayUnreachable`: the TCP probe to `spec.egress.address` failed.  Verify the gateway
-    is running and the remote operator's self-discovered or override address is correct.
-  - `GatewayAddressMissing`: no egress address is set.  Verify the remote operator's
-    `provider-gateway` LoadBalancer Service has an external IP, or set `GRID_GATEWAY_ADDRESS`.
+  - `TrustMaterialMissing`: configure the CA Secret, local client identity,
+    `serverName`, and canonical pin policy.
+  - `TrustMaterialInvalid`: trust material is malformed, oversized, or uses the
+    deprecated PEM fingerprint field.
+  - `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, or
+    `CertificateNotYetValid`: inspect the live gateway certificate and
+    configured CA/server name.
+  - `PinMismatch`: the live leaf certificate does not match either configured
+    canonical pin.
+  - `AdvertisedCertMismatch`: wait for certificate gossip to converge or
+    investigate an unexpected live gateway identity.
+  - `HandshakeTimeout` or `TlsProtocolError`: the TCP endpoint answered but did
+    not complete the expected TLS protocol.
 
 **Phase is Active, site became Unreachable**
 
-- The TCP probe against `spec.egress.address` failed.  The `GridSite` controller moved the
-  site from Active to Unreachable.  When the gateway becomes reachable again, the site moves
-  to Connecting.  Returning to Active requires the gateway to be reachable and
-  `spec.trust.certFingerprint` to match the received public certificate.
+- The connection to `spec.egress.address` failed. When connectivity returns,
+  the complete configured identity probe must pass before the site returns to
+  Active.
 
 **RBAC for GridSite status updates**
 

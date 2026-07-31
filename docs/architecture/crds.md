@@ -233,6 +233,10 @@ spec:
     address: egress.cluster-b.example.com:8443
     tls:
       mode: Mutual
+      serverName: egress.cluster-b.example.com
+  trust:
+    canonicalFingerprints:
+      - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   region: us-east-1
   zone: us-east-1a
   sovereigntyZone: us
@@ -260,9 +264,9 @@ A discovered SWIM peer is not automatically authorized for routing.
 |---|---|---|
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
-| `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs TCP probe |
-| `Active` | CertificatePinned — configured fingerprint matches received cert and TCP probe succeeds | `GridSite` controller promotes from Connecting and preserves Active while probe succeeds |
-| `Unreachable` | Probe failure while Active | `GridSite` controller moves Active → Unreachable on TCP probe failure |
+| `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
+| `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
+| `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
 
 **Reason codes** (in `status.reason`):
@@ -272,9 +276,20 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
-| `GatewayAddressMissing` | Discovered or Connecting | No gateway address known; see `GRID_GATEWAY_ADDRESS` |
-| `GatewayReachable` | Connecting | TCP probe to gateway address succeeded; mTLS trust verification is outside this check |
-| `GatewayUnreachable` | Connecting or Unreachable | TCP probe to gateway address failed |
+| `GatewayAddressMissing` | Discovered | No gateway address known; see `GRID_GATEWAY_ADDRESS` |
+| `EgressMissing` | Connecting or Unreachable | A previously probed site has no egress address |
+| `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
+| `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
+| `PlaintextUnreachable` | Connecting or Unreachable | TCP probe failed (explicit Plaintext mode) |
+| `ConnectTimeout` / `ConnectionFailed` | Connecting or Unreachable | TCP connection timed out or failed |
+| `HandshakeTimeout` / `TlsProtocolError` | Connecting | TLS handshake timed out or failed |
+| `UntrustedIssuer` | Connecting | Server certificate does not chain to the configured Grid trust root |
+| `IdentityMismatch` | Connecting | Server SAN does not match configured `serverName` |
+| `CertificateExpired` / `CertificateNotYetValid` | Connecting | Server certificate is outside its validity period |
+| `PinMismatch` | Connecting | Canonical fingerprint does not match a configured pin |
+| `AdvertisedCertMismatch` | Connecting | SWIM-advertised certificate does not match either configured rotation pin |
+| `TrustMaterialMissing` | Connecting | CA, client certificate, key, server name, or pin policy is absent |
+| `TrustMaterialInvalid` | Connecting | Trust material is malformed, oversized, or uses the deprecated fingerprint format |
 
 **GridSite phase transitions:**
 
@@ -286,11 +301,16 @@ A discovered SWIM peer is not automatically authorized for routing.
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
   If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
   and the site stays Discovered with reason `GatewayAddressMissing`.
-- Connecting: the `GridSite` controller runs a TCP probe against `spec.egress.address` on each
-  reconcile. The probe only proves TCP reachability. Advancing to Active also requires
-  `spec.trust.certFingerprint` to match the SHA-256 fingerprint of `status.publicCertPem`.
-- Active → Unreachable: the `GridSite` controller demotes Active to Unreachable when the TCP
-  probe fails, allowing the overlay to deprioritize unreachable sites.
+- Connecting: the `GridSite` controller probes the egress gateway on each reconcile.  For
+  `Mutual` TLS mode, the probe performs a bounded TLS handshake verifying the CA chain,
+  `serverName` SAN, and required `canonicalFingerprints` pin. For explicit
+  `Plaintext` mode, it performs a bounded TCP connect for diagnostics but keeps
+  the site in `Connecting`; TCP reachability alone cannot make a site
+  routing-eligible. Active also requires mTLS client credentials
+  (`siteSecretRef` must be configured on the `GridNetwork`).
+- Active → Unreachable: the `GridSite` controller demotes Active to Unreachable when the probe
+  cannot connect. Identity or trust failures demote Active to Connecting, distinguishing a
+  reachable but unverified endpoint from an unreachable endpoint.
 
 **`spec.egress.address` source:** For auto-discovered sites, the egress address is sourced from
 the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
@@ -315,35 +335,24 @@ structural check passed.  It does **not** mean:
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
 
+**`spec.egress.tls` fields:**
+
+| Field | Meaning |
+|---|---|
+| `mode` | `Mutual` (default) — TLS handshake with CA verification and client auth; `Plaintext` — TCP-only diagnostics that never become routing-eligible |
+| `serverName` | Expected DNS identity for TLS SNI and SAN verification; required for `Mutual`, must be absent for `Plaintext` |
+
 **`spec.trust` fields:**
 
 | Field | Meaning |
 |---|---|
-| `certFingerprint` | SHA-256 fingerprint of the expected `publicCertPem` (colon-separated hex, PEM whitespace-trimmed before hashing); when set and matching, the operator promotes from `Connecting` to `Active`, and actively re-checks while `Active` — fingerprint mismatch demotes back to `Connecting` |
-
-**`status.reason` values for `Connecting` phase:**
-
-| Reason | Meaning |
-|---|---|
-| `GatewayAddressKnown` | Egress address received; site advancing from Discovered to Connecting |
-| `GatewayUnreachable` | TCP probe to gateway address failed |
-| `GatewayAddressMissing` | No gateway address set; cannot probe |
-| `TrustMaterialMissing` | TCP probe succeeded; no public certificate received yet |
-| `TrustMaterialInvalid` | Received PEM failed structural check (not a certificate, or discarded private key) |
-| `TrustPolicyMissing` | TCP probe succeeded; valid cert received; `spec.trust.certFingerprint` not configured |
-| `TrustPolicyMismatch` | TCP probe succeeded; cert fingerprint does not match `spec.trust.certFingerprint` |
-
-**`status.reason` values for `Active` phase:**
-
-| Reason | Meaning |
-|---|---|
-| `TrustPolicyVerified` | Fingerprint matched; site promoted from `Connecting` to `Active` |
-| `TrustPolicyVerified` | Site was already `Active`; fingerprint still matches and TCP probe succeeded |
+| `canonicalFingerprints` | Required DER-certificate SHA-256 pins (`hex(sha256(der_bytes))`), one or two entries for bounded rotation overlap |
+| `certFingerprint` | **Deprecated.** Legacy PEM-based fingerprint; rejected at runtime with `TrustMaterialInvalid`; migrate to `canonicalFingerprints` |
 
 **Routing eligibility:** `GridSite.status.phase == Active` is the control-plane eligibility
-gate for remote CRDT provider records. Active means the control plane has verified the
-remote site's certificate fingerprint and TCP connectivity - sufficient information to
-include the site's providers in routing overlays for consideration.
+gate for remote CRDT provider records. Active means the control plane has
+verified the remote site's identity through TLS, which is sufficient to include
+the site's providers in routing overlays for consideration.
 
 Provider records from a peer whose `GridSite` is in `Discovered`, `Connecting`, `Pending`,
 `Unreachable`, or `Left` are excluded from the routing overlay. Records from a peer with
@@ -351,56 +360,31 @@ no matching `GridSite` are also excluded (fail-closed).
 
 GridSite Active is a control-plane eligibility signal. It means Grid has enough
 site/trust information to consider the site for overlay generation. It does not
-currently prove that a Praxis gateway has completed an mTLS handshake, accepted
-client identity, loaded the latest routing config, or authorized provider-side
-traffic. Data-plane readiness is verified separately at request time by provider
-gateway filters.
+prove that a Praxis gateway has loaded the latest routing config or authorized
+provider-side traffic. Data-plane readiness is verified separately at request
+time by provider gateway filters.
 
 See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
 
-### Future Readiness Conditions
-
-Future Grid versions may implement richer readiness conditions beyond the current
-control-plane eligibility model:
-
-- `TransportReachable` — TCP connectivity verified
-- `CertificatePinned` — fingerprint matches configured trust policy
-- `MTLSVerified` — successful mTLS handshake with peer gateway
-- `PeerAuthorized` — client certificate identity validated
-- `RoutingConfigLoaded` — gateway has loaded latest routing overlay
-- `RoutingReady` — end-to-end data-plane readiness confirmed
-
-The current Active phase combines `TransportReachable` and `CertificatePinned`.
-
-Example status — gateway reachable, cert received, policy configured and matching:
+Example status — Mutual TLS verified:
 
 ```yaml
 status:
   phase: Active
-  reason: TrustPolicyVerified
-  message: "gateway reachable; certificate fingerprint verified against configured trust policy"
+  reason: TlsVerified
+  message: "TLS handshake succeeded; certificate chain, identity, and pin verified"
   observedGeneration: 5
+  lastProbeTime: "2026-07-30T12:00:00Z"
+  lastTransitionTime: "2026-07-30T11:55:00Z"
 ```
 
-Example status — gateway reachable, cert received, no policy configured:
-
-```yaml
-status:
-  phase: Connecting
-  reason: TrustPolicyMissing
-  message: >
-    gateway reachable; public certificate received; set spec.trust.certFingerprint
-    to the certificate SHA-256 fingerprint to authorize this site
-  observedGeneration: 3
-```
-
-Example status — gateway reachable, no cert yet:
+Example status — trust material missing:
 
 ```yaml
 status:
   phase: Connecting
   reason: TrustMaterialMissing
-  message: "gateway reachable; awaiting public trust material from remote site"
+  message: "required trust material not available"
   observedGeneration: 3
 ```
 
@@ -413,6 +397,33 @@ status:
   message: "gateway address not yet available; cannot advance to Connecting"
   observedGeneration: 2
 ```
+
+### Status conditions (acceptance criterion open)
+
+The current `GridSite` status uses a flat
+`phase`/`reason`/`message` model rather than a
+Kubernetes-style `conditions[]` array.
+
+Issue #11's acceptance criteria include a conditions-based
+status contract.  That criterion is **not yet resolved**:
+it requires either (a) implementing a `conditions[]` array
+or (b) formally amending the issue to accept the
+`phase`/`reason`/`message` model as the replacement.
+Neither has happened at the time of writing.
+
+The flat model is the current contract:
+
+- `phase` provides the primary lifecycle state;
+  `reason` encodes the machine-readable probe outcome;
+  `message` gives a bounded human-readable explanation.
+- Richer conditions (e.g. `Reachable`, `IdentityVerified`,
+  `CertificatePinned`) may be added when multi-signal
+  readiness is needed (see `docs/architecture/overview.md`,
+  Trust and Readiness section).
+
+Tools and automation **must not** depend on a
+`conditions[]` field existing.  Match on `phase` for
+coarse state and on `reason` for specific probe outcomes.
 
 ## InferenceProvider
 

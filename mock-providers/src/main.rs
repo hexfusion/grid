@@ -10,10 +10,11 @@
     reason = "CLI binary that prints to the terminal"
 )]
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use mock_providers::{AppState, anthropic, bedrock, openai, vertex};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 // ---------------------------------------------------------------------------
@@ -28,14 +29,34 @@ struct Cli {
     #[arg(
         short,
         long,
-        required_unless_present_any = ["tcp_probe", "http_probe"],
-        conflicts_with_all = ["tcp_probe", "http_probe"]
+        required_unless_present_any = ["tcp_probe", "http_probe", "tls_probe_server"],
+        conflicts_with_all = ["tcp_probe", "http_probe", "tls_probe_server"]
     )]
     provider: Option<ProviderKind>,
 
     /// Port to listen on.
     #[arg(long, default_value = "8080")]
     port: u16,
+
+    /// Run a TLS-only probe server that accepts mTLS connections.
+    #[arg(
+        long,
+        conflicts_with_all = ["provider", "tcp_probe", "http_probe"],
+        requires_all = ["tls_cert", "tls_key", "tls_ca"]
+    )]
+    tls_probe_server: bool,
+
+    /// PEM certificate chain file for TLS probe server.
+    #[arg(long, requires = "tls_probe_server")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key file for TLS probe server.
+    #[arg(long, requires = "tls_probe_server")]
+    tls_key: Option<PathBuf>,
+
+    /// PEM CA certificate file for client verification.
+    #[arg(long, requires = "tls_probe_server")]
+    tls_ca: Option<PathBuf>,
 
     /// Run one bounded TCP connectivity probe and exit.
     #[arg(long, value_name = "HOST:PORT", conflicts_with = "provider")]
@@ -82,11 +103,24 @@ enum ProviderKind {
 // Main
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "CLI dispatch: TLS probe, one-shot probes, or provider server"
+)]
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+
+    if cli.tls_probe_server {
+        let cert_path = cli.tls_cert.as_deref().unwrap_or_else(|| std::process::exit(2));
+        let key_path = cli.tls_key.as_deref().unwrap_or_else(|| std::process::exit(2));
+        let ca_path = cli.tls_ca.as_deref().unwrap_or_else(|| std::process::exit(2));
+        run_tls_probe_server(cli.port, cert_path, key_path, ca_path).await;
+        return;
+    }
+
     if run_selected_probe(&cli).await {
         return;
     }
@@ -152,6 +186,99 @@ async fn run_selected_probe(cli: &Cli) -> bool {
         return true;
     }
     false
+}
+
+/// Run a TLS-only probe server that accepts mTLS connections.
+///
+/// Loads the certificate chain, private key, and CA from PEM files, builds a
+/// `rustls` server configuration with mutual TLS client verification, and
+/// accepts connections in a loop. Each accepted connection completes the TLS
+/// handshake and is then dropped — no HTTP is served.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear TLS config: load PEM → build ServerConfig → accept loop"
+)]
+#[expect(clippy::infinite_loop, reason = "server runs forever until killed by parent process")]
+async fn run_tls_probe_server(
+    port: u16,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    ca_path: &std::path::Path,
+) {
+    let cert_pem = std::fs::read(cert_path).unwrap_or_else(|e| {
+        eprintln!("tls-probe-server: failed to read cert {}: {e}", cert_path.display());
+        std::process::exit(1);
+    });
+    let key_pem = std::fs::read(key_path).unwrap_or_else(|e| {
+        eprintln!("tls-probe-server: failed to read key {}: {e}", key_path.display());
+        std::process::exit(1);
+    });
+    let ca_pem = std::fs::read(ca_path).unwrap_or_else(|e| {
+        eprintln!("tls-probe-server: failed to read CA {}: {e}", ca_path.display());
+        std::process::exit(1);
+    });
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| {
+            eprintln!("tls-probe-server: invalid cert PEM: {e}");
+            std::process::exit(1);
+        });
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).unwrap_or_else(|e| {
+        eprintln!("tls-probe-server: invalid key PEM: {e}");
+        std::process::exit(1);
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(&ca_pem) {
+        let cert = cert.unwrap_or_else(|e| {
+            eprintln!("tls-probe-server: invalid CA PEM: {e}");
+            std::process::exit(1);
+        });
+        roots.add(cert).unwrap_or_else(|e| {
+            eprintln!("tls-probe-server: failed to add CA cert: {e}");
+            std::process::exit(1);
+        });
+    }
+
+    let provider = rustls::crypto::ring::default_provider();
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("tls-probe-server: failed to build client verifier: {e}");
+            std::process::exit(1);
+        });
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|e| {
+            eprintln!("tls-probe-server: failed to build TLS config: {e}");
+            std::process::exit(1);
+        })
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .unwrap_or_else(|e| {
+            eprintln!("tls-probe-server: failed to set cert/key: {e}");
+            std::process::exit(1);
+        });
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
+        eprintln!("tls-probe-server: failed to bind {addr}: {e}");
+        std::process::exit(1);
+    });
+    let local_port = listener.local_addr().map_or(port, |a| a.port());
+    eprintln!("tls-probe-server=listening port={local_port}");
+
+    loop {
+        let Ok((stream, _peer)) = listener.accept().await else {
+            continue;
+        };
+        let acc = acceptor.clone();
+        tokio::spawn(async move {
+            drop(acc.accept(stream).await);
+        });
+    }
 }
 
 /// Run a single TCP probe for `NetworkPolicy` verification.
@@ -297,6 +424,49 @@ mod tests {
     #[test]
     fn one_mode_is_required() {
         assert!(Cli::try_parse_from(["mock-providers"]).is_err());
+    }
+
+    #[test]
+    fn tls_probe_server_mode_parses_without_provider() {
+        let cli = Cli::try_parse_from([
+            "mock-providers",
+            "--tls-probe-server",
+            "--tls-cert",
+            "/tmp/cert.pem",
+            "--tls-key",
+            "/tmp/key.pem",
+            "--tls-ca",
+            "/tmp/ca.pem",
+            "--port",
+            "9443",
+        ])
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(cli.provider.is_none());
+        assert!(cli.tls_probe_server);
+        assert_eq!(cli.port, 9443);
+    }
+
+    #[test]
+    fn tls_probe_server_requires_cert_paths() {
+        let result = Cli::try_parse_from(["mock-providers", "--tls-probe-server"]);
+        assert!(result.is_err(), "tls-probe-server without cert paths must fail");
+    }
+
+    #[test]
+    fn tls_probe_server_conflicts_with_provider() {
+        let result = Cli::try_parse_from([
+            "mock-providers",
+            "--provider",
+            "openai",
+            "--tls-probe-server",
+            "--tls-cert",
+            "/tmp/c.pem",
+            "--tls-key",
+            "/tmp/k.pem",
+            "--tls-ca",
+            "/tmp/ca.pem",
+        ]);
+        assert!(result.is_err(), "tls-probe-server must conflict with --provider");
     }
 
     #[test]

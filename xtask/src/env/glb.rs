@@ -285,14 +285,32 @@ fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std::error::Er
     Ok(format!("{:x}", Sha256::digest(output.stdout)))
 }
 
-/// Compute the control-plane trust fingerprint for one generated site certificate.
+/// Compute the canonical DER-based SHA-256 fingerprint for a generated site certificate.
 ///
-/// Unlike [`certificate_sha256`], `GridSite` trust hashes the normalized PEM
-/// bytes because that is the representation distributed through SWIM.
+/// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
+/// This matches the `canonicalFingerprints` format used by the `GridSite`
+/// trust policy for identity-aware gateway probes.
 pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let path = Path::new(GENERATED_CERTS_DIR).join(format!("{site}-cert.pem"));
-    let pem = fs::read_to_string(&path)?;
-    Ok(crate::env::operator::sha256_fingerprint(&pem))
+    certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join(format!("{site}-cert.pem")))
+}
+
+/// Compute the canonical DER-based fingerprint from a PEM certificate string.
+///
+/// Used to compare a SWIM-advertised `publicCertPem` against a staged identity.
+/// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
+///
+/// Writes the PEM to a temporary file and delegates to `openssl x509` for
+/// the PEM→DER conversion, matching the same approach used by
+/// [`certificate_sha256`].
+pub(crate) fn pem_to_canonical_fingerprint(pem: &str) -> String {
+    let tmp = match tempfile::NamedTempFile::new() {
+        Ok(f) => f,
+        Err(_err) => return String::new(),
+    };
+    if fs::write(tmp.path(), pem.trim()).is_err() {
+        return String::new();
+    }
+    certificate_sha256(tmp.path()).unwrap_or_default()
 }
 
 /// Render provider gateway configs with the edge certificate digest.

@@ -40,12 +40,29 @@ spec:
                       type: string
                     tls:
                       default:
-                        mode: ""
+                        mode: Mutual
                       description: TLS mode for the connection.
                       properties:
                         mode:
                           default: Mutual
-                          description: 'TLS mode: Mutual, Simple, or Passthrough.'
+                          description: TLS transport mode.
+                          enum:
+                            - Mutual
+                            - Plaintext
+                          type: string
+                        serverName:
+                          description: |-
+                            Expected DNS identity for TLS verification.
+
+                            Used as both the TLS SNI value and for certificate SAN
+                            verification.  Required when `mode` is [`EgressTlsMode::Mutual`];
+                            must be absent for [`EgressTlsMode::Plaintext`].
+
+                            Must be a valid DNS name (not an IP address), at most 253
+                            characters.
+                          maxLength: 253
+                          minLength: 1
+                          nullable: true
                           type: string
                       type: object
                   required:
@@ -70,23 +87,39 @@ spec:
                     Trust policy for this site.
 
                     When configured, the operator verifies the received public certificate against
-                    this policy before promoting the site to `Active`.  If absent, the site remains
-                    `Connecting` with reason `TrustPolicyMissing` regardless of cert material.
+                    this policy before promoting the site to `Active`. If absent, the site remains
+                    `Connecting` with reason `TrustMaterialMissing` regardless of certificate
+                    material.
                   nullable: true
                   properties:
+                    canonicalFingerprints:
+                      description: |-
+                        Canonical DER-certificate SHA-256 fingerprint pins.
+
+                        Each entry is a 64-character lowercase hex string computed as
+                        `hex(sha256(der_bytes))` where `der_bytes` are the raw DER encoding
+                        of the leaf certificate.
+
+                        At most two entries are allowed: the current pin and an optional
+                        next pin for bounded rotation overlap.  The probe succeeds if the
+                        peer leaf certificate matches **any** entry in this list.
+                      items:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      maxItems: 2
+                      minItems: 1
+                      nullable: true
+                      type: array
                     certFingerprint:
                       description: |-
-                        Expected SHA-256 fingerprint of the remote site's public certificate PEM.
+                        Legacy SHA-256 fingerprint of the remote site's public certificate PEM.
 
                         Format: colon-separated lowercase hex bytes, e.g. `"ab:cd:ef:..."`.
                         Computed as `sha256(pem_bytes)` where `pem_bytes` are the UTF-8 bytes of
                         `status.publicCertPem`.
 
-                        To compute from the PEM string: `printf '%s' "$cert_pem" | sha256sum`.
-
-                        When this field matches the SHA-256 of `status.publicCertPem`, the site is
-                        promoted to `Active` after a successful TCP probe.  When absent, the site
-                        remains `Connecting` with reason `TrustPolicyMissing`.
+                        **Deprecated:** use `canonicalFingerprints` for new deployments.
+                        The two fields must not both be set.
                       nullable: true
                       type: string
                   type: object
@@ -122,7 +155,7 @@ spec:
                       type: boolean
                   type: object
                 lastProbeTime:
-                  description: Timestamp of the last SWIM probe.
+                  description: Timestamp of the last data-plane gateway health evaluation.
                   nullable: true
                   type: string
                 lastTransitionTime:
@@ -164,9 +197,8 @@ spec:
                   description: |-
                     Machine-readable reason for the current phase.
 
-                    Empty when `phase` is `Active` without additional context.
-                    Examples: `"AwaitingDiscovery"`, `"EgressKnown"`, `"EgressMissing"`,
-                    `"AwaitingReadiness"`.
+                    Examples: `"AwaitingDiscovery"`, `"GatewayAddressKnown"`,
+                    `"TlsVerified"`, and `"IdentityVerificationRequired"`.
                   type: string
               type: object
           required:

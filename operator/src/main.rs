@@ -92,6 +92,7 @@ async fn main() {
         run_network_controller(client.clone(), Arc::clone(&ctx)),
         run_site_controller(client.clone()),
         run_provider_controller(client.clone()),
+        run_metrics_server(),
     );
 
     if let Err(e) = result {
@@ -471,6 +472,7 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
     let api = Api::<GridSite>::all(client.clone());
 
     Controller::new(api, watcher::Config::default())
+        .with_config(kube::runtime::controller::Config::default().concurrency(16))
         .run(grid_site::reconcile, grid_site::error_policy, Arc::new(client))
         .for_each(|result| async {
             match result {
@@ -504,6 +506,34 @@ async fn run_provider_controller(client: Client) -> Result<(), Box<dyn std::erro
         .await;
 
     Ok(())
+}
+
+/// Serve Prometheus metrics and health endpoints.
+async fn run_metrics_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = std::env::var("GRID_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_owned());
+    let app = axum::Router::new()
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .route("/healthz", axum::routing::get(health_handler))
+        .route("/readyz", axum::routing::get(health_handler));
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bound_addr = listener.local_addr().map_or_else(|_| addr.clone(), |a| a.to_string());
+    tracing::info!(addr = %bound_addr, "metrics server started");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Prometheus text-format metrics handler.
+async fn metrics_handler() -> impl axum::response::IntoResponse {
+    let body = operator::metrics::encode_metrics();
+    (
+        [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
+/// Health check handler for liveness and readiness probes.
+async fn health_handler() -> &'static str {
+    "ok"
 }
 
 #[cfg(test)]

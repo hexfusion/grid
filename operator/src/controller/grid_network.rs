@@ -1728,7 +1728,8 @@ fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
 /// Phase ownership:
 /// - Pending → Discovered: this function (`GridNetwork` controller), based on SWIM Alive
 /// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
-/// - Connecting → Active: plaintext transport promotes on TCP probe; TLS transport requires trust verification.
+/// - Connecting → Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
+///   but remain in Connecting.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential spec-apply + conditional status-patch per discovered site"
@@ -1883,6 +1884,23 @@ async fn reconcile_discovered_sites(
                     tracing::warn!(
                         name = %site.name,
                         "received cert PEM from remote site is not a valid certificate"
+                    );
+                },
+                CertPemStatus::TooLarge => {
+                    let invalid_status_doc = serde_json::json!({
+                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "kind": "GridSite",
+                        "status": {
+                            "publicCertPem": null,
+                            "reason": "TrustMaterialInvalid",
+                            "message": "received cert PEM from remote site exceeds the configured size bound"
+                        }
+                    });
+                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
+                        .await?;
+                    tracing::warn!(
+                        name = %site.name,
+                        "received cert PEM from remote site exceeds the configured size bound"
                     );
                 },
             }

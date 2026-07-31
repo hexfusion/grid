@@ -19,8 +19,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sha2::{Digest as _, Sha256};
-
 use super::{image_overrides, kind, kubectl};
 
 /// Time allowed for the operator to reconcile a provider's status.
@@ -307,6 +305,71 @@ pub(crate) const SWIM_TRUST_CA_SECRET: &str = "swim-trust-ca";
 
 /// Kubernetes Secret name for site B's site certificate.
 pub(crate) const SWIM_TRUST_SITE_SECRET: &str = "swim-trust-b-cert";
+
+// ---------------------------------------------------------------------------
+// Certificate rotation validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name used by the `GridSite` certificate rotation validation.
+pub(crate) const ROTATION_NETWORK: &str = "op-e2e-rotation-net";
+
+/// Gateway reference name in the rotation test `GridNetwork`.
+pub(crate) const ROTATION_GW: &str = "op-e2e-rotation-gw";
+
+/// `GridSite` name for the rotation test.
+pub(crate) const ROTATION_SITE: &str = "op-e2e-rotation-site";
+
+/// SWIM site identity for the single operator in the rotation test.
+pub(crate) const ROTATION_SWIM_ID: &str = "rotation-node";
+
+/// `InferenceProvider` name for the rotation test.
+pub(crate) const ROTATION_PROVIDER: &str = "op-e2e-rotation-prov";
+
+/// Model served by the rotation test provider.
+pub(crate) const ROTATION_MODEL: &str = "model-rotation";
+
+/// DNS SAN used in all rotation test certificates.
+pub(crate) const ROTATION_DNS_SAN: &str = "rotation-site.grid.internal";
+
+/// SWIM identity for the remote peer in the routing-eligibility section.
+pub(crate) const ROTATION_REMOTE_SWIM_ID: &str = "rotation-remote";
+
+/// `InferenceProvider` for the remote peer's routing-eligibility proof.
+pub(crate) const ROTATION_REMOTE_PROVIDER: &str = "op-e2e-rotation-remote-prov";
+
+/// Model served by the remote rotation test provider.
+pub(crate) const ROTATION_REMOTE_MODEL: &str = "model-rotation-remote";
+
+/// Timeout for polling `GridSite` status during rotation steps.
+pub(crate) const ROTATION_POLL_TIMEOUT: Duration = Duration::from_secs(90);
+
+// ---------------------------------------------------------------------------
+// Multi-replica convergence validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name used by the multi-replica convergence test.
+pub(crate) const CONVERGENCE_NETWORK: &str = "op-e2e-convergence-net";
+
+/// Gateway reference name in the convergence test `GridNetwork`.
+pub(crate) const CONVERGENCE_GW: &str = "op-e2e-convergence-gw";
+
+/// `GridSite` name for the convergence test.
+pub(crate) const CONVERGENCE_SITE: &str = "op-e2e-convergence-site";
+
+/// `InferenceProvider` name for the convergence test.
+pub(crate) const CONVERGENCE_PROVIDER: &str = "op-e2e-convergence-prov";
+
+/// Model served by the convergence test provider.
+pub(crate) const CONVERGENCE_MODEL: &str = "model-convergence";
+
+/// DNS SAN used in convergence test certificates.
+pub(crate) const CONVERGENCE_DNS_SAN: &str = "convergence-site.grid.internal";
+
+/// Timeout for polling `GridSite` status during convergence steps.
+pub(crate) const CONVERGENCE_POLL_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Duration to observe stability after convergence.
+pub(crate) const CONVERGENCE_STABILITY_WINDOW: Duration = Duration::from_secs(30);
 
 /// `GridNetwork` name used by the SWIM transport encryption validation.
 pub(crate) const SWIM_ENCRYPT_NETWORK: &str = "op-e2e-swim-encrypt-net";
@@ -984,9 +1047,11 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
         .args(["config", "use-context", context])
         .status()?;
 
-    eprintln!("  spawning operator (out-of-cluster)...");
+    let metrics_addr = reserve_metrics_addr()?;
+    eprintln!("  spawning operator (out-of-cluster, metrics={metrics_addr})...");
     let child = Command::new("cargo")
         .args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
+        .env("GRID_METRICS_ADDR", &metrics_addr)
         .stdin(Stdio::null())
         .spawn()?;
     // Brief pause so the operator establishes its watches before fixtures are polled.
@@ -1045,9 +1110,10 @@ pub(crate) fn spawn_operator_with_swim_for_context(
     }
     std::fs::write(&kubeconfig_path, &output.stdout)?;
 
+    let metrics_addr = reserve_metrics_addr()?;
     eprintln!(
         "  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?}, \
-         context={context}, kubeconfig={})",
+         context={context}, metrics={metrics_addr}, kubeconfig={})",
         kubeconfig_path.display()
     );
     // Redirect stdout and stderr to per-site log files rather than inheriting the
@@ -1069,6 +1135,7 @@ pub(crate) fn spawn_operator_with_swim_for_context(
         .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
         .env("GRID_SWIM_SITE_NAME", site_name)
         .env("GRID_SWIM_SEEDS", seeds)
+        .env("GRID_METRICS_ADDR", &metrics_addr)
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -1108,6 +1175,27 @@ pub(crate) fn reserve_local_udp_addr() -> Result<SocketAddr, Box<dyn std::error:
     Ok(addr)
 }
 
+/// Reserve a currently available localhost TCP address for the operator metrics server.
+///
+/// Same best-effort pattern as [`reserve_local_udp_addr`].
+pub(crate) fn reserve_metrics_addr() -> Result<String, Box<dyn std::error::Error>> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?.to_string();
+    drop(listener);
+    Ok(addr)
+}
+
+/// Assert that a child process is still alive (non-blocking).
+///
+/// Uses `try_wait()` to check without blocking.  Returns `Ok(())` if the
+/// child is still running, `Err` if it has exited.
+pub(crate) fn assert_operator_alive(child: &mut Child) -> Result<(), Box<dyn std::error::Error>> {
+    match child.try_wait()? {
+        Some(status) => Err(format!("operator exited unexpectedly: {status}").into()),
+        None => Ok(()),
+    }
+}
+
 /// Default data-plane gateway port used in site-join SWIM tests.
 pub(crate) const SITE_JOIN_GATEWAY_PORT: u16 = 19080;
 
@@ -1140,13 +1228,18 @@ pub(crate) fn spawn_operator_with_swim(
         .args(["config", "use-context", context])
         .status()?;
 
-    eprintln!("  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?})...");
+    let metrics_addr = reserve_metrics_addr()?;
+    eprintln!(
+        "  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?}, \
+         metrics={metrics_addr})..."
+    );
     let mut cmd = Command::new("cargo");
     cmd.args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
         .env("GRID_SWIM_BIND_ADDR", bind_addr)
         .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
         .env("GRID_SWIM_SITE_NAME", site_name)
         .env("GRID_SWIM_SEEDS", seeds)
+        .env("GRID_METRICS_ADDR", &metrics_addr)
         .stdin(Stdio::null());
     if let Some(gw) = gateway_address.filter(|s| !s.is_empty()) {
         cmd.env("GRID_GATEWAY_ADDRESS", gw);
@@ -1155,6 +1248,167 @@ pub(crate) fn spawn_operator_with_swim(
     // Brief pause so the operator establishes watches and starts its SWIM listener.
     std::thread::sleep(Duration::from_secs(3));
     Ok(child)
+}
+
+/// Operator process paired with its metrics address for E2E scraping.
+pub(crate) struct SpawnedOperator {
+    /// The operator child process.
+    pub child: Child,
+    /// The `host:port` where the operator serves `/metrics`.
+    pub metrics_addr: String,
+}
+
+/// Spawn the Grid operator with SWIM, returning the metrics address.
+///
+/// Identical to [`spawn_operator_with_swim`] except the metrics address
+/// is also returned so E2E tests can scrape `/metrics` during the run.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument maps to a distinct operator env var"
+)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "spawn + settle sleep in xtask; no async runtime available"
+)]
+pub(crate) fn spawn_operator_with_swim_tracked(
+    context: &str,
+    bind_addr: &str,
+    advertise_addr: &str,
+    site_name: &str,
+    seeds: &str,
+    gateway_address: Option<&str>,
+) -> Result<SpawnedOperator, Box<dyn std::error::Error>> {
+    eprintln!("  setting kubectl context to {context}...");
+    Command::new("kubectl")
+        .args(["config", "use-context", context])
+        .status()?;
+
+    let metrics_addr = reserve_metrics_addr()?;
+    eprintln!(
+        "  spawning tracked SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?}, \
+         metrics={metrics_addr})..."
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
+        .env("GRID_SWIM_BIND_ADDR", bind_addr)
+        .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
+        .env("GRID_SWIM_SITE_NAME", site_name)
+        .env("GRID_SWIM_SEEDS", seeds)
+        .env("GRID_METRICS_ADDR", &metrics_addr)
+        .stdin(Stdio::null());
+    if let Some(gw) = gateway_address.filter(|s| !s.is_empty()) {
+        cmd.env("GRID_GATEWAY_ADDRESS", gw);
+    }
+    let child = cmd.spawn()?;
+    std::thread::sleep(Duration::from_secs(3));
+    Ok(SpawnedOperator { child, metrics_addr })
+}
+
+/// Scrape Prometheus metrics from an operator's `/metrics` endpoint.
+pub(crate) fn scrape_metrics(metrics_addr: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("http://{metrics_addr}/metrics");
+    let output = Command::new("curl").args(["-sf", "--max-time", "5", &url]).output()?;
+    if !output.status.success() {
+        return Err(format!("metrics scrape failed: {url}").into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Assert that scraped metrics text contains no secrets or unbounded data.
+///
+/// Checks for: PEM markers, private key material, Bearer tokens, and
+/// 64-char hex runs that could be fingerprints used as label values.
+pub(crate) fn assert_metrics_safe(metrics_text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let forbidden = ["BEGIN CERTIFICATE", "BEGIN PRIVATE KEY", "PRIVATE KEY", "Bearer "];
+    for pattern in &forbidden {
+        if metrics_text.contains(pattern) {
+            return Err(format!("metrics text contains forbidden pattern: {pattern:?}").into());
+        }
+    }
+    for line in metrics_text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let label_section = line
+            .split_once('{')
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(labels, _)| labels);
+        if let Some(labels) = label_section {
+            for label_val in labels.split(',') {
+                let val = label_val.split_once('=').map_or("", |(_, v)| v.trim_matches('"'));
+                if val.len() == 64 && val.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(format!("metrics label contains 64-char hex (possible fingerprint): {val}").into());
+                }
+            }
+        }
+    }
+    eprintln!("  [PASS] metrics safety: no secrets or unbounded label values");
+    Ok(())
+}
+
+/// Sum all matching Prometheus counter values from metrics text.
+///
+/// `required_labels` is a slice of `key="value"` pairs.  A line matches
+/// if it starts with `name{` and its label section contains every
+/// required pair.  Values from all matching lines are summed, so callers
+/// that omit a label (e.g. `from_phase`) get the aggregate across all
+/// values of that label.
+fn sum_counter(metrics_text: &str, name: &str, required_labels: &[&str]) -> f64 {
+    let prefix = format!("{name}{{");
+    let mut total = 0.0_f64;
+    for line in metrics_text.lines() {
+        if line.starts_with('#') || !line.starts_with(&prefix) {
+            continue;
+        }
+        let all_match = required_labels.iter().all(|lbl| line.contains(lbl));
+        if all_match && let Some(val_str) = line.rsplit(' ').next() {
+            total += val_str.parse().unwrap_or(0.0);
+        }
+    }
+    total
+}
+
+/// Assert that a probe counter increased between two scrapes.
+pub(crate) fn assert_probe_counter_increased(
+    before: &str,
+    after: &str,
+    outcome: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let outcome_lbl = format!("outcome=\"{outcome}\"");
+    let labels: &[&str] = &[&outcome_lbl, "tls_mode=\"Mutual\""];
+    let v_before = sum_counter(before, "grid_gateway_probe_total", labels);
+    let v_after = sum_counter(after, "grid_gateway_probe_total", labels);
+    if v_after <= v_before {
+        return Err(format!(
+            "probe counter for outcome={outcome:?} did not increase: before={v_before} after={v_after}"
+        )
+        .into());
+    }
+    eprintln!("  [PASS] probe counter outcome={outcome:?}: {v_before} → {v_after}");
+    Ok(())
+}
+
+/// Assert that a phase transition counter increased between two scrapes.
+pub(crate) fn assert_transition_counter_increased(
+    before: &str,
+    after: &str,
+    to_phase: &str,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let to_lbl = format!("to_phase=\"{to_phase}\"");
+    let reason_lbl = format!("reason=\"{reason}\"");
+    let labels: &[&str] = &[&to_lbl, &reason_lbl];
+    let v_before = sum_counter(before, "grid_site_phase_transition_total", labels);
+    let v_after = sum_counter(after, "grid_site_phase_transition_total", labels);
+    if v_after <= v_before {
+        return Err(format!(
+            "transition counter to={to_phase:?} reason={reason:?} did not increase: \
+             before={v_before} after={v_after}"
+        )
+        .into());
+    }
+    eprintln!("  [PASS] transition counter to={to_phase:?} reason={reason:?}: {v_before} → {v_after}");
+    Ok(())
 }
 
 /// Generate a random 64-character hex string suitable as a `GRID_SWIM_ENCRYPT_KEY`.
@@ -1208,6 +1462,7 @@ fn operator_log_files(site_name: &str) -> Result<(std::fs::File, std::fs::File),
     clippy::too_many_arguments,
     reason = "each argument maps to one operator env var; grouping would obscure the contract"
 )]
+#[expect(clippy::too_many_lines, reason = "env var setup for keyed SWIM operator spawn")]
 pub(crate) fn spawn_operator_with_swim_keyed(
     context: &str,
     bind_addr: &str,
@@ -1223,8 +1478,10 @@ pub(crate) fn spawn_operator_with_swim_keyed(
         .status()?;
 
     let encrypted = swim_key_hex.is_some();
+    let metrics_addr = reserve_metrics_addr()?;
     eprintln!(
-        "  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?}, encrypted={encrypted})..."
+        "  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?}, \
+         encrypted={encrypted}, metrics={metrics_addr})..."
     );
     let (log_file, log_file2) = operator_log_files(site_name)?;
     let operator_bin = operator_binary_path();
@@ -1233,6 +1490,7 @@ pub(crate) fn spawn_operator_with_swim_keyed(
         .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
         .env("GRID_SWIM_SITE_NAME", site_name)
         .env("GRID_SWIM_SEEDS", seeds)
+        .env("GRID_METRICS_ADDR", &metrics_addr)
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -3442,48 +3700,160 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
     Ok(())
 }
 
-/// Minimal structurally-valid certificate PEM used in eligibility E2E tests.
-///
-/// This is not a real certificate — it exists only to satisfy the `GridSite`
-/// controller's fingerprint trust policy check so test sites can reach `Active`
-/// without full TLS infrastructure.  The matching fingerprint is computed by
-/// [`sha256_fingerprint`] and configured in `spec.trust.certFingerprint`.
-pub(crate) const TEST_TRUST_CERT_PEM: &str =
-    "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END CERTIFICATE-----\n";
+// ---------------------------------------------------------------------------
+// Identity-aware TLS fixture for routing eligibility
+// ---------------------------------------------------------------------------
 
-/// Apply a `GridSite` configured for routing eligibility testing.
+/// Guard that kills a spawned TLS probe server process on drop.
+pub(crate) struct TlsFixtureGuard {
+    /// Address the TLS probe server is listening on (e.g. `"127.0.0.1:9443"`).
+    #[expect(dead_code, reason = "read by the rotation verifier")]
+    pub addr: String,
+    /// Spawned TLS probe server process.
+    child: Option<Child>,
+    /// Temporary directory holding PEM files (kept alive for the server).
+    _temp_dir: tempfile::TempDir,
+}
+
+impl Drop for TlsFixtureGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            drop(child.kill());
+            drop(child.wait());
+        }
+    }
+}
+
+/// Compute the canonical DER SHA-256 fingerprint from a PEM certificate string.
 ///
-/// Configures `spec.trust.certFingerprint` (fingerprint of [`TEST_TRUST_CERT_PEM`])
-/// and injects `TEST_TRUST_CERT_PEM` into `status.publicCertPem` so the `GridSite`
-/// controller can verify the fingerprint and promote the site to `Active`
-/// automatically when the TCP probe at `egress_addr` succeeds.
+/// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
+/// Uses the `pem` crate for PEM→DER conversion (no `openssl` subprocess).
+pub(crate) fn pem_fingerprint(cert_pem: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use sha2::{Digest as _, Sha256};
+    let parsed = pem::parse(cert_pem.trim())?;
+    Ok(format!("{:x}", Sha256::digest(parsed.contents())))
+}
+
+/// Create a Kubernetes generic Secret from in-memory PEM strings.
 ///
-/// The caller must ensure a TCP listener is bound at `egress_addr` so the probe
-/// passes.  After calling this function, wait for `Active` (or `TrustPolicyVerified`)
-/// rather than asserting immediately.
+/// Writes PEM content to temporary files and creates the Secret with
+/// keys `ca.crt`, `tls.crt`, and `tls.key` using `kubectl create secret
+/// generic --dry-run=client -o yaml | kubectl apply -f -`.
 #[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "two sequential kubectl calls (spec apply + status merge patch) with distinct error paths; splitting adds indirection without clarity"
+    reason = "one kubectl call assembling CA + cert + key files into a Secret; splitting adds indirection"
 )]
-pub(crate) fn apply_active_gridsite_for_eligibility(
+pub(crate) fn create_tls_secret_from_pem(
+    context: &str,
+    namespace: &str,
+    secret_name: &str,
+    ca_pem: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    temp_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ca_path = temp_dir.join("ca.crt");
+    let cert_path = temp_dir.join("tls.crt");
+    let key_path = temp_dir.join("tls.key");
+    std::fs::write(&ca_path, ca_pem)?;
+    std::fs::write(&cert_path, cert_pem)?;
+    std::fs::write(&key_path, key_pem)?;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            namespace,
+            "create",
+            "secret",
+            "generic",
+            secret_name,
+            &format!("--from-file=ca.crt={}", ca_path.display()),
+            &format!("--from-file=tls.crt={}", cert_path.display()),
+            &format!("--from-file=tls.key={}", key_path.display()),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to render Secret/{secret_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    kubectl::apply_manifest(context, &String::from_utf8(output.stdout)?)?;
+    eprintln!("  [OK] Secret/{secret_name} created in {namespace}");
+    Ok(())
+}
+
+/// Patch a `GridNetwork` to add TLS secret references.
+pub(crate) fn patch_gridnetwork_tls_refs(
+    context: &str,
+    network: &str,
+    ca_secret_name: &str,
+    site_secret_name: &str,
+    namespace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::json!({
+        "spec": {
+            "tls": {
+                "caSecretRef": { "name": ca_secret_name, "namespace": namespace },
+                "siteSecretRef": { "name": site_secret_name, "namespace": namespace }
+            }
+        }
+    })
+    .to_string();
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridnetworks",
+            network,
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl patch gridnetwork {network} TLS refs failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    eprintln!("  [OK] GridNetwork {network:?}: TLS refs patched (ca={ca_secret_name}, site={site_secret_name})");
+    Ok(())
+}
+
+/// Apply a `GridSite` configured for identity-aware TLS eligibility.
+///
+/// Patches the `GridSite` with `mode: Mutual`, `serverName`, and
+/// `canonicalFingerprints`, then seeds status to `Connecting/HarnessPreparation`.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "two sequential kubectl calls (spec + status patch) with distinct error paths"
+)]
+pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
     context: &str,
     site_k8s_name: &str,
     network_ref: &str,
     egress_addr: &str,
+    canonical_fingerprint: &str,
+    server_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let test_fp = sha256_fingerprint(TEST_TRUST_CERT_PEM);
-    // 1. Configure spec: egress + trust policy. Strategy: try a merge patch first (non-destructive — never removes
-    //    existing labels or other spec fields).  If the resource does not yet exist, fall back to a plain kubectl apply
-    //    to create it.  A plain apply on a NEW resource is safe because there are no prior labels to lose; on an
-    //    EXISTING resource it would do a three-way merge that strips labels from the previous
-    //    last-applied-configuration, so we always prefer the patch path when the resource already exists. Server-side
-    //    apply without --force-conflicts would be another option, but SSA also removes labels that were set by an
-    //    earlier client-side apply because those labels end up with no managedFields owner.
     let spec_patch = serde_json::json!({
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } },
-            "trust": { "certFingerprint": test_fp }
+            "egress": {
+                "address": egress_addr,
+                "tls": { "mode": "Mutual", "serverName": server_name }
+            },
+            "trust": { "canonicalFingerprints": [canonical_fingerprint] }
         }
     });
     let patch_out = Command::new("kubectl")
@@ -3499,15 +3869,17 @@ pub(crate) fn apply_active_gridsite_for_eligibility(
         ])
         .output()?;
     if !patch_out.status.success() {
-        // Resource doesn't exist yet — create it with a minimal apply.
         let create_spec = serde_json::to_string_pretty(&serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "GridSite",
             "metadata": { "name": site_k8s_name },
             "spec": {
                 "gridNetworkRef": network_ref,
-                "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } },
-                "trust": { "certFingerprint": test_fp }
+                "egress": {
+                    "address": egress_addr,
+                    "tls": { "mode": "Mutual", "serverName": server_name }
+                },
+                "trust": { "canonicalFingerprints": [canonical_fingerprint] }
             }
         }))
         .unwrap_or_else(|e| {
@@ -3516,17 +3888,11 @@ pub(crate) fn apply_active_gridsite_for_eligibility(
         });
         kubectl::apply_manifest(context, &create_spec)?;
     }
-    // 2. Seed status with phase=Connecting and inject the matching cert.  The GridSite controller Connecting arm
-    //    promotes to Active when the TCP probe passes and the fingerprint matches. Seeding Connecting is necessary for
-    //    newly-created GridSites that would otherwise remain in Pending (which the GridSite controller never
-    //    auto-advances; only the GridNetwork controller does that on SWIM Alive events).  For pre-existing Connecting
-    //    sites this is a no-op on phase, only adding the cert.
-    let cert_merge = serde_json::json!({
+    let status_merge = serde_json::json!({
         "status": {
             "phase": "Connecting",
             "reason": "HarnessPreparation",
-            "message": "harness-seeded Connecting; awaiting trust verification",
-            "publicCertPem": TEST_TRUST_CERT_PEM,
+            "message": "harness-seeded Connecting; awaiting identity-aware TLS probe",
         }
     });
     let out = Command::new("kubectl")
@@ -3539,7 +3905,7 @@ pub(crate) fn apply_active_gridsite_for_eligibility(
             "--subresource=status",
             "--type=merge",
             "-p",
-            &cert_merge.to_string(),
+            &status_merge.to_string(),
         ])
         .output()?;
     if !out.status.success() {
@@ -3550,10 +3916,402 @@ pub(crate) fn apply_active_gridsite_for_eligibility(
         .into());
     }
     eprintln!(
-        "  [OK] GridSite {site_k8s_name:?} spec+trust configured; \
-         publicCertPem injected — controller will promote to Active when TCP probe passes \
-         (network={network_ref:?}, egress={egress_addr:?})"
+        "  [OK] GridSite {site_k8s_name:?} TLS identity probe configured; \
+         controller will promote to Active when mTLS probe + pin match passes \
+         (network={network_ref:?}, egress={egress_addr:?}, serverName={server_name:?})"
     );
+    Ok(())
+}
+
+/// Set up a complete TLS-verified `GridSite` for routing eligibility testing.
+///
+/// Generates a CA and site certificate, creates Kubernetes Secrets, patches
+/// the `GridNetwork` with TLS references, spawns a local mTLS probe server,
+/// and configures the `GridSite` for identity-aware probing.
+///
+/// Returns a [`TlsFixtureGuard`] that kills the probe server on drop.
+/// After calling this function, wait for `Active` (`TlsVerified`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear setup sequence: cert gen → secrets → network patch → server spawn → site patch"
+)]
+pub(crate) fn setup_tls_verified_gridsite(
+    context: &str,
+    site_k8s_name: &str,
+    network_ref: &str,
+) -> Result<TlsFixtureGuard, Box<dyn std::error::Error>> {
+    let dns_san = format!("{site_k8s_name}.grid.internal");
+    let ca = certs::generate_ca("e2e-test-ca").map_err(|e| format!("CA generation failed: {e}"))?;
+    let site_cert =
+        certs::generate_dns_cert(&ca, site_k8s_name, &dns_san).map_err(|e| format!("site cert gen failed: {e}"))?;
+    let canonical_fp = pem_fingerprint(&site_cert.cert_pem)?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.path();
+
+    let ca_secret = format!("{site_k8s_name}-ca");
+    let site_secret = format!("{site_k8s_name}-tls");
+    create_tls_secret_from_pem(
+        context,
+        "default",
+        &ca_secret,
+        &ca.cert_pem,
+        &site_cert.cert_pem,
+        &site_cert.key_pem,
+        temp_path,
+    )?;
+    create_tls_secret_from_pem(
+        context,
+        "default",
+        &site_secret,
+        &ca.cert_pem,
+        &site_cert.cert_pem,
+        &site_cert.key_pem,
+        temp_path,
+    )?;
+    patch_gridnetwork_tls_refs(context, network_ref, &ca_secret, &site_secret, "default")?;
+
+    let cert_path = temp_path.join("server-cert.pem");
+    let key_path = temp_path.join("server-key.pem");
+    let ca_cert_path = temp_path.join("server-ca.pem");
+    std::fs::write(&cert_path, &site_cert.cert_pem)?;
+    std::fs::write(&key_path, &site_cert.key_pem)?;
+    std::fs::write(&ca_cert_path, &ca.cert_pem)?;
+
+    let mut child = spawn_tls_probe_server(0, &cert_path, &key_path, &ca_cert_path)?;
+    let addr = wait_for_tls_server_ready(&mut child)?;
+
+    apply_tls_verified_gridsite_for_eligibility(context, site_k8s_name, network_ref, &addr, &canonical_fp, &dns_san)?;
+
+    Ok(TlsFixtureGuard {
+        addr,
+        child: Some(child),
+        _temp_dir: temp_dir,
+    })
+}
+
+/// Spawn a local TLS probe server process using the `mock-providers` binary.
+pub(crate) fn spawn_tls_probe_server(
+    port: u16,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    ca_path: &std::path::Path,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    let child = Command::new("cargo")
+        .args([
+            "run",
+            "-p",
+            "mock-providers",
+            "--",
+            "--tls-probe-server",
+            "--port",
+            &port.to_string(),
+            "--tls-cert",
+        ])
+        .arg(cert_path)
+        .arg("--tls-key")
+        .arg(key_path)
+        .arg("--tls-ca")
+        .arg(ca_path)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()?;
+    Ok(child)
+}
+
+/// Wait for the TLS probe server to emit its ready line on stderr.
+///
+/// Reads stderr until the `tls-probe-server=listening port=NNNN` line appears,
+/// then returns the listen address (e.g. `"127.0.0.1:NNNN"`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "channel-based non-blocking read with deadline + child exit detection"
+)]
+pub(crate) fn wait_for_tls_server_ready(child: &mut Child) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::BufRead as _;
+
+    let stderr = child.stderr.take().ok_or("TLS probe server has no stderr")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if Instant::now() > deadline {
+            return Err("TLS probe server did not become ready within 60s".into());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("TLS probe server exited early: {status}").into());
+        }
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(line)) => {
+                if let Some(rest) = line.strip_prefix("tls-probe-server=listening port=") {
+                    let port: u16 = rest.trim().parse()?;
+                    return Ok(format!("127.0.0.1:{port}"));
+                }
+            },
+            Ok(Err(e)) => return Err(format!("TLS probe server stderr read error: {e}").into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("TLS probe server closed stderr without emitting ready line".into());
+            },
+        }
+    }
+}
+
+/// Delete Kubernetes Secrets created by [`setup_tls_verified_gridsite`].
+#[expect(clippy::unnecessary_wraps, reason = "callers chain with ? for consistency")]
+pub(crate) fn cleanup_tls_fixture_secrets(
+    context: &str,
+    site_k8s_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ca_secret = format!("{site_k8s_name}-ca");
+    let site_secret = format!("{site_k8s_name}-tls");
+    for name in [&ca_secret, &site_secret] {
+        drop(
+            Command::new("kubectl")
+                .args([
+                    "--context",
+                    context,
+                    "-n",
+                    "default",
+                    "delete",
+                    "secret",
+                    name,
+                    "--ignore-not-found",
+                ])
+                .output(),
+        );
+    }
+    Ok(())
+}
+
+/// Patch `GridSite.spec.trust.canonicalFingerprints` to a new set of fingerprints.
+pub(crate) fn patch_gridsite_fingerprints(
+    context: &str,
+    site_name: &str,
+    fingerprints: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::json!({
+        "spec": { "trust": { "canonicalFingerprints": fingerprints } }
+    })
+    .to_string();
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridsites",
+            site_name,
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "patch canonicalFingerprints for {site_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    eprintln!(
+        "  [OK] GridSite {site_name:?}: canonicalFingerprints updated ({} pins)",
+        fingerprints.len()
+    );
+    Ok(())
+}
+
+/// Restart a TLS probe server with different certificate files.
+///
+/// Kills the old server process, spawns a new one on the same port,
+/// and waits for it to become ready. Returns the new `Child`.
+pub(crate) fn restart_tls_probe_server(
+    old_child: &mut Option<Child>,
+    port: u16,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    ca_path: &std::path::Path,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    if let Some(mut c) = old_child.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    #[expect(clippy::disallowed_methods, reason = "brief pause for port release")]
+    std::thread::sleep(Duration::from_millis(500));
+    let mut child = spawn_tls_probe_server(port, cert_path, key_path, ca_path)?;
+    let addr = wait_for_tls_server_ready(&mut child)?;
+    eprintln!("  [OK] TLS probe server restarted at {addr}");
+    Ok(child)
+}
+
+/// Apply the `GridNetwork` and `InferenceProvider` fixtures for the rotation test.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
+)]
+pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": ROTATION_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": ROTATION_GW,
+                "namespace": "default",
+                "localSiteName": site_name
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("rotation network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": ROTATION_PROVIDER },
+        "spec": {
+            "gridNetworkRef": ROTATION_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-rotation.default.svc:8080",
+            "models": [{ "name": ROTATION_MODEL }],
+            "routingClusterRef": site_name
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("rotation provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] rotation fixtures applied (network={ROTATION_NETWORK}, \
+         provider={ROTATION_PROVIDER}, site={site_name})"
+    );
+    Ok(())
+}
+
+/// Apply the `InferenceProvider` fixture for the remote SWIM peer in the
+/// rotation test.  The provider references `ROTATION_REMOTE_SWIM_ID` so it
+/// is published as CRDT state from the remote operator and subject to the
+/// routing eligibility gate on the primary operator's overlay.
+pub(crate) fn apply_rotation_remote_provider(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": ROTATION_REMOTE_PROVIDER },
+        "spec": {
+            "gridNetworkRef": ROTATION_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-rotation-remote.default.svc:8080",
+            "models": [{ "name": ROTATION_REMOTE_MODEL }],
+            "routingClusterRef": ROTATION_REMOTE_SWIM_ID
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("rotation remote provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] remote rotation provider applied (provider={ROTATION_REMOTE_PROVIDER}, \
+         site={ROTATION_REMOTE_SWIM_ID})"
+    );
+    Ok(())
+}
+
+/// Clean up all rotation test resources, including remote-peer artifacts.
+pub(crate) fn cleanup_rotation_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay_cm = format!("grid-overlay-{ROTATION_NETWORK}-{ROTATION_GW}");
+    drop(delete_namespaced_resource(context, "configmap", &overlay_cm, "default"));
+    drop(delete_cluster_resource(context, "inferenceprovider", ROTATION_PROVIDER));
+    drop(delete_cluster_resource(
+        context,
+        "inferenceprovider",
+        ROTATION_REMOTE_PROVIDER,
+    ));
+    drop(delete_cluster_resource(context, "gridsite", ROTATION_SITE));
+    let remote_site = auto_discovered_gridsite_name(ROTATION_NETWORK, ROTATION_REMOTE_SWIM_ID);
+    drop(delete_cluster_resource(context, "gridsite", &remote_site));
+    drop(delete_cluster_resource(context, "gridnetwork", ROTATION_NETWORK));
+    cleanup_tls_fixture_secrets(context, ROTATION_SITE)?;
+    Ok(())
+}
+
+/// Apply the `GridNetwork` and `InferenceProvider` fixtures for the convergence test.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
+)]
+pub(crate) fn apply_convergence_test_fixtures(
+    context: &str,
+    site_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": CONVERGENCE_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": CONVERGENCE_GW,
+                "namespace": "default",
+                "localSiteName": site_name
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("convergence network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": CONVERGENCE_PROVIDER },
+        "spec": {
+            "gridNetworkRef": CONVERGENCE_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-convergence.default.svc:8080",
+            "models": [{ "name": CONVERGENCE_MODEL }],
+            "routingClusterRef": site_name
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("convergence provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] convergence fixtures applied (network={CONVERGENCE_NETWORK}, \
+         provider={CONVERGENCE_PROVIDER}, site={site_name})"
+    );
+    Ok(())
+}
+
+/// Clean up all convergence test resources.
+pub(crate) fn cleanup_convergence_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay_cm = format!("grid-overlay-{CONVERGENCE_NETWORK}-{CONVERGENCE_GW}");
+    drop(delete_namespaced_resource(context, "configmap", &overlay_cm, "default"));
+    drop(delete_cluster_resource(
+        context,
+        "inferenceprovider",
+        CONVERGENCE_PROVIDER,
+    ));
+    drop(delete_cluster_resource(context, "gridsite", CONVERGENCE_SITE));
+    drop(delete_cluster_resource(context, "gridnetwork", CONVERGENCE_NETWORK));
+    cleanup_tls_fixture_secrets(context, CONVERGENCE_SITE)?;
     Ok(())
 }
 
@@ -3596,11 +4354,141 @@ pub(crate) fn assert_no_crdt_candidates_for_site(
     Ok(())
 }
 
+
+/// Validate `GridSite` transition events with deterministic filtering,
+/// sorting, and content assertions.
+///
+/// Fetches events for `site_name`, filters to `reportingController ==
+/// "grid-site-controller"` and `action == "GatewayProbe"`, sorts by
+/// `eventTime`, then asserts:
+///
+/// - Each event note is bounded (≤ 1024 bytes).
+/// - Event `type` matches the reason classification (Normal for
+///   `TlsVerified`/`AwaitingDiscovery`/`GatewayAddressKnown`/`Left`, Warning otherwise).
+/// - No consecutive duplicate reasons after time-sort.
+/// - Every `expected_reasons` entry appears at least once.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential event fetch, filter, sort, and validate"
+)]
+pub(crate) fn validate_gridsite_events(
+    context: &str,
+    site_name: &str,
+    expected_reasons: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "events.events.k8s.io",
+            "--field-selector",
+            &format!("regarding.name={site_name}"),
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("kubectl get events failed: {stderr}").into());
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let items = parsed
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Events response missing items array")?;
+
+    let mut filtered: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|item| {
+            let controller = item
+                .get("reportingController")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let action = item.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+            controller == "grid-site-controller" && action == "GatewayProbe"
+        })
+        .collect();
+
+    filtered.sort_by(|a, b| {
+        let ta = a.get("eventTime").and_then(serde_json::Value::as_str).unwrap_or("");
+        let tb = b.get("eventTime").and_then(serde_json::Value::as_str).unwrap_or("");
+        ta.cmp(tb)
+    });
+
+    eprintln!(
+        "  validating {count} filtered events for {site_name}",
+        count = filtered.len()
+    );
+
+    let normal_reasons: &[&str] = &["TlsVerified", "AwaitingDiscovery", "GatewayAddressKnown", "Left"];
+    let mut seen_reasons: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut prev_reason: Option<String> = None;
+
+    for event in &filtered {
+        let reason: String = event
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .into();
+        let note = event.get("note").and_then(serde_json::Value::as_str).unwrap_or("");
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+        if note.len() > 1024 {
+            return Err(format!(
+                "event note exceeds 1024 bytes: reason={reason:?} note_len={}",
+                note.len()
+            )
+            .into());
+        }
+
+        let expected_type = if normal_reasons.contains(&reason.as_str()) {
+            "Normal"
+        } else {
+            "Warning"
+        };
+        if event_type != expected_type {
+            return Err(format!(
+                "event type mismatch: reason={reason:?} expected type={expected_type:?} got={event_type:?}"
+            )
+            .into());
+        }
+
+        if let Some(prev) = &prev_reason
+            && *prev == reason
+        {
+            return Err(format!("duplicate consecutive transition event after time-sort: reason={reason:?}").into());
+        }
+
+        seen_reasons.insert(reason.clone());
+        prev_reason = Some(reason);
+    }
+
+    for expected in expected_reasons {
+        if !seen_reasons.contains(*expected) {
+            return Err(format!(
+                "expected event reason {expected:?} not found in {count} events for {site_name}",
+                count = filtered.len()
+            )
+            .into());
+        }
+    }
+
+    eprintln!(
+        "  [PASS] {count} events validated for {site_name}: reasons={reasons:?}",
+        count = filtered.len(),
+        reasons = seen_reasons
+    );
+    Ok(())
+}
+
 /// Delete resources created by the SWIM overlay validation.
 ///
 /// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     cleanup_test_network_resources(context, SWIM_OVERLAY_NETWORK, SWIM_OVERLAY_GW, &[SWIM_OVERLAY_PROVIDER])?;
+    let secondary_k8s_name = auto_discovered_gridsite_name(SWIM_OVERLAY_NETWORK, SWIM_NODE_SECONDARY_NAME);
+    cleanup_tls_fixture_secrets(context, &secondary_k8s_name)?;
     eprintln!("  [OK] stale SWIM overlay test resources removed");
     Ok(())
 }
@@ -3892,6 +4780,37 @@ pub(crate) fn wait_for_site_candidate_in_overlay(
     }
 }
 
+/// Poll until the overlay `ConfigMap` contains no candidate from `excluded_site`.
+///
+/// Bumps the `GridNetwork` each cycle to force re-render.  Returns `Ok(())`
+/// once the overlay either has no candidate with that site name, or the
+/// `ConfigMap` is absent entirely (no overlay means no candidates).
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
+pub(crate) fn wait_for_no_site_candidate_in_overlay(
+    context: &str,
+    network: &str,
+    gw: &str,
+    excluded_site: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        drop(bump_gridnetwork(context, network));
+        if assert_no_crdt_candidates_for_site(context, network, gw, excluded_site).is_ok() {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for overlay to exclude site={excluded_site:?} in {network}/{gw} ({}s)",
+                timeout.as_secs()
+            )
+            .into());
+        }
+        eprintln!("  waiting for overlay to exclude site={excluded_site:?} in {network}/{gw}...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// Apply the three-node SWIM mesh `GridNetwork` and leaf-node `InferenceProvider` fixtures.
 ///
 /// The `GridNetwork` uses `localSiteName = site_a_name` so node A's operator renders the
@@ -4049,6 +4968,8 @@ pub(crate) fn cleanup_swim_mesh_test_resources(context: &str) -> Result<(), Box<
     delete_cluster_resource(context, "gridnetwork", SWIM_MESH_WRONG_NETWORK)?;
     cleanup_auto_discovered_gridsites_for_network(context, SWIM_MESH_NETWORK);
     cleanup_auto_discovered_gridsites_for_network(context, SWIM_MESH_WRONG_NETWORK);
+    let c_site_k8s_name = auto_discovered_gridsite_name(SWIM_MESH_NETWORK, SWIM_MESH_SITE_C);
+    cleanup_tls_fixture_secrets(context, &c_site_k8s_name)?;
     eprintln!("  [OK] stale SWIM mesh test resources removed");
     Ok(())
 }
@@ -4056,19 +4977,6 @@ pub(crate) fn cleanup_swim_mesh_test_resources(context: &str) -> Result<(), Box<
 // ---------------------------------------------------------------------------
 // Fingerprint trust promotion helpers
 // ---------------------------------------------------------------------------
-
-/// Compute the SHA-256 fingerprint of a PEM string.
-///
-/// Returns a colon-separated lowercase hex string (95 chars: 32 pairs + 31 colons).
-/// This matches the algorithm used by `operator::resources::trust_bundle::sha256_fingerprint`
-/// and is the correct value for `GridSite.spec.trust.certFingerprint`.
-#[must_use]
-pub(crate) fn sha256_fingerprint(pem_str: &str) -> String {
-    // Trim surrounding whitespace so fingerprints match regardless of trailing
-    // newlines from kubectl jsonpath vs Kubernetes API deserialization.
-    let digest = Sha256::digest(pem_str.trim().as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
-}
 
 /// Apply the trust fingerprint test `GridNetwork` and `InferenceProvider` fixtures.
 ///
@@ -4191,24 +5099,33 @@ pub(crate) fn read_gridsite_public_cert_pem(context: &str, site_name: &str) -> O
     if pem.is_empty() { None } else { Some(pem) }
 }
 
-/// Apply egress address to a `GridSite` spec without patching the phase.
+/// Apply egress address and TLS configuration to a `GridSite` spec.
 ///
 /// This allows the `GridSite` controller to advance phases naturally —
 /// use this to exercise the trust-policy-gated promotion path from the
 /// auto-discovered lifecycle state.
+///
+/// When `server_name` is `Some`, the egress TLS mode is set to `Mutual`
+/// with the specified DNS identity for SNI/SAN verification.  When `None`,
+/// the mode is set to `Plaintext` for development-only TCP probes.
 pub(crate) fn apply_gridsite_egress(
     context: &str,
     site_k8s_name: &str,
     network_ref: &str,
     egress_addr: &str,
+    server_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let tls = match server_name {
+        Some(name) => serde_json::json!({ "mode": "Mutual", "serverName": name }),
+        None => serde_json::json!({ "mode": "Plaintext" }),
+    };
     let spec = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridSite",
         "metadata": { "name": site_k8s_name },
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } }
+            "egress": { "address": egress_addr, "tls": tls }
         }
     }))
     .unwrap_or_else(|e| {
@@ -4218,29 +5135,6 @@ pub(crate) fn apply_gridsite_egress(
     kubectl::apply_manifest(context, &spec)?;
     eprintln!("  [OK] GridSite {site_k8s_name:?}: egress={egress_addr:?} applied (phase NOT patched)");
     Ok(())
-}
-
-/// Poll until `GridSite.status.publicCertPem` is non-empty.
-///
-/// Returns the PEM string when available, or an error on timeout.
-#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
-pub(crate) fn wait_for_gridsite_public_cert_pem(
-    context: &str,
-    site_name: &str,
-    timeout: Duration,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let start = Instant::now();
-    loop {
-        if let Some(pem) = read_gridsite_public_cert_pem(context, site_name) {
-            eprintln!("  [OK] GridSite {site_name:?}: publicCertPem received");
-            return Ok(pem);
-        }
-        if start.elapsed() >= timeout {
-            return Err(format!("timeout waiting for GridSite {site_name:?} publicCertPem").into());
-        }
-        eprintln!("  waiting for GridSite {site_name:?} publicCertPem...");
-        std::thread::sleep(POLL_INTERVAL);
-    }
 }
 
 /// Read the `status.reason` field from a `GridSite` resource.
@@ -4260,40 +5154,6 @@ pub(crate) fn read_gridsite_reason(context: &str, site_name: &str) -> String {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default()
-}
-
-/// Patch `GridSite.spec.trust.certFingerprint`.
-pub(crate) fn patch_gridsite_cert_fingerprint(
-    context: &str,
-    site_name: &str,
-    fingerprint: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let patch = serde_json::to_string(&serde_json::json!({
-        "spec": { "trust": { "certFingerprint": fingerprint } }
-    }))
-    .unwrap_or_else(|_| "{}".to_owned());
-    let out = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "patch",
-            "gridsites",
-            site_name,
-            "--type=merge",
-            "-p",
-            &patch,
-        ])
-        .output()?;
-    if out.status.success() {
-        eprintln!("  [OK] GridSite {site_name:?}: spec.trust.certFingerprint patched");
-        Ok(())
-    } else {
-        Err(format!(
-            "kubectl patch gridsite {site_name} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )
-        .into())
-    }
 }
 
 /// Poll until `GridSite.status.reason == expected_reason`, bumping `network` each cycle.
@@ -4323,6 +5183,47 @@ pub(crate) fn wait_for_gridsite_reason_in_network(
         eprintln!(
             "  waiting for GridSite {site_name:?} reason={expected_reason:?} \
              (current={reason:?})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Poll until both `GridSite.status.phase` and `GridSite.status.reason` match,
+/// bumping `network` each cycle.
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "phase+reason combined check requires all site, network, expected values"
+)]
+pub(crate) fn wait_for_gridsite_phase_and_reason_in_network(
+    context: &str,
+    site_name: &str,
+    network: &str,
+    expected_phase: &str,
+    expected_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        drop(bump_gridnetwork(context, network));
+        let reason = read_gridsite_reason(context, site_name);
+        let phase = read_gridsite_phase(context, site_name).unwrap_or_default();
+        if phase == expected_phase && reason == expected_reason {
+            eprintln!("  [OK] GridSite {site_name:?}: phase={phase:?} reason={reason:?}");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridSite {site_name:?} \
+                 phase={expected_phase:?} reason={expected_reason:?}; \
+                 last observed: phase={phase:?} reason={reason:?}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for GridSite {site_name:?} \
+             phase={expected_phase:?} reason={expected_reason:?} \
+             (current: phase={phase:?} reason={reason:?})..."
         );
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -5008,7 +5909,7 @@ pub(crate) fn patch_gridsite_phase(
 }
 
 /// Read the current `status.phase` of a `GridSite`.
-fn read_gridsite_phase(context: &str, site_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn read_gridsite_phase(context: &str, site_name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let out = Command::new("kubectl")
         .args([
             "--context",
@@ -5581,6 +6482,7 @@ pub(crate) fn cleanup_site_join_resources(context: &str) -> Result<(), Box<dyn s
     cleanup_auto_discovered_gridsites_for_network(context, SITE_JOIN_NETWORK);
     delete_cluster_resource(context, "gridnetwork", SITE_JOIN_NETWORK)?;
     delete_cluster_resource(context, "gridnetwork", SITE_JOIN_WRONG_NETWORK)?;
+    cleanup_tls_fixture_secrets(context, SITE_JOIN_JOINING_SITE)?;
     eprintln!("  [OK] stale site-join-discovery resources removed from {context}");
     Ok(())
 }

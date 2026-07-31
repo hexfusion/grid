@@ -49,9 +49,26 @@ spec:
               value: ""
             - name: GRID_GATEWAY_ADDRESS
               value: ""
+            - name: GRID_METRICS_ADDR
+              value: "0.0.0.0:9090"
             - name: RUST_LOG
               value: "info"
           ports:
             - name: swim-udp
               containerPort: 7946
               protocol: UDP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10

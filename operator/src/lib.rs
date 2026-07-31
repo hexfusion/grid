@@ -12,6 +12,8 @@ pub mod controller;
 pub mod crd;
 /// Operator error types.
 pub mod error;
+/// Prometheus metrics for gateway probe and phase-transition observability.
+pub mod metrics;
 /// Pure Prometheus text-format parser for inference backend metrics.
 pub mod metrics_parser;
 /// Async HTTP scraper for Prometheus `/metrics` endpoints.

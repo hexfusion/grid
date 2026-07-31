@@ -39,7 +39,9 @@ spec:
               mode: mutual_tls
               sni: west-provider.grid.internal
   tls:
-    caSecretRef: null
+    caSecretRef:
+      name: edge-gateway-tls
+      namespace: grid-system
     siteSecretRef:
       name: edge-gateway-tls
       namespace: grid-system

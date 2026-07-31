@@ -37,3 +37,8 @@ pub mod routing_overlay;
 pub mod secret;
 /// Trust bundle management for grid mTLS.
 pub mod trust_bundle;
+
+/// Typed gateway probe outcome and phase-transition contracts.
+pub(crate) mod gateway_probe;
+/// TLS gateway probe — bounded handshake and peer certificate extraction.
+pub(crate) mod tls_probe;

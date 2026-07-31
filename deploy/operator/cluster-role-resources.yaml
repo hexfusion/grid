@@ -8,7 +8,7 @@ rules:
   # ── Secrets (namespaced) ────────────────────────────────────────────
   #
   # Read paths:
-  #   - TLS site certificate (tls.crt only; tls.key is never read)
+  #   - TLS site certificate (tls.crt, tls.key for mTLS client auth)
   #   - SWIM encryption key (swimKeyRef)
   #   - Credential Secrets (existence + key validation only)
   #
@@ -34,6 +34,18 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
+
+  # ── Events (namespaced) ────────────────────────────────────────────
+  #
+  # Write paths:
+  #   - Kubernetes Events emitted by the GridSite controller on
+  #     phase transitions and gateway probe state changes.
+  #
+  # Only create and patch are required (initial publish and series
+  # deduplication).
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 
   # ── ConfigMaps (namespaced) ─────────────────────────────────────────
   #

@@ -1223,10 +1223,14 @@ fn apply_edge_stacks(forge: &str, config: &Path) -> Result<(), Box<dyn std::erro
 /// Pin each provider's SWIM-advertised public certificate on both edge sites.
 ///
 /// SWIM discovery supplies the endpoint and public certificate, but it does
-/// not authorize routing. The demo compares the received certificate to the
-/// locally generated out-of-band identity before configuring the `GridSite`
-/// fingerprint policy. Edge Deployments are applied only after both provider
-/// sites reach `Active`, so a missing or mismatched trust record fails closed.
+/// not authorize routing.  The demo compares the received certificate to the
+/// locally generated out-of-band identity and configures the `GridSite` with:
+///
+/// - `canonicalFingerprints`: DER-based SHA-256 pin for the provider certificate
+/// - `serverName`: DNS SAN identity for TLS SNI/SAN verification
+///
+/// Edge Deployments are applied only after both provider sites reach `Active`,
+/// so a missing or mismatched trust record fails closed.
 fn authorize_provider_sites_for_edges() -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -1237,26 +1241,67 @@ fn authorize_provider_sites_for_edges() -> Result<(), Box<dyn std::error::Error>
         for provider in PROVIDER_CLUSTERS {
             let site_name = format!("glb-demo-{provider}");
             operator::wait_for_auto_gridsite(&context, &site_name, "glb-demo", TRUST_TIMEOUT)?;
-            let expected_fingerprint = glb::site_certificate_fingerprint(provider)?;
-            wait_for_expected_site_certificate(&context, &site_name, &expected_fingerprint, TRUST_TIMEOUT)?;
-            operator::patch_gridsite_cert_fingerprint(&context, &site_name, &expected_fingerprint)?;
+            let canonical_fp = glb::site_certificate_fingerprint(provider)?;
+            wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
+            let server_name = format!("{provider}.grid.internal");
+            patch_gridsite_identity_trust(&context, &site_name, &canonical_fp, &server_name)?;
             operator::wait_for_gridsite_phase(&context, &site_name, "Active", TRUST_TIMEOUT)?;
         }
     }
     Ok(())
 }
 
-/// Wait for certificate gossip to replace missing or stale site trust material.
+/// Patch a `GridSite` with canonical fingerprint and server name for identity-aware probing.
+fn patch_gridsite_identity_trust(
+    context: &str,
+    site_name: &str,
+    canonical_fp: &str,
+    server_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::json!({
+        "spec": {
+            "egress": { "tls": { "mode": "Mutual", "serverName": server_name } },
+            "trust": { "canonicalFingerprints": [canonical_fp] }
+        }
+    })
+    .to_string();
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridsites",
+            site_name,
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl patch gridsite {site_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    eprintln!("  [OK] GridSite {site_name:?}: canonicalFingerprints + serverName={server_name:?} patched");
+    Ok(())
+}
+
+/// Wait for certificate gossip to deliver the expected provider certificate.
+///
+/// Compares the canonical DER-based SHA-256 fingerprint of the SWIM-advertised
+/// certificate against the out-of-band staged identity.
 fn wait_for_expected_site_certificate(
     context: &str,
     site_name: &str,
-    expected_fingerprint: &str,
+    expected_canonical_fp: &str,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     loop {
         if operator::read_gridsite_public_cert_pem(context, site_name)
-            .is_some_and(|pem| operator::sha256_fingerprint(&pem) == expected_fingerprint)
+            .is_some_and(|pem| glb::pem_to_canonical_fingerprint(&pem) == expected_canonical_fp)
         {
             eprintln!("  [OK] GridSite {site_name:?}: advertised certificate matches the staged identity");
             return Ok(());
