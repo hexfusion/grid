@@ -12,9 +12,14 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    DemoMode, GlbDemoModeOptions, GlbDemoOptions, IngressMode, glb, gtm_emulator, image_overrides, kubectl, operator,
-    workload,
+    DemoMode, GlbDemoModeOptions, GlbDemoOptions, IngressMode,
+    external_provider::{self, ExternalProviderDescriptor},
+    glb, gtm_emulator, image_overrides, kubectl, operator, workload,
 };
+
+#[cfg(test)]
+#[path = "test_render_config.rs"]
+mod test_render_config;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -150,6 +155,11 @@ pub(crate) struct SetupContext {
     forge_bin: String,
     /// Ingress topology for this run.
     ingress_mode: IngressMode,
+    /// Resolved external provider descriptor when enabled.
+    external_provider: Option<ExternalProviderDescriptor>,
+    /// Path to the external provider key file (kept separate from the descriptor
+    /// so the descriptor never carries the filesystem path after validation).
+    external_key_file: Option<PathBuf>,
 }
 
 /// Outcome of the narrated demonstration.
@@ -158,6 +168,8 @@ struct DemoOutcome {
     capabilities: Vec<CapabilityResult>,
     /// Observed routing paths from discovery.
     observed_paths: Vec<ObservedPathEntry>,
+    /// Sanitized live external-provider proof, when enabled.
+    external_provider: Option<ExternalProviderProof>,
     /// Concise failure detail when the run did not complete successfully.
     error: Option<String>,
 }
@@ -189,6 +201,9 @@ struct EvidenceReport {
     capabilities: Vec<CapabilityResult>,
     /// Observed routing paths.
     observed_paths: Vec<ObservedPathEntry>,
+    /// Sanitized live external-provider proof, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_provider: Option<ExternalProviderProof>,
     /// Lifecycle actions performed.
     lifecycle: LifecycleRecord,
     /// Paths to generated artifacts.
@@ -215,6 +230,43 @@ pub(crate) struct ObservedPathEntry {
     provider: String,
     /// Narrative path description.
     path: String,
+}
+
+/// Sanitized facts observed during a live external-provider request.
+#[derive(Debug, Clone, Serialize)]
+struct ExternalProviderProof {
+    /// HTTP response status.
+    http_status: u16,
+    /// Gateway selected by the traffic manager.
+    edge: String,
+    /// Authenticated provider gateway that handled the request.
+    provider_gateway: String,
+    /// Candidate identity present in the selected edge overlay.
+    candidate_id: String,
+    /// Provider-local upstream cluster.
+    cluster: String,
+    /// Model reported by the external provider response.
+    response_model: String,
+    /// Exact overlay revision distributed to and accepted by the selected edge.
+    serving_revision: String,
+    /// Request duration in seconds.
+    duration_secs: f64,
+}
+
+impl ExternalProviderProof {
+    /// Render one concise capability evidence string.
+    fn summary(&self) -> String {
+        format!(
+            "HTTP {}; edge={}; gateway={}; candidate={}; cluster={}; model={}; revision={}",
+            self.http_status,
+            self.edge,
+            self.provider_gateway,
+            self.candidate_id,
+            self.cluster,
+            self.response_model,
+            self.serving_revision,
+        )
+    }
 }
 
 /// Lifecycle actions recorded.
@@ -257,17 +309,28 @@ pub(crate) fn setup(
     forge_config: &Path,
     ingress_mode: IngressMode,
 ) -> Result<SetupContext, Box<dyn std::error::Error>> {
-    let context = prepare_setup(forge_config, ingress_mode)?;
+    let context = prepare_setup(forge_config, ingress_mode, None, None)?;
     deploy_setup(&context)?;
     Ok(context)
 }
 
 /// Resolve setup inputs before creating any runtime resources.
-fn prepare_setup(forge_config: &Path, ingress_mode: IngressMode) -> Result<SetupContext, Box<dyn std::error::Error>> {
+///
+/// When `external_provider` and `external_key_file` are provided, the key file
+/// is validated before any clusters are created so the demo fails fast on
+/// invalid credentials.
+fn prepare_setup(
+    forge_config: &Path,
+    ingress_mode: IngressMode,
+    external_provider: Option<ExternalProviderDescriptor>,
+    external_key_file: Option<PathBuf>,
+) -> Result<SetupContext, Box<dyn std::error::Error>> {
     Ok(SetupContext {
-        resolved_config: materialize_config(forge_config, ingress_mode)?,
+        resolved_config: materialize_config(forge_config, ingress_mode, external_provider.as_ref())?,
         forge_bin: glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?,
         ingress_mode,
+        external_provider,
+        external_key_file,
     })
 }
 
@@ -275,7 +338,8 @@ fn prepare_setup(forge_config: &Path, ingress_mode: IngressMode) -> Result<Setup
 #[expect(clippy::too_many_lines, reason = "sequential mode-aware environment deployment")]
 fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>> {
     let is_workload = context.ingress_mode == IngressMode::Workload;
-    let total_phases: usize = if is_workload { 7 } else { SETUP_PHASES };
+    let base_phases = if is_workload { 7 } else { SETUP_PHASES };
+    let total_phases = base_phases + usize::from(context.external_provider.is_some());
     let cluster_desc = if is_workload { "four" } else { "five" };
 
     eprintln!();
@@ -283,10 +347,10 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
     eprintln!("ENVIRONMENT SETUP");
     eprintln!("{OUTPUT_RULE}");
 
-    let mut phase = 0_usize;
+    let mut phase_number = 0_usize;
     let mut next = || {
-        phase += 1;
-        phase
+        phase_number += 1;
+        phase_number
     };
 
     eprintln!();
@@ -294,7 +358,7 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
         "[SETUP {}/{total_phases}] Staging demo certificates and provider identities",
         next()
     );
-    glb::stage_provider_boundary_with_mode(context.ingress_mode)?;
+    glb::stage_provider_boundary_with_mode_and_external(context.ingress_mode, context.external_provider.as_ref())?;
 
     eprintln!();
     eprintln!(
@@ -321,14 +385,24 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
         "[SETUP {}/{total_phases}] Installing provider trust, credentials, and policy",
         next()
     );
-    glb::install_provider_boundary_with_mode(context.ingress_mode)?;
+    glb::install_provider_boundary_with_mode_and_external(context.ingress_mode, context.external_key_file.as_deref())?;
 
     eprintln!();
-    eprintln!(
-        "[SETUP {}/{total_phases}] Deploying two provider gateways and three private inference providers",
-        next()
-    );
-    apply_provider_stacks(&context.forge_bin, &context.resolved_config)?;
+    let provider_desc = if context.external_provider.is_some() {
+        "Deploying two provider gateways, three private and one external inference provider"
+    } else {
+        "Deploying two provider gateways and three private inference providers"
+    };
+    eprintln!("[SETUP {}/{total_phases}] {provider_desc}", next());
+    apply_provider_stacks(
+        &context.forge_bin,
+        &context.resolved_config,
+        context.external_provider.as_ref(),
+    )?;
+    if let Some(ext) = &context.external_provider {
+        glb::apply_openai_inference_provider(ext)?;
+        eprintln!("  [OK] east-provider: OpenAI external provider configured");
+    }
 
     eprintln!();
     eprintln!(
@@ -336,6 +410,10 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
         next()
     );
     apply_edge_stacks(&context.forge_bin, &context.resolved_config)?;
+    if let Some(ext) = &context.external_provider {
+        glb::patch_edge_configs_for_openai(ext)?;
+        eprintln!("  [OK] edge gateways: OpenAI routing cluster configured");
+    }
 
     if !is_workload {
         eprintln!();
@@ -352,7 +430,18 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
         next()
     );
     explain_overlay_convergence();
-    let overlay_evidence = glb::wait_for_edge_overlays_ready()?;
+    let expected_candidates = if context.external_provider.is_some() { 4 } else { 3 };
+    let overlay_evidence = glb::wait_for_edge_overlays_ready_with_count(expected_candidates)?;
+
+    if let Some(ext) = &context.external_provider {
+        eprintln!();
+        eprintln!(
+            "[SETUP {}/{total_phases}] Verifying OpenAI provider appears in overlay",
+            next()
+        );
+        eprintln!("  model: {}", ext.model);
+        eprintln!("  cluster: {}", ext.routing_cluster);
+    }
 
     eprintln!();
     eprintln!(
@@ -397,6 +486,17 @@ fn explain_overlay_convergence() {
 pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
     let ingress_mode = options.ingress_mode();
+
+    // Resolve and validate external provider before any cluster creation.
+    let ext_descriptor = external_provider::resolve_external_provider(
+        options.external_provider,
+        options.external_provider_key_file.as_deref(),
+        options.external_provider_model.as_deref(),
+    )?;
+    let ext_key_file = options.external_provider_key_file.clone();
+    if ingress_mode == IngressMode::Workload && ext_descriptor.is_some() {
+        return Err("external providers require the global-ingress demo mode".into());
+    }
     let run_id = format_utc_timestamp();
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
@@ -405,10 +505,16 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id);
     fs::create_dir_all(&evidence_dir)?;
 
-    let setup_ctx = prepare_setup(forge_config, ingress_mode);
+    let setup_ctx = prepare_setup(forge_config, ingress_mode, ext_descriptor, ext_key_file);
     let mut outcome = match &setup_ctx {
         Ok(context) => match deploy_setup(context) {
-            Ok(()) => demonstrate_inner(&context.resolved_config, mode, ingress_mode, &mut narrator),
+            Ok(()) => demonstrate_inner(
+                &context.resolved_config,
+                mode,
+                ingress_mode,
+                context.external_provider.as_ref(),
+                &mut narrator,
+            ),
             Err(error) => failed_outcome(Vec::new(), Vec::new(), "Environment setup", concise_error(error)),
         },
         Err(error) => failed_outcome(Vec::new(), Vec::new(), "Environment preparation", concise_error(error)),
@@ -462,6 +568,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
         error: outcome.error.clone(),
         capabilities: outcome.capabilities,
         observed_paths: outcome.observed_paths,
+        external_provider: outcome.external_provider,
         lifecycle,
         artifacts: ArtifactPaths {
             narration: narration_path.display().to_string(),
@@ -498,7 +605,7 @@ pub(crate) fn demonstrate_with_options(
     let mode = options.mode();
     let ingress_mode = options.ingress_mode();
     let mut narrator = Narrator::new();
-    match demonstrate_inner(forge_config, mode, ingress_mode, &mut narrator).error {
+    match demonstrate_inner(forge_config, mode, ingress_mode, None, &mut narrator).error {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
@@ -513,10 +620,11 @@ fn demonstrate_inner(
     forge_config: &Path,
     mode: DemoMode,
     ingress_mode: IngressMode,
+    external: Option<&ExternalProviderDescriptor>,
     narrator: &mut Narrator,
 ) -> DemoOutcome {
     match ingress_mode {
-        IngressMode::Global => demonstrate_global(forge_config, mode, narrator),
+        IngressMode::Global => demonstrate_global(forge_config, mode, external, narrator),
         IngressMode::Workload => demonstrate_workload(forge_config, mode, narrator),
     }
 }
@@ -526,8 +634,14 @@ fn demonstrate_inner(
     clippy::too_many_lines,
     reason = "sequential scenario narration is clearest in one function"
 )]
-fn demonstrate_global(forge_config: &Path, mode: DemoMode, narrator: &mut Narrator) -> DemoOutcome {
+fn demonstrate_global(
+    forge_config: &Path,
+    mode: DemoMode,
+    external: Option<&ExternalProviderDescriptor>,
+    narrator: &mut Narrator,
+) -> DemoOutcome {
     let mut capabilities = Vec::new();
+    let mut external_provider = None;
 
     print_introduction(narrator, mode);
 
@@ -669,11 +783,58 @@ fn demonstrate_global(forge_config: &Path, mode: DemoMode, narrator: &mut Narrat
         narrator.narrate("[SKIP] Demos 3-5 run only in full mode.");
     }
 
+    // Optional: Live external provider scenario.
+    if let Some(ext) = external {
+        let scenario_num = if mode == DemoMode::Full { 6 } else { 3 };
+        print_scenario(
+            narrator,
+            scenario_num,
+            "Live external provider",
+            "As a platform owner, I need to prove that a real external API provider can be routed through the Grid provider boundary with credential replacement and public TLS.",
+        );
+        match prove_external_provider(narrator, ext) {
+            Ok(proof) => {
+                capabilities.push(CapabilityResult {
+                    capability: "Live external provider".to_owned(),
+                    result: "pass",
+                    evidence: proof.summary(),
+                });
+                external_provider = Some(proof);
+            },
+            Err(error) => {
+                return failed_outcome(
+                    capabilities,
+                    observed_paths,
+                    "Live external provider",
+                    concise_error(error),
+                );
+            },
+        }
+    } else {
+        let absence = match glb::verify_external_provider_absent() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return failed_outcome(
+                    capabilities,
+                    observed_paths,
+                    "Live external provider absence",
+                    concise_error(error),
+                );
+            },
+        };
+        capabilities.push(CapabilityResult {
+            capability: "Live external provider".to_owned(),
+            result: "skipped",
+            evidence: format!("not enabled; {absence}"),
+        });
+    }
+
     print_boundaries(narrator, mode);
 
     DemoOutcome {
         capabilities,
         observed_paths,
+        external_provider,
         error: None,
     }
 }
@@ -790,6 +951,7 @@ fn demonstrate_workload(forge_config: &Path, mode: DemoMode, narrator: &mut Narr
     DemoOutcome {
         capabilities,
         observed_paths: workload_paths,
+        external_provider: None,
         error: None,
     }
 }
@@ -1537,6 +1699,152 @@ fn restart_grid_operator(cluster: &str) -> Result<(), Box<dyn std::error::Error>
     kubectl::wait_for_rollout_ns(&context, "grid-operator", "grid-system", cluster)
 }
 
+/// Prove external provider routing through the Grid provider boundary.
+///
+/// Sends one small, non-streaming request with an invalid caller credential
+/// to prove final-hop credential replacement. Records only status, provider,
+/// model, and timing. Never retains the prompt, response body, or token.
+#[expect(clippy::too_many_lines, reason = "linear request-response-evidence sequence")]
+fn prove_external_provider(
+    narrator: &mut Narrator,
+    ext: &ExternalProviderDescriptor,
+) -> Result<ExternalProviderProof, Box<dyn std::error::Error>> {
+    narrator.narrate("");
+    narrator.narrate("EXTERNAL PROVIDER PROOF");
+    narrator.narrate(&format!("  provider: {} ({})", ext.routing_cluster, ext.provider_kind));
+    narrator.narrate(&format!("  model: {}", ext.model));
+    narrator.narrate(&format!("  endpoint: {}", ext.endpoint()));
+    narrator.narrate("  requests: 1 (non-streaming, low token limit)");
+    narrator.narrate("  caller auth: invalid (proves final-hop replacement)");
+    narrator.narrate("");
+
+    let request_start = Instant::now();
+
+    let body = serde_json::json!({
+        "model": ext.model,
+        "input": "Say exactly: hello",
+        "max_output_tokens": 16,
+        "stream": false,
+    });
+
+    let gtm_ip = gtm_emulator::resolve_gtm_ip()?;
+    let gtm_ca = ".forge/runtime/glb-tls/gtm/ca.crt";
+    let public_name = "api.grid-glb.test";
+    let public_port: u16 = 8443;
+    let resolve = format!("{public_name}:{public_port}:{gtm_ip}");
+    let url = format!("https://{public_name}:{public_port}/v1/responses");
+
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "30",
+            "--cacert",
+            gtm_ca,
+            "--noproxy",
+            public_name,
+            "--resolve",
+            &resolve,
+            "--include",
+            "-X",
+            "POST",
+            &url,
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            "Authorization: Bearer invalid-caller-token",
+            "-d",
+            &body.to_string(),
+        ])
+        .output()?;
+
+    let elapsed = request_start.elapsed();
+    if !output.status.success() {
+        return Err(format!("external provider request failed: curl exit status {}", output.status).into());
+    }
+    let raw = String::from_utf8(output.stdout)?;
+    let (headers, response_body) = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .ok_or("external provider response contained no header terminator")?;
+    let status_code = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or("failed to parse external provider HTTP status")?;
+
+    narrator.narrate(&format!(
+        "  [{}] HTTP {} in {:.1}s (model: {}, cluster: {})",
+        if status_code == 200 { "PASS" } else { "FAIL" },
+        status_code,
+        elapsed.as_secs_f64(),
+        ext.model,
+        ext.routing_cluster,
+    ));
+
+    if status_code != 200 {
+        let hint = match status_code {
+            401 => "credential replacement may have failed or key is invalid",
+            403 => "model or API path may not be authorized",
+            404 => "model not found or endpoint path is incorrect",
+            429 => "rate limited by OpenAI",
+            _ => "unexpected response status",
+        };
+        return Err(format!("external provider returned HTTP {status_code}: {hint}").into());
+    }
+
+    let edge = response_header(headers, "x-grid-demo-edge-gateway")
+        .filter(|value| matches!(*value, "east-edge" | "west-edge"))
+        .ok_or("external provider response missing valid edge attribution")?;
+    let provider_gateway = response_header(headers, "x-ai-demo-provider-gateway")
+        .filter(|value| *value == "east-provider")
+        .ok_or("external provider response missing east-provider gateway attribution")?;
+
+    let response: serde_json::Value = serde_json::from_str(response_body)
+        .map_err(|error| format!("external provider response is not valid JSON: {error}"))?;
+    if response.get("object").and_then(serde_json::Value::as_str) != Some("response") {
+        return Err("external provider response is not an OpenAI Responses object".into());
+    }
+    response
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.starts_with("resp_") && value.len() <= 256)
+        .ok_or("external provider response missing bounded OpenAI response ID")?;
+    let response_model = response
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .ok_or("external provider response missing bounded model")?;
+    if !response.get("output").is_some_and(serde_json::Value::is_array) {
+        return Err("external provider response missing output array".into());
+    }
+
+    let serving_revision = glb::verify_external_candidate(edge, ext)?;
+    let proof = ExternalProviderProof {
+        http_status: status_code,
+        edge: edge.to_owned(),
+        provider_gateway: provider_gateway.to_owned(),
+        candidate_id: glb::openai_candidate_id(&ext.model),
+        cluster: ext.routing_cluster.to_owned(),
+        response_model: response_model.to_owned(),
+        serving_revision,
+        duration_secs: elapsed.as_secs_f64(),
+    };
+    narrator.narrate("  [PASS] OpenAI Responses object validated (response ID format and output array)");
+    narrator.narrate(&format!("  evidence: {}", proof.summary()));
+    Ok(proof)
+}
+
+/// Find one case-insensitive response header without retaining response bytes.
+fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        candidate.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
 /// Build a failed outcome while preserving completed capability evidence.
 fn failed_outcome(
     mut capabilities: Vec<CapabilityResult>,
@@ -1552,6 +1860,7 @@ fn failed_outcome(
     DemoOutcome {
         capabilities,
         observed_paths,
+        external_provider: None,
         error: Some(error),
     }
 }
@@ -1693,17 +2002,25 @@ fn evidence_mode_label(mode: DemoMode, ingress_mode: IngressMode) -> &'static st
 // ---------------------------------------------------------------------------
 
 /// Render image overrides into a Forge config without mutating source files.
-fn materialize_config(source: &Path, ingress_mode: IngressMode) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn materialize_config(
+    source: &Path,
+    ingress_mode: IngressMode,
+    external_provider: Option<&ExternalProviderDescriptor>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
-    let rendered = render_config(&content, ingress_mode)?;
+    let rendered = render_config(&content, ingress_mode, external_provider)?;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     let output = parent.join(RESOLVED_CONFIG_NAME);
     fs::write(&output, rendered)?;
     Ok(output)
 }
 
-/// Render image overrides into one Forge configuration document.
-fn render_config(content: &str, ingress_mode: IngressMode) -> Result<String, Box<dyn std::error::Error>> {
+/// Render image overrides and optional provider integration into one Forge configuration.
+fn render_config(
+    content: &str,
+    ingress_mode: IngressMode,
+    external_provider: Option<&ExternalProviderDescriptor>,
+) -> Result<String, Box<dyn std::error::Error>> {
     validate_image_contract_for_mode(ingress_mode)?;
     let mut config: serde_yaml::Value = serde_yaml::from_str(content)?;
     let spec = mapping_mut(&mut config, "spec")?;
@@ -1711,7 +2028,99 @@ fn render_config(content: &str, ingress_mode: IngressMode) -> Result<String, Box
         strip_gtm_cluster(spec)?;
     }
     set_cluster_image_properties_for_mode(spec, ingress_mode)?;
+
+    if external_provider.is_some() {
+        add_openai_credential_mount(spec)?;
+    }
+
     Ok(serde_yaml::to_string(&config)?)
+}
+
+/// Clone inference-sim stack as inference-sim-openai with required `OpenAI` credential mount.
+///
+/// Creates east-only stack to prevent west-provider requiring credentials that only exist in east-provider.
+#[expect(
+    clippy::too_many_lines,
+    reason = "YAML path traversal and validation requires comprehensive error checking"
+)]
+fn add_openai_credential_mount(spec: &mut serde_yaml::Mapping) -> Result<(), Box<dyn std::error::Error>> {
+    let stacks = spec
+        .get_mut("stacks")
+        .and_then(|v| v.as_mapping_mut())
+        .ok_or("spec.stacks not found or not a mapping")?;
+
+    if stacks.contains_key("inference-sim-openai") {
+        return Err("inference-sim-openai stack already exists".into());
+    }
+
+    let inference_sim = stacks
+        .get("inference-sim")
+        .and_then(|v| v.as_mapping())
+        .ok_or("inference-sim stack not found")?;
+
+    let mut inference_sim_openai = inference_sim.clone();
+
+    let steps = inference_sim_openai
+        .get_mut("steps")
+        .and_then(|v| v.as_sequence_mut())
+        .ok_or("inference-sim-openai.steps not found or not a sequence")?;
+
+    let mut found_helm_step = false;
+    for step in steps {
+        if let Some(step_map) = step.as_mapping_mut()
+            && step_map.get("type").and_then(|v| v.as_str()) == Some("helm")
+            && step_map.get("release").and_then(|v| v.as_str()) == Some("provider-gateway")
+        {
+            let values = step_map
+                .get_mut("values")
+                .and_then(|v| v.as_mapping_mut())
+                .ok_or("provider-gateway Helm values not found")?;
+
+            let credentials = values
+                .entry("credentials".into())
+                .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
+                .as_sequence_mut()
+                .ok_or("credentials is not a sequence")?;
+
+            for cred in credentials.iter() {
+                if let Some(name) = cred.get("name").and_then(|v| v.as_str())
+                    && name == "openai-api-key"
+                {
+                    return Err("OpenAI credential mount already exists".into());
+                }
+            }
+
+            let openai_credential = serde_yaml::Value::Mapping(
+                [
+                    ("name".into(), "openai-api-key".into()),
+                    ("mountPath".into(), "/etc/praxis/credentials/openai".into()),
+                    ("optional".into(), false.into()),
+                ]
+                .iter()
+                .cloned()
+                .collect(),
+            );
+
+            credentials.push(openai_credential);
+            found_helm_step = true;
+            break;
+        }
+    }
+
+    if !found_helm_step {
+        return Err("provider-gateway Helm step not found in inference-sim stack".into());
+    }
+
+    if let Some(desc) = inference_sim_openai.get_mut("description") {
+        *desc = "Private inference backend with OpenAI external provider support".into();
+    }
+
+    stacks.insert(
+        "inference-sim-openai".into(),
+        serde_yaml::Value::Mapping(inference_sim_openai),
+    );
+
+    Ok(())
 }
 
 /// Validate image references and pull policy for the given ingress mode.
@@ -1846,13 +2255,34 @@ fn apply_foundation_stacks_with_mode(
 }
 
 /// Apply provider sites and private provider paths before edge rendering.
-fn apply_provider_stacks(forge: &str, config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Select the appropriate stack name for a provider based on region and external provider status.
+///
+/// Returns `inference-sim-openai` only for east-provider with external providers enabled.
+/// This separation prevents west-provider from requiring credentials that only exist in east-provider.
+fn select_stack_for_provider(region: &str, has_external_provider: bool) -> &'static str {
+    if region == "east" && has_external_provider {
+        "inference-sim-openai"
+    } else {
+        "inference-sim"
+    }
+}
+
+/// Apply provider stack configuration using appropriate inference stack for each region.
+fn apply_provider_stacks(
+    forge: &str,
+    config: &Path,
+    external_provider: Option<&ExternalProviderDescriptor>,
+) -> Result<(), Box<dyn std::error::Error>> {
     for (cluster, site_stack) in [
         ("east-provider", "east-provider-site"),
         ("west-provider", "west-provider-site"),
     ] {
         run_forge(forge, config, &["stack", "apply", cluster, site_stack])?;
-        run_forge(forge, config, &["stack", "apply", cluster, "inference-sim"])?;
+
+        let region = if cluster.starts_with("east") { "east" } else { "west" };
+        let inference_stack = select_stack_for_provider(region, external_provider.is_some());
+
+        run_forge(forge, config, &["stack", "apply", cluster, inference_stack])?;
     }
     Ok(())
 }
@@ -2108,7 +2538,7 @@ mod setup_tests {
         #[test]
         fn materialized_config_uses_glb_image_contract() -> Result<(), Box<dyn std::error::Error>> {
             let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
-            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global)?;
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global, None)?;
             assert!(rendered.contains(&image_overrides::demo_gateway_image(IngressMode::Global)));
             assert!(rendered.contains(&image_overrides::demo_operator_image(IngressMode::Global)));
             assert!(rendered.contains(&image_overrides::demo_mock_provider_image(IngressMode::Global)));
@@ -2225,7 +2655,7 @@ mod setup_tests {
         #[test]
         fn workload_config_has_four_clusters() -> Result<(), Box<dyn std::error::Error>> {
             let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
-            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload)?;
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload, None)?;
             let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
             let clusters = config
                 .get("spec")
@@ -2247,7 +2677,7 @@ mod setup_tests {
         #[test]
         fn global_config_has_five_clusters() -> Result<(), Box<dyn std::error::Error>> {
             let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
-            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global)?;
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global, None)?;
             let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
             let clusters = config
                 .get("spec")
@@ -2261,7 +2691,7 @@ mod setup_tests {
         #[test]
         fn workload_config_strips_gtm_stacks() -> Result<(), Box<dyn std::error::Error>> {
             let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
-            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload)?;
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload, None)?;
             let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
             let stacks = config
                 .get("spec")
@@ -2311,6 +2741,9 @@ mod setup_tests {
                 teardown: false,
                 keep_on_failure: false,
                 evidence_dir: None,
+                external_provider: None,
+                external_provider_key_file: None,
+                external_provider_model: None,
             };
             assert_eq!(options.mode(), DemoMode::Full);
         }
@@ -2326,6 +2759,9 @@ mod setup_tests {
                 teardown: false,
                 keep_on_failure: false,
                 evidence_dir: None,
+                external_provider: None,
+                external_provider_key_file: None,
+                external_provider_model: None,
             };
             assert_eq!(options.mode(), DemoMode::Quick);
             assert_eq!(options.ingress_mode(), IngressMode::Global);
@@ -2342,10 +2778,14 @@ mod setup_tests {
                 teardown: false,
                 keep_on_failure: false,
                 evidence_dir: None,
+                external_provider: None,
+                external_provider_key_file: None,
+                external_provider_model: None,
             };
             assert_eq!(options.ingress_mode(), IngressMode::Workload);
         }
 
+        #[expect(clippy::too_many_lines, reason = "complete serialized evidence fixture")]
         fn sample_report(mode: &'static str, status: &'static str) -> EvidenceReport {
             EvidenceReport {
                 schema_version: EVIDENCE_SCHEMA_VERSION,
@@ -2366,6 +2806,7 @@ mod setup_tests {
                     provider: "west-provider".to_owned(),
                     path: "client -> east-edge -> west-provider gateway -> backend".to_owned(),
                 }],
+                external_provider: None,
                 lifecycle: LifecycleRecord {
                     teardown_requested: true,
                     teardown_performed: true,
@@ -2389,6 +2830,34 @@ mod setup_tests {
             assert!(parsed["error"].is_null());
             assert!(parsed["capabilities"].is_array());
             assert!(parsed["observed_paths"].is_array());
+            assert!(parsed.get("external_provider").is_none());
+        }
+
+        #[test]
+        fn external_provider_proof_serializes_observed_runtime_fields() {
+            let proof = ExternalProviderProof {
+                http_status: 200,
+                edge: "east-edge".to_owned(),
+                provider_gateway: "east-provider".to_owned(),
+                candidate_id: "candidate-1".to_owned(),
+                cluster: "openai-api".to_owned(),
+                response_model: "gpt-test".to_owned(),
+                serving_revision: "a".repeat(64),
+                duration_secs: 1.25,
+            };
+            let value = serde_json::to_value(&proof).unwrap();
+            assert_eq!(value["http_status"], 200);
+            assert_eq!(value["edge"], "east-edge");
+            assert_eq!(value["provider_gateway"], "east-provider");
+            assert_eq!(value["cluster"], "openai-api");
+            assert_eq!(value["serving_revision"], "a".repeat(64));
+        }
+
+        #[test]
+        fn response_header_is_case_insensitive() {
+            let headers = "HTTP/2 200\r\nX-Grid-Demo-Edge-Gateway: east-edge\r\n";
+            assert_eq!(response_header(headers, "x-grid-demo-edge-gateway"), Some("east-edge"));
+            assert_eq!(response_header(headers, "missing"), None);
         }
 
         #[test]
@@ -2521,6 +2990,69 @@ mod setup_tests {
             assert_eq!(bytes.get(8).copied(), Some(b'T'));
             assert!(bytes.get(..8).unwrap().iter().all(u8::is_ascii_digit));
             assert!(bytes.get(9..15).unwrap().iter().all(u8::is_ascii_digit));
+        }
+
+        // ----- External provider CLI tests -----
+
+        #[test]
+        fn external_provider_key_file_requires_provider() {
+            let result = <crate::Cli as clap::Parser>::try_parse_from([
+                "xtask",
+                "env",
+                "run-grid-glb-demo",
+                "--external-provider-key-file",
+                "/tmp/key",
+            ]);
+            assert!(
+                result.is_err(),
+                "--external-provider-key-file requires --external-provider"
+            );
+        }
+
+        #[test]
+        fn external_provider_model_requires_provider() {
+            let result = <crate::Cli as clap::Parser>::try_parse_from([
+                "xtask",
+                "env",
+                "run-grid-glb-demo",
+                "--external-provider-model",
+                "gpt-5-mini",
+            ]);
+            assert!(
+                result.is_err(),
+                "--external-provider-model requires --external-provider"
+            );
+        }
+
+        #[test]
+        fn external_provider_parses_with_all_flags() {
+            let cli = <crate::Cli as clap::Parser>::try_parse_from([
+                "xtask",
+                "env",
+                "run-grid-glb-demo",
+                "--external-provider",
+                "openai",
+                "--external-provider-key-file",
+                "/tmp/test-key",
+                "--external-provider-model",
+                "gpt-5-mini",
+            ]);
+            assert!(cli.is_ok(), "valid combination must parse: {:?}", cli.err());
+        }
+
+        #[test]
+        fn external_provider_alone_parses_without_key_and_model() {
+            let cli = <crate::Cli as clap::Parser>::try_parse_from([
+                "xtask",
+                "env",
+                "run-grid-glb-demo",
+                "--external-provider",
+                "openai",
+            ]);
+            assert!(
+                cli.is_ok(),
+                "clap allows --external-provider alone (runtime validation rejects it)"
+            );
         }
 
         #[test]

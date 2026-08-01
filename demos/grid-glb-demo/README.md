@@ -1003,6 +1003,89 @@ Operators are restarted sequentially so the test exercises normal rolling
 maintenance rather than intentionally taking the entire discovery mesh down.
 Quick mode skips this longer durability proof.
 
+## Live OpenAI Provider (Optional)
+
+The demo can optionally route one real inference request through a live OpenAI
+endpoint. When enabled, the east provider gateway gains a fourth upstream
+(`openai-api`) alongside the three simulated providers. No sixth cluster is
+created; the OpenAI route shares the east provider gateway's mTLS boundary.
+
+### What It Proves
+
+The request follows the full Grid data path:
+
+```text
+client -> GTM emulator -> selected edge -> east provider gateway -> api.openai.com:443
+```
+
+This proves that Grid provider selection, the authenticated provider hop,
+credential injection, and upstream TLS work with a real external API, not only
+simulated backends. The caller sends `Authorization: Bearer invalid-caller-token`
+to prove credential replacement at the provider gateway.
+
+### Prerequisites
+
+- An OpenAI API key stored in a file outside the repository.
+- The file must be owned by the current user, mode `0600` (not group- or
+  world-readable), regular (not a symlink), and no larger than 4096 bytes.
+- Outbound HTTPS to `api.openai.com:443` from the east-provider Kind cluster.
+
+### Usage
+
+```bash
+cargo xtask env run-grid-glb-demo \
+  --quick \
+  --teardown \
+  --external-provider openai \
+  --external-provider-key-file /path/to/openai-key \
+  --external-provider-model gpt-4o-mini
+```
+
+The three `--external-provider*` flags are all-or-nothing. Omitting all three
+runs the standard simulated-only demo. Providing `--external-provider` without
+`--external-provider-key-file` or `--external-provider-model` is rejected at
+preflight before any clusters are created.
+
+### Billing
+
+The demo sends one non-streaming request with `max_output_tokens: 16`. Typical
+cost is a fraction of a cent. No periodic health probes or retries are sent.
+
+### Request Format
+
+The request uses the OpenAI Responses API (`/v1/responses`) in native format.
+No translation layer or prompt rewriting is applied.
+
+### Security And Evidence
+
+- The API key is never read by the Rust process. It is passed to
+  `kubectl create secret --from-file` which reads it directly.
+- The key file path, content, length, prefix, suffix, hash, and fingerprint
+  are never logged, narrated, or included in evidence.
+- The key is stored as a Kubernetes Secret mounted into the provider gateway
+  pod. It does not appear in ConfigMaps, YAML templates, command arguments,
+  environment variables, or the evidence report.
+- Evidence records only: HTTP status, provider identity, model, and timing.
+  Prompt text, response body, and OpenAI request identifiers are not retained.
+
+### Common Errors
+
+| Status | Likely cause |
+|---|---|
+| 401 | Invalid or expired API key |
+| 403 | Key lacks permission for the requested model |
+| 404 | Model name not recognized by OpenAI |
+| 429 | Rate limit or quota exceeded |
+| DNS/TLS failure | No outbound connectivity from the Kind cluster |
+
+### Not In Scope
+
+- Anthropic, AWS Bedrock, Google Vertex, or other provider APIs.
+- Request format translation between provider APIs.
+- Streaming responses.
+- Periodic health probing of the external endpoint.
+- Automatic Secret management by the Grid operator (`auth.manual: true`).
+
 ## Run The Demo
 
 ### Quickstart

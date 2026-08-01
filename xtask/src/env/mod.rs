@@ -3,6 +3,7 @@
 pub(crate) mod certs;
 pub(crate) mod config;
 pub(crate) mod consumer;
+pub(crate) mod external_provider;
 pub(crate) mod gateway;
 pub(crate) mod glb;
 pub(crate) mod glb_demo;
@@ -49,6 +50,14 @@ pub(crate) enum IngressMode {
     Global,
     /// Four clusters without GTM; workloads originate inside consumer clusters.
     Workload,
+}
+
+/// Supported external inference providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ExternalProvider {
+    /// `OpenAI` API provider (api.openai.com).
+    #[value(name = "openai")]
+    OpenAi,
 }
 
 /// Scenario-selection options shared by GLB demo commands.
@@ -105,6 +114,18 @@ pub(crate) struct GlbDemoOptions {
     /// Directory for machine-readable evidence output.
     #[arg(long)]
     pub(crate) evidence_dir: Option<PathBuf>,
+
+    /// Enable an external inference provider.
+    #[arg(long, value_enum)]
+    pub(crate) external_provider: Option<ExternalProvider>,
+
+    /// Path to the external provider API key file.
+    #[arg(long, requires = "external_provider")]
+    pub(crate) external_provider_key_file: Option<PathBuf>,
+
+    /// Model to use with the external provider.
+    #[arg(long, requires = "external_provider")]
+    pub(crate) external_provider_model: Option<String>,
 }
 
 impl GlbDemoOptions {

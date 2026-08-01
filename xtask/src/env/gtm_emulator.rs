@@ -346,6 +346,20 @@ fn wait_for_edge(session: &str, expected_edge: &str, timeout: Duration) -> Resul
     Err(format!("session {session:?} did not converge to {expected_edge} within {timeout:?}").into())
 }
 
+/// Resolve the GTM emulator's `LoadBalancer` IP.
+pub(crate) fn resolve_gtm_ip() -> Result<String, Box<dyn std::error::Error>> {
+    let ip = kubectl_jsonpath(
+        "gtm-emulator",
+        "service/gtm-emulator",
+        "{.status.loadBalancer.ingress[0].ip}",
+    )?;
+    let trimmed = ip.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err("GTM emulator service has no LoadBalancer IP".into());
+    }
+    Ok(trimmed)
+}
+
 /// Send one request through the stable verified HTTPS endpoint.
 pub(crate) fn request_path(session: &str) -> Result<EdgeSample, Box<dyn std::error::Error>> {
     request_path_with_affinity(session, session)

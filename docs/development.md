@@ -13,7 +13,12 @@ cover code style, testing requirements, file
 organization, and security practices. Submissions
 that do not follow these conventions will be rejected.
 
+Grid also follows the shared
+[Praxis development conventions], including the rules for comments,
+tracing, testing, lint suppressions, and human review.
+
 [conventions.md]:./conventions.md
+[Praxis development conventions]:https://github.com/praxis-proxy/praxis/blob/main/docs/developing/conventions.md
 
 ## Build
 

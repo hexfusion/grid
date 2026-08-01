@@ -17,7 +17,8 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 use crate::env::{
-    DemoMode, IngressMode, StepResult, StepStatus, certs, kubectl, print_validate_all_table, safe_truncate_str, verify,
+    DemoMode, IngressMode, StepResult, StepStatus, certs, external_provider::ExternalProviderDescriptor, kubectl,
+    print_validate_all_table, safe_truncate_str, verify,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,15 @@ const EAST_SECONDARY_PROVIDER: &str = "east-provider-secondary";
 /// Routing-cluster identity of the second east provider.
 const EAST_SECONDARY_CLUSTER: &str = "sim-east-provider-secondary";
 
+/// Kubernetes Secret for the `OpenAI` API key.
+const OPENAI_CREDENTIAL_SECRET: &str = "openai-api-key";
+
+/// Provider identity for the `OpenAI` external provider.
+const OPENAI_PROVIDER: &str = "openai-api-provider";
+
+/// Routing-cluster identity for the `OpenAI` external provider.
+const OPENAI_ROUTING_CLUSTER: &str = "openai-api";
+
 /// AI-owned candidate identity header on the authenticated provider hop.
 const AI_ROUTING_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 
@@ -183,11 +193,14 @@ pub(crate) fn prepare_provider_boundary() -> Result<(), Box<dyn std::error::Erro
 /// This phase does not require Kubernetes. It runs before the provider
 /// workload stack so no pod is created with unresolved trust placeholders.
 pub(crate) fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    stage_provider_boundary_with_mode(IngressMode::Global)
+    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None)
 }
 
-/// Generate and stage identities, optionally skipping GTM TLS in workload mode.
-pub(crate) fn stage_provider_boundary_with_mode(ingress_mode: IngressMode) -> Result<(), Box<dyn std::error::Error>> {
+/// Generate identities for an ingress mode and optional external provider.
+pub(crate) fn stage_provider_boundary_with_mode_and_external(
+    ingress_mode: IngressMode,
+    external: Option<&ExternalProviderDescriptor>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let identities = vec![
         "east-edge".to_owned(),
         "west-edge".to_owned(),
@@ -206,7 +219,7 @@ pub(crate) fn stage_provider_boundary_with_mode(ingress_mode: IngressMode) -> Re
     }
     let east_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
     let west_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
-    stage_provider_configs(&east_edge_digest, &west_edge_digest)?;
+    stage_provider_configs_with_external(&east_edge_digest, &west_edge_digest, external)?;
     Ok(())
 }
 
@@ -215,12 +228,19 @@ pub(crate) fn stage_provider_boundary_with_mode(ingress_mode: IngressMode) -> Re
 /// The `grid-system` namespace must exist. Provider deployments may already
 /// exist or may be applied after this function returns.
 pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    install_provider_boundary_with_mode(IngressMode::Global)
+    install_provider_boundary_with_mode_and_external(IngressMode::Global, None)
 }
 
-/// Install staged identities and credentials, skipping GTM in workload mode.
+/// Install identities for an ingress mode and optional external provider.
+///
+/// When `external_key_file` is provided, the `OpenAI` API key Secret is created
+/// from that file on the east-provider cluster. The key file content is never
+/// read or logged by this process; `kubectl --from-file` handles the read.
 #[expect(clippy::too_many_lines, reason = "mode-branched sequential identity installation")]
-pub(crate) fn install_provider_boundary_with_mode(ingress_mode: IngressMode) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn install_provider_boundary_with_mode_and_external(
+    ingress_mode: IngressMode,
+    external_key_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if ingress_mode == IngressMode::Global {
         ensure_demo_namespace("gtm-emulator")?;
     }
@@ -242,6 +262,9 @@ pub(crate) fn install_provider_boundary_with_mode(ingress_mode: IngressMode) -> 
                 SECONDARY_PROVIDER_CREDENTIAL_SECRET,
                 &secondary_credential,
             )?;
+            if let Some(key_file) = external_key_file {
+                apply_openai_credential_from_file(key_file)?;
+            }
         }
         restart_provider_deployments_if_present(provider)?;
     }
@@ -250,7 +273,14 @@ pub(crate) fn install_provider_boundary_with_mode(ingress_mode: IngressMode) -> 
     } else {
         ""
     };
-    eprintln!("grid-routing: edge identities{gtm_note}, provider configs, mTLS material, and credentials installed");
+    let ext_label = if external_key_file.is_some() {
+        " OpenAI credential,"
+    } else {
+        ""
+    };
+    eprintln!(
+        "grid-routing: edge identities{gtm_note}, provider configs, mTLS material,{ext_label} and credentials installed"
+    );
     Ok(())
 }
 
@@ -334,7 +364,12 @@ pub(crate) fn pem_to_canonical_fingerprint(pem: &str) -> String {
 }
 
 /// Render provider gateway configs with the edge certificate digest.
-fn stage_provider_configs(east_edge_digest: &str, west_edge_digest: &str) -> Result<(), Box<dyn std::error::Error>> {
+#[expect(clippy::too_many_lines, reason = "template rendering with token validation")]
+fn stage_provider_configs_with_external(
+    east_edge_digest: &str,
+    west_edge_digest: &str,
+    external: Option<&ExternalProviderDescriptor>,
+) -> Result<(), Box<dyn std::error::Error>> {
     for provider in PROVIDER_CLUSTERS {
         let source = Path::new("demos/grid-glb-demo/configs")
             .join(provider)
@@ -351,7 +386,7 @@ fn stage_provider_configs(east_edge_digest: &str, west_edge_digest: &str) -> Res
             )
             .into());
         }
-        let rendered = template
+        let mut rendered = template
             .replace(EDGE_US_EAST_CERT_DIGEST_TOKEN, east_edge_digest)
             .replace(EDGE_US_WEST_CERT_DIGEST_TOKEN, west_edge_digest)
             .replace(PROVIDER_CANDIDATE_ID_TOKEN, &provider_candidate_id(provider)?)
@@ -359,11 +394,418 @@ fn stage_provider_configs(east_edge_digest: &str, west_edge_digest: &str) -> Res
                 SECONDARY_PROVIDER_CANDIDATE_ID_TOKEN,
                 &provider_candidate_id(EAST_SECONDARY_PROVIDER)?,
             );
+        if *provider == "east-provider"
+            && let Some(ext) = external
+        {
+            rendered = append_openai_provider_config(&rendered, ext)?;
+        }
         let target_dir = Path::new(".forge/runtime/glb-tls/provider-configs").join(provider);
         fs::create_dir_all(&target_dir)?;
         fs::write(target_dir.join("praxis.yaml"), rendered)?;
     }
     Ok(())
+}
+
+/// Patch the rendered edge gateway `ConfigMaps` to include the `OpenAI` cluster.
+///
+/// Forge has already rendered `configs/edge/praxis.yaml` with captures and
+/// created the `edge-gateway-config` `ConfigMap`. This function reads the
+/// deployed `ConfigMap`, injects the `OpenAI` entries, and re-applies it.
+pub(crate) fn patch_edge_configs_for_openai(
+    ext: &ExternalProviderDescriptor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // This patch runs after Forge capture rendering, so it must use the
+    // concrete provider address rather than introduce a new capture token.
+    let provider_context = kubectl_context("east-provider");
+    let provider_ip = get_provider_gateway_ip(&provider_context)?;
+    let provider_endpoint = format!("{provider_ip}:8443");
+
+    for edge in EDGE_CLUSTERS {
+        let context = kubectl_context(edge);
+        let config = read_configmap_key(&context, "edge-gateway-config", "praxis.yaml")?;
+        let patched = append_openai_edge_config(&config, ext, &provider_endpoint)?;
+        apply_configmap_key(&context, "edge-gateway-config", "praxis.yaml", &patched)?;
+        restart_deployment(edge, "edge-gateway")?;
+        kubectl::wait_for_rollout_ns(&context, "edge-gateway", GRID_SYSTEM_NS, edge)?;
+    }
+    Ok(())
+}
+
+/// Read one key from a `ConfigMap`.
+fn read_configmap_key(context: &str, configmap: &str, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "configmap",
+            configmap,
+            "-o",
+            &format!("go-template={{{{index .data \"{key}\"}}}}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read ConfigMap {configmap} key {key}: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    let result = String::from_utf8(output.stdout)?;
+    if result.is_empty() {
+        return Err(format!("ConfigMap {configmap} key {key} returned empty value").into());
+    }
+    Ok(result)
+}
+
+/// Replace one key in a `ConfigMap` by re-creating with dry-run and applying.
+fn apply_configmap_key(
+    context: &str,
+    configmap: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = tempfile::NamedTempFile::new()?;
+    fs::write(tmp.path(), value)?;
+    let from_file = format!("--from-file={key}={}", tmp.path().display());
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "configmap",
+            configmap,
+            &from_file,
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to render ConfigMap {configmap}: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    kubectl::apply_manifest(context, &String::from_utf8(output.stdout)?)
+}
+
+/// Append the `OpenAI` provider route, credential, and upstream to the east provider config.
+#[expect(clippy::too_many_lines, reason = "multi-section YAML insertion that reads linearly")]
+fn append_openai_provider_config(
+    config: &str,
+    ext: &ExternalProviderDescriptor,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let candidate_id = openai_candidate_id(&ext.model);
+
+    let route_entry = format!(
+        "          - candidate_id: {candidate_id}
+            model: {model}
+            paths:
+{paths}
+            cluster: {cluster}
+            credential:
+              strategy: bearer_token
+              secretRef:
+                name: {secret_name}
+                namespace: grid-system
+                key: {secret_key}",
+        model = ext.model,
+        paths = ext
+            .allowed_paths
+            .iter()
+            .map(|p| format!("              - {p}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        cluster = ext.routing_cluster,
+        secret_name = ext.secret_name,
+        secret_key = ext.secret_key,
+    );
+
+    let credential_entry = format!(
+        "          - strategy: bearer_token
+            name: {secret_name}
+            namespace: grid-system
+            key: {secret_key}
+            file: {credential_file}",
+        secret_name = ext.secret_name,
+        secret_key = ext.secret_key,
+        credential_file = ext.credential_file(),
+    );
+
+    let cluster_entry = format!(
+        r#"          - name: {cluster}
+            authority: {authority}
+            tls:
+              sni: {sni}
+              verify: true
+            endpoints:
+              - "{endpoint}""#,
+        cluster = ext.routing_cluster,
+        authority = ext.hostname,
+        sni = ext.sni,
+        endpoint = ext.endpoint(),
+    );
+
+    let mut result = config.to_owned();
+
+    // Insert after the last provider_route entry (before credential_inject filter).
+    if let Some(pos) = result.find("      - filter: credential_inject") {
+        result.insert_str(pos, &format!("{route_entry}\n"));
+    } else {
+        return Err("cannot find credential_inject filter in provider config".into());
+    }
+
+    // Insert after the last credential_inject entry (before load_balancer filter).
+    if let Some(pos) = result.find("      - filter: load_balancer") {
+        result.insert_str(pos, &format!("{credential_entry}\n"));
+    } else {
+        return Err("cannot find load_balancer filter in provider config".into());
+    }
+
+    // Insert after the last load_balancer cluster entry (before admin section).
+    if let Some(pos) = result.find("\nadmin:") {
+        result.insert_str(pos, &format!("\n{cluster_entry}\n"));
+    } else {
+        return Err("cannot find admin section in provider config".into());
+    }
+
+    Ok(result)
+}
+
+/// Append the `OpenAI` routing cluster to the edge gateway config.
+#[expect(clippy::too_many_lines, reason = "multi-section YAML insertion that reads linearly")]
+#[expect(
+    clippy::string_slice,
+    reason = "byte offset from str::find is always a char boundary"
+)]
+fn append_openai_edge_config(
+    config: &str,
+    ext: &ExternalProviderDescriptor,
+    provider_endpoint: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Add openai-api to provider_hop_clusters list.
+    let hop_marker = "provider_hop_clusters:";
+    let Some(hop_pos) = config.find(hop_marker) else {
+        return Err("cannot find provider_hop_clusters in edge config".into());
+    };
+    let after_hop = hop_pos + hop_marker.len();
+    // Find the next filter or config key after the hop clusters list.
+    // Insert the new cluster at the end of the list.
+    let list_end = config[after_hop..]
+        .find("\n        expected_overlay_scope:")
+        .ok_or("cannot find expected_overlay_scope after provider_hop_clusters")?;
+    let insert_pos = after_hop + list_end;
+    let mut result = config.to_owned();
+    result.insert_str(insert_pos, &format!("\n          - {}", ext.routing_cluster));
+
+    // Add the openai-api cluster to the load_balancer section.
+    // Reuse the east-provider endpoint and TLS since the traffic goes through the same gateway.
+    let cluster_entry = format!(
+        r#"
+          - name: {cluster}
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: east-provider.grid.internal
+              verify: true
+            endpoints:
+              - "{provider_endpoint}""#,
+        cluster = ext.routing_cluster,
+        provider_endpoint = provider_endpoint,
+    );
+
+    if let Some(pos) = result.find("\nadmin:") {
+        result.insert_str(pos, &cluster_entry);
+    } else {
+        return Err("cannot find admin section in edge config".into());
+    }
+
+    Ok(result)
+}
+
+/// Create the `OpenAI` API key Secret from the user-supplied key file.
+///
+/// Uses `kubectl create secret --from-file --dry-run=client -o yaml | kubectl apply`
+/// to avoid passing the token in command arguments or environment variables.
+pub(crate) fn apply_openai_credential_from_file(key_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kubectl_context("east-provider");
+    let from_file_arg = format!("--from-file=token={}", key_file.display());
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "secret",
+            "generic",
+            OPENAI_CREDENTIAL_SECRET,
+            &from_file_arg,
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to render OpenAI credential Secret: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    kubectl::apply_manifest(&context, &String::from_utf8(output.stdout)?)
+}
+
+/// Apply the `OpenAI` `InferenceProvider` CRD to the east-provider cluster.
+#[expect(clippy::too_many_lines, reason = "CRD manifest template that reads linearly")]
+pub(crate) fn apply_openai_inference_provider(
+    ext: &ExternalProviderDescriptor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = format!(
+        "apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: {name}
+spec:
+  gridNetworkRef: glb-demo
+  providerKind: {provider_kind}
+  backendKind: {backend_kind}
+  endpoint: https://{hostname}
+  models:
+    - name: {model}
+  routingClusterRef: {routing_cluster}
+  siteSelector:
+    matchLabels:
+      grid.praxis-proxy.io/provider-site: east-provider
+  accessPolicy:
+    siteSelector:
+      matchLabels: {{}}
+  auth:
+    strategy: bearer_token
+    secretRef:
+      name: {secret_name}
+      namespace: grid-system
+      key: {secret_key}
+    manual: true",
+        name = OPENAI_PROVIDER,
+        provider_kind = ext.provider_kind,
+        backend_kind = ext.backend_kind,
+        hostname = ext.hostname,
+        model = ext.model,
+        routing_cluster = ext.routing_cluster,
+        secret_name = ext.secret_name,
+        secret_key = ext.secret_key,
+    );
+    let context = kubectl_context("east-provider");
+    kubectl::apply_manifest(&context, &manifest)
+}
+
+/// Compute the candidate ID for the `OpenAI` external provider.
+pub(crate) fn openai_candidate_id(model: &str) -> String {
+    fnv1a_hex8(&format!(
+        "{DEMO_CANDIDATE_KIND}/{model}/east-provider/{OPENAI_ROUTING_CLUSTER}"
+    ))
+}
+
+/// Verify the exact external-provider candidate and accepted revision on one edge.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps candidate, distributed revision, and serving revision proof atomic"
+)]
+pub(crate) fn verify_external_candidate(
+    edge: &str,
+    ext: &ExternalProviderDescriptor,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let overlay: serde_json::Value = serde_json::from_str(&read_overlay(edge)?)
+        .map_err(|error| format!("failed to parse {edge} overlay: {error}"))?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{edge} overlay missing candidates array"))?;
+    let candidate_id = openai_candidate_id(&ext.model);
+    let candidate = candidates
+        .iter()
+        .find(|candidate| {
+            candidate.get("cluster").and_then(serde_json::Value::as_str) == Some(ext.routing_cluster)
+                && candidate.get("stable_id").and_then(serde_json::Value::as_str) == Some(candidate_id.as_str())
+        })
+        .ok_or_else(|| {
+            format!(
+                "{edge} overlay missing external candidate {candidate_id} for cluster {}",
+                ext.routing_cluster
+            )
+        })?;
+    if candidate.get("name").and_then(serde_json::Value::as_str) != Some(ext.model.as_str()) {
+        return Err(format!("{edge} external candidate model does not match {}", ext.model).into());
+    }
+
+    let revision = overlay_revision(edge)?;
+    verify_edge_accepted_revision(edge, &revision)?;
+    let logs = edge_gateway_logs(edge)?;
+    if !logs.lines().any(|line| {
+        (line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
+            && accepted_revision_from_line(line) == Some(revision.as_str())
+            && serving_revision_from_line(line) == Some(revision.as_str())
+    }) {
+        return Err(format!("{edge} logs do not prove serving overlay revision {revision}").into());
+    }
+    Ok(revision)
+}
+
+/// Prove a normal-mode deployment contains no OpenAI-specific runtime resources.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks every external-provider runtime surface in one fail-closed audit"
+)]
+pub(crate) fn verify_external_provider_absent() -> Result<String, Box<dyn std::error::Error>> {
+    let east_provider = kubectl_context("east-provider");
+    for (resource, name) in [
+        ("secret", OPENAI_CREDENTIAL_SECRET),
+        ("inferenceprovider", OPENAI_PROVIDER),
+    ] {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &east_provider,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                resource,
+                name,
+                "--ignore-not-found",
+                "-o",
+                "name",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!("failed to check for {resource}/{name}").into());
+        }
+        if !output.stdout.is_empty() {
+            return Err(format!("normal mode unexpectedly created {resource}/{name}").into());
+        }
+    }
+
+    let provider_config = read_configmap_key(&east_provider, "provider-gateway-config", "praxis.yaml")?;
+    if provider_config.contains("openai-api") || provider_config.contains("openai-api-key") {
+        return Err("normal-mode provider configuration contains OpenAI entries".into());
+    }
+    for edge in EDGE_CLUSTERS {
+        let edge_config = read_configmap_key(&kubectl_context(edge), "edge-gateway-config", "praxis.yaml")?;
+        if edge_config.contains("openai-api") {
+            return Err(format!("normal-mode {edge} configuration contains OpenAI entries").into());
+        }
+    }
+
+    Ok("OpenAI Secret, InferenceProvider, provider route, and edge clusters absent".to_owned())
 }
 
 /// Generate a public-facing certificate for the stable local GTM name.
@@ -2567,12 +3009,14 @@ fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Require both edge overlays to exist and be projected at
 /// `/etc/praxis/routing`.
-fn check_edge_overlay_mounts() -> Result<String, Box<dyn std::error::Error>> {
+fn check_edge_overlay_mounts_with_count(expected_candidates: usize) -> Result<String, Box<dyn std::error::Error>> {
     let mut evidence = Vec::new();
     let mut revisions = Vec::new();
     for edge in EDGE_CLUSTERS {
-        let revision = verify_single_edge_overlay(edge)?;
-        evidence.push(format!("{edge}=3 candidates, projected `ConfigMap`"));
+        let revision = verify_single_edge_overlay_with_count(edge, expected_candidates)?;
+        evidence.push(format!(
+            "{edge}={expected_candidates} candidates, projected `ConfigMap`"
+        ));
         revisions.push((edge, revision));
     }
     for (edge, revision) in revisions {
@@ -2587,15 +3031,43 @@ fn check_edge_overlay_mounts() -> Result<String, Box<dyn std::error::Error>> {
 ///
 /// Returns an error when all provider candidates and the overlay projection
 /// do not become ready before the provider-state timeout.
+pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::error::Error>> {
+    // Try to auto-detect the candidate count by checking the actual overlay
+    match detect_candidate_count() {
+        Ok(count) => wait_for_edge_overlays_ready_with_count(count),
+        Err(_) => wait_for_edge_overlays_ready_with_count(3), // fallback to default
+    }
+}
+
+/// Detect the expected candidate count by checking the first edge's overlay
+fn detect_candidate_count() -> Result<usize, Box<dyn std::error::Error>> {
+    let context = kubectl_context("east-edge");
+    let overlay = kubectl_jsonpath(
+        &context,
+        "configmap",
+        OVERLAY_CONFIGMAP,
+        r"{.data.routing-config\.json}",
+    )?;
+    let document: serde_json::Value = serde_json::from_str(&overlay)?;
+    let candidates = document
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates")?;
+    Ok(candidates.len())
+}
+
+/// Wait for edge overlays to be ready with the expected candidate count.
 #[expect(
     clippy::disallowed_methods,
     reason = "bounded polling for asynchronous SWIM and operator convergence"
 )]
-pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn wait_for_edge_overlays_ready_with_count(
+    expected_candidates: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + PROVIDER_STATE_WAIT;
     let mut last_error = String::from("overlay validation has not run");
     while Instant::now() < deadline {
-        match check_edge_overlay_mounts() {
+        match check_edge_overlay_mounts_with_count(expected_candidates) {
             Ok(evidence) => return Ok(evidence),
             Err(error) => last_error = error.to_string(),
         }
@@ -2609,7 +3081,11 @@ pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::erro
     clippy::too_many_lines,
     reason = "linear validation sequence, splitting hurts readability"
 )]
-fn verify_single_edge_overlay(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
+
+fn verify_single_edge_overlay_with_count(
+    edge: &str,
+    expected_candidates: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
     let context = kubectl_context(edge);
 
     let overlay = kubectl_jsonpath(
@@ -2627,7 +3103,7 @@ fn verify_single_edge_overlay(edge: &str) -> Result<String, Box<dyn std::error::
         .get("candidates")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| format!("{edge} overlay missing candidates"))?;
-    if local_site != edge || candidates.len() != 3 {
+    if local_site != edge || candidates.len() != expected_candidates {
         return Err(format!(
             "{edge} overlay local_site={local_site:?}, candidates={}",
             candidates.len()
@@ -2748,6 +3224,29 @@ fn logs_prove_acceptance(logs: &str, revision: &str) -> bool {
 /// avoid matching the suffix of `previous_serving_revision`.
 fn accepted_revision_from_line(line: &str) -> Option<&str> {
     const FIELD: &str = "accepted_revision=";
+    for (index, _) in line.match_indices(FIELD) {
+        let has_field_boundary = index == 0
+            || line
+                .get(..index)
+                .and_then(|prefix| prefix.chars().next_back())
+                .is_some_and(char::is_whitespace);
+        if !has_field_boundary {
+            continue;
+        }
+        let value = line.get(index + FIELD.len()..)?;
+        let value = if let Some(quoted) = value.strip_prefix('"') {
+            quoted.split('"').next()
+        } else {
+            value.split_whitespace().next()
+        };
+        return value.filter(|revision| !revision.is_empty());
+    }
+    None
+}
+
+/// Extract an exact `serving_revision` field without matching its `previous_` prefix.
+fn serving_revision_from_line(line: &str) -> Option<&str> {
+    const FIELD: &str = "serving_revision=";
     for (index, _) in line.match_indices(FIELD) {
         let has_field_boundary = index == 0
             || line
@@ -2994,7 +3493,7 @@ fn unix_nanos() -> u128 {
 /// Return the provider-site gateway responsible for a backend identity.
 fn provider_gateway_site(provider: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     match provider {
-        "east-provider" | EAST_SECONDARY_PROVIDER => Ok("east-provider"),
+        "east-provider" | EAST_SECONDARY_PROVIDER | OPENAI_PROVIDER => Ok("east-provider"),
         "west-provider" => Ok("west-provider"),
         _ => Err(format!("unknown demo provider identity {provider}").into()),
     }
@@ -3534,6 +4033,7 @@ fn provider_routing_cluster(provider: &str) -> Result<&'static str, Box<dyn std:
         "east-provider" => Ok("sim-east-provider"),
         EAST_SECONDARY_PROVIDER => Ok(EAST_SECONDARY_CLUSTER),
         "west-provider" => Ok("sim-west-provider"),
+        OPENAI_PROVIDER => Ok(OPENAI_ROUTING_CLUSTER),
         _ => Err(format!("unknown demo provider identity {provider}").into()),
     }
 }
@@ -4965,6 +5465,15 @@ clusters:
     }
 
     #[test]
+    fn serving_revision_parser_rejects_previous_revision_field() {
+        let line = "overlay reloaded accepted_revision=next serving_revision=next previous_serving_revision=old";
+        assert_eq!(serving_revision_from_line(line), Some("next"));
+
+        let previous_only = "overlay rejected previous_serving_revision=old";
+        assert_eq!(serving_revision_from_line(previous_only), None);
+    }
+
+    #[test]
     fn acceptance_rejects_prefix_or_longer_revision() {
         let line = "overlay reloaded accepted_revision=\"abc123_extra_suffix\"";
         assert!(
@@ -5140,6 +5649,200 @@ clusters:
         assert!(
             msg.contains("operator restore to 5"),
             "should restore to original count 5, not hardcoded 1: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // External OpenAI provider tests
+    // -----------------------------------------------------------------
+
+    fn minimal_provider_config() -> &'static str {
+        "\
+filter_chains:
+  - name: provider-inference
+    filters:
+      - filter: provider_route
+        routes:
+          - candidate_id: abc123
+            cluster: mock-backend
+      - filter: credential_inject
+        credentials:
+          - strategy: bearer_token
+            name: mock-inference-credential
+            file: /etc/praxis/credentials/mock-inference/token
+      - filter: load_balancer
+        clusters:
+          - name: mock-backend
+            endpoints:
+              - \"mock-inference:8080\"
+
+admin:
+  address: \"127.0.0.1:9901\""
+    }
+
+    fn minimal_edge_config() -> &'static str {
+        "\
+filter_chains:
+  - name: main
+    filters:
+      - filter: intelligent_route
+        provider_hop_clusters:
+          - sim-east-provider
+          - sim-west-provider
+        expected_overlay_scope:
+          network: glb-demo
+      - filter: load_balancer
+        clusters:
+          - name: sim-east-provider
+            endpoints:
+              - \"172.18.0.6:8443\"
+
+admin:
+  address: \"127.0.0.1:9901\""
+    }
+
+    #[test]
+    fn openai_candidate_id_is_deterministic() {
+        let id1 = openai_candidate_id("gpt-5-mini");
+        let id2 = openai_candidate_id("gpt-5-mini");
+        assert_eq!(id1, id2, "same model must produce the same candidate ID");
+        assert_eq!(id1.len(), 8, "candidate ID must be 8 hex characters");
+        assert!(id1.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn openai_candidate_id_varies_by_model() {
+        let a = openai_candidate_id("gpt-5-mini");
+        let b = openai_candidate_id("gpt-5");
+        assert_ne!(a, b, "different models must produce different candidate IDs");
+    }
+
+    #[test]
+    fn openai_candidate_id_differs_from_simulated_providers() {
+        let openai = openai_candidate_id("sim-model-v1");
+        let east = provider_candidate_id("east-provider").unwrap_or_else(|_| std::process::abort());
+        let west = provider_candidate_id("west-provider").unwrap_or_else(|_| std::process::abort());
+        assert_ne!(
+            openai, east,
+            "OpenAI ID must differ from east-provider even for same model name"
+        );
+        assert_ne!(openai, west);
+    }
+
+    #[test]
+    fn append_openai_provider_config_inserts_route_and_cluster() {
+        let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
+        let result =
+            append_openai_provider_config(minimal_provider_config(), &ext).unwrap_or_else(|_| std::process::abort());
+
+        assert!(result.contains(&format!("cluster: {}", ext.routing_cluster)));
+        assert!(result.contains(&format!("model: {}", ext.model)));
+        assert!(result.contains(&format!("name: {}", ext.secret_name)));
+        assert!(result.contains(&format!("authority: {}", ext.hostname)));
+        assert!(result.contains(&format!("sni: {}", ext.sni)));
+        assert!(result.contains(&ext.endpoint()));
+
+        let route_pos = result.find("candidate_id:").unwrap_or_else(|| std::process::abort());
+        let inject_pos = result
+            .find("filter: credential_inject")
+            .unwrap_or_else(|| std::process::abort());
+        let lb_pos = result
+            .find("filter: load_balancer")
+            .unwrap_or_else(|| std::process::abort());
+        let admin_pos = result.find("admin:").unwrap_or_else(|| std::process::abort());
+        assert!(route_pos < inject_pos, "route must come before credential_inject");
+        assert!(inject_pos < lb_pos, "credential_inject must come before load_balancer");
+        assert!(lb_pos < admin_pos, "load_balancer must come before admin");
+    }
+
+    #[test]
+    fn append_openai_provider_config_preserves_existing_entries() {
+        let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
+        let result =
+            append_openai_provider_config(minimal_provider_config(), &ext).unwrap_or_else(|_| std::process::abort());
+
+        assert!(result.contains("mock-backend"), "original cluster must be preserved");
+        assert!(
+            result.contains("mock-inference-credential"),
+            "original credential must be preserved"
+        );
+    }
+
+    #[test]
+    fn append_openai_provider_config_rejects_missing_markers() {
+        let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
+        let bad = "some: yaml\nwithout: markers";
+        assert!(append_openai_provider_config(bad, &ext).is_err());
+    }
+
+    #[test]
+    fn append_openai_edge_config_adds_hop_cluster() {
+        let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
+        let result = append_openai_edge_config(minimal_edge_config(), &ext, "172.18.0.6:8443")
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(result.contains(&format!("- {}", ext.routing_cluster)));
+        assert!(result.contains(&format!("name: {}", ext.routing_cluster)));
+        assert!(result.contains("east-provider.grid.internal"));
+        assert!(result.contains("172.18.0.6:8443"));
+        assert!(!result.contains("captures.east-provider.provider-gateway-ip"));
+    }
+
+    #[test]
+    fn append_openai_edge_config_preserves_existing_clusters() {
+        let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
+        let result = append_openai_edge_config(minimal_edge_config(), &ext, "172.18.0.6:8443")
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            result.contains("sim-east-provider"),
+            "existing clusters must be preserved"
+        );
+        assert!(
+            result.contains("sim-west-provider"),
+            "existing clusters must be preserved"
+        );
+    }
+
+    #[test]
+    fn generated_configs_never_contain_token_patterns() {
+        let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
+        let provider =
+            append_openai_provider_config(minimal_provider_config(), &ext).unwrap_or_else(|_| std::process::abort());
+        let edge = append_openai_edge_config(minimal_edge_config(), &ext, "172.18.0.6:8443")
+            .unwrap_or_else(|_| std::process::abort());
+
+        for config in [&provider, &edge] {
+            assert!(
+                !config.contains("sk-"),
+                "generated config must not contain API key prefixes"
+            );
+            assert!(
+                !config.contains(CLIENT_BEARER_TOKEN),
+                "generated config must not contain the client credential"
+            );
+        }
+    }
+
+    #[test]
+    fn static_provider_templates_contain_no_openai_tokens() {
+        let configs = workspace_root().join("demos/grid-glb-demo/configs");
+        for provider in PROVIDER_CLUSTERS {
+            let template = fs::read_to_string(configs.join(format!("{provider}/praxis.yaml")))
+                .unwrap_or_else(|_| std::process::abort());
+            assert!(
+                !template.contains("openai"),
+                "{provider} static template must not contain openai references (added programmatically)"
+            );
+            assert!(
+                !template.contains("sk-"),
+                "{provider} static template must not contain API key prefixes"
+            );
+        }
+        let edge = fs::read_to_string(configs.join("edge/praxis.yaml")).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !edge.contains("openai"),
+            "edge static template must not contain openai references (added programmatically)"
         );
     }
 }
