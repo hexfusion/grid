@@ -1,0 +1,145 @@
+# -- Number of operator replicas. Must be 1 until multi-replica operation
+# is qualified.
+replicaCount: 1
+
+# -- Operator container image settings.
+image:
+  # -- Image repository.
+  repository: ghcr.io/praxis-proxy/grid-operator
+  # -- Image tag. Defaults to the chart appVersion when empty.
+  tag: ""
+  # -- Immutable image digest (sha256:<64 hex>). When set, tag is ignored.
+  digest: ""
+  # -- Image pull policy.
+  pullPolicy: "IfNotPresent"
+
+# -- Pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the fully qualified app name.
+fullnameOverride: ""
+# -- Labels added to all chart-managed resources.
+commonLabels: {}
+# -- Labels added to the operator pod template.
+podLabels: {}
+# -- Annotations added to the operator pod template.
+podAnnotations: {}
+
+# -- ServiceAccount configuration.
+serviceAccount:
+  # -- Create a ServiceAccount for the operator.
+  create: true
+  # -- ServiceAccount name. When create is true, defaults to the release
+  # fullname. When create is false, defaults to "default".
+  name: ""
+  # -- Annotations on the ServiceAccount (e.g. for IAM role binding).
+  annotations: {}
+
+# -- RBAC configuration.
+rbac:
+  # -- Create ClusterRoles, ClusterRoleBindings, and RoleBindings.
+  create: true
+
+# -- Additional namespaces where the operator needs Secret, ConfigMap,
+# Event, and Service access. The release namespace is always included.
+resourceNamespaces: []
+
+# -- Logging configuration.
+log:
+  # -- RUST_LOG filter directive.
+  level: "info"
+
+# -- Metrics and health server configuration.
+metrics:
+  # -- Metrics server bind address (host:port).
+  bindAddress: "0.0.0.0:9090"
+  # -- Metrics ClusterIP Service.
+  service:
+    # -- Create a ClusterIP Service for the metrics port.
+    enabled: true
+    # -- Service port number.
+    port: 9090
+    # -- Service annotations.
+    annotations: {}
+
+# -- SWIM protocol configuration.
+swim:
+  # -- SWIM bind address (host:port).
+  bindAddress: "0.0.0.0:7946"
+  # -- Externally reachable SWIM advertise address (host:port). Defaults to
+  # Pod IP and bind port. Must be set when a LoadBalancer or NodePort Service
+  # fronts the SWIM port and remote peers connect through that address.
+  advertiseAddress: ""
+  # -- Bootstrap SWIM site name override.
+  siteName: ""
+  # -- Bootstrap SWIM seed addresses (comma-separated).
+  seeds: ""
+  # -- SWIM Service (disabled by default).
+  service:
+    # -- Create a Service for the SWIM port.
+    enabled: false
+    # -- Service type: ClusterIP, LoadBalancer, or NodePort.
+    type: "ClusterIP"
+    # -- Service port number.
+    port: 7946
+    # -- Service annotations.
+    annotations: {}
+    # -- Static IP for LoadBalancer type.
+    loadBalancerIP: ""
+    # -- External traffic policy. Defaults to Local for LoadBalancer, omitted
+    # for ClusterIP and NodePort.
+    externalTrafficPolicy: ""
+
+# -- Advertised gateway address configuration.
+gateway:
+  # -- Gateway address override.
+  address: ""
+  # -- Gateway Kubernetes Service name for the operator to discover. Maps to
+  # GRID_GATEWAY_SERVICE_NAME.
+  serviceName: ""
+  # -- Gateway port for operator-to-gateway discovery. Maps to
+  # GRID_GATEWAY_PORT.
+  port: ""
+
+# -- Probe timing configuration.
+health:
+  # -- Liveness probe settings.
+  liveness:
+    # -- Initial delay before the first liveness probe.
+    initialDelaySeconds: 5
+    # -- Period between liveness probes.
+    periodSeconds: 10
+  # -- Readiness probe settings.
+  readiness:
+    # -- Initial delay before the first readiness probe.
+    initialDelaySeconds: 5
+    # -- Period between readiness probes.
+    periodSeconds: 10
+
+# -- Prometheus ServiceMonitor (requires the Prometheus Operator CRD).
+serviceMonitor:
+  # -- Create a ServiceMonitor resource.
+  enabled: false
+  # -- Additional labels on the ServiceMonitor.
+  labels: {}
+  # -- ServiceMonitor namespace override.
+  namespace: ""
+  # -- Prometheus scrape interval.
+  interval: ""
+  # -- Prometheus scrape timeout.
+  scrapeTimeout: ""
+
+# -- Container resource requests and limits.
+resources: {}
+# -- Node selector for pod scheduling.
+nodeSelector: {}
+# -- Pod affinity rules.
+affinity: {}
+# -- Pod tolerations.
+tolerations: []
+# -- Topology spread constraints.
+topologySpreadConstraints: []
+# -- Priority class for the operator pod.
+priorityClassName: ""

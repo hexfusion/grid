@@ -1,0 +1,38 @@
+Praxis gateway installed.
+
+  Release:   {{ .Release.Name }}
+  Namespace: {{ .Release.Namespace }}
+  Image:     {{ include "praxis-gateway.image" . }}
+  Config:    {{ .Values.config.existingConfigMap }}
+
+TEMPORARY CHART: This chart deploys the Praxis process directly as a
+Kubernetes workload. It is not an operator. Long-term ownership moves to
+the Praxis/Gateway Operator repository when that deployment API exists.
+
+Verify the gateway is running:
+
+  kubectl get deployment {{ include "praxis-gateway.fullname" . }} -n {{ .Release.Namespace }}
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "praxis-gateway.name" . }},app.kubernetes.io/instance={{ .Release.Name }}
+{{- if .Values.service.enabled }}
+
+Run Helm tests:
+
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.overlay.enabled }}
+
+Overlay ConfigMap: {{ .Values.overlay.existingConfigMap }}
+  Mount path: {{ .Values.overlay.mountPath }}
+{{- end }}
+{{- if .Values.tls.enabled }}
+
+TLS Secret: {{ .Values.tls.existingSecret }}
+  Mount path: {{ .Values.tls.mountPath }}
+{{- end }}
+{{- if .Values.credentials }}
+
+Credential mounts:
+{{- range .Values.credentials }}
+  - {{ .name }} -> {{ .mountPath }}{{ if .optional }} (optional){{ end }}
+{{- end }}
+{{- end }}

@@ -8,9 +8,41 @@ orchestration is isolated under **Development Validation Environments**.
 
 ### Install
 
-Grid provides deployment manifests for the operator and CRDs.
+Grid provides a Helm chart and Kustomize manifests for the operator and CRDs.
 
-**Option 1: Kustomize (recommended)**
+**Option 1: Helm (recommended)**
+
+```console
+helm install grid-operator \
+  oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version 0.1.0 \
+  --namespace grid-system \
+  --create-namespace
+```
+
+To grant resource access to additional namespaces:
+
+```console
+helm upgrade grid-operator \
+  oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --set "resourceNamespaces={app-ns,data-ns}" \
+  --namespace grid-system
+```
+
+Helm installs CRDs on first install but does not upgrade them. When upgrading
+to a version with changed CRDs, apply the new CRDs before the chart upgrade:
+
+```console
+kubectl apply -f charts/grid-operator/crds/
+helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version <new-version> --namespace grid-system
+```
+
+Uninstalling the chart removes namespaced resources but retains CRDs and
+custom resources. See the [chart README](../../charts/grid-operator/README.md)
+for the full values reference.
+
+**Option 2: Kustomize**
 
 ```console
 # Complete Grid deployment (CRDs + operator)

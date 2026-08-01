@@ -113,8 +113,24 @@ Grid operator image builds use a multi-stage Containerfile:
 
 See `deploy/examples/` and `config/samples/` for complete deployment examples.
 
+## Helm Chart
+
+The recommended production installation path is the Helm chart at
+[`charts/grid-operator/`](../charts/grid-operator/). The Kustomize manifests
+in this directory are retained for development and raw-manifest users.
+
+```bash
+helm install grid-operator \
+  oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version 0.1.0 \
+  --namespace grid-system \
+  --create-namespace
+```
+
+See the [chart README](../charts/grid-operator/README.md) for values,
+upgrade procedures, and CRD lifecycle.
+
 ## Remaining Blockers
 
 - **Praxis AI gateway packaging**: separate from Grid; requires upstream PRs to land
-- **Helm/OLM**: deferred unless demand materializes; current Kustomize/YAML paths are sufficient
 - **Forge dev environment**: multi-cluster orchestration is a separate future track (see [issue #2](https://github.com/praxis-proxy/grid/issues/2))

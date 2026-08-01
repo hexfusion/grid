@@ -35,3 +35,6 @@ tests/env/certs/
 # Forge runtime state and generated files
 .forge/
 demos/grid-glb-demo/.forge.resolved.yaml
+
+# Helm chart packaging artifacts
+*.tgz

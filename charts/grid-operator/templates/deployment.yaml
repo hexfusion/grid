@@ -1,0 +1,122 @@
+{{- include "grid-operator.validateDigest" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "grid-operator.fullname" . }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "grid-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $selectorLabels := include "grid-operator.selectorLabels" . | fromYaml }}
+        {{- $podLabels := mustMergeOverwrite (dict) (.Values.podLabels | default dict) $selectorLabels }}
+        {{- toYaml $podLabels | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "grid-operator.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: {{ include "grid-operator.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: GRID_SWIM_BIND_ADDR
+              value: {{ .Values.swim.bindAddress | quote }}
+            - name: GRID_SWIM_ADVERTISE_ADDR
+              {{- if .Values.swim.advertiseAddress }}
+              value: {{ .Values.swim.advertiseAddress | quote }}
+              {{- else }}
+              value: "$(POD_IP):{{ splitList ":" .Values.swim.bindAddress | last }}"
+              {{- end }}
+            {{- if .Values.swim.siteName }}
+            - name: GRID_SWIM_SITE_NAME
+              value: {{ .Values.swim.siteName | quote }}
+            {{- end }}
+            {{- if .Values.swim.seeds }}
+            - name: GRID_SWIM_SEEDS
+              value: {{ .Values.swim.seeds | quote }}
+            {{- end }}
+            {{- if .Values.gateway.address }}
+            - name: GRID_GATEWAY_ADDRESS
+              value: {{ .Values.gateway.address | quote }}
+            {{- end }}
+            {{- if .Values.gateway.serviceName }}
+            - name: GRID_GATEWAY_SERVICE_NAME
+              value: {{ .Values.gateway.serviceName | quote }}
+            {{- end }}
+            {{- if .Values.gateway.port }}
+            - name: GRID_GATEWAY_PORT
+              value: {{ .Values.gateway.port | quote }}
+            {{- end }}
+            - name: GRID_METRICS_ADDR
+              value: {{ .Values.metrics.bindAddress | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.log.level | quote }}
+          ports:
+            - name: swim-udp
+              containerPort: {{ splitList ":" .Values.swim.bindAddress | last }}
+              protocol: UDP
+            - name: metrics
+              containerPort: {{ splitList ":" .Values.metrics.bindAddress | last }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: {{ .Values.health.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.health.liveness.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: {{ .Values.health.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.health.readiness.periodSeconds }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}

@@ -1,0 +1,131 @@
+# -- Number of gateway replicas.
+replicaCount: 1
+
+# -- Gateway container image settings.
+image:
+  # -- Image repository.
+  repository: ghcr.io/praxis-proxy/praxis-ai
+  # -- Image tag (required unless digest is set).
+  tag: ""
+  # -- Immutable image digest (sha256:<64 hex>). When set, tag is ignored.
+  digest: ""
+  # -- Image pull policy.
+  pullPolicy: "IfNotPresent"
+
+# -- Pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the fully qualified app name.
+fullnameOverride: ""
+# -- Labels added to all chart-managed resources.
+commonLabels: {}
+# -- Additional labels on the gateway pod template. Selector labels cannot
+# be overridden.
+podLabels: {}
+# -- Annotations on the gateway pod template.
+podAnnotations: {}
+
+# -- Extra pod-level securityContext fields (e.g. runAsUser, runAsGroup).
+# runAsNonRoot and seccompProfile are always set by the chart.
+podSecurityContext: {}
+# runAsUser: 100
+# runAsGroup: 101
+
+# -- Container arguments. Defaults to the config file path.
+args:
+  - "--config"
+  - "/etc/praxis/praxis.yaml"
+
+# -- Required Praxis configuration.
+config:
+  # -- Name of an existing ConfigMap containing the Praxis configuration.
+  # The chart does not create or manage this ConfigMap.
+  existingConfigMap: ""
+  # -- Key within the ConfigMap that holds praxis.yaml.
+  key: "praxis.yaml"
+
+# -- Primary listener port configuration.
+port:
+  # -- Container port number.
+  containerPort: 8080
+  # -- Port name.
+  name: "http"
+  # -- Port protocol.
+  protocol: "TCP"
+
+# -- Gateway Service configuration.
+service:
+  # -- Create a Service for the gateway.
+  enabled: true
+  # -- Service type.
+  type: "ClusterIP"
+  # -- Service port number.
+  port: 8080
+  # -- Service annotations.
+  annotations: {}
+  # -- Static IP for LoadBalancer type.
+  loadBalancerIP: ""
+
+# -- Optional operator-produced overlay ConfigMap mount (edge gateways).
+overlay:
+  # -- Enable overlay ConfigMap mount.
+  enabled: false
+  # -- Name of the existing overlay ConfigMap.
+  existingConfigMap: ""
+  # -- Mount path for overlay files.
+  mountPath: "/etc/praxis/routing"
+  # -- Items to project from the ConfigMap.
+  items:
+    - key: "routing-config.json"
+      path: "routing-config.json"
+    - key: "routing-overlay.json"
+      path: "routing-overlay.json"
+
+# -- TLS Secret mount.
+tls:
+  # -- Enable TLS Secret mount.
+  enabled: false
+  # -- Name of the existing TLS Secret.
+  existingSecret: ""
+  # -- Mount path for TLS files.
+  mountPath: "/etc/praxis/tls"
+
+# -- Credential Secret mounts for provider gateways. Each entry mounts an
+# existing Secret at the specified path.
+credentials: []
+# - name: mock-inference-credential
+#   mountPath: /etc/praxis/credentials/mock-inference
+#   optional: false
+# - name: mock-inference-secondary-credential
+#   mountPath: /etc/praxis/credentials/mock-inference-secondary
+#   optional: true
+
+# -- Probe configuration.
+health:
+  # -- Readiness probe settings. Set to null to disable.
+  readiness:
+    tcpSocket:
+      port: "http"
+    initialDelaySeconds: 3
+    periodSeconds: 5
+  # -- Liveness probe settings. Set to null to disable.
+  liveness:
+    tcpSocket:
+      port: "http"
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+# -- Container resource requests and limits.
+resources: {}
+# -- Node selector for pod scheduling.
+nodeSelector: {}
+# -- Pod affinity rules.
+affinity: {}
+# -- Pod tolerations.
+tolerations: []
+# -- Topology spread constraints.
+topologySpreadConstraints: []
+# -- Priority class for the gateway pod.
+priorityClassName: ""

@@ -1029,9 +1029,9 @@ fi
 git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:9f6d6b8bc683c34263ddb76717cb740900edf1906f2f463155f6e0ae403bb818
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:c41ff91f20f6acd1db83f8906555427c5d8c8850047d88e7ff398433a63c03c1
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:4908d48061d39ad5747e698998e11b23d3ff76943f4dcca194cc16afab1a0c6f
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:2039ef5dd958c55369b4df7b41dc80a772b4ff216908da724d1e5135e396d319
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:b1c87cfb895e5dd717cb2c79a7df4821703c4cbd8a9e3872d4c92cf33958711d
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:deac6f257a712d6b5cdf12171f85ecd10fcd6a1f5ead324bf956449fcfbb1d86
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
 printf 'Gateway: %s\nOperator: %s\nMock provider: %s\nPull policy: %s\n' \
@@ -1102,9 +1102,9 @@ cargo run -p forge -- \
 Use the published validation images by immutable digest:
 
 ```bash
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:9f6d6b8bc683c34263ddb76717cb740900edf1906f2f463155f6e0ae403bb818
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:c41ff91f20f6acd1db83f8906555427c5d8c8850047d88e7ff398433a63c03c1
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:4908d48061d39ad5747e698998e11b23d3ff76943f4dcca194cc16afab1a0c6f
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:2039ef5dd958c55369b4df7b41dc80a772b4ff216908da724d1e5135e396d319
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:b1c87cfb895e5dd717cb2c79a7df4821703c4cbd8a9e3872d4c92cf33958711d
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:deac6f257a712d6b5cdf12171f85ecd10fcd6a1f5ead324bf956449fcfbb1d86
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 ```
 
@@ -1117,6 +1117,15 @@ into the Kind clusters.
 validation, accepted/serving revision evidence, `provider_route`,
 `credential_inject`, hot reload, downstream mTLS, upstream mTLS, and peer
 identity trust. The legacy mock-EPP image is not used by this demo.
+
+Previous validated set (retain as public fallback):
+
+```bash
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:9f6d6b8bc683c34263ddb76717cb740900edf1906f2f463155f6e0ae403bb818
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:c41ff91f20f6acd1db83f8906555427c5d8c8850047d88e7ff398433a63c03c1
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:4908d48061d39ad5747e698998e11b23d3ff76943f4dcca194cc16afab1a0c6f
+export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
+```
 
 ### Local Images
 

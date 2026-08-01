@@ -22,6 +22,7 @@ endif
 	kind-up kind-down \
 	dev-env dev-push dev-integration \
 	setup-hooks \
+	helm-lint helm-test \
 	help
 
 # -------------------------------------------------------------------
@@ -113,6 +114,16 @@ glb-demo-images: | require-container-engine
 	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .
 
 # -------------------------------------------------------------------
+# Helm
+# -------------------------------------------------------------------
+
+helm-lint:
+	./scripts/verify-helm-chart.sh
+
+helm-test:
+	KIND=1 ./scripts/verify-helm-chart.sh
+
+# -------------------------------------------------------------------
 # KIND
 # -------------------------------------------------------------------
 
@@ -179,6 +190,10 @@ help:
 	@echo "  audit            cargo audit + cargo deny"
 	@echo "  coverage         HTML coverage report"
 	@echo "  coverage-check   fail if line coverage < 80%%"
+	@echo ""
+	@echo "Helm:"
+	@echo "  helm-lint        lint, template, schema, CRD sync, package"
+	@echo "  helm-test        helm-lint + Kind install/upgrade/test/uninstall"
 	@echo ""
 	@echo "Container:"
 	@echo "  container            build container image"

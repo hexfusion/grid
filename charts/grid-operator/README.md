@@ -1,0 +1,219 @@
+# Grid Operator Helm Chart
+
+Helm chart for the Grid operator, a multi-site AI inference routing controller
+for Kubernetes.
+
+## Prerequisites
+
+- Kubernetes >= 1.26
+- Helm >= 3.12
+
+## Install
+
+By semantic version (OCI installation available from the next Grid release):
+
+```bash
+helm install grid-operator \
+  oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version <version> \
+  --namespace grid-system \
+  --create-namespace
+```
+
+By immutable digest (from the GitHub release notes):
+
+```bash
+helm install grid-operator \
+  oci://ghcr.io/praxis-proxy/charts/grid-operator@sha256:<digest> \
+  --namespace grid-system \
+  --create-namespace
+```
+
+From a local checkout:
+
+```bash
+helm install grid-operator charts/grid-operator \
+  --namespace grid-system \
+  --create-namespace
+```
+
+## Verify
+
+```bash
+kubectl get crd gridnetworks.grid.praxis-proxy.io
+kubectl get deployment grid-operator -n grid-system
+helm test grid-operator -n grid-system
+```
+
+## Uninstall
+
+```bash
+helm uninstall grid-operator -n grid-system
+```
+
+Helm removes all namespaced resources (Deployment, ServiceAccount, Services,
+RoleBindings) but **does not remove CRDs or custom resources**. This is
+standard Helm CRD behavior. Existing GridNetworks, GridSites, and
+InferenceProviders survive uninstall.
+
+To remove CRDs and all custom resources:
+
+```bash
+kubectl delete crd gridnetworks.grid.praxis-proxy.io \
+  gridsites.grid.praxis-proxy.io \
+  inferenceproviders.grid.praxis-proxy.io
+```
+
+## Upgrade
+
+```bash
+helm upgrade grid-operator \
+  oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version <new-version> \
+  --namespace grid-system
+```
+
+### CRD upgrades
+
+Helm installs CRDs on first install but **does not upgrade them** on
+`helm upgrade`. When upgrading to a version with changed CRDs, apply the
+new CRDs before upgrading the chart.
+
+From the OCI chart artifact:
+
+```bash
+helm pull oci://ghcr.io/praxis-proxy/charts/grid-operator --version <new-version> --untar
+kubectl apply -f grid-operator/crds/
+```
+
+From the source repository:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/gridnetwork.yaml
+kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/gridsite.yaml
+kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/inferenceprovider.yaml
+```
+
+Then upgrade the chart:
+
+```bash
+helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version <new-version> --namespace grid-system
+```
+
+## Values
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `replicaCount` | int | `1` | Operator replicas. Must be 1 (schema-enforced). |
+| `image.repository` | string | `ghcr.io/praxis-proxy/grid-operator` | Image repository. |
+| `image.tag` | string | `""` | Image tag. Defaults to chart appVersion. |
+| `image.digest` | string | `""` | Immutable digest. When set, tag is ignored. Must match `sha256:<64 hex>`. |
+| `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
+| `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
+| `nameOverride` | string | `""` | Override chart name in resource names. |
+| `fullnameOverride` | string | `""` | Override fully qualified app name. |
+| `commonLabels` | object | `{}` | Labels added to all resources. |
+| `podLabels` | object | `{}` | Labels on the operator pod. |
+| `podAnnotations` | object | `{}` | Annotations on the operator pod. |
+| `serviceAccount.create` | bool | `true` | Create a ServiceAccount. |
+| `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname. |
+| `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations (e.g. IAM role binding). |
+| `rbac.create` | bool | `true` | Create RBAC resources. |
+| `resourceNamespaces` | list | `[]` | Additional namespaces for resource access. The release namespace is always included. |
+| `log.level` | string | `info` | RUST_LOG filter directive. |
+| `metrics.bindAddress` | string | `0.0.0.0:9090` | Metrics server bind address. |
+| `metrics.service.enabled` | bool | `true` | Create a metrics ClusterIP Service. |
+| `metrics.service.port` | int | `9090` | Metrics Service port. |
+| `metrics.service.annotations` | object | `{}` | Metrics Service annotations. |
+| `swim.bindAddress` | string | `0.0.0.0:7946` | SWIM protocol bind address. |
+| `swim.advertiseAddress` | string | `""` | Externally reachable SWIM address. Defaults to Pod IP. |
+| `swim.siteName` | string | `""` | Bootstrap SWIM site name. |
+| `swim.seeds` | string | `""` | Bootstrap SWIM seeds (comma-separated). |
+| `swim.service.enabled` | bool | `false` | Create a SWIM Service. |
+| `swim.service.type` | string | `ClusterIP` | SWIM Service type. |
+| `swim.service.port` | int | `7946` | SWIM Service port. |
+| `swim.service.annotations` | object | `{}` | SWIM Service annotations. |
+| `swim.service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
+| `swim.service.externalTrafficPolicy` | string | `""` | External traffic policy. Defaults to Local for LoadBalancer. |
+| `gateway.address` | string | `""` | Advertised gateway address override. |
+| `gateway.serviceName` | string | `""` | Gateway Kubernetes Service name for discovery. |
+| `gateway.port` | string | `""` | Gateway port for discovery. |
+| `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
+| `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
+| `health.readiness.initialDelaySeconds` | int | `5` | Readiness probe initial delay. |
+| `health.readiness.periodSeconds` | int | `10` | Readiness probe period. |
+| `serviceMonitor.enabled` | bool | `false` | Create a Prometheus ServiceMonitor. |
+| `serviceMonitor.labels` | object | `{}` | Additional ServiceMonitor labels. |
+| `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace override. |
+| `serviceMonitor.interval` | string | `""` | Prometheus scrape interval. |
+| `serviceMonitor.scrapeTimeout` | string | `""` | Prometheus scrape timeout. |
+| `resources` | object | `{}` | Container resource requests and limits. |
+| `nodeSelector` | object | `{}` | Node selector for scheduling. |
+| `affinity` | object | `{}` | Pod affinity rules. |
+| `tolerations` | list | `[]` | Pod tolerations. |
+| `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
+| `priorityClassName` | string | `""` | Pod priority class. |
+
+## RBAC and namespace access
+
+The chart creates two ClusterRoles:
+
+1. **CRD access** (`<release>-crd`): cluster-wide watch/patch on GridNetworks,
+   GridSites, and InferenceProviders.
+2. **Resource access** (`<release>-resources`): namespace-scoped
+   get/create/patch on Secrets, Services, ConfigMaps, and Events.
+
+Resource access is bound via RoleBindings. The release namespace always gets
+a RoleBinding. Additional namespaces are added through `resourceNamespaces`:
+
+```bash
+helm upgrade grid-operator charts/grid-operator \
+  --set "resourceNamespaces={app-ns,data-ns}" \
+  --namespace grid-system
+```
+
+The `default` namespace is **not** implicitly included. Users must list it
+in `resourceNamespaces` if the operator needs access there.
+
+## Security
+
+The chart enforces OpenShift-compatible restricted security defaults:
+
+- `runAsNonRoot: true` (no fixed UID, so OpenShift can assign one)
+- `readOnlyRootFilesystem: true`
+- `allowPrivilegeEscalation: false`
+- All Linux capabilities dropped
+- `seccompProfile.type: RuntimeDefault`
+
+## Monitoring
+
+Enable a Prometheus ServiceMonitor (requires the Prometheus Operator CRD):
+
+```yaml
+serviceMonitor:
+  enabled: true
+  interval: 30s
+```
+
+## SWIM Service
+
+Expose the SWIM port for cross-cluster mesh connectivity:
+
+```yaml
+swim:
+  advertiseAddress: "swim.east1.example.com:7946"
+  service:
+    enabled: true
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+```
+
+When a LoadBalancer or NodePort Service fronts the SWIM port, set
+`swim.advertiseAddress` to the externally reachable address and port.
+Without this, the operator advertises its Pod IP, which is not routable
+from remote clusters.
+
+The chart creates a Service but does not configure cross-cluster networking,
+DNS, or firewall rules. Those remain deployment-platform responsibilities.

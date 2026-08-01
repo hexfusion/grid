@@ -1128,17 +1128,34 @@ fn validate_image_contract() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Split a `repo:tag` image reference into `(repo, tag)`.
+fn split_image_ref(image: &str) -> (String, String) {
+    image.rsplit_once(':').map_or_else(
+        || (image.to_owned(), "latest".to_owned()),
+        |(repo, tag)| (repo.to_owned(), tag.to_owned()),
+    )
+}
+
 /// Apply environment-selected images to stack template properties.
 fn set_cluster_image_properties(spec: &mut serde_yaml::Mapping) -> Result<(), Box<dyn std::error::Error>> {
+    let gateway_image = image_overrides::glb_gateway_image();
+    let operator_image = image_overrides::glb_operator_image();
+    let (gw_repo, gw_tag) = split_image_ref(&gateway_image);
+    let (op_repo, op_tag) = split_image_ref(&operator_image);
+
     let clusters = sequence_mut(spec, "clusters")?;
     for cluster in clusters {
         let cluster = cluster.as_mapping_mut().ok_or("cluster entry must be a mapping")?;
         let properties = mapping_mut_in(cluster, "properties")?;
         for (key, value) in [
-            ("gatewayImage", image_overrides::glb_gateway_image()),
-            ("operatorImage", image_overrides::glb_operator_image()),
+            ("gatewayImage", gateway_image.clone()),
+            ("operatorImage", operator_image.clone()),
             ("mockProviderImage", image_overrides::glb_mock_provider_image()),
             ("imagePullPolicy", image_overrides::image_pull_policy()),
+            ("gatewayImageRepo", gw_repo.clone()),
+            ("gatewayImageTag", gw_tag.clone()),
+            ("operatorImageRepo", op_repo.clone()),
+            ("operatorImageTag", op_tag.clone()),
         ] {
             properties.insert(yaml_key(key), serde_yaml::Value::String(value));
         }
@@ -1175,9 +1192,6 @@ fn apply_foundation_stacks(forge: &str, config: &Path) -> Result<(), Box<dyn std
 
     for cluster in GRID_CLUSTERS {
         run_forge(forge, config, &["stack", "apply", cluster, "metallb"])?;
-    }
-    for cluster in GRID_CLUSTERS {
-        run_forge(forge, config, &["stack", "apply", cluster, "swim-lb"])?;
     }
 
     for cluster in GRID_CLUSTERS {
@@ -1436,71 +1450,85 @@ mod setup_tests {
         }
 
         #[test]
-        fn swim_service_stack_creates_its_namespace_first() -> Result<(), Box<dyn std::error::Error>> {
+        fn grid_operator_stack_uses_helm_and_captures_swim_ip() -> Result<(), Box<dyn std::error::Error>> {
             let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
             let forge: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(source)?)?;
             let steps = forge
                 .get("spec")
                 .and_then(|value| value.get("stacks"))
-                .and_then(|value| value.get("swim-lb"))
+                .and_then(|value| value.get("grid-operator"))
                 .and_then(|value| value.get("steps"))
                 .and_then(serde_yaml::Value::as_sequence)
-                .ok_or("swim-lb steps must be a sequence")?;
+                .ok_or("grid-operator steps must be a sequence")?;
 
-            let first_path = steps
+            let first_type = steps
                 .first()
-                .and_then(|value| value.get("path"))
+                .and_then(|value| value.get("type"))
                 .and_then(serde_yaml::Value::as_str);
-            let second_path = steps
-                .get(1)
-                .and_then(|value| value.get("path"))
-                .and_then(serde_yaml::Value::as_str);
+            assert_eq!(first_type, Some("helm"), "grid-operator must use a Helm step");
 
-            assert_eq!(first_path, Some("resources/grid-system-namespace.yaml"));
-            assert_eq!(second_path, Some("resources/operator-swim-service.yaml"));
+            let has_capture = steps.iter().any(|step| {
+                step.get("type")
+                    .and_then(serde_yaml::Value::as_str)
+                    .is_some_and(|t| t == "capture")
+                    && step
+                        .get("key")
+                        .and_then(serde_yaml::Value::as_str)
+                        .is_some_and(|k| k == "swim-lb-ip")
+            });
+            assert!(has_capture, "grid-operator must capture swim-lb-ip");
             Ok(())
         }
 
         #[test]
-        fn operator_site_configuration_preserves_the_base_deployment() -> Result<(), Box<dyn std::error::Error>> {
-            let forge = fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))?;
+        #[expect(clippy::too_many_lines, reason = "asserts Helm SWIM wiring for four identity stacks")]
+        fn identity_stacks_use_helm_with_swim_config() -> Result<(), Box<dyn std::error::Error>> {
+            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let forge: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(source)?)?;
+            let stacks = forge
+                .get("spec")
+                .and_then(|value| value.get("stacks"))
+                .ok_or("forge.yaml must have stacks")?;
+
             for site in ["east-edge", "east-provider", "west-edge", "west-provider"] {
-                let identity = format!("GRID_SWIM_SITE_NAME={site}");
-                let identity_index = forge
-                    .find(&identity)
-                    .ok_or_else(|| format!("{site} has no explicit SWIM identity"))?;
-                let network = format!("resources/gridnetwork-{site}.yaml");
-                let network_index = forge
-                    .find(&network)
-                    .ok_or_else(|| format!("{site} has no GridNetwork step"))?;
-                assert!(
-                    identity_index < network_index,
-                    "{site} identity must be set before its GridNetwork is applied"
-                );
-                let between = forge
-                    .get(identity_index..network_index)
-                    .ok_or_else(|| format!("{site} stack order is invalid"))?;
-                assert!(
-                    between.contains("rollout") && between.contains("status"),
-                    "{site} operator rollout must complete before its GridNetwork is applied"
-                );
+                let stack_name = format!("{site}-operator");
+                let steps = stacks
+                    .get(&stack_name)
+                    .and_then(|value| value.get("steps"))
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .ok_or_else(|| format!("{stack_name} steps must be a sequence"))?;
+
+                let helm_step = steps
+                    .first()
+                    .filter(|step| {
+                        step.get("type")
+                            .and_then(serde_yaml::Value::as_str)
+                            .is_some_and(|t| t == "helm")
+                    })
+                    .ok_or_else(|| format!("{stack_name} must start with a Helm step"))?;
+
+                let site_name = helm_step
+                    .get("values")
+                    .and_then(|value| value.get("swim"))
+                    .and_then(|value| value.get("siteName"))
+                    .and_then(serde_yaml::Value::as_str)
+                    .ok_or_else(|| format!("{stack_name} must set swim.siteName"))?;
+                assert_eq!(site_name, site, "{stack_name} siteName must match the site identity");
+
+                let has_wait = steps.iter().any(|step| {
+                    step.get("type")
+                        .and_then(serde_yaml::Value::as_str)
+                        .is_some_and(|t| t == "wait")
+                });
+                assert!(has_wait, "{stack_name} must wait for the operator rollout");
             }
-            assert!(
-                !forge.contains("operator-env-"),
-                "partial Deployment overlays can disturb base security settings"
-            );
             Ok(())
         }
 
         #[test]
         fn demo_workloads_use_restricted_container_defaults() -> Result<(), Box<dyn std::error::Error>> {
             let resources = workspace_root().join("demos/grid-glb-demo/resources");
-            for manifest in [
-                "edge-gateway-deployment.yaml",
-                "provider-gateway-deployment.yaml",
-                "gtm-emulator-deployment.yaml",
-                "provider-workloads.yaml",
-            ] {
+            for manifest in ["provider-workloads.yaml", "provider-workload-east-secondary.yaml"] {
                 let deployment = fs::read_to_string(resources.join(manifest))?;
                 for required in [
                     "automountServiceAccountToken: false",

@@ -1,0 +1,126 @@
+name: Helm
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  HELM_VERSION: v3.17.3
+  KIND_VERSION: v0.31.0
+  KUBECONFORM_VERSION: 0.6.7
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Static chart validation (lint, template, schema, CRD sync, package)
+  # ----------------------------------------------------------------------------
+
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL -o /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73  /tmp/kubeconform.tar.gz" | sha256sum -c
+          tar xz -C /usr/local/bin kubeconform < /tmp/kubeconform.tar.gz
+          rm /tmp/kubeconform.tar.gz
+          kubeconform -v
+
+      - name: Validate charts (static)
+        run: ./scripts/verify-helm-chart.sh
+
+      - name: Validate rendered manifests against Kubernetes schema
+        run: |
+          for chart in charts/grid-operator charts/praxis-gateway; do
+            echo "--- Validating $chart ---"
+            EXTRA_ARGS=()
+            if [ "$chart" = "charts/praxis-gateway" ]; then
+              EXTRA_ARGS=(--set config.existingConfigMap=schema-check --set image.tag=v0.1.0-ci)
+            fi
+            helm template validate-schema "$chart" --namespace grid-system "${EXTRA_ARGS[@]}" \
+              | kubeconform -strict -kubernetes-version 1.30.0 -summary
+          done
+
+      - name: Upload rendered manifests
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6db9b8a1f7c064f3c1960d9c7e5c2 # v4.6.2
+        with:
+          name: rendered-manifests
+          path: /tmp/helm-rendered-*.yaml
+          if-no-files-found: ignore
+          retention-days: 5
+
+  # ----------------------------------------------------------------------------
+  # Kind chart lifecycle test (install/upgrade/uninstall wiring with pause:3.9;
+  # real Praxis runtime behavior is proven by the GLB demo)
+  # ----------------------------------------------------------------------------
+
+  kind:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install Kind
+        run: |
+          curl -fsSL -o /usr/local/bin/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  /usr/local/bin/kind" | sha256sum -c
+          chmod +x /usr/local/bin/kind
+          kind version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build operator image for Kind
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/operator/Containerfile
+          push: false
+          load: true
+          tags: ghcr.io/praxis-proxy/grid-operator:ci
+          cache-from: type=gha,scope=helm-kind-operator
+          cache-to: type=gha,mode=max,scope=helm-kind-operator
+
+      - name: Run Kind lifecycle tests
+        run: |
+          KIND=1 GRID_OPERATOR_CI_TAG=ci ./scripts/verify-helm-chart.sh
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6db9b8a1f7c064f3c1960d9c7e5c2 # v4.6.2
+        with:
+          name: kind-test-logs
+          path: /tmp/helm-kind-logs/
+          if-no-files-found: ignore
+          retention-days: 5

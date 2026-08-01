@@ -188,11 +188,75 @@ jobs:
           sbom: true
 
   # ----------------------------------------------------------------------------
+  # Package and publish Helm chart to GHCR OCI registry
+  # ----------------------------------------------------------------------------
+
+  chart:
+    needs: [validate, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      chart_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.17.3
+
+      - name: Validate chart version matches tag
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          CHART_VERSION=$(grep '^version:' charts/grid-operator/Chart.yaml | awk '{print $2}')
+          CHART_APP_VERSION=$(grep '^appVersion:' charts/grid-operator/Chart.yaml | awk '{print $2}' | tr -d '"')
+          if [ "$CHART_VERSION" != "$VERSION" ]; then
+            echo "::error::Chart version ($CHART_VERSION) != tag version ($VERSION)"
+            exit 1
+          fi
+          if [ "$CHART_APP_VERSION" != "$TAG" ]; then
+            echo "::error::Chart appVersion ($CHART_APP_VERSION) != release tag ($TAG)"
+            exit 1
+          fi
+
+      - name: Lint chart
+        run: helm lint charts/grid-operator --strict
+
+      - name: Package chart
+        run: helm package charts/grid-operator
+
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Push chart to OCI registry
+        id: push
+        run: |
+          CHART_TGZ="grid-operator-${{ needs.validate.outputs.version }}.tgz"
+          OUTPUT=$(helm push "$CHART_TGZ" oci://ghcr.io/praxis-proxy/charts 2>&1)
+          echo "$OUTPUT"
+          DIGEST=$(echo "$OUTPUT" | grep -oP 'sha256:[0-9a-f]{64}' | head -1)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Upload chart artifact for release job
+        uses: actions/upload-artifact@ea165f8d65b6db9b8a1f7c064f3c1960d9c7e5c2 # v4.6.2
+        with:
+          name: grid-operator-chart
+          path: "grid-operator-${{ needs.validate.outputs.version }}.tgz"
+          if-no-files-found: error
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------
   # Publish release notes with immutable image references
   # ----------------------------------------------------------------------------
 
   github-release:
-    needs: [validate, container]
+    needs: [validate, container, chart]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -201,11 +265,18 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.tag }}
 
+      - name: Download chart artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: grid-operator-chart
+
       - name: Write image manifest
         env:
           OPERATOR_DIGEST: ${{ needs.container.outputs.operator_digest }}
           MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
+          CHART_DIGEST: ${{ needs.chart.outputs.chart_digest }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           cat > release-images.md <<EOF
           ## Container Images
@@ -214,6 +285,22 @@ jobs:
           ${AI_ROLLUP_IMAGE}
           ${OPERATOR_IMAGE_NAME}@${OPERATOR_DIGEST}
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
+          \`\`\`
+
+          ## Helm Chart
+
+          \`\`\`text
+          oci://ghcr.io/praxis-proxy/charts/grid-operator --version ${VERSION}
+          oci://ghcr.io/praxis-proxy/charts/grid-operator@${CHART_DIGEST}
+          \`\`\`
+
+          Install:
+
+          \`\`\`bash
+          helm install grid-operator \\
+            oci://ghcr.io/praxis-proxy/charts/grid-operator \\
+            --version ${VERSION} \\
+            --namespace grid-system --create-namespace
           \`\`\`
 
           The Grid images were built from \`${SOURCE_SHA}\`. The Praxis AI
@@ -226,8 +313,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: >-
           gh release create "$TAG"
+          "grid-operator-${VERSION}.tgz"
           --verify-tag
           --title "Grid $TAG"
           --generate-notes

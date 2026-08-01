@@ -15,7 +15,7 @@ spec:
 
   clusters:
     - name: east-provider
-      stacks: [metallb, swim-lb, grid-operator, east-provider-operator, east-provider-site, inference-sim]
+      stacks: [metallb, grid-operator, east-provider-operator, east-provider-site, inference-sim]
       properties:
         region: east
         role: provider
@@ -23,9 +23,13 @@ spec:
         operatorImage: "grid-operator:glb-demo"
         mockProviderImage: "grid-mock-providers:glb-demo"
         imagePullPolicy: Never
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "glb-demo"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "glb-demo"
 
     - name: west-provider
-      stacks: [metallb, swim-lb, grid-operator, west-provider-operator, west-provider-site, inference-sim]
+      stacks: [metallb, grid-operator, west-provider-operator, west-provider-site, inference-sim]
       properties:
         region: west
         role: provider
@@ -33,9 +37,13 @@ spec:
         operatorImage: "grid-operator:glb-demo"
         mockProviderImage: "grid-mock-providers:glb-demo"
         imagePullPolicy: Never
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "glb-demo"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "glb-demo"
 
     - name: east-edge
-      stacks: [metallb, swim-lb, grid-operator, east-edge-operator, east-edge-site, edge-gateway]
+      stacks: [metallb, grid-operator, east-edge-operator, east-edge-site, edge-gateway]
       properties:
         region: east
         role: edge
@@ -43,9 +51,13 @@ spec:
         operatorImage: "grid-operator:glb-demo"
         mockProviderImage: "grid-mock-providers:glb-demo"
         imagePullPolicy: Never
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "glb-demo"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "glb-demo"
 
     - name: west-edge
-      stacks: [metallb, swim-lb, grid-operator, west-edge-operator, west-edge-site, edge-gateway]
+      stacks: [metallb, grid-operator, west-edge-operator, west-edge-site, edge-gateway]
       properties:
         region: west
         role: edge
@@ -53,6 +65,10 @@ spec:
         operatorImage: "grid-operator:glb-demo"
         mockProviderImage: "grid-mock-providers:glb-demo"
         imagePullPolicy: Never
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "glb-demo"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "glb-demo"
 
     - name: gtm-emulator
       stacks: [metallb, gtm-emulator]
@@ -63,6 +79,10 @@ spec:
         operatorImage: "grid-operator:glb-demo"
         mockProviderImage: "grid-mock-providers:glb-demo"
         imagePullPolicy: Never
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "glb-demo"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "glb-demo"
 
   stacks:
     metallb:
@@ -80,48 +100,29 @@ spec:
           name: forge-pool
 
     grid-operator:
-      description: Grid CRDs and operator
+      description: Grid CRDs, operator, and SWIM LoadBalancer via Helm
       steps:
-        - type: kustomize
-          path: resources/grid-operator
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-{{ cluster.name }}
-            - -n
-            - grid-system
-            - set
-            - image
-            - deployment/grid-operator
-            - operator={{ cluster.properties.operatorImage }}
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-{{ cluster.name }}
-            - -n
-            - grid-system
-            - patch
-            - deployment/grid-operator
-            - --type=json
-            - -p
-            - '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"{{ cluster.properties.imagePullPolicy }}"}]'
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              service:
+                enabled: true
+                type: "LoadBalancer"
         - type: wait
           resource: deployment/grid-operator
           namespace: grid-system
           condition: available
           timeout: "120s"
-
-    swim-lb:
-      description: SWIM membership LoadBalancer Service for cross-cluster discovery
-      steps:
-        - type: manifest
-          path: resources/grid-system-namespace.yaml
-        - type: manifest
-          path: resources/operator-swim-service.yaml
         - type: capture
-          resource: svc/operator-swim-lb
+          resource: svc/grid-operator-swim
           namespace: grid-system
           jsonpath: "{.status.loadBalancer.ingress[0].ip}"
           key: swim-lb-ip
@@ -131,128 +132,116 @@ spec:
     east-provider-operator:
       description: East provider Grid operator identity and SWIM peers
       steps:
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-east-provider
-            - -n
-            - grid-system
-            - set
-            - env
-            - deployment/grid-operator
-            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
-            - GRID_SWIM_ADVERTISE_ADDR={{ captures.east-provider.swim-lb-ip }}:7946
-            - GRID_SWIM_SITE_NAME=east-provider
-            - GRID_SWIM_SEEDS={{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946
-            - GRID_GATEWAY_PORT=8443
-            - RUST_LOG=info
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-east-provider
-            - -n
-            - grid-system
-            - rollout
-            - status
-            - deployment/grid-operator
-            - --timeout=120s
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              advertiseAddress: "{{ captures.east-provider.swim-lb-ip }}:7946"
+              siteName: "east-provider"
+              seeds: "{{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              port: "8443"
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
 
     west-provider-operator:
       description: West provider Grid operator identity and SWIM peers
       steps:
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-west-provider
-            - -n
-            - grid-system
-            - set
-            - env
-            - deployment/grid-operator
-            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
-            - GRID_SWIM_ADVERTISE_ADDR={{ captures.west-provider.swim-lb-ip }}:7946
-            - GRID_SWIM_SITE_NAME=west-provider
-            - GRID_SWIM_SEEDS={{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946
-            - GRID_GATEWAY_PORT=8443
-            - RUST_LOG=info
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-west-provider
-            - -n
-            - grid-system
-            - rollout
-            - status
-            - deployment/grid-operator
-            - --timeout=120s
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              advertiseAddress: "{{ captures.west-provider.swim-lb-ip }}:7946"
+              siteName: "west-provider"
+              seeds: "{{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              port: "8443"
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
 
     east-edge-operator:
       description: East edge Grid operator identity and SWIM peers
       steps:
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-east-edge
-            - -n
-            - grid-system
-            - set
-            - env
-            - deployment/grid-operator
-            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
-            - GRID_SWIM_ADVERTISE_ADDR={{ captures.east-edge.swim-lb-ip }}:7946
-            - GRID_SWIM_SITE_NAME=east-edge
-            - GRID_SWIM_SEEDS={{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946
-            - GRID_GATEWAY_SERVICE_NAME=edge-gateway
-            - GRID_GATEWAY_PORT=8080
-            - RUST_LOG=info
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-east-edge
-            - -n
-            - grid-system
-            - rollout
-            - status
-            - deployment/grid-operator
-            - --timeout=120s
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              advertiseAddress: "{{ captures.east-edge.swim-lb-ip }}:7946"
+              siteName: "east-edge"
+              seeds: "{{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "edge-gateway"
+              port: "8080"
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
 
     west-edge-operator:
       description: West edge Grid operator identity and SWIM peers
       steps:
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-west-edge
-            - -n
-            - grid-system
-            - set
-            - env
-            - deployment/grid-operator
-            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
-            - GRID_SWIM_ADVERTISE_ADDR={{ captures.west-edge.swim-lb-ip }}:7946
-            - GRID_SWIM_SITE_NAME=west-edge
-            - GRID_SWIM_SEEDS={{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946
-            - GRID_GATEWAY_SERVICE_NAME=edge-gateway
-            - GRID_GATEWAY_PORT=8080
-            - RUST_LOG=info
-        - type: exec
-          command:
-            - kubectl
-            - --context
-            - kind-grid-glb-west-edge
-            - -n
-            - grid-system
-            - rollout
-            - status
-            - deployment/grid-operator
-            - --timeout=120s
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              advertiseAddress: "{{ captures.west-edge.swim-lb-ip }}:7946"
+              siteName: "west-edge"
+              seeds: "{{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "edge-gateway"
+              port: "8080"
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
 
     east-provider-site:
       description: East provider site and inference capacity
@@ -287,8 +276,6 @@ spec:
       description: East edge site and operator-rendered routing overlay
       steps:
         - type: manifest
-          path: resources/operator-role-binding-grid-system.yaml
-        - type: manifest
           path: resources/site-east-edge.yaml
         - type: manifest
           path: policies/provider-access.yaml
@@ -298,8 +285,6 @@ spec:
     west-edge-site:
       description: West edge site and operator-rendered routing overlay
       steps:
-        - type: manifest
-          path: resources/operator-role-binding-grid-system.yaml
         - type: manifest
           path: resources/site-west-edge.yaml
         - type: manifest
@@ -322,12 +307,60 @@ spec:
               --from-file=praxis.yaml=.forge/runtime/glb-tls/provider-configs/{{ cluster.name }}/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-glb-{{ cluster.name }} apply -f -
-        - type: template-manifest
-          path: resources/provider-gateway-deployment.yaml
+        - type: helm
+          release: provider-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            nameOverride: "provider-gateway"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            podSecurityContext:
+              runAsUser: 100
+              runAsGroup: 101
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            config:
+              existingConfigMap: "provider-gateway-config"
+            port:
+              containerPort: 8443
+              name: "https-mtls"
+            service:
+              type: "LoadBalancer"
+              port: 8443
+            health:
+              readiness:
+                tcpSocket:
+                  port: "https-mtls"
+                initialDelaySeconds: 3
+                periodSeconds: 5
+              liveness:
+                tcpSocket:
+                  port: "https-mtls"
+                initialDelaySeconds: 5
+                periodSeconds: 10
+            tls:
+              enabled: true
+              existingSecret: "provider-gateway-tls"
+            credentials:
+              - name: "mock-inference-credential"
+                mountPath: "/etc/praxis/credentials/mock-inference"
+              - name: "mock-inference-secondary-credential"
+                mountPath: "/etc/praxis/credentials/mock-inference-secondary"
+                optional: true
+            podLabels:
+              grid.praxis-proxy.io/backend-access: "provider-gateway"
+              grid.praxis-proxy.io/provider-site: "{{ cluster.name }}"
         - type: manifest
           path: resources/backend-network-policy.yaml
-        - type: manifest
-          path: resources/provider-gateway.yaml
         - type: wait
           resource: deployment/mock-inference
           namespace: grid-system
@@ -362,10 +395,39 @@ spec:
               --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/edge/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-glb-{{ cluster.name }} apply -f -
-        - type: template-manifest
-          path: resources/edge-gateway-deployment.yaml
-        - type: manifest
-          path: resources/edge-gateway-service.yaml
+        - type: helm
+          release: edge-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            nameOverride: "edge-gateway"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            podSecurityContext:
+              runAsUser: 100
+              runAsGroup: 101
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            config:
+              existingConfigMap: "edge-gateway-config"
+            service:
+              type: "LoadBalancer"
+            overlay:
+              enabled: true
+              existingConfigMap: "grid-overlay-glb-demo-edge-gateway"
+            tls:
+              enabled: true
+              existingSecret: "edge-gateway-tls"
+            podLabels:
+              grid.praxis-proxy.io/edge-site: "{{ cluster.name }}"
         - type: wait
           resource: deployment/edge-gateway
           namespace: grid-system
@@ -397,10 +459,49 @@ spec:
               --from-file=praxis.yaml=.forge/runtime/gtm-emulator/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-glb-gtm-emulator apply -f -
-        - type: template-manifest
-          path: resources/gtm-emulator-deployment.yaml
-        - type: manifest
-          path: resources/gtm-emulator-service.yaml
+        - type: helm
+          release: gtm-emulator
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            nameOverride: "gtm-emulator"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            podSecurityContext:
+              runAsUser: 100
+              runAsGroup: 101
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            config:
+              existingConfigMap: "gtm-emulator-config"
+            health:
+              readiness:
+                tcpSocket:
+                  port: "https"
+                initialDelaySeconds: 3
+                periodSeconds: 5
+              liveness:
+                tcpSocket:
+                  port: "https"
+                initialDelaySeconds: 5
+                periodSeconds: 10
+            port:
+              containerPort: 8443
+              name: "https"
+            service:
+              type: "LoadBalancer"
+              port: 8443
+            tls:
+              enabled: true
+              existingSecret: "gtm-emulator-tls"
         - type: wait
           resource: deployment/gtm-emulator
           namespace: grid-system

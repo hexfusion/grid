@@ -52,7 +52,7 @@ const PROVIDER_CLUSTERS: &[&str] = &["east-provider", "west-provider"];
 const EDGE_CLUSTERS: &[&str] = &["east-edge", "west-edge"];
 
 /// SWIM LB service name in the GLB demo.
-const SWIM_LB_SERVICE: &str = "operator-swim-lb";
+const SWIM_LB_SERVICE: &str = "grid-operator-swim";
 
 /// Overlay [`ConfigMap`] name on the edge site.
 ///
@@ -4286,15 +4286,26 @@ clusters:
     }
 
     #[test]
-    fn provider_deployment_mounts_credential_secret() {
-        let deployment =
-            fs::read_to_string(workspace_root().join("demos/grid-glb-demo/resources/provider-gateway-deployment.yaml"))
-                .unwrap_or_else(|_| std::process::abort());
-        assert!(deployment.contains("mountPath: /etc/praxis/credentials/mock-inference"));
-        assert!(deployment.contains("secretName: mock-inference-credential"));
-        assert!(deployment.contains("mountPath: /etc/praxis/credentials/mock-inference-secondary"));
-        assert!(deployment.contains("secretName: mock-inference-secondary-credential"));
-        assert!(!deployment.contains(CLIENT_BEARER_TOKEN));
+    fn provider_gateway_helm_values_mount_credential_secrets() {
+        let forge = fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            forge.contains("name: \"mock-inference-credential\""),
+            "forge.yaml must declare the primary credential Secret"
+        );
+        assert!(
+            forge.contains("mountPath: \"/etc/praxis/credentials/mock-inference\""),
+            "forge.yaml must mount the primary credential"
+        );
+        assert!(
+            forge.contains("name: \"mock-inference-secondary-credential\""),
+            "forge.yaml must declare the secondary credential Secret"
+        );
+        assert!(
+            forge.contains("mountPath: \"/etc/praxis/credentials/mock-inference-secondary\""),
+            "forge.yaml must mount the secondary credential"
+        );
+        assert!(!forge.contains(CLIENT_BEARER_TOKEN));
     }
 
     #[test]
@@ -4325,18 +4336,17 @@ clusters:
 
     #[test]
     fn backend_network_policy_separates_data_and_health_access() {
-        let resources = workspace_root().join("demos/grid-glb-demo/resources");
-        let policy =
-            fs::read_to_string(resources.join("backend-network-policy.yaml")).unwrap_or_else(|_| std::process::abort());
-        let gateway = fs::read_to_string(resources.join("provider-gateway-deployment.yaml"))
+        let root = workspace_root();
+        let policy = fs::read_to_string(root.join("demos/grid-glb-demo/resources/backend-network-policy.yaml"))
             .unwrap_or_else(|_| std::process::abort());
+        let forge =
+            fs::read_to_string(root.join("demos/grid-glb-demo/forge.yaml")).unwrap_or_else(|_| std::process::abort());
 
         assert!(policy.contains("grid.praxis-proxy.io/backend-access: provider-gateway"));
         assert!(policy.contains("app.kubernetes.io/name: grid-operator"));
-        assert!(gateway.contains("grid.praxis-proxy.io/backend-access: provider-gateway"));
         assert!(
-            !gateway.contains("app.kubernetes.io/name: grid-operator"),
-            "provider gateway must retain its own workload identity"
+            forge.contains("grid.praxis-proxy.io/backend-access"),
+            "forge.yaml must set the backend-access pod label on provider gateways"
         );
     }
 
@@ -4475,13 +4485,11 @@ clusters:
             .unwrap_or_else(|_| std::process::abort());
         for site in ["east-edge", "east-provider", "west-edge", "west-provider"] {
             assert!(
-                forge.contains(&format!("GRID_SWIM_SITE_NAME={site}")),
-                "{site} must set an explicit SWIM identity"
+                forge.contains(&format!("siteName: \"{site}\"")),
+                "{site} must set an explicit SWIM identity via Helm values"
             );
         }
-        assert!(forge.contains("kubectl"));
-        assert!(forge.contains("set"));
-        assert!(forge.contains("env"));
+        assert!(forge.contains("type: helm"), "operator stacks must use Helm releases");
         assert!(
             !forge.contains("operator-env-"),
             "partial Deployment overlays can remove base security settings"
