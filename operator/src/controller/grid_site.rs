@@ -529,11 +529,10 @@ fn event_type_for_reason(reason: &str) -> EventType {
 
 /// Truncate an event note to a bounded length.
 ///
-/// Reuses [`MAX_STATUS_MESSAGE_LEN`] from [`gateway_probe`] to keep
+/// Reuses [`MAX_STATUS_MESSAGE_LEN`](crate::resources::gateway_probe::MAX_STATUS_MESSAGE_LEN)
+/// from [`gateway_probe`](crate::resources::gateway_probe) to keep
 /// Event notes well within the Kubernetes soft 1 KB limit and prevent
 /// accidental PEM or key leakage.
-///
-/// [`gateway_probe`]: crate::resources::gateway_probe
 fn truncate_event_note(message: &str) -> String {
     use crate::resources::gateway_probe::MAX_STATUS_MESSAGE_LEN;
     if message.chars().count() <= MAX_STATUS_MESSAGE_LEN {

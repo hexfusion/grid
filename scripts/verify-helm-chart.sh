@@ -7,6 +7,7 @@ KIND_CLUSTER=""
 
 OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
 OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.0}"
+DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.0"
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -205,10 +206,10 @@ echo ""
 echo "=== Template rendering ==="
 helm template verify-default "$GW_DIR" "${GW_REQ[@]}" --namespace grid-system > /tmp/helm-rendered-gateway.yaml 2>/dev/null || true
 try_template "$GW_DIR" "gateway default" "${GW_REQ[@]}" --namespace grid-system
-if grep -q 'image: ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.0' /tmp/helm-rendered-gateway.yaml; then
-  pass "gateway default image: Grid v0.1.0 rollup"
+if grep -Fq "image: ${DEFAULT_GATEWAY_IMAGE}" /tmp/helm-rendered-gateway.yaml; then
+  pass "gateway default image: ${DEFAULT_GATEWAY_IMAGE}"
 else
-  fail "gateway default image is not the Grid v0.1.0 rollup"
+  fail "gateway default image is not ${DEFAULT_GATEWAY_IMAGE}"
 fi
 
 # ── Variant renderings ──────────────────────────────────────────────

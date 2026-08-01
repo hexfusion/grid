@@ -92,10 +92,11 @@ jobs:
 
       - name: Install Kind
         run: |
-          curl -fsSL -o /usr/local/bin/kind \
+          curl -fsSL -o /tmp/kind \
             "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
-          echo "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  /usr/local/bin/kind" | sha256sum -c
-          chmod +x /usr/local/bin/kind
+          echo "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  /tmp/kind" | sha256sum -c
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          rm /tmp/kind
           kind version
 
       - name: Set up Docker Buildx
