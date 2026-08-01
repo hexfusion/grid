@@ -51,15 +51,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{/*
 Container image reference.
-Requires either image.tag or image.digest to be set explicitly.
+Defaults the tag to the chart appVersion when no digest or tag is set.
 */}}
 {{- define "praxis-gateway.image" -}}
 {{- if .Values.image.digest }}
 {{- printf "%s@%s" .Values.image.repository .Values.image.digest }}
-{{- else if .Values.image.tag }}
-{{- printf "%s:%s" .Values.image.repository .Values.image.tag }}
 {{- else }}
-{{- fail "image.tag or image.digest is required — the chart does not publish a default Praxis image" }}
+{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
 {{- end }}
 {{- end }}
 

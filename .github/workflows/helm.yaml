@@ -66,7 +66,7 @@ jobs:
 
       - name: Upload rendered manifests
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6db9b8a1f7c064f3c1960d9c7e5c2 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rendered-manifests
           path: /tmp/helm-rendered-*.yaml
@@ -118,7 +118,7 @@ jobs:
 
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6db9b8a1f7c064f3c1960d9c7e5c2 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kind-test-logs
           path: /tmp/helm-kind-logs/

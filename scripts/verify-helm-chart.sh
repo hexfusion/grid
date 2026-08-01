@@ -187,8 +187,9 @@ echo "======================================================================"
 echo "  Praxis Gateway Chart ($GW_DIR)"
 echo "======================================================================"
 
-# Common required arg for the gateway chart
-GW_REQ=(--set config.existingConfigMap=test-config --set image.tag=v0.1.0-test)
+# Common required argument for the gateway chart. The image intentionally uses
+# the chart default so this path validates the released Grid rollup contract.
+GW_REQ=(--set config.existingConfigMap=test-config)
 
 # ── Helm lint ────────────────────────────────────────────────────────
 echo ""
@@ -204,6 +205,11 @@ echo ""
 echo "=== Template rendering ==="
 helm template verify-default "$GW_DIR" "${GW_REQ[@]}" --namespace grid-system > /tmp/helm-rendered-gateway.yaml 2>/dev/null || true
 try_template "$GW_DIR" "gateway default" "${GW_REQ[@]}" --namespace grid-system
+if grep -q 'image: ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.0' /tmp/helm-rendered-gateway.yaml; then
+  pass "gateway default image: Grid v0.1.0 rollup"
+else
+  fail "gateway default image is not the Grid v0.1.0 rollup"
+fi
 
 # ── Variant renderings ──────────────────────────────────────────────
 try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
@@ -248,7 +254,6 @@ fi
 echo ""
 echo "=== Schema rejection (gateway) ==="
 try_reject "$GW_DIR" "missing config" --set image.tag=v0.1.0-test --namespace grid-system
-try_reject "$GW_DIR" "missing image" --set config.existingConfigMap=test-config
 try_reject "$GW_DIR" "invalid digest (gw)" "${GW_REQ[@]}" --set image.digest=invalid
 try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.type=ExternalName
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true

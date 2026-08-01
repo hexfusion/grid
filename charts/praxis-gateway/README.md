@@ -31,17 +31,20 @@ kubectl create configmap edge-gateway-config \
 
 helm install edge-gateway charts/praxis-gateway \
   --namespace grid-system \
-  --set config.existingConfigMap=edge-gateway-config \
-  --set image.tag=<version>
+  --set config.existingConfigMap=edge-gateway-config
 ```
+
+The default image is the Grid v0.1.0 Praxis AI rollup. Override
+`image.repository`, `image.tag`, or `image.digest` to install another compatible
+Praxis image. Prefer a digest when reproducing a validated deployment.
 
 ## Values
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `replicaCount` | int | `1` | Gateway replicas. |
-| `image.repository` | string | `ghcr.io/praxis-proxy/praxis-ai` | Image repository. |
-| `image.tag` | string | `""` | Image tag. **Required** unless `image.digest` is set. |
+| `image.repository` | string | `ghcr.io/praxis-proxy/grid-ai-rollup` | Image repository. |
+| `image.tag` | string | `""` | Image tag. Defaults to chart `appVersion` (`v0.1.0`). |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |

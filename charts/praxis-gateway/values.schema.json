@@ -20,7 +20,7 @@
         },
         "tag": {
           "type": "string",
-          "description": "Image tag. Required unless image.digest is set."
+          "description": "Image tag. Defaults to the chart appVersion when empty."
         },
         "digest": {
           "type": "string",
