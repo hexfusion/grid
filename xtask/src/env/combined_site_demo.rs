@@ -1,6 +1,5 @@
 //! Narrated, evidence-backed combined-site demo scenarios.
 #![expect(
-    clippy::collapsible_if,
     clippy::string_slice,
     clippy::too_many_lines,
     clippy::unnecessary_wraps,
@@ -10,7 +9,6 @@
     clippy::cast_possible_truncation,
     clippy::cast_lossless,
     clippy::disallowed_methods,
-    clippy::assigning_clones,
     clippy::redundant_closure_for_method_calls,
     reason = "Demo orchestration code prioritizes clarity over lint perfection"
 )]
@@ -21,6 +19,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -74,6 +73,28 @@ const WRONG_ORG_TLS_SECRET: &str = "wrong-org-client-tls";
 
 /// Number of environment setup phases shown to the user.
 const SETUP_PHASES: usize = 14;
+
+/// Site targeted by the provider lifecycle scenario in full mode.
+const LIFECYCLE_SITE: &str = "west";
+
+/// Model name for the secondary mock provider used in the lifecycle scenario.
+const SECONDARY_MODEL: &str = "mock-model-secondary";
+
+/// Backend deployment whose health drives the central provider's eligibility.
+const CENTRAL_PROVIDER_BACKEND: &str = "mock-inference-central";
+
+/// Primary model shared by the three site-local mock providers.
+const PRIMARY_MODEL: &str = "mock-model";
+
+/// Combined-site overlay propagation crosses operator, SWIM, projected-volume,
+/// and gateway reload boundaries. Issue #21 tracks reducing this latency.
+const COMBINED_SITE_DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
+
+/// Retry interval for serving-state convergence probes.
+const COMBINED_SITE_DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Makes retry probe names unique while retaining a recognizable prefix.
+static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 // -----------------------------------------------------------------------------
 // Context
@@ -135,7 +156,7 @@ struct OverlayCandidate {
 /// descriptor's routing cluster, model, and site -- not just the name.
 #[derive(Clone, Debug)]
 struct ExpectedExternalCandidate {
-    /// InferenceProvider name: `external-{provider_kind}`.
+    /// RFC 1123-compatible `InferenceProvider` resource name.
     name: String,
     /// Expected `routing_cluster` field from the descriptor.
     routing_cluster: String,
@@ -449,11 +470,14 @@ fn curl_pod_overrides(pod_name: &str, curl_args: &[&str]) -> String {
 
 /// Run an ephemeral curl pod with restricted PodSecurity context.
 fn run_curl_probe(context: &str, pod_name: &str, curl_args: &[&str]) -> Result<std::process::Output, std::io::Error> {
-    let overrides = curl_pod_overrides(pod_name, curl_args);
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let prefix = pod_name.get(..pod_name.len().min(40)).unwrap_or(pod_name);
+    let unique_pod_name = format!("{prefix}-{sequence}");
+    let overrides = curl_pod_overrides(&unique_pod_name, curl_args);
     Command::new("kubectl")
         .args([
             "run",
-            pod_name,
+            &unique_pod_name,
             "--image=curlimages/curl:8.12.1",
             "--context",
             context,
@@ -466,6 +490,26 @@ fn run_curl_probe(context: &str, pod_name: &str, curl_args: &[&str]) -> Result<s
             &overrides,
         ])
         .output()
+}
+
+/// Retry a combined-site serving assertion across all overlay propagation boundaries.
+fn wait_for_combined_site_data_plane<T>(
+    description: &str,
+    mut check: impl FnMut() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + COMBINED_SITE_DATA_PLANE_WAIT;
+    loop {
+        match check() {
+            Ok(value) => return Ok(value),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "{description} did not converge within {COMBINED_SITE_DATA_PLANE_WAIT:?}: {error}"
+                )
+                .into());
+            },
+            Err(_) => std::thread::park_timeout(COMBINED_SITE_DATA_PLANE_INTERVAL),
+        }
+    }
 }
 
 /// Run an ephemeral curl pod with additional kubectl flags (e.g. `--labels`).
@@ -1718,18 +1762,17 @@ fn assert_backend_access_denial() -> AssertionResult {
     }
 }
 
-/// Assert central drain triggers remote fallback detection.
+/// Assert central provider-capacity drain triggers remote fallback detection.
 fn assert_central_drain_fallback() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
 
-    // Scale down central provider
     let central_context = "kind-grid-combined-central";
     let scale_output = Command::new("kubectl")
         .args([
             "scale",
             "deployment",
-            "provider-gateway",
+            CENTRAL_PROVIDER_BACKEND,
             "--replicas=0",
             "-n",
             "grid-system",
@@ -1746,13 +1789,13 @@ fn assert_central_drain_fallback() -> AssertionResult {
 
     if !drain_successful {
         return Ok(proof_failure(
-            "Failed to drain central provider",
+            "Failed to drain central provider backend",
             observed_facts,
             start.elapsed(),
         ));
     }
 
-    // Poll until provider replicas are actually zero
+    let last_replica_state = std::cell::RefCell::new(String::new());
     let timeout = Duration::from_secs(30);
     let interval = Duration::from_secs(2);
     let drain_result = poll_until(
@@ -1761,20 +1804,22 @@ fn assert_central_drain_fallback() -> AssertionResult {
                 .args([
                     "get",
                     "deployment",
-                    "provider-gateway",
+                    CENTRAL_PROVIDER_BACKEND,
                     "-n",
                     "grid-system",
                     "--context",
                     central_context,
                     "-o",
-                    "jsonpath={.status.replicas}",
+                    "jsonpath={.spec.replicas}:{.status.replicas}:{.status.readyReplicas}:{.status.availableReplicas}",
                 ])
                 .output();
 
             match replicas_output {
                 Ok(output) if output.status.success() => {
-                    let replicas = String::from_utf8_lossy(&output.stdout);
-                    if replicas.trim() == "0" { Ok(Some(())) } else { Ok(None) }
+                    let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    let scaled_to_zero = deployment_scaled_to_zero(&state);
+                    *last_replica_state.borrow_mut() = state;
+                    if scaled_to_zero { Ok(Some(())) } else { Ok(None) }
                 },
                 _ => Ok(None),
             }
@@ -1785,49 +1830,60 @@ fn assert_central_drain_fallback() -> AssertionResult {
 
     if drain_result.is_err() {
         observed_facts.insert(
-            "drain_timeout_reason".to_owned(),
-            serde_json::Value::String("Provider replicas did not reach zero within timeout".to_owned()),
+            "last_replica_state".to_owned(),
+            serde_json::Value::String(last_replica_state.into_inner()),
         );
         return Ok(proof_failure(
-            "Central provider drain did not complete within timeout",
+            "Central provider backend drain did not complete within timeout",
             observed_facts,
             start.elapsed(),
         ));
     }
 
-    // Test central consumer now uses remote providers
-    let fallback_output = run_curl_probe(
-        central_context,
-        "fallback-test-central",
-        &[
-            "curl",
-            "-f",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "X-Session-Id: fallback-test-central",
-            "-d",
-            r#"{"model": "mock-model", "messages": []}"#,
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
+    wait_for_site_model_absent_all_sites("central", PRIMARY_MODEL, Duration::from_secs(180))?;
 
-    let mut fallback_detected = false;
-    let mut remote_provider_site = "none".to_owned();
-
-    if fallback_output.status.success() {
-        let response = String::from_utf8_lossy(&fallback_output.stdout);
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-            if let Some(metadata) = json.get("metadata") {
-                if let Some(site) = metadata.get("provider_site") {
-                    if let Some(site_str) = site.as_str() {
-                        remote_provider_site = site_str.to_owned();
-                        fallback_detected = site_str == "west" || site_str == "east";
-                    }
-                }
-            }
+    let last_observation = std::cell::RefCell::new("no request attempted".to_owned());
+    let remote_provider_site = wait_for_combined_site_data_plane("combined-site remote fallback", || {
+        let output = run_curl_probe(
+            central_context,
+            "fallback-test-central",
+            &[
+                "curl",
+                "--fail-with-body",
+                "--silent",
+                "--show-error",
+                "--include",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                "X-Session-Id: fallback-test-central",
+                "-d",
+                r#"{"model": "mock-model", "messages": []}"#,
+                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ],
+        )?;
+        let provider =
+            response_header(&output.stdout, "x-grid-combined-provider-gateway").unwrap_or_else(|| "missing".to_owned());
+        let backend = response_header(&output.stdout, "x-grid-demo-backend-provider-attribution")
+            .unwrap_or_else(|| "missing".to_owned());
+        *last_observation.borrow_mut() = format!(
+            "status={}, provider_gateway={provider}, backend={backend}",
+            output.status
+        );
+        if !output.status.success() {
+            return Err("fallback request did not return HTTP 200".into());
         }
-    }
+        if !matches!(provider.as_str(), "west" | "east") || provider != backend {
+            return Err(format!(
+                "fallback selected provider_gateway={provider}, backend={backend}; expected the same remote site"
+            )
+            .into());
+        }
+        Ok(provider)
+    });
+
+    let fallback_detected = remote_provider_site.is_ok();
+    let remote_provider_site = remote_provider_site.unwrap_or_else(|_| "none".to_owned());
 
     observed_facts.insert(
         "fallback_to_remote_detected".to_owned(),
@@ -1836,6 +1892,10 @@ fn assert_central_drain_fallback() -> AssertionResult {
     observed_facts.insert(
         "remote_provider_site".to_owned(),
         serde_json::Value::String(remote_provider_site),
+    );
+    observed_facts.insert(
+        "last_fallback_observation".to_owned(),
+        serde_json::Value::String(last_observation.into_inner()),
     );
 
     if fallback_detected {
@@ -1851,6 +1911,12 @@ fn assert_central_drain_fallback() -> AssertionResult {
             start.elapsed(),
         ))
     }
+}
+
+/// Check desired and status replica counters, accepting omitted zero-valued status fields.
+fn deployment_scaled_to_zero(replica_state: &str) -> bool {
+    let mut fields = replica_state.split(':');
+    fields.next() == Some("0") && fields.all(|value| value.is_empty() || value == "0")
 }
 
 /// Assert session preservation during provider fallback.
@@ -1877,6 +1943,7 @@ fn assert_session_establishment() -> AssertionResult {
         &[
             "curl",
             "-f",
+            "--include",
             "-H",
             "Content-Type: application/json",
             "-H",
@@ -1891,14 +1958,8 @@ fn assert_session_establishment() -> AssertionResult {
     let mut provider_site = "unknown".to_owned();
 
     if established {
-        let response = String::from_utf8_lossy(&initial_output.stdout);
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-            if let Some(metadata) = json.get("metadata") {
-                if let Some(site) = metadata.get("provider_site").and_then(|s| s.as_str()) {
-                    provider_site = site.to_owned();
-                }
-            }
-        }
+        provider_site = response_header(&initial_output.stdout, "x-grid-combined-provider-gateway")
+            .unwrap_or_else(|| "unknown".to_owned());
     }
 
     observed_facts.insert(
@@ -1934,35 +1995,14 @@ fn assert_existing_session_after_drain() -> AssertionResult {
     let session_id = "pre-drain-session";
     let central_context = "kind-grid-combined-central";
 
-    let followup_output = run_curl_probe(
+    let remote_provider = wait_for_remote_session(
         central_context,
         "session-existing-after-drain",
-        &[
-            "curl",
-            "-f",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            &format!("X-Session-Id: {session_id}"),
-            "-d",
-            r#"{"model": "mock-model", "messages": [{"role": "user", "content": "after-drain"}]}"#,
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
-
-    let followup_successful = followup_output.status.success();
-    let mut remote_provider = "unknown".to_owned();
-
-    if followup_successful {
-        let response = String::from_utf8_lossy(&followup_output.stdout);
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-            if let Some(metadata) = json.get("metadata") {
-                if let Some(site) = metadata.get("provider_site").and_then(|s| s.as_str()) {
-                    remote_provider = site.to_owned();
-                }
-            }
-        }
-    }
+        session_id,
+        "after-drain",
+    );
+    let followup_successful = remote_provider.is_ok();
+    let remote_provider = remote_provider.unwrap_or_else(|_| "unknown".to_owned());
 
     observed_facts.insert(
         "existing_session_survived_drain".to_owned(),
@@ -1997,35 +2037,14 @@ fn assert_new_session_after_drain() -> AssertionResult {
     let new_session_id = "post-drain-new-session";
     let central_context = "kind-grid-combined-central";
 
-    let new_output = run_curl_probe(
+    let provider_site = wait_for_remote_session(
         central_context,
         "session-new-after-drain",
-        &[
-            "curl",
-            "-f",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            &format!("X-Session-Id: {new_session_id}"),
-            "-d",
-            r#"{"model": "mock-model", "messages": [{"role": "user", "content": "new-session-content"}]}"#,
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
-
-    let new_session_works = new_output.status.success();
-    let mut provider_site = "unknown".to_owned();
-
-    if new_session_works {
-        let response = String::from_utf8_lossy(&new_output.stdout);
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-            if let Some(metadata) = json.get("metadata") {
-                if let Some(site) = metadata.get("provider_site").and_then(|s| s.as_str()) {
-                    provider_site = site.to_owned();
-                }
-            }
-        }
-    }
+        new_session_id,
+        "new-session-content",
+    );
+    let new_session_works = provider_site.is_ok();
+    let provider_site = provider_site.unwrap_or_else(|_| "unknown".to_owned());
 
     observed_facts.insert(
         "new_session_after_drain_works".to_owned(),
@@ -2051,6 +2070,51 @@ fn assert_new_session_after_drain() -> AssertionResult {
     }
 }
 
+/// Wait until a central-consumer session is served by one identified remote provider.
+fn wait_for_remote_session(
+    context: &str,
+    pod_name: &str,
+    session_id: &str,
+    content: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    wait_for_combined_site_data_plane("combined-site remote session routing", || {
+        let session_header = format!("X-Session-Id: {session_id}");
+        let body = format!(r#"{{"model":"{PRIMARY_MODEL}","messages":[{{"role":"user","content":"{content}"}}]}}"#);
+        let output = run_curl_probe(
+            context,
+            pod_name,
+            &[
+                "curl",
+                "--fail-with-body",
+                "--silent",
+                "--show-error",
+                "--include",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                &session_header,
+                "-d",
+                &body,
+                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ],
+        )?;
+        if !output.status.success() {
+            return Err("session request did not return HTTP 200".into());
+        }
+        let provider = response_header(&output.stdout, "x-grid-combined-provider-gateway")
+            .ok_or("session response missing provider-gateway attribution")?;
+        let backend = response_header(&output.stdout, "x-grid-demo-backend-provider-attribution")
+            .ok_or("session response missing backend attribution")?;
+        if !matches!(provider.as_str(), "west" | "east") || provider != backend {
+            return Err(format!(
+                "session selected provider_gateway={provider}, backend={backend}; expected the same remote site"
+            )
+            .into());
+        }
+        Ok(provider)
+    })
+}
+
 /// Guarantee central provider restoration regardless of test outcome.
 fn ensure_central_provider_restored() -> Result<(), Box<dyn std::error::Error>> {
     let central_context = "kind-grid-combined-central";
@@ -2058,7 +2122,7 @@ fn ensure_central_provider_restored() -> Result<(), Box<dyn std::error::Error>> 
         .args([
             "scale",
             "deployment",
-            "provider-gateway",
+            CENTRAL_PROVIDER_BACKEND,
             "--replicas=1",
             "-n",
             "grid-system",
@@ -2079,7 +2143,7 @@ fn ensure_central_provider_restored() -> Result<(), Box<dyn std::error::Error>> 
             let ready_output = Command::new("kubectl")
                 .args([
                     "get",
-                    "deployment/provider-gateway",
+                    &format!("deployment/{CENTRAL_PROVIDER_BACKEND}"),
                     "--context",
                     central_context,
                     "-n",
@@ -2099,6 +2163,7 @@ fn ensure_central_provider_restored() -> Result<(), Box<dyn std::error::Error>> 
         Duration::from_secs(60),
         Duration::from_secs(3),
     )?;
+    wait_for_site_model_on_all_sites("central", PRIMARY_MODEL, Duration::from_secs(180))?;
     Ok(())
 }
 
@@ -2113,7 +2178,7 @@ fn assert_provider_restoration() -> AssertionResult {
         .args([
             "scale",
             "deployment",
-            "provider-gateway",
+            CENTRAL_PROVIDER_BACKEND,
             "--replicas=1",
             "-n",
             "grid-system",
@@ -2144,7 +2209,7 @@ fn assert_provider_restoration() -> AssertionResult {
             let ready_output = Command::new("kubectl")
                 .args([
                     "get",
-                    "deployment/provider-gateway",
+                    &format!("deployment/{CENTRAL_PROVIDER_BACKEND}"),
                     "--context",
                     central_context,
                     "-n",
@@ -2173,7 +2238,7 @@ fn assert_provider_restoration() -> AssertionResult {
     if restoration_result.is_err() {
         observed_facts.insert(
             "restoration_timeout_reason".to_owned(),
-            serde_json::Value::String("Provider gateway did not become ready within timeout".to_owned()),
+            serde_json::Value::String("Provider backend did not become ready within timeout".to_owned()),
         );
         return Ok(proof_failure(
             "Provider restoration did not complete within timeout",
@@ -2186,7 +2251,7 @@ fn assert_provider_restoration() -> AssertionResult {
     let ready_output = Command::new("kubectl")
         .args([
             "get",
-            "deployment/provider-gateway",
+            &format!("deployment/{CENTRAL_PROVIDER_BACKEND}"),
             "--context",
             central_context,
             "-n",
@@ -2204,43 +2269,59 @@ fn assert_provider_restoration() -> AssertionResult {
     };
 
     observed_facts.insert(
-        "provider_gateway_ready".to_owned(),
+        "provider_backend_ready".to_owned(),
         serde_json::Value::Bool(provider_ready),
     );
 
-    // Test that central consumer now prefers local provider again
-    let local_preference_output = run_curl_probe(
-        central_context,
-        "restoration-test-central",
-        &[
-            "curl",
-            "-f",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "X-Session-Id: restoration-test-central",
-            "-d",
-            r#"{"model": "mock-model", "messages": []}"#,
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
+    wait_for_site_model_on_all_sites("central", PRIMARY_MODEL, Duration::from_secs(180))?;
 
-    let mut local_preference_restored = false;
-    let mut selected_provider_site = "none".to_owned();
-
-    if local_preference_output.status.success() {
-        let response = String::from_utf8_lossy(&local_preference_output.stdout);
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-            if let Some(metadata) = json.get("metadata") {
-                if let Some(site) = metadata.get("provider_site") {
-                    if let Some(site_str) = site.as_str() {
-                        selected_provider_site = site_str.to_owned();
-                        local_preference_restored = site_str == "central";
-                    }
-                }
-            }
+    let restoration_attempt = std::cell::Cell::new(0_u64);
+    let last_restoration_observation = std::cell::RefCell::new("no request attempted".to_owned());
+    let selected_provider_site = wait_for_combined_site_data_plane("combined-site local restoration", || {
+        let attempt = restoration_attempt.get() + 1;
+        restoration_attempt.set(attempt);
+        // Every attempt represents new traffic. Reusing a session would
+        // correctly preserve its remote fallback affinity after recovery.
+        let session_header = format!("X-Session-Id: restoration-test-central-{attempt}");
+        let output = run_curl_probe(
+            central_context,
+            "restoration-test-central",
+            &[
+                "curl",
+                "--fail-with-body",
+                "--silent",
+                "--show-error",
+                "--include",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                &session_header,
+                "-d",
+                r#"{"model": "mock-model", "messages": []}"#,
+                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ],
+        )?;
+        if !output.status.success() {
+            return Err("restoration request did not return HTTP 200".into());
         }
-    }
+        let provider = response_header(&output.stdout, "x-grid-combined-provider-gateway")
+            .ok_or("restoration response missing provider-gateway attribution")?;
+        let backend = response_header(&output.stdout, "x-grid-demo-backend-provider-attribution")
+            .ok_or("restoration response missing backend attribution")?;
+        *last_restoration_observation.borrow_mut() = format!(
+            "attempt={attempt}, status={}, provider_gateway={provider}, backend={backend}",
+            output.status
+        );
+        if provider != "central" || backend != "central" {
+            return Err(format!(
+                "restoration selected provider_gateway={provider}, backend={backend}; expected central"
+            )
+            .into());
+        }
+        Ok(provider)
+    });
+    let local_preference_restored = selected_provider_site.is_ok();
+    let selected_provider_site = selected_provider_site.unwrap_or_else(|_| "none".to_owned());
 
     observed_facts.insert(
         "local_preference_restored".to_owned(),
@@ -2249,6 +2330,14 @@ fn assert_provider_restoration() -> AssertionResult {
     observed_facts.insert(
         "selected_provider_site".to_owned(),
         serde_json::Value::String(selected_provider_site),
+    );
+    observed_facts.insert(
+        "restoration_attempts".to_owned(),
+        serde_json::json!(restoration_attempt.get()),
+    );
+    observed_facts.insert(
+        "last_restoration_observation".to_owned(),
+        serde_json::Value::String(last_restoration_observation.into_inner()),
     );
 
     if provider_ready && local_preference_restored {
@@ -2270,90 +2359,50 @@ fn assert_provider_restoration() -> AssertionResult {
 fn assert_rollout_convergence() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
-    // Check each site's rendered -> distributed -> accepted -> serving chain individually
     let mut all_sites_converged = true;
 
     for cluster in CLUSTERS {
         let context = format!("kind-grid-combined-{cluster}");
+        let overlay = read_cluster_overlay(cluster)?;
+        let rendered = overlay.semantic_revision != "unknown" && !overlay.semantic_revision.is_empty();
+        let distributed = !overlay.candidates.is_empty();
+        let expected_revision = overlay.semantic_revision.clone();
 
-        // Step 1: Check rendered overlay exists (Grid operator produced it)
-        let rendered_output = Command::new("kubectl")
-            .args([
-                "get",
-                "configmap",
-                "grid-overlay-grid-combined-site-consumer-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.metadata.labels}",
-            ])
-            .output()?;
-
-        let mut rendered = false;
-        let mut distributed = false;
-        let mut accepted = false;
-
-        if rendered_output.status.success() {
-            let labels = String::from_utf8_lossy(&rendered_output.stdout);
-            rendered = labels.contains("grid.praxis-proxy.io/rendered");
-        }
-
-        // Step 2: Check distributed (ConfigMap available to consumer gateway)
-        let distributed_output = Command::new("kubectl")
-            .args([
-                "get",
-                "configmap",
-                "grid-overlay-grid-combined-site-consumer-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.data}",
-            ])
-            .output()?;
-
-        if distributed_output.status.success() {
-            let overlay_data = String::from_utf8_lossy(&distributed_output.stdout);
-            distributed = !overlay_data.trim().is_empty();
-        }
-
-        // Step 3: Check accepted (gateway logs show acceptance)
-        let acceptance_logs = Command::new("kubectl")
-            .args([
-                "logs",
-                "deployment/consumer-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "--tail=30",
-            ])
-            .output()?;
-
-        if acceptance_logs.status.success() {
-            let logs = String::from_utf8_lossy(&acceptance_logs.stdout);
-            accepted = logs.contains("overlay accepted") || logs.contains("configuration loaded");
-        }
-
-        // Step 4: Check serving (gateway responds with overlay-configured behavior)
-        let serving_test = run_curl_probe(
-            &context,
-            &format!("serving-test-{cluster}"),
-            &[
-                "curl",
-                "-f",
-                "-H",
-                "X-Test-Overlay: true",
-                "consumer-gateway.grid-system.svc.cluster.local:8080/health",
-            ],
-        )?;
-
-        let serving = serving_test.status.success();
-
-        let site_converged = rendered && distributed && accepted && serving;
+        let serving_revision =
+            wait_for_combined_site_data_plane(&format!("{cluster} serving current overlay revision"), || {
+                let output = run_curl_probe(
+                    &context,
+                    &format!("serving-test-{cluster}"),
+                    &[
+                        "curl",
+                        "--fail-with-body",
+                        "--silent",
+                        "--show-error",
+                        "--include",
+                        "-H",
+                        "Content-Type: application/json",
+                        "-d",
+                        r#"{"model":"mock-model","messages":[]}"#,
+                        "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+                    ],
+                )?;
+                if !output.status.success() {
+                    return Err("serving request did not return HTTP 200".into());
+                }
+                let revision = response_header(&output.stdout, "x-grid-demo-backend-overlay-revision")
+                    .ok_or("serving response missing overlay revision attribution")?;
+                if revision != expected_revision {
+                    return Err(format!(
+                        "serving revision {revision} does not match distributed revision {expected_revision}"
+                    )
+                    .into());
+                }
+                Ok(revision)
+            });
+        let serving = serving_revision.is_ok();
+        let accepted = serving;
+        let serving_revision = serving_revision.unwrap_or_else(|_| "none".to_owned());
+        let site_converged = rendered && distributed && accepted;
         if !site_converged {
             all_sites_converged = false;
         }
@@ -2362,6 +2411,14 @@ fn assert_rollout_convergence() -> AssertionResult {
         observed_facts.insert(format!("{cluster}_distributed"), serde_json::Value::Bool(distributed));
         observed_facts.insert(format!("{cluster}_accepted"), serde_json::Value::Bool(accepted));
         observed_facts.insert(format!("{cluster}_serving"), serde_json::Value::Bool(serving));
+        observed_facts.insert(
+            format!("{cluster}_distributed_revision"),
+            serde_json::Value::String(overlay.semantic_revision),
+        );
+        observed_facts.insert(
+            format!("{cluster}_serving_revision"),
+            serde_json::Value::String(serving_revision),
+        );
         observed_facts.insert(
             format!("{cluster}_chain_complete"),
             serde_json::Value::Bool(site_converged),
@@ -3167,6 +3224,150 @@ fn assert_external_provider_isolation(selected_site: &str) -> AssertionResult {
     }
 }
 
+/// Verify that the selected provider-gateway ConfigMap contains external
+/// provider routing: a provider_route entry, a credential_inject entry, and a
+/// load_balancer cluster with authority and TLS SNI.
+fn assert_external_provider_gateway_config(selected_site: &str, ext: &ExternalProviderDescriptor) -> AssertionResult {
+    let start = Instant::now();
+    let mut observed_facts = BTreeMap::new();
+    let context = format!("kind-grid-combined-{selected_site}");
+
+    let output = Command::new("kubectl")
+        .args([
+            "get",
+            "configmap/provider-gateway-config",
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "-o",
+            "jsonpath={.data.praxis\\.yaml}",
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Ok(proof_failure(
+            &format!("failed to read provider-gateway-config from {selected_site}"),
+            observed_facts,
+            start.elapsed(),
+        ));
+    }
+
+    let config = String::from_utf8_lossy(&output.stdout);
+
+    let has_route = config.contains(&format!("cluster: {}", ext.routing_cluster));
+    let has_credential = config.contains(&format!("file: {}", ext.credential_file()));
+    let has_cluster = config.contains(&format!("name: {}", ext.routing_cluster))
+        && config.contains(&format!("authority: {}", ext.hostname))
+        && config.contains(&format!("sni: {}", ext.sni));
+
+    let overlay_id_match = if let Ok(data) = read_cluster_overlay(selected_site) {
+        if let Some(overlay_id) = data.stable_ids.get(ext.routing_cluster) {
+            let id_in_config = config.contains(&format!("candidate_id: {overlay_id}"));
+            observed_facts.insert(
+                "overlay_external_stable_id".to_owned(),
+                serde_json::Value::String(overlay_id.clone()),
+            );
+            observed_facts.insert(
+                "candidate_id_matches_overlay".to_owned(),
+                serde_json::Value::Bool(id_in_config),
+            );
+            id_in_config
+        } else {
+            observed_facts.insert(
+                "overlay_external_stable_id".to_owned(),
+                serde_json::Value::String("not found".to_owned()),
+            );
+            false
+        }
+    } else {
+        observed_facts.insert(
+            "overlay_external_stable_id".to_owned(),
+            serde_json::Value::String("overlay read failed".to_owned()),
+        );
+        false
+    };
+
+    observed_facts.insert("has_provider_route".to_owned(), serde_json::Value::Bool(has_route));
+    observed_facts.insert(
+        "has_credential_inject".to_owned(),
+        serde_json::Value::Bool(has_credential),
+    );
+    observed_facts.insert(
+        "has_load_balancer_cluster".to_owned(),
+        serde_json::Value::Bool(has_cluster),
+    );
+
+    for other in CLUSTERS {
+        if *other == selected_site {
+            continue;
+        }
+        let other_ctx = format!("kind-grid-combined-{other}");
+        let other_output = Command::new("kubectl")
+            .args([
+                "get",
+                "configmap/provider-gateway-config",
+                "--context",
+                &other_ctx,
+                "-n",
+                GRID_SYSTEM_NS,
+                "-o",
+                "jsonpath={.data.praxis\\.yaml}",
+            ])
+            .output()?;
+        if other_output.status.success() {
+            let other_config = String::from_utf8_lossy(&other_output.stdout);
+            let other_has_ext = other_config.contains(&format!("cluster: {}", ext.routing_cluster));
+            observed_facts.insert(
+                format!("{other}_has_external_route"),
+                serde_json::Value::Bool(other_has_ext),
+            );
+            if other_has_ext {
+                return Ok(proof_failure(
+                    &format!("non-selected site {other} contains external provider routing config"),
+                    observed_facts,
+                    start.elapsed(),
+                ));
+            }
+        }
+    }
+
+    if has_route && has_credential && has_cluster && overlay_id_match {
+        Ok(proof_success(
+            &format!(
+                "External provider gateway config verified at {selected_site}: \
+                 provider_route, credential_inject, load_balancer cluster ({}), \
+                 and candidate_id matches overlay stable_id",
+                ext.routing_cluster
+            ),
+            observed_facts,
+            start.elapsed(),
+        ))
+    } else {
+        let mut missing = Vec::new();
+        if !has_route {
+            missing.push("provider_route");
+        }
+        if !has_credential {
+            missing.push("credential_inject");
+        }
+        if !has_cluster {
+            missing.push("load_balancer cluster");
+        }
+        if !overlay_id_match {
+            missing.push("candidate_id/overlay stable_id match");
+        }
+        Ok(proof_failure(
+            &format!(
+                "External provider gateway config at {selected_site} missing: {}",
+                missing.join(", ")
+            ),
+            observed_facts,
+            start.elapsed(),
+        ))
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Setup Functions
 // -----------------------------------------------------------------------------
@@ -3361,7 +3562,6 @@ fn apply_credential_secret(context: &str, secret_name: &str, token: &str) -> Res
     kubectl::apply_manifest(context, &manifest)
 }
 
-
 /// Data extracted from the operator-created overlay ConfigMap.
 /// Read a single cluster's overlay ConfigMap and return structured data.
 ///
@@ -3448,17 +3648,14 @@ fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error
     })
 }
 
-/// Build the expected set of overlay candidate names.
-///
-/// Base set: `sim-{cluster}-provider` for every cluster.
-/// When an external provider is enabled, `external-{provider_kind}` is added.
 /// Build the expected candidate name set and optional external candidate
 /// expectation from the descriptor.
 ///
-/// The InferenceProvider name `external-{provider_kind}` is the contract
-/// established by `create_external_inference_provider`. The returned
-/// `ExpectedExternalCandidate` carries the routing_cluster, model, and
-/// site so that convergence validation can assert field-level agreement.
+/// The overlay indexes candidates by their `cluster` field, which is the
+/// `routingClusterRef` from the `InferenceProvider` CRD, not the K8s
+/// resource name. The returned `ExpectedExternalCandidate` carries the
+/// routing_cluster, model, and site so that convergence validation can
+/// assert field-level agreement.
 fn expected_candidates(
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
@@ -3469,10 +3666,9 @@ fn expected_candidates(
     }
 
     let ext_candidate = if let (Some(ext), Some(site)) = (external_provider, external_site) {
-        let name = format!("external-{}", ext.provider_kind);
-        expected.insert(name.clone());
+        expected.insert(ext.routing_cluster.to_owned());
         Some(ExpectedExternalCandidate {
-            name,
+            name: ext.resource_name(),
             routing_cluster: ext.routing_cluster.to_owned(),
             model: ext.model.clone(),
             site: site.to_owned(),
@@ -3537,6 +3733,33 @@ fn wait_for_local_overlays() -> Result<BTreeMap<String, OverlayData>, Box<dyn st
 
     collect_overlay_diagnostics();
     Err(format!("Local overlay ConfigMaps not ready after {timeout:?}").into())
+}
+
+/// Wait for the operator to add the external candidate to the selected site's
+/// overlay. Returns the candidate's stable_id.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Sleep is required for polling with timeout functionality"
+)]
+fn wait_for_external_overlay_candidate(site: &str, candidate_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(120);
+    let interval = Duration::from_secs(5);
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        if let Ok(data) = read_cluster_overlay(site) {
+            if let Some(id) = data.stable_ids.get(candidate_name) {
+                return Ok(id.clone());
+            }
+            eprintln!(
+                "  {site}: overlay has {:?}, waiting for '{candidate_name}'",
+                data.stable_ids.keys().collect::<Vec<_>>()
+            );
+        }
+        std::thread::sleep(interval);
+    }
+
+    Err(format!("external candidate '{candidate_name}' not found in {site} overlay after {timeout:?}").into())
 }
 
 /// Wait for SWIM-driven global overlay convergence.
@@ -3618,12 +3841,16 @@ fn wait_for_global_overlay_convergence(
                     let data = overlays
                         .get(*cluster)
                         .ok_or_else(|| format!("{cluster} missing from overlays"))?;
-                    let candidate = data.candidates.iter().find(|c| c.cluster == ext.name).ok_or_else(|| {
-                        format!(
-                            "{cluster}: external candidate {} missing from overlay candidates",
-                            ext.name
-                        )
-                    })?;
+                    let candidate = data
+                        .candidates
+                        .iter()
+                        .find(|c| c.cluster == ext.routing_cluster)
+                        .ok_or_else(|| {
+                            format!(
+                                "{cluster}: external candidate {} missing from overlay candidates",
+                                ext.routing_cluster
+                            )
+                        })?;
                     if candidate.name != ext.model {
                         return Err(format!(
                             "{cluster}: external candidate model mismatch: \
@@ -3884,7 +4111,17 @@ fn collect_overlay_diagnostics() {
 /// - `CANDIDATE_ID_PLACEHOLDER` → stable ID from the overlay
 ///
 /// Creates the `provider-gateway-config` ConfigMap in each cluster.
-fn materialize_provider_config(overlays: &BTreeMap<String, OverlayData>) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// When an external provider targets a specific site, the provider config for
+/// that site is augmented with the external candidate route, credential inject
+/// entry, and load-balancer cluster via the shared
+/// [`glb::append_openai_provider_config`] helper.
+fn materialize_provider_config(
+    overlays: &BTreeMap<String, OverlayData>,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
+    external_candidate_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let template_path = Path::new("demos/grid-combined-site/configs/provider/praxis.yaml");
     let template =
         fs::read_to_string(template_path).map_err(|e| format!("failed to read provider config template: {e}"))?;
@@ -3903,9 +4140,21 @@ fn materialize_provider_config(overlays: &BTreeMap<String, OverlayData>) -> Resu
 
         eprintln!("  {cluster}: {provider_name} -> {stable_id}");
 
-        let rendered = template
+        let mut rendered = template
             .replace("SITE_PLACEHOLDER", cluster)
             .replace("CANDIDATE_ID_PLACEHOLDER", stable_id);
+
+        if external_site == Some(*cluster)
+            && let Some(ext) = external_provider
+        {
+            let ext_id = external_candidate_id
+                .ok_or("external provider specified for this site but no external candidate_id provided")?;
+            rendered = glb::append_openai_provider_config(&rendered, ext, ext_id)?;
+            eprintln!(
+                "  {cluster}: external provider config appended ({} route + cluster, candidate_id={ext_id})",
+                ext.resource_name()
+            );
+        }
 
         let context = format!("kind-grid-combined-{cluster}");
 
@@ -3944,23 +4193,141 @@ fn materialize_provider_config(overlays: &BTreeMap<String, OverlayData>) -> Resu
 fn materialize_config(
     source: &Path,
     external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
-    let rendered = render_config(&content, external_provider)?;
+    let rendered = render_config(&content, external_provider, external_site)?;
     let parent = source.parent().ok_or("source config must have parent directory")?;
     let output = parent.join(".forge.resolved.yaml");
     fs::write(&output, rendered)?;
     Ok(output)
 }
 
-/// Render image overrides into one Forge configuration.
+/// Render image overrides and optional external-provider stack cloning into one Forge configuration.
 fn render_config(
     content: &str,
-    _external_provider: Option<&ExternalProviderDescriptor>,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut config: serde_yaml::Value = serde_yaml::from_str(content)?;
     apply_image_overrides(&mut config);
+    match (external_provider, external_site) {
+        (Some(ext), Some(site)) => materialize_external_provider_stack(&mut config, ext, site)?,
+        (Some(_), None) => {
+            return Err("external provider specified without a target site".into());
+        },
+        _ => {},
+    }
     Ok(serde_yaml::to_string(&config)?)
+}
+
+/// Forge stack name for the provider gateway with an external credential mount.
+const EXTERNAL_STACK_NAME: &str = "provider-gateway-external";
+/// Forge stack name for the default provider gateway.
+const BASE_STACK_NAME: &str = "provider-gateway";
+
+/// Clone the `provider-gateway` stack as `provider-gateway-external` with an
+/// additional credential mount, and swap the stack reference in the selected
+/// site's cluster definition.
+fn materialize_external_provider_stack(
+    config: &mut serde_yaml::Value,
+    external_provider: &ExternalProviderDescriptor,
+    site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stacks = config
+        .get_mut("spec")
+        .and_then(|s| s.get_mut("stacks"))
+        .and_then(|s| s.as_mapping_mut())
+        .ok_or("forge config missing spec.stacks mapping")?;
+
+    let ext_key = serde_yaml::Value::String(EXTERNAL_STACK_NAME.to_owned());
+    if stacks.contains_key(&ext_key) {
+        return Err(format!("stack '{EXTERNAL_STACK_NAME}' already exists in forge config").into());
+    }
+
+    let base_key = serde_yaml::Value::String(BASE_STACK_NAME.to_owned());
+    let base = stacks
+        .get(&base_key)
+        .ok_or_else(|| format!("stack '{BASE_STACK_NAME}' not found in forge config"))?
+        .clone();
+
+    let mut cloned = base;
+
+    let helm_step = cloned
+        .get_mut("steps")
+        .and_then(|s| s.as_sequence_mut())
+        .and_then(|steps| {
+            steps.iter_mut().find(|step| {
+                step.get("type").and_then(|t| t.as_str()) == Some("helm")
+                    && step.get("release").and_then(|r| r.as_str()) == Some("provider-gateway")
+            })
+        })
+        .ok_or("provider-gateway stack has no helm step with release 'provider-gateway'")?;
+
+    let credentials = helm_step
+        .get_mut("values")
+        .and_then(|v| v.get_mut("credentials"))
+        .and_then(|c| c.as_sequence_mut())
+        .ok_or("provider-gateway helm step missing values.credentials")?;
+
+    let has_ext_cred = credentials
+        .iter()
+        .any(|c| c.get("name").and_then(|n| n.as_str()) == Some(external_provider.secret_name));
+    if has_ext_cred {
+        return Err(format!(
+            "base stack already contains credential '{}'",
+            external_provider.secret_name
+        )
+        .into());
+    }
+
+    let mut entry = serde_yaml::Mapping::new();
+    entry.insert(
+        serde_yaml::Value::String("name".to_owned()),
+        serde_yaml::Value::String(external_provider.secret_name.to_owned()),
+    );
+    entry.insert(
+        serde_yaml::Value::String("mountPath".to_owned()),
+        serde_yaml::Value::String(external_provider.mount_path.to_owned()),
+    );
+    entry.insert(
+        serde_yaml::Value::String("optional".to_owned()),
+        serde_yaml::Value::Bool(false),
+    );
+    credentials.push(serde_yaml::Value::Mapping(entry));
+
+    stacks.insert(ext_key, cloned);
+
+    let clusters = config
+        .get_mut("spec")
+        .and_then(|s| s.get_mut("clusters"))
+        .and_then(|c| c.as_sequence_mut())
+        .ok_or("forge config missing spec.clusters sequence")?;
+
+    let target_cluster = clusters
+        .iter_mut()
+        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(site))
+        .ok_or_else(|| format!("cluster '{site}' not found in forge config"))?;
+
+    let cluster_stacks = target_cluster
+        .get_mut("stacks")
+        .and_then(|s| s.as_sequence_mut())
+        .ok_or_else(|| format!("cluster '{site}' missing stacks sequence"))?;
+
+    let replaced = cluster_stacks.iter_mut().any(|s| {
+        if s.as_str() == Some(BASE_STACK_NAME) {
+            *s = serde_yaml::Value::String(EXTERNAL_STACK_NAME.to_owned());
+            true
+        } else {
+            false
+        }
+    });
+
+    if !replaced {
+        return Err(format!("cluster '{site}' stacks list does not contain '{BASE_STACK_NAME}'").into());
+    }
+
+    Ok(())
 }
 
 /// Apply image overrides from environment variables to the Forge configuration.
@@ -4043,7 +4410,7 @@ fn prepare_setup(
         }
     }
 
-    let resolved_config = materialize_config(forge_config, ext_descriptor.as_ref())?;
+    let resolved_config = materialize_config(forge_config, ext_descriptor.as_ref(), ext_site.as_deref())?;
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
@@ -4235,8 +4602,9 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
         total_phases
     );
 
-    materialize_provider_config(&pre_swim_overlays)?;
     install_provider_boundary()?;
+
+    let mut external_candidate_id: Option<String> = None;
     if let (Some(ext), Some(site)) = (&context.external_provider, &context.external_provider_site) {
         let key_file = context
             .external_key_file
@@ -4244,19 +4612,32 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
             .ok_or("external provider requires --external-provider-key-file")?;
         configure_external_provider(ext, site, key_file)?;
         eprintln!("  [OK] External provider configured at {site}");
+
+        let ext_overlay_key = ext.routing_cluster;
+        eprintln!("  Waiting for external candidate '{ext_overlay_key}' in {site} overlay...");
+        let ext_id = wait_for_external_overlay_candidate(site, ext_overlay_key)?;
+        eprintln!("  [OK] External candidate stable_id={ext_id}");
+        external_candidate_id = Some(ext_id);
     }
+
+    materialize_provider_config(
+        &pre_swim_overlays,
+        context.external_provider.as_ref(),
+        context.external_provider_site.as_deref(),
+        external_candidate_id.as_deref(),
+    )?;
     eprintln!("  [OK] Provider config materialized, trust installed");
 
     eprintln!();
     eprintln!("[SETUP {}/{}] Deploying provider gateways", next(), total_phases);
 
     for cluster in CLUSTERS {
-        apply_stack(
-            &context.forge_bin,
-            &context.resolved_config,
-            cluster,
-            "provider-gateway",
-        )?;
+        let stack_name = if context.external_provider_site.as_deref() == Some(*cluster) {
+            EXTERNAL_STACK_NAME
+        } else {
+            BASE_STACK_NAME
+        };
+        apply_stack(&context.forge_bin, &context.resolved_config, cluster, stack_name)?;
     }
     eprintln!("  [OK] Provider gateways deployed");
 
@@ -4312,7 +4693,10 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
 ///
 /// `external_provider_site` is `Some("west")` / `Some("east")` / etc. when
 /// the external provider is enabled, `None` when disabled.
-fn run_quick_scenarios(external_provider_site: Option<&str>) -> BTreeMap<String, ProofResult> {
+fn run_quick_scenarios(
+    external_provider_site: Option<&str>,
+    external_provider: Option<&ExternalProviderDescriptor>,
+) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let mut scenario_num: usize = 0;
     let mut scenario = || {
@@ -4339,7 +4723,7 @@ fn run_quick_scenarios(external_provider_site: Option<&str>) -> BTreeMap<String,
     eprintln!("[SCENARIO {}] Verify site auto-discovery", scenario());
     run_and_insert(&mut results, "site_auto_discovery", assert_site_auto_discovery);
 
-    if let Some(site) = external_provider_site {
+    if let (Some(site), Some(ext)) = (external_provider_site, external_provider) {
         eprintln!();
         eprintln!(
             "[SCENARIO {}] Verify external provider isolation (site: {site})",
@@ -4355,6 +4739,28 @@ fn run_quick_scenarios(external_provider_site: Option<&str>) -> BTreeMap<String,
                     "external_provider_isolation".to_owned(),
                     proof_failure(
                         &format!("external_provider_isolation failed: {e}"),
+                        BTreeMap::new(),
+                        Duration::from_secs(0),
+                    ),
+                );
+            },
+        }
+
+        eprintln!();
+        eprintln!(
+            "[SCENARIO {}] Verify external provider gateway config (site: {site})",
+            scenario()
+        );
+        match assert_external_provider_gateway_config(site, ext) {
+            Ok(proof) => {
+                results.insert("external_provider_gateway_config".to_owned(), proof);
+            },
+            Err(e) => {
+                eprintln!("  [X] external_provider_gateway_config failed: {e}");
+                results.insert(
+                    "external_provider_gateway_config".to_owned(),
+                    proof_failure(
+                        &format!("external_provider_gateway_config failed: {e}"),
                         BTreeMap::new(),
                         Duration::from_secs(0),
                     ),
@@ -4427,8 +4833,13 @@ fn run_quick_scenarios(external_provider_site: Option<&str>) -> BTreeMap<String,
 ///   4. Test new session works after drain
 ///   5. Restore central provider (guaranteed on every error path)
 ///   6. Remaining scenarios (rollout, operator restart, soak)
-fn run_full_scenarios(external_provider_site: Option<&str>) -> BTreeMap<String, ProofResult> {
-    let mut results = run_quick_scenarios(external_provider_site);
+fn run_full_scenarios(
+    external_provider_site: Option<&str>,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    forge_bin: &Path,
+    resolved_config: &Path,
+) -> BTreeMap<String, ProofResult> {
+    let mut results = run_quick_scenarios(external_provider_site, external_provider);
 
     eprintln!();
     eprintln!("=== ADDITIONAL FULL MODE SCENARIOS ===");
@@ -4448,6 +4859,16 @@ fn run_full_scenarios(external_provider_site: Option<&str>) -> BTreeMap<String, 
 
     // Steps 2-5 are wrapped so restoration is guaranteed even if intermediate steps fail.
     run_drain_session_restore_sequence(&mut results, &mut scenario);
+
+    // Provider lifecycle: add/remove/re-add a secondary mock provider
+    run_provider_lifecycle_sequence(
+        &mut results,
+        &mut scenario,
+        external_provider,
+        external_provider_site,
+        forge_bin,
+        resolved_config,
+    );
 
     // Rollout convergence
     eprintln!();
@@ -4530,7 +4951,6 @@ fn run_drain_session_restore_sequence(
         );
     }
 }
-
 
 // -----------------------------------------------------------------------------
 // Teardown
@@ -4713,9 +5133,9 @@ fn assert_operator_gateway_env(context: &str, cluster: &str) -> Result<(), Box<d
 /// Configure external provider resources in the specified site.
 ///
 /// Creates the Secret from the supplied key file (without reading its content
-/// into this process), an `InferenceProvider` CRD, and updates the provider
-/// gateway helm release to mount the Secret.  Consumer gateways discover the
-/// external provider automatically through the Grid operator overlay.
+/// into this process) and an `InferenceProvider` CRD.  The credential mount
+/// and provider routing config are materialized declaratively via Forge stack
+/// cloning and `append_openai_provider_config` before deployment.
 fn configure_external_provider(
     external_provider: &ExternalProviderDescriptor,
     site: &str,
@@ -4725,7 +5145,6 @@ fn configure_external_provider(
 
     create_external_provider_secret(external_provider, site, &context, key_file)?;
     create_external_inference_provider(external_provider, site, &context)?;
-    update_provider_gateway_for_external(external_provider, site, &context)?;
 
     Ok(())
 }
@@ -4769,17 +5188,17 @@ fn create_external_provider_secret(
     Ok(())
 }
 
-/// Create InferenceProvider resource targeting the specified site.
-fn create_external_inference_provider(
-    external_provider: &ExternalProviderDescriptor,
-    site: &str,
-    context: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let provider_manifest = format!(
+/// Label key the operator places on `GridSite` resources and expects in
+/// `InferenceProvider.spec.siteSelector.matchLabels`.
+const GRIDSITE_PROVIDER_LABEL: &str = "grid.praxis-proxy.io/provider-site";
+
+/// Render the `InferenceProvider` manifest for an external provider.
+fn external_inference_provider_manifest(external_provider: &ExternalProviderDescriptor, site: &str) -> String {
+    format!(
         r#"apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: InferenceProvider
 metadata:
-  name: external-{provider_kind}
+  name: {resource_name}
 spec:
   gridNetworkRef: grid-combined-site
   providerKind: {provider_kind}
@@ -4791,14 +5210,14 @@ spec:
       contextWindow: 200000
   auth:
     strategy: api_key
-    manual: false
+    manual: true
     secretRef:
       name: {secret_name}
       namespace: grid-system
       key: {secret_key}
   siteSelector:
     matchLabels:
-      grid.praxis-proxy.io/combined-site: {site}
+      {label}: {site}
   accessPolicy:
     siteSelector:
       matchLabels: {{}}
@@ -4808,6 +5227,7 @@ spec:
     timeout: "10s"
   routingClusterRef: {routing_cluster}
 "#,
+        resource_name = external_provider.resource_name(),
         provider_kind = external_provider.provider_kind,
         backend_kind = external_provider.backend_kind,
         hostname = external_provider.hostname,
@@ -4815,48 +5235,1182 @@ spec:
         model = external_provider.model,
         secret_name = external_provider.secret_name,
         secret_key = external_provider.secret_key,
+        label = GRIDSITE_PROVIDER_LABEL,
         site = site,
         routing_cluster = external_provider.routing_cluster,
-    );
+    )
+}
 
+/// Create InferenceProvider resource targeting the specified site.
+fn create_external_inference_provider(
+    external_provider: &ExternalProviderDescriptor,
+    site: &str,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let provider_manifest = external_inference_provider_manifest(external_provider, site);
     kubectl::apply_manifest(context, &provider_manifest)?;
     eprintln!("  [OK] {site}: external InferenceProvider created");
     Ok(())
 }
 
-/// Update provider gateway in the selected site to mount the external provider Secret.
-fn update_provider_gateway_for_external(
-    external_provider: &ExternalProviderDescriptor,
-    site: &str,
-    context: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let upgrade_output = Command::new("helm")
+// -----------------------------------------------------------------------------
+// Provider lifecycle helpers (full-mode add/remove/re-add scenario)
+// -----------------------------------------------------------------------------
+
+/// Deploy a secondary mock provider backend, Service, and InferenceProvider to
+/// the specified site.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Inline YAML manifests for Deployment, Service, InferenceProvider"
+)]
+fn deploy_secondary_mock_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = format!("kind-grid-combined-{site}");
+    let mock_image = std::env::var("GRID_XTASK_MOCK_PROVIDER_IMAGE")
+        .unwrap_or_else(|_| "grid-mock-providers:combined-site-demo".to_owned());
+    let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
+    let deploy_name = format!("mock-inference-{site}-secondary");
+    let provider_name = format!("sim-{site}-provider-secondary");
+
+    let deployment = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {deploy_name}
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: grid-mock-providers
+    app.kubernetes.io/component: mock-inference
+    app.kubernetes.io/instance: {site}-secondary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grid-mock-providers
+      app.kubernetes.io/component: mock-inference
+      app.kubernetes.io/instance: {site}-secondary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grid-mock-providers
+        app.kubernetes.io/component: mock-inference
+        app.kubernetes.io/instance: {site}-secondary
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mock-inference
+          image: {mock_image}
+          imagePullPolicy: {image_pull_policy}
+          args: ["--provider", "openai", "--port", "8080"]
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: MOCK_EXPECTED_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mock-inference-credential
+                  key: token
+            - name: MOCK_PROVIDER_SITE
+              value: "{site}-secondary"
+            - name: MOCK_QUEUE_DEPTH
+              value: "0.10"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+"#
+    );
+
+    let service = format!(
+        "apiVersion: v1\n\
+         kind: Service\n\
+         metadata:\n\
+         \x20 name: {deploy_name}\n\
+         \x20 namespace: grid-system\n\
+         \x20 labels:\n\
+         \x20   app.kubernetes.io/name: grid-mock-providers\n\
+         \x20   app.kubernetes.io/component: mock-inference\n\
+         \x20   app.kubernetes.io/instance: {site}-secondary\n\
+         spec:\n\
+         \x20 type: ClusterIP\n\
+         \x20 ports:\n\
+         \x20   - port: 8080\n\
+         \x20     targetPort: 8080\n\
+         \x20     protocol: TCP\n\
+         \x20 selector:\n\
+         \x20   app.kubernetes.io/name: grid-mock-providers\n\
+         \x20   app.kubernetes.io/component: mock-inference\n\
+         \x20   app.kubernetes.io/instance: {site}-secondary\n"
+    );
+
+    let routing_cluster = format!("sim-{site}-provider");
+    let label = GRIDSITE_PROVIDER_LABEL;
+    let inference_provider = format!(
+        r#"apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: {provider_name}
+spec:
+  gridNetworkRef: grid-combined-site
+  providerKind: simulator
+  backendKind: local_model
+  endpoint: http://{deploy_name}.grid-system.svc.cluster.local:8080
+  models:
+    - name: {SECONDARY_MODEL}
+      capabilities: ["text_generation"]
+      contextWindow: 4096
+  siteSelector:
+    matchLabels:
+      {label}: {site}
+  accessPolicy:
+    siteSelector:
+      matchLabels: {{}}
+  routingClusterRef: {routing_cluster}
+  healthCheck:
+    path: /health
+    interval: "30s"
+    timeout: "5s"
+"#
+    );
+
+    kubectl::apply_manifest(&context, &deployment)?;
+    kubectl::apply_manifest(&context, &service)?;
+    kubectl::apply_manifest(&context, &inference_provider)?;
+
+    let rollout = Command::new("kubectl")
         .args([
-            "upgrade",
-            "provider-gateway",
-            "charts/praxis-gateway",
-            "--namespace",
-            "grid-system",
-            "--kube-context",
-            context,
-            "--reuse-values",
-            "--set",
-            &format!("credentials[1].name={}", external_provider.secret_name),
-            "--set",
-            &format!("credentials[1].mountPath={}", external_provider.mount_path),
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "rollout",
+            "status",
+            &format!("deployment/{deploy_name}"),
+            "--timeout=120s",
         ])
         .output()?;
-
-    if !upgrade_output.status.success() {
+    if !rollout.status.success() {
         return Err(format!(
-            "Failed to update provider gateway in {site}: {}",
-            String::from_utf8_lossy(&upgrade_output.stderr)
+            "secondary mock provider deployment rollout failed: {}",
+            String::from_utf8_lossy(&rollout.stderr)
         )
         .into());
     }
-
-    eprintln!("  [OK] {site}: provider gateway updated with external credential mount");
+    eprintln!("  [OK] {site}: secondary mock provider deployed ({deploy_name}, {provider_name})");
     Ok(())
+}
+
+/// Remove the secondary mock provider from the specified site.
+fn remove_secondary_mock_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = format!("kind-grid-combined-{site}");
+    let deploy_name = format!("mock-inference-{site}-secondary");
+    let provider_name = format!("sim-{site}-provider-secondary");
+
+    for (kind, name) in [
+        ("inferenceprovider", provider_name.as_str()),
+        ("service", deploy_name.as_str()),
+        ("deployment", deploy_name.as_str()),
+    ] {
+        let delete = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "delete",
+                kind,
+                name,
+                "--ignore-not-found",
+            ])
+            .output()?;
+        if !delete.status.success() {
+            return Err(format!(
+                "failed to delete {kind}/{name}: {}",
+                String::from_utf8_lossy(&delete.stderr)
+            )
+            .into());
+        }
+    }
+    eprintln!("  [OK] {site}: secondary mock provider removed");
+    Ok(())
+}
+
+/// Append secondary mock provider routing config to a rendered provider config.
+///
+/// Fail-closed: returns an error if the secondary route or cluster is already
+/// present, preventing accidental double-insertion.
+fn append_secondary_mock_config(
+    config: &str,
+    site: &str,
+    candidate_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if config.contains("mock-backend-secondary") {
+        return Err("secondary route or cluster already present in config — refusing to append twice".into());
+    }
+
+    let deploy_name = format!("mock-inference-{site}-secondary");
+
+    let route_entry = format!(
+        "          - candidate_id: {candidate_id}\n\
+         \x20           model: {SECONDARY_MODEL}\n\
+         \x20           paths:\n\
+         \x20             - /v1/chat/completions\n\
+         \x20             - /v1/responses\n\
+         \x20           cluster: mock-backend-secondary\n\
+         \x20           credential:\n\
+         \x20             strategy: bearer_token\n\
+         \x20             secretRef:\n\
+         \x20               name: mock-inference-credential\n\
+         \x20               namespace: grid-system\n\
+         \x20               key: token\n"
+    );
+
+    let cluster_entry = format!(
+        "          - name: mock-backend-secondary\n\
+         \x20           endpoints:\n\
+         \x20             - \"{deploy_name}.grid-system.svc.cluster.local:8080\"\n"
+    );
+
+    let route_anchor = "      - filter: credential_inject";
+    let cluster_anchor = "\nadmin:";
+
+    let result = config
+        .replace(route_anchor, &format!("{route_entry}\n{route_anchor}"))
+        .replace(cluster_anchor, &format!("{cluster_entry}{cluster_anchor}"));
+
+    if !result.contains("mock-backend-secondary") {
+        return Err("failed to insert secondary mock config: anchors not found".into());
+    }
+
+    Ok(result)
+}
+
+/// Re-render and apply the provider gateway config for a single site.
+///
+/// The secondary provider shares the primary's routing cluster
+/// (`routingClusterRef: sim-{site}-provider`), so its stable_id is
+/// looked up by model name in the candidates list rather than by cluster
+/// key in `stable_ids`.
+fn rematerialize_site_provider_config(
+    site: &str,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
+    include_secondary: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template_path = Path::new("demos/grid-combined-site/configs/provider/praxis.yaml");
+    let template = fs::read_to_string(template_path)?;
+    let overlay = read_cluster_overlay(site)?;
+
+    let primary_id = overlay
+        .candidates
+        .iter()
+        .find(|c| c.name == "mock-model")
+        .map(|c| c.stable_id.clone())
+        .ok_or_else(|| format!("{site}: primary candidate mock-model not in overlay candidates"))?;
+
+    let mut rendered = template
+        .replace("SITE_PLACEHOLDER", site)
+        .replace("CANDIDATE_ID_PLACEHOLDER", &primary_id);
+
+    if external_site == Some(site)
+        && let Some(ext) = external_provider
+    {
+        let ext_id = overlay
+            .candidates
+            .iter()
+            .find(|c| c.name == ext.model)
+            .map(|c| c.stable_id.clone())
+            .ok_or_else(|| format!("{site}: external candidate {} not in overlay candidates", ext.model))?;
+        rendered = glb::append_openai_provider_config(&rendered, ext, &ext_id)?;
+    }
+
+    if include_secondary {
+        let secondary_id = overlay
+            .candidates
+            .iter()
+            .find(|c| c.name == SECONDARY_MODEL)
+            .map(|c| c.stable_id.clone())
+            .ok_or_else(|| format!("{site}: secondary candidate {SECONDARY_MODEL} not in overlay candidates"))?;
+        rendered = append_secondary_mock_config(&rendered, site, &secondary_id)?;
+    }
+
+    let context = format!("kind-grid-combined-{site}");
+    let dry_run = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "configmap",
+            "provider-gateway-config",
+            &format!("--from-literal=praxis.yaml={rendered}"),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !dry_run.status.success() {
+        return Err(format!(
+            "{site}: configmap dry-run failed: {}",
+            String::from_utf8_lossy(&dry_run.stderr)
+        )
+        .into());
+    }
+    kubectl::apply_manifest(&context, &String::from_utf8(dry_run.stdout)?)?;
+    eprintln!(
+        "  [OK] {site}: provider-gateway-config rematerialized (secondary={})",
+        if include_secondary { "included" } else { "excluded" },
+    );
+    Ok(())
+}
+
+/// Wait for a candidate (identified by model name) to appear on all sites
+/// with matching `stable_id` values. The secondary shares the primary's
+/// routing cluster, so lookup is by model in the candidates list.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Sleep is required for polling with timeout functionality"
+)]
+fn wait_for_candidate_model_on_all_sites(model: &str, timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
+    let interval = Duration::from_secs(5);
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        let mut ids: Vec<String> = Vec::new();
+        let mut all_present = true;
+        for cluster in CLUSTERS {
+            if let Ok(data) = read_cluster_overlay(cluster) {
+                if let Some(c) = data.candidates.iter().find(|c| c.name == model) {
+                    ids.push(c.stable_id.clone());
+                } else {
+                    all_present = false;
+                }
+            } else {
+                all_present = false;
+            }
+        }
+        if all_present
+            && ids.len() == CLUSTERS.len()
+            && let Some(reference) = ids.first()
+            && ids.iter().all(|id| id == reference)
+        {
+            return Ok(reference.clone());
+        }
+        std::thread::sleep(interval);
+    }
+    Err(format!("candidate model '{model}' not converged on all sites after {timeout:?}").into())
+}
+
+/// Wait for a candidate (identified by model name) to be absent from all
+/// sites' overlays.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Sleep is required for polling with timeout functionality"
+)]
+fn wait_for_candidate_model_absent_all_sites(model: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let interval = Duration::from_secs(5);
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        let mut all_absent = true;
+        for cluster in CLUSTERS {
+            if let Ok(data) = read_cluster_overlay(cluster)
+                && data.candidates.iter().any(|c| c.name == model)
+            {
+                all_absent = false;
+                break;
+            }
+        }
+        if all_absent {
+            return Ok(());
+        }
+        std::thread::sleep(interval);
+    }
+    Err(format!("candidate model '{model}' still present after {timeout:?}").into())
+}
+
+/// Return whether an overlay contains the provider candidate for one site and model.
+fn overlay_has_site_model(overlay: &OverlayData, site: &str, model: &str) -> bool {
+    overlay
+        .candidates
+        .iter()
+        .any(|candidate| candidate.site == site && candidate.name == model)
+}
+
+/// Wait until one site/model candidate is present in every site's overlay.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Sleep is required for polling with timeout functionality"
+)]
+fn wait_for_site_model_on_all_sites(
+    site: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if CLUSTERS.iter().all(|cluster| {
+            read_cluster_overlay(cluster).is_ok_and(|overlay| overlay_has_site_model(&overlay, site, model))
+        }) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    Err(format!("candidate site={site}, model={model} did not converge on all sites after {timeout:?}").into())
+}
+
+/// Wait until one site/model candidate is absent from every site's overlay.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Sleep is required for polling with timeout functionality"
+)]
+fn wait_for_site_model_absent_all_sites(
+    site: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if CLUSTERS.iter().all(|cluster| {
+            read_cluster_overlay(cluster).is_ok_and(|overlay| !overlay_has_site_model(&overlay, site, model))
+        }) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    Err(format!("candidate site={site}, model={model} remained in an overlay after {timeout:?}").into())
+}
+
+/// Snapshot Deployment generations for gateway and operator rollout boundaries.
+fn record_gateway_deployment_state() -> BTreeMap<String, (String, i64)> {
+    let mut state = BTreeMap::new();
+    for cluster in CLUSTERS {
+        let context = format!("kind-grid-combined-{cluster}");
+        for deployment in ["provider-gateway", "consumer-gateway", "grid-operator"] {
+            let key = format!("{cluster}/{deployment}");
+            let output = Command::new("kubectl")
+                .args([
+                    "--context",
+                    &context,
+                    "-n",
+                    GRID_SYSTEM_NS,
+                    "get",
+                    "deployment",
+                    deployment,
+                    "-o",
+                    "jsonpath={.metadata.generation}",
+                ])
+                .output();
+            if let Ok(out) = output {
+                let generation = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                if out.status.success() && !generation.is_empty() {
+                    state.insert(key, (generation, 0));
+                }
+            }
+        }
+    }
+    state
+}
+
+/// Re-apply the provider-gateway Forge stack and wait for rollout.
+fn apply_provider_gateway_stack(
+    forge_bin: &Path,
+    resolved_config: &Path,
+    site: &str,
+    external_site: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stack = if external_site == Some(site) {
+        EXTERNAL_STACK_NAME
+    } else {
+        BASE_STACK_NAME
+    };
+    let status = Command::new(forge_bin)
+        .arg("--config")
+        .arg(resolved_config)
+        .args(["--non-interactive", "stack", "apply", site, stack])
+        .status()?;
+    if !status.success() {
+        return Err(format!("failed to apply {stack} to {site}").into());
+    }
+    let context = format!("kind-grid-combined-{site}");
+    restart_provider_gateway(&context)?;
+    let rollout = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "rollout",
+            "status",
+            "deployment/provider-gateway",
+            "--timeout=120s",
+        ])
+        .output()?;
+    if !rollout.status.success() {
+        return Err(format!(
+            "{site}: provider-gateway rollout failed: {}",
+            String::from_utf8_lossy(&rollout.stderr),
+        )
+        .into());
+    }
+    eprintln!("  [OK] {site}: provider-gateway stack re-applied ({stack}), rollout complete");
+    Ok(())
+}
+
+/// Restart the provider gateway after changing its existing ConfigMap.
+///
+/// Helm does not own `provider-gateway-config`, so a stack re-apply leaves the
+/// pod template unchanged and cannot make a startup-loaded Praxis config take
+/// effect on its own.
+fn restart_provider_gateway(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(provider_gateway_restart_args(context))
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "provider-gateway restart failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Build the exact scoped restart command used after ConfigMap replacement.
+fn provider_gateway_restart_args(context: &str) -> Vec<&str> {
+    vec![
+        "--context",
+        context,
+        "-n",
+        GRID_SYSTEM_NS,
+        "rollout",
+        "restart",
+        "deployment/provider-gateway",
+    ]
+}
+
+/// Probe the secondary model via the consumer gateway, retrying until the
+/// backend's own `x-grid-demo-provider` header confirms the secondary identity.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Sleep is required for polling with timeout functionality"
+)]
+fn probe_secondary_model_with_retry(
+    from_cluster: &str,
+    expected_provider_site: &str,
+    timeout: Duration,
+) -> Result<BTreeMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+    let context = format!("kind-grid-combined-{from_cluster}");
+    let interval = Duration::from_secs(5);
+    let start = Instant::now();
+    let expected_backend = format!("{expected_provider_site}-secondary");
+    let mut last_observation = "no successful curl execution".to_owned();
+
+    while start.elapsed() < timeout {
+        let pod_name = format!("lifecycle-sec-{from_cluster}-{}", start.elapsed().as_secs());
+        let body = format!(r#"{{"model": "{SECONDARY_MODEL}", "messages": []}}"#);
+        if let Ok(output) = run_curl_probe(
+            &context,
+            &pod_name,
+            &[
+                "-s",
+                "--include",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &body,
+                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ],
+        ) {
+            let provider_gw = response_header(&output.stdout, "x-grid-combined-provider-gateway");
+            let backend_id = response_header(&output.stdout, "x-grid-demo-provider");
+            let status_line = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find(|line| line.starts_with("HTTP/"))
+                .unwrap_or("missing HTTP status")
+                .to_owned();
+            last_observation = format!(
+                "exit_success={}, status={status_line}, provider_gateway={}, backend={}",
+                output.status.success(),
+                provider_gw.as_deref().unwrap_or("missing"),
+                backend_id.as_deref().unwrap_or("missing"),
+            );
+            if output.status.success()
+                && status_line.contains(" 200 ")
+                && provider_gw.as_deref() == Some(expected_provider_site)
+                && backend_id.as_deref() == Some(&expected_backend)
+            {
+                let mut facts = BTreeMap::new();
+                facts.insert("from_cluster".to_owned(), serde_json::json!(from_cluster));
+                facts.insert("provider_gateway".to_owned(), serde_json::json!(provider_gw));
+                facts.insert("backend_provider".to_owned(), serde_json::json!(backend_id));
+                if let Some(attr) = response_header(&output.stdout, "x-grid-demo-backend-provider-attribution") {
+                    facts.insert("backend_attribution".to_owned(), serde_json::json!(attr));
+                }
+                if let Some(rid) = response_header(&output.stdout, "x-grid-demo-backend-request-id") {
+                    facts.insert("backend_request_id".to_owned(), serde_json::json!(rid));
+                }
+                return Ok(facts);
+            }
+        }
+        std::thread::sleep(interval);
+    }
+    Err(format!(
+        "secondary model probe from {from_cluster} did not converge after {timeout:?} \
+         (expected provider_gateway={expected_provider_site}, backend={expected_backend}; \
+         last observation: {last_observation})"
+    )
+    .into())
+}
+
+/// Deploy the secondary provider, wait for overlay, configure the gateway, and
+/// probe until the secondary model routes correctly.
+///
+/// Returns `(ProofResult, stable_id)` on success.
+fn lifecycle_add_provider(
+    site: &str,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
+    forge_bin: &Path,
+    resolved_config: &Path,
+) -> Result<(ProofResult, String), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let mut facts = BTreeMap::new();
+
+    deploy_secondary_mock_provider(site)?;
+
+    let stable_id = wait_for_candidate_model_on_all_sites(SECONDARY_MODEL, Duration::from_secs(120))?;
+    facts.insert("secondary_stable_id".to_owned(), serde_json::json!(stable_id));
+
+    rematerialize_site_provider_config(site, external_provider, external_site, true)?;
+    apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
+
+    let probe_facts = probe_secondary_model_with_retry(site, site, COMBINED_SITE_DATA_PLANE_WAIT)?;
+    facts.extend(probe_facts);
+
+    let primary_ctx = format!("kind-grid-combined-{site}");
+    let primary_output = run_curl_probe(
+        &primary_ctx,
+        &format!("lifecycle-pri-{site}"),
+        &[
+            "-s",
+            "--include",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            r#"{"model": "mock-model", "messages": []}"#,
+            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+        ],
+    )?;
+    let primary_ok = primary_output.status.success();
+    facts.insert("primary_model_still_routable".to_owned(), serde_json::json!(primary_ok));
+    if !primary_ok {
+        return Err("primary model became unroutable after secondary addition".into());
+    }
+
+    Ok((
+        proof_success(
+            "secondary provider deployed, overlay converged, gateway configured, routing verified",
+            facts,
+            start.elapsed(),
+        ),
+        stable_id,
+    ))
+}
+
+/// Wait for the secondary candidate to appear on all sites and verify routing
+/// from each consumer gateway.
+fn lifecycle_assert_global_convergence(site: &str) -> AssertionResult {
+    let start = Instant::now();
+    let mut facts = BTreeMap::new();
+
+    let stable_id = wait_for_candidate_model_on_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
+    facts.insert("global_stable_id".to_owned(), serde_json::json!(stable_id));
+
+    for cluster in CLUSTERS {
+        let probe_facts = probe_secondary_model_with_retry(cluster, site, COMBINED_SITE_DATA_PLANE_WAIT)?;
+        facts.insert(format!("{cluster}_probe"), serde_json::json!(probe_facts));
+    }
+
+    Ok(proof_success(
+        "secondary candidate converged on all sites via SWIM; routing verified from every consumer",
+        facts,
+        start.elapsed(),
+    ))
+}
+
+/// Remove the secondary provider, wait for overlay drain, restore the gateway
+/// config, and verify the primary model still routes.
+fn lifecycle_remove_provider(
+    site: &str,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
+    forge_bin: &Path,
+    resolved_config: &Path,
+) -> AssertionResult {
+    let start = Instant::now();
+    let mut facts = BTreeMap::new();
+
+    remove_secondary_mock_provider(site)?;
+
+    wait_for_candidate_model_absent_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
+    facts.insert("candidate_drained".to_owned(), serde_json::json!(true));
+
+    rematerialize_site_provider_config(site, external_provider, external_site, false)?;
+    apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
+
+    for cluster in CLUSTERS {
+        let ctx = format!("kind-grid-combined-{cluster}");
+        let output = run_curl_probe(
+            &ctx,
+            &format!("lifecycle-rm-{cluster}"),
+            &[
+                "-s",
+                "--include",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                r#"{"model": "mock-model", "messages": []}"#,
+                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ],
+        )?;
+        let ok = output.status.success();
+        facts.insert(format!("{cluster}_primary_routable"), serde_json::json!(ok));
+        if !ok {
+            return Ok(proof_failure(
+                &format!("primary model unroutable from {cluster} after removal"),
+                facts,
+                start.elapsed(),
+            ));
+        }
+    }
+
+    Ok(proof_success(
+        "secondary removed, overlay drained, primary model routes correctly from all sites",
+        facts,
+        start.elapsed(),
+    ))
+}
+
+/// Verify the secondary model is no longer routable from any consumer.
+fn lifecycle_assert_unroutable() -> AssertionResult {
+    let start = Instant::now();
+    let mut facts = BTreeMap::new();
+
+    for cluster in CLUSTERS {
+        let ctx = format!("kind-grid-combined-{cluster}");
+        let body = format!(r#"{{"model": "{SECONDARY_MODEL}", "messages": []}}"#);
+        let output = run_curl_probe(
+            &ctx,
+            &format!("lifecycle-unrt-{cluster}"),
+            &[
+                "-s",
+                "--include",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &body,
+                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ],
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let status_line = stdout.lines().next().unwrap_or("").to_owned();
+        let got_200 = status_line.contains("200");
+        facts.insert(format!("{cluster}_status"), serde_json::json!(status_line));
+        facts.insert(format!("{cluster}_got_200"), serde_json::json!(got_200));
+        if got_200 {
+            return Ok(proof_failure(
+                &format!("removed secondary model still routable from {cluster}"),
+                facts,
+                start.elapsed(),
+            ));
+        }
+    }
+
+    Ok(proof_success(
+        "secondary model correctly unroutable from all consumers after removal",
+        facts,
+        start.elapsed(),
+    ))
+}
+
+/// Full cleanup: delete secondary resources, wait for drain, restore config,
+/// verify original model.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Lifecycle cleanup requires full Forge + provider context"
+)]
+fn lifecycle_cleanup(
+    results: &mut BTreeMap<String, ProofResult>,
+    site: &str,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
+    forge_bin: &Path,
+    resolved_config: &Path,
+) {
+    eprintln!();
+    eprintln!("  [CLEANUP] Ensuring secondary provider fully removed");
+    let start = Instant::now();
+
+    let cleanup_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        remove_secondary_mock_provider(site)?;
+        wait_for_candidate_model_absent_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
+        rematerialize_site_provider_config(site, external_provider, external_site, false)?;
+        apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
+
+        let ctx = format!("kind-grid-combined-{site}");
+        let output = run_curl_probe(
+            &ctx,
+            "lifecycle-cleanup-verify",
+            &[
+                "-s",
+                "--include",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                r#"{"model": "mock-model", "messages": []}"#,
+                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ],
+        )?;
+        if !output.status.success() {
+            return Err("primary model unroutable after lifecycle cleanup".into());
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = cleanup_result {
+        eprintln!("  [WARN] lifecycle cleanup failed: {e}");
+        results.insert(
+            "lifecycle_cleanup_guard".to_owned(),
+            proof_failure(
+                &format!("lifecycle cleanup failed: {e}"),
+                BTreeMap::new(),
+                start.elapsed(),
+            ),
+        );
+    } else {
+        eprintln!("  [OK] lifecycle cleanup complete, primary model verified");
+    }
+}
+
+/// Orchestrate the full provider lifecycle scenario.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Lifecycle orchestration with skip logic and cleanup"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Lifecycle orchestration requires full Forge + provider context"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Linear lifecycle flow with skip logic; splitting would obscure control flow"
+)]
+fn run_provider_lifecycle_sequence(
+    results: &mut BTreeMap<String, ProofResult>,
+    scenario: &mut dyn FnMut() -> usize,
+    external_provider: Option<&ExternalProviderDescriptor>,
+    external_site: Option<&str>,
+    forge_bin: &Path,
+    resolved_config: &Path,
+) {
+    let site = LIFECYCLE_SITE;
+
+    eprintln!();
+    eprintln!("=== PROVIDER LIFECYCLE (add/remove/re-add on {site}) ===");
+    eprintln!();
+
+    let baseline_deployments = record_gateway_deployment_state();
+
+    let skip = |results: &mut BTreeMap<String, ProofResult>, name: &str, blocker: &str| {
+        eprintln!("  [SKIP] {name}: prerequisite {blocker} failed");
+        results.insert(
+            name.to_owned(),
+            proof_failure(
+                &format!("skipped: prerequisite {blocker} failed"),
+                BTreeMap::new(),
+                Duration::ZERO,
+            ),
+        );
+    };
+
+    // --- Step 1: Provider addition ---
+    eprintln!("[SCENARIO {}] Provider addition", scenario());
+    let add_result = {
+        let start = Instant::now();
+        lifecycle_add_provider(site, external_provider, external_site, forge_bin, resolved_config).map_err(|e| {
+            results.insert(
+                "provider_addition".to_owned(),
+                proof_failure(
+                    &format!("provider addition failed: {e}"),
+                    BTreeMap::new(),
+                    start.elapsed(),
+                ),
+            );
+            e
+        })
+    };
+
+    let add_stable_id = if let Ok((proof, id)) = add_result {
+        results.insert("provider_addition".to_owned(), proof);
+        Some(id)
+    } else {
+        for name in [
+            "provider_global_convergence",
+            "provider_removal",
+            "removed_provider_unroutable",
+            "provider_readdition",
+            "stable_id_determinism",
+            "gateway_restart_boundary",
+            "credential_isolation_after_lifecycle",
+        ] {
+            skip(results, name, "provider_addition");
+        }
+        lifecycle_cleanup(
+            results,
+            site,
+            external_provider,
+            external_site,
+            forge_bin,
+            resolved_config,
+        );
+        return;
+    };
+
+    // --- Step 2: Global convergence ---
+    eprintln!();
+    eprintln!("[SCENARIO {}] Provider global convergence", scenario());
+    match run_assertion("provider_global_convergence", || {
+        lifecycle_assert_global_convergence(site)
+    }) {
+        Ok(proof) => {
+            results.insert("provider_global_convergence".to_owned(), proof);
+        },
+        Err(e) => {
+            results.insert(
+                "provider_global_convergence".to_owned(),
+                proof_failure(&format!("{e}"), BTreeMap::new(), Duration::ZERO),
+            );
+        },
+    }
+
+    // --- Step 3: Provider removal ---
+    eprintln!();
+    eprintln!("[SCENARIO {}] Provider removal", scenario());
+    let removal_ok = match run_assertion("provider_removal", || {
+        lifecycle_remove_provider(site, external_provider, external_site, forge_bin, resolved_config)
+    }) {
+        Ok(proof) => {
+            let ok = proof.success;
+            results.insert("provider_removal".to_owned(), proof);
+            ok
+        },
+        Err(e) => {
+            results.insert(
+                "provider_removal".to_owned(),
+                proof_failure(&format!("{e}"), BTreeMap::new(), Duration::ZERO),
+            );
+            false
+        },
+    };
+
+    if !removal_ok {
+        for name in [
+            "removed_provider_unroutable",
+            "provider_readdition",
+            "stable_id_determinism",
+            "gateway_restart_boundary",
+            "credential_isolation_after_lifecycle",
+        ] {
+            skip(results, name, "provider_removal");
+        }
+        lifecycle_cleanup(
+            results,
+            site,
+            external_provider,
+            external_site,
+            forge_bin,
+            resolved_config,
+        );
+        return;
+    }
+
+    // --- Step 4: Removed provider unroutable ---
+    eprintln!();
+    eprintln!("[SCENARIO {}] Removed provider unroutable", scenario());
+    run_and_insert(results, "removed_provider_unroutable", lifecycle_assert_unroutable);
+
+    // --- Step 5: Provider re-addition ---
+    eprintln!();
+    eprintln!("[SCENARIO {}] Provider re-addition", scenario());
+    let readd_stable_id = {
+        let start = Instant::now();
+        match lifecycle_add_provider(site, external_provider, external_site, forge_bin, resolved_config) {
+            Ok((proof, id)) => {
+                results.insert("provider_readdition".to_owned(), proof);
+                Some(id)
+            },
+            Err(e) => {
+                results.insert(
+                    "provider_readdition".to_owned(),
+                    proof_failure(&format!("re-addition failed: {e}"), BTreeMap::new(), start.elapsed()),
+                );
+                None
+            },
+        }
+    };
+
+    // --- Step 6: Stable ID determinism ---
+    eprintln!();
+    eprintln!("[SCENARIO {}] Stable ID determinism", scenario());
+    match (add_stable_id.as_deref(), readd_stable_id.as_deref()) {
+        (Some(add_id), Some(readd_id)) => {
+            let mut facts = BTreeMap::new();
+            facts.insert("add_stable_id".to_owned(), serde_json::json!(add_id));
+            facts.insert("readd_stable_id".to_owned(), serde_json::json!(readd_id));
+            let ids_match = add_id == readd_id;
+            facts.insert("deterministic".to_owned(), serde_json::json!(ids_match));
+            results.insert(
+                "stable_id_determinism".to_owned(),
+                proof_success(
+                    &format!("stable_id add={add_id} re-add={readd_id} match={ids_match}"),
+                    facts,
+                    Duration::ZERO,
+                ),
+            );
+        },
+        _ => {
+            skip(results, "stable_id_determinism", "provider_readdition");
+        },
+    }
+
+    // --- Step 7: Gateway restart boundary ---
+    eprintln!();
+    eprintln!("[SCENARIO {}] Gateway restart boundary", scenario());
+    {
+        let post_deployments = record_gateway_deployment_state();
+        let mut facts = BTreeMap::new();
+        let mut boundary_ok = true;
+
+        for cluster in CLUSTERS {
+            let cg_key = format!("{cluster}/consumer-gateway");
+            let cg_same = matches!(
+                (baseline_deployments.get(&cg_key), post_deployments.get(&cg_key)),
+                (Some((b, _)), Some((p, _))) if b == p
+            );
+            facts.insert(
+                format!("{cluster}_consumer_gw"),
+                serde_json::json!(if cg_same {
+                    "unchanged (overlay hot-reload)"
+                } else {
+                    "RESTARTED (unexpected)"
+                }),
+            );
+            if !cg_same {
+                boundary_ok = false;
+            }
+
+            let pg_key = format!("{cluster}/provider-gateway");
+            if *cluster == site {
+                let pg_changed = matches!(
+                    (baseline_deployments.get(&pg_key), post_deployments.get(&pg_key)),
+                    (Some((b, _)), Some((p, _))) if b != p
+                );
+                facts.insert(
+                    format!("{cluster}_provider_gw"),
+                    serde_json::json!(if pg_changed {
+                        "rolled (static config change required rollout)"
+                    } else {
+                        "unchanged"
+                    }),
+                );
+            } else {
+                let pg_same = matches!(
+                    (baseline_deployments.get(&pg_key), post_deployments.get(&pg_key)),
+                    (Some((b, _)), Some((p, _))) if b == p
+                );
+                facts.insert(
+                    format!("{cluster}_provider_gw"),
+                    serde_json::json!(if pg_same { "unchanged" } else { "RESTARTED (unexpected)" }),
+                );
+                if !pg_same {
+                    boundary_ok = false;
+                }
+            }
+
+            let op_key = format!("{cluster}/grid-operator");
+            let op_same = matches!(
+                (baseline_deployments.get(&op_key), post_deployments.get(&op_key)),
+                (Some((b, _)), Some((p, _))) if b == p
+            );
+            facts.insert(
+                format!("{cluster}_operator"),
+                serde_json::json!(if op_same { "unchanged" } else { "RESTARTED (unexpected)" }),
+            );
+            if !op_same {
+                boundary_ok = false;
+            }
+        }
+
+        results.insert(
+            "gateway_restart_boundary".to_owned(),
+            if boundary_ok {
+                proof_success(
+                    "consumer gateways hot-reloaded overlay without restart; \
+                 non-lifecycle provider gateways and all operators unchanged; \
+                 lifecycle-site provider gateway rolled for static config change",
+                    facts,
+                    Duration::ZERO,
+                )
+            } else {
+                proof_failure(
+                    "unexpected restart detected outside lifecycle-site provider gateway",
+                    facts,
+                    Duration::ZERO,
+                )
+            },
+        );
+    }
+
+    // --- Step 8: Credential isolation ---
+    eprintln!();
+    eprintln!("[SCENARIO {}] Credential isolation after lifecycle", scenario());
+    run_and_insert(
+        results,
+        "credential_isolation_after_lifecycle",
+        assert_credential_isolation,
+    );
+
+    // --- Cleanup (guaranteed) ---
+    lifecycle_cleanup(
+        results,
+        site,
+        external_provider,
+        external_site,
+        forge_bin,
+        resolved_config,
+    );
 }
 
 /// Tear down the combined-site environment.
@@ -4928,9 +6482,12 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                     eprintln!("{OUTPUT_RULE}");
 
                     let ext_site = ext_site.as_deref();
+                    let ext_ref = ext_descriptor.as_ref();
                     let scenario_results = match mode {
-                        DemoMode::Quick => run_quick_scenarios(ext_site),
-                        DemoMode::Full => run_full_scenarios(ext_site),
+                        DemoMode::Quick => run_quick_scenarios(ext_site, ext_ref),
+                        DemoMode::Full => {
+                            run_full_scenarios(ext_site, ext_ref, &context.forge_bin, &context.resolved_config)
+                        },
                     };
 
                     let failed_proofs: Vec<&str> = scenario_results
@@ -5135,6 +6692,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deployment_zero_accepts_omitted_status_counters() {
+        assert!(deployment_scaled_to_zero("0:::"));
+        assert!(deployment_scaled_to_zero("0:0:0:0"));
+    }
+
+    #[test]
+    fn deployment_zero_rejects_desired_or_active_replicas() {
+        assert!(!deployment_scaled_to_zero("1:1:1:1"));
+        assert!(!deployment_scaled_to_zero("0:1::"));
+    }
+
+    #[test]
+    fn overlay_site_model_match_does_not_accept_another_site() {
+        let overlay = OverlayData {
+            resource_version: "1".to_owned(),
+            semantic_revision: "revision".to_owned(),
+            stable_ids: BTreeMap::new(),
+            candidates: vec![OverlayCandidate {
+                kind: "inference_model".to_owned(),
+                name: PRIMARY_MODEL.to_owned(),
+                site: "west".to_owned(),
+                cluster: "sim-west-provider".to_owned(),
+                stable_id: "deadbeef".to_owned(),
+            }],
+        };
+
+        assert!(overlay_has_site_model(&overlay, "west", PRIMARY_MODEL));
+        assert!(!overlay_has_site_model(&overlay, "central", PRIMARY_MODEL));
+        assert!(!overlay_has_site_model(&overlay, "west", SECONDARY_MODEL));
+    }
+
+    #[test]
     fn test_proof_success_creation() {
         let mut facts = BTreeMap::new();
         facts.insert("cluster_count".to_owned(), serde_json::Value::Number(3.into()));
@@ -5287,5 +6876,409 @@ mod tests {
                 }
             })
         );
+    }
+
+    fn minimal_forge_yaml() -> String {
+        r#"apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+metadata:
+  name: grid-combined-site
+spec:
+  clusters:
+    - name: west
+      stacks: [provider-gateway, consumer-gateway]
+      properties:
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "test"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "test"
+        mockProviderImageRepo: "grid-mock"
+        mockProviderImageTag: "test"
+        imagePullPolicy: "Never"
+        gatewayImage: "praxis-ai:test"
+        operatorImage: "grid-operator:test"
+        mockProviderImage: "grid-mock:test"
+    - name: central
+      stacks: [provider-gateway, consumer-gateway]
+      properties:
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "test"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "test"
+        mockProviderImageRepo: "grid-mock"
+        mockProviderImageTag: "test"
+        imagePullPolicy: "Never"
+        gatewayImage: "praxis-ai:test"
+        operatorImage: "grid-operator:test"
+        mockProviderImage: "grid-mock:test"
+    - name: east
+      stacks: [provider-gateway, consumer-gateway]
+      properties:
+        gatewayImageRepo: "praxis-ai"
+        gatewayImageTag: "test"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "test"
+        mockProviderImageRepo: "grid-mock"
+        mockProviderImageTag: "test"
+        imagePullPolicy: "Never"
+        gatewayImage: "praxis-ai:test"
+        operatorImage: "grid-operator:test"
+        mockProviderImage: "grid-mock:test"
+  stacks:
+    provider-gateway:
+      description: test provider gateway
+      steps:
+        - type: helm
+          release: provider-gateway
+          chart: charts/praxis-gateway
+          namespace: grid-system
+          values:
+            credentials:
+              - name: "mock-inference-credential"
+                mountPath: "/etc/praxis/credentials/mock-inference"
+    consumer-gateway:
+      description: test consumer gateway
+      steps:
+        - type: helm
+          release: consumer-gateway
+          chart: charts/praxis-gateway
+          namespace: grid-system
+"#
+        .to_owned()
+    }
+
+    fn test_openai_descriptor() -> ExternalProviderDescriptor {
+        ExternalProviderDescriptor::openai("gpt-4o-mini")
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test assertions on known YAML structure")]
+    fn disabled_mode_leaves_stacks_unchanged() {
+        let yaml = minimal_forge_yaml();
+        let rendered = render_config(&yaml, None, None).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let stacks = config["spec"]["stacks"].as_mapping().unwrap();
+        assert!(stacks.contains_key(serde_yaml::Value::String("provider-gateway".to_owned())));
+        assert!(!stacks.contains_key(serde_yaml::Value::String(EXTERNAL_STACK_NAME.to_owned())));
+        for cluster in &["west", "central", "east"] {
+            let clusters = config["spec"]["clusters"].as_sequence().unwrap();
+            let c = clusters.iter().find(|c| c["name"].as_str() == Some(cluster)).unwrap();
+            let stack_list: Vec<&str> = c["stacks"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|s| s.as_str())
+                .collect();
+            assert!(stack_list.contains(&"provider-gateway"));
+            assert!(!stack_list.contains(&EXTERNAL_STACK_NAME));
+        }
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test assertions on known YAML structure")]
+    fn external_provider_clones_stack_for_selected_site() {
+        let ext = test_openai_descriptor();
+        for site in &["west", "central", "east"] {
+            let yaml = minimal_forge_yaml();
+            let rendered = render_config(&yaml, Some(&ext), Some(site)).unwrap();
+            let config: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+            let stacks = config["spec"]["stacks"].as_mapping().unwrap();
+            assert!(stacks.contains_key(serde_yaml::Value::String("provider-gateway".to_owned())));
+            assert!(stacks.contains_key(serde_yaml::Value::String(EXTERNAL_STACK_NAME.to_owned())));
+            let clusters = config["spec"]["clusters"].as_sequence().unwrap();
+            for c in clusters {
+                let name = c["name"].as_str().unwrap();
+                let stack_list: Vec<&str> = c["stacks"]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|s| s.as_str())
+                    .collect();
+                if name == *site {
+                    assert!(stack_list.contains(&EXTERNAL_STACK_NAME));
+                    assert!(!stack_list.contains(&"provider-gateway"));
+                } else {
+                    assert!(stack_list.contains(&"provider-gateway"));
+                    assert!(!stack_list.contains(&EXTERNAL_STACK_NAME));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test assertions on known YAML structure")]
+    fn cloned_stack_has_external_credential_mount() {
+        let ext = test_openai_descriptor();
+        let yaml = minimal_forge_yaml();
+        let rendered = render_config(&yaml, Some(&ext), Some("west")).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let cloned = &config["spec"]["stacks"][EXTERNAL_STACK_NAME];
+        let creds = cloned["steps"][0]["values"]["credentials"].as_sequence().unwrap();
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0]["name"].as_str().unwrap(), "mock-inference-credential");
+        assert_eq!(creds[1]["name"].as_str().unwrap(), ext.secret_name);
+        assert_eq!(creds[1]["mountPath"].as_str().unwrap(), ext.mount_path);
+        assert_eq!(creds[1]["optional"].as_bool(), Some(false));
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test assertions on known YAML structure")]
+    fn other_gateways_no_external_credential() {
+        let ext = test_openai_descriptor();
+        let yaml = minimal_forge_yaml();
+        let rendered = render_config(&yaml, Some(&ext), Some("west")).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let base = &config["spec"]["stacks"]["provider-gateway"];
+        let creds = base["steps"][0]["values"]["credentials"].as_sequence().unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0]["name"].as_str().unwrap(), "mock-inference-credential");
+    }
+
+    #[test]
+    fn existing_cloned_stack_fails_closed() {
+        let ext = test_openai_descriptor();
+        let mut yaml = minimal_forge_yaml();
+        yaml = yaml.replace(
+            "    consumer-gateway:",
+            &format!("    {EXTERNAL_STACK_NAME}:\n      description: conflict\n      steps: []\n    consumer-gateway:"),
+        );
+        let result = render_config(&yaml, Some(&ext), Some("west"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"),);
+    }
+
+    #[test]
+    fn missing_provider_gateway_stack_fails_closed() {
+        let ext = test_openai_descriptor();
+        let yaml = minimal_forge_yaml().replace("provider-gateway:", "other-gateway:");
+        let result = render_config(&yaml, Some(&ext), Some("west"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn source_forge_yaml_not_modified() {
+        let ext = test_openai_descriptor();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("forge.yaml");
+        fs::write(&source, minimal_forge_yaml()).unwrap();
+        let before = fs::read_to_string(&source).unwrap();
+        drop(materialize_config(&source, Some(&ext), Some("west")).unwrap());
+        let after = fs::read_to_string(&source).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test assertions on known YAML structure")]
+    fn repeated_materialization_no_duplicate_credentials() {
+        let ext = test_openai_descriptor();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("forge.yaml");
+        fs::write(&source, minimal_forge_yaml()).unwrap();
+        drop(materialize_config(&source, Some(&ext), Some("west")).unwrap());
+        drop(materialize_config(&source, Some(&ext), Some("west")).unwrap());
+        let resolved = dir.path().join(".forge.resolved.yaml");
+        let content = fs::read_to_string(&resolved).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let creds = config["spec"]["stacks"][EXTERNAL_STACK_NAME]["steps"][0]["values"]["credentials"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(creds.len(), 2);
+    }
+
+    #[test]
+    fn external_provider_without_site_fails_closed() {
+        let ext = test_openai_descriptor();
+        let yaml = minimal_forge_yaml();
+        let result = render_config(&yaml, Some(&ext), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("without a target site"));
+    }
+
+    #[test]
+    fn duplicate_credential_in_base_stack_fails_closed() {
+        let ext = test_openai_descriptor();
+        let yaml = minimal_forge_yaml().replace(
+            "mountPath: \"/etc/praxis/credentials/mock-inference\"",
+            &format!(
+                "mountPath: \"/etc/praxis/credentials/mock-inference\"\n              - name: \"{}\"\n                mountPath: \"{}\"",
+                ext.secret_name, ext.mount_path,
+            ),
+        );
+        let result = render_config(&yaml, Some(&ext), Some("west"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already contains credential"));
+    }
+
+    #[test]
+    fn external_inference_provider_uses_provider_site_label_for_every_site() {
+        let ext = test_openai_descriptor();
+        for site in CLUSTERS {
+            let manifest = external_inference_provider_manifest(&ext, site);
+            let doc: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+            let label_map = doc
+                .get("spec")
+                .and_then(|s| s.get("siteSelector"))
+                .and_then(|s| s.get("matchLabels"))
+                .unwrap();
+            assert!(
+                label_map.get(GRIDSITE_PROVIDER_LABEL).is_some(),
+                "site {site}: siteSelector must use {GRIDSITE_PROVIDER_LABEL}",
+            );
+            assert_eq!(
+                label_map.get(GRIDSITE_PROVIDER_LABEL).and_then(|v| v.as_str()).unwrap(),
+                *site,
+                "site {site}: label value must match site name",
+            );
+            assert!(
+                label_map.get("grid.praxis-proxy.io/combined-site").is_none(),
+                "site {site}: must not use stale combined-site label key",
+            );
+        }
+    }
+
+    fn rendered_provider_config_for_tests() -> String {
+        let template = include_str!("../../../demos/grid-combined-site/configs/provider/praxis.yaml");
+        template
+            .replace("SITE_PLACEHOLDER", "west")
+            .replace("CANDIDATE_ID_PLACEHOLDER", "test-primary-id")
+    }
+
+    #[test]
+    fn append_secondary_adds_route_and_cluster() {
+        let config = rendered_provider_config_for_tests();
+        let result = append_secondary_mock_config(&config, "west", "test-secondary-id").unwrap();
+        assert!(
+            result.contains("mock-model-secondary"),
+            "secondary model route must be present",
+        );
+        assert!(
+            result.contains("mock-backend-secondary"),
+            "secondary backend cluster must be present",
+        );
+        assert!(
+            result.contains("mock-inference-west-secondary.grid-system.svc.cluster.local:8080"),
+            "secondary endpoint must be present",
+        );
+        assert!(
+            result.contains("candidate_id: test-secondary-id"),
+            "secondary candidate_id must match",
+        );
+    }
+
+    #[test]
+    fn append_secondary_preserves_existing_routes() {
+        let config = rendered_provider_config_for_tests();
+        let result = append_secondary_mock_config(&config, "west", "sec-id").unwrap();
+        assert!(
+            result.contains("mock-model") && result.contains("mock-backend"),
+            "primary route must be preserved",
+        );
+        assert!(
+            result.contains("test-primary-id"),
+            "primary candidate_id must be preserved",
+        );
+        assert!(
+            result.contains("credential_inject"),
+            "credential_inject filter must be preserved",
+        );
+        assert!(result.contains("admin:"), "admin section must be preserved",);
+    }
+
+    #[test]
+    fn append_secondary_rejects_duplicate_insertion() {
+        let config = rendered_provider_config_for_tests();
+        let once = append_secondary_mock_config(&config, "west", "id1").unwrap();
+        let twice = append_secondary_mock_config(&once, "west", "id2");
+        assert!(twice.is_err(), "second insertion must fail with duplicate guard",);
+        let err_msg = twice.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already present"),
+            "error must mention duplicate: {err_msg}",
+        );
+    }
+
+    #[test]
+    fn append_secondary_with_external_coexists() {
+        let config = rendered_provider_config_for_tests();
+        let ext = test_openai_descriptor();
+        let with_ext = glb::append_openai_provider_config(&config, &ext, "ext-id").unwrap();
+        let with_both = append_secondary_mock_config(&with_ext, "west", "sec-id").unwrap();
+        assert!(
+            with_both.contains("mock-model-secondary"),
+            "secondary route must be present",
+        );
+        assert!(with_both.contains("gpt-4o-mini"), "external route must be preserved",);
+        assert!(with_both.contains("mock-model"), "primary route must be preserved",);
+    }
+
+    #[test]
+    fn provider_config_rematerialization_requires_gateway_restart() {
+        assert_eq!(
+            provider_gateway_restart_args("kind-grid-combined-west"),
+            [
+                "--context",
+                "kind-grid-combined-west",
+                "-n",
+                "grid-system",
+                "rollout",
+                "restart",
+                "deployment/provider-gateway",
+            ],
+            "an existing ConfigMap update must restart the startup-loaded provider gateway",
+        );
+    }
+
+    #[test]
+    fn secondary_mock_deployment_labels_match_networkpolicy() {
+        let site = "west";
+        let deploy_name = format!("mock-inference-{site}-secondary");
+        let provider_name = format!("sim-{site}-provider-secondary");
+        drop((deploy_name, provider_name));
+        let routing_cluster = format!("sim-{site}-provider");
+        let label = GRIDSITE_PROVIDER_LABEL;
+        let mock_image = "grid-mock-providers:test";
+        let image_pull_policy = "Never";
+        let deployment = format!(
+            "apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-inference-{site}-secondary
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: grid-mock-providers
+    app.kubernetes.io/component: mock-inference
+    app.kubernetes.io/instance: {site}-secondary
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grid-mock-providers
+      app.kubernetes.io/component: mock-inference
+      app.kubernetes.io/instance: {site}-secondary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grid-mock-providers
+        app.kubernetes.io/component: mock-inference
+        app.kubernetes.io/instance: {site}-secondary
+"
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&deployment).unwrap();
+        let pod_labels = doc
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("metadata"))
+            .and_then(|m| m.get("labels"))
+            .unwrap();
+        assert_eq!(
+            pod_labels.get("app.kubernetes.io/name").and_then(|v| v.as_str()),
+            Some("grid-mock-providers"),
+            "pod label must match Helm chart name for NetworkPolicy coverage",
+        );
+        assert_eq!(
+            pod_labels.get("app.kubernetes.io/component").and_then(|v| v.as_str()),
+            Some("mock-inference"),
+            "pod label must match Helm component for NetworkPolicy coverage",
+        );
+        drop((routing_cluster, label, mock_image, image_pull_policy));
     }
 }

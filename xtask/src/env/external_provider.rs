@@ -81,6 +81,11 @@ impl ExternalProviderDescriptor {
         format!("{}:{}", self.hostname, self.port)
     }
 
+    /// Return the RFC 1123-compatible name used for Kubernetes resources.
+    pub(crate) fn resource_name(&self) -> String {
+        format!("external-{}", self.provider_kind.replace('_', "-"))
+    }
+
     /// Return the credential file path inside the gateway pod.
     pub(crate) fn credential_file(&self) -> String {
         format!("{}/{}", self.mount_path, self.secret_key)
@@ -219,6 +224,7 @@ mod tests {
             let desc = ExternalProviderDescriptor::openai("gpt-5-mini");
             assert_eq!(desc.kind, ExternalProvider::OpenAi);
             assert_eq!(desc.provider_kind, "open_ai");
+            assert_eq!(desc.resource_name(), "external-open-ai");
             assert_eq!(desc.backend_kind, "api_provider");
             assert_eq!(desc.hostname, "api.openai.com");
             assert_eq!(desc.port, 443);

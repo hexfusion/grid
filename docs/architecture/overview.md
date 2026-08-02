@@ -180,10 +180,6 @@ local workload
   separate compliance domains, or when sharing a cluster creates an
   unacceptable failure or change blast radius.
 
-The three-cluster combined-site demo is under implementation and validation.
-Do not treat that topology as runtime-proven until its automated security,
-local-routing, remote-fallback, restoration, and cleanup assertions pass.
-
 ### Routing And Failover In Either Topology
 
 - **Provider selection:** Grid may select any eligible local or remote provider

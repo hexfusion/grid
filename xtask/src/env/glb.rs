@@ -355,7 +355,7 @@ fn stage_provider_configs_with_external(
         if *provider == "east-provider"
             && let Some(ext) = external
         {
-            rendered = append_openai_provider_config(&rendered, ext)?;
+            rendered = append_openai_provider_config(&rendered, ext, &openai_candidate_id(&ext.model))?;
         }
         let target_dir = Path::new(".forge/runtime/glb-tls/provider-configs").join(provider);
         fs::create_dir_all(&target_dir)?;
@@ -455,12 +455,11 @@ fn apply_configmap_key(
 
 /// Append the `OpenAI` provider route, credential, and upstream to the east provider config.
 #[expect(clippy::too_many_lines, reason = "multi-section YAML insertion that reads linearly")]
-fn append_openai_provider_config(
+pub(crate) fn append_openai_provider_config(
     config: &str,
     ext: &ExternalProviderDescriptor,
+    candidate_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let candidate_id = openai_candidate_id(&ext.model);
-
     let route_entry = format!(
         "          - candidate_id: {candidate_id}
             model: {model}
@@ -5711,8 +5710,8 @@ admin:
     #[test]
     fn append_openai_provider_config_inserts_route_and_cluster() {
         let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
-        let result =
-            append_openai_provider_config(minimal_provider_config(), &ext).unwrap_or_else(|_| std::process::abort());
+        let result = append_openai_provider_config(minimal_provider_config(), &ext, &openai_candidate_id(&ext.model))
+            .unwrap_or_else(|_| std::process::abort());
 
         assert!(result.contains(&format!("cluster: {}", ext.routing_cluster)));
         assert!(result.contains(&format!("model: {}", ext.model)));
@@ -5745,8 +5744,8 @@ admin:
     #[test]
     fn append_openai_provider_config_preserves_existing_entries() {
         let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
-        let result =
-            append_openai_provider_config(minimal_provider_config(), &ext).unwrap_or_else(|_| std::process::abort());
+        let result = append_openai_provider_config(minimal_provider_config(), &ext, &openai_candidate_id(&ext.model))
+            .unwrap_or_else(|_| std::process::abort());
 
         assert!(result.contains("mock-backend"), "original cluster must be preserved");
         assert!(
@@ -5759,7 +5758,23 @@ admin:
     fn append_openai_provider_config_rejects_missing_markers() {
         let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
         let bad = "some: yaml\nwithout: markers";
-        assert!(append_openai_provider_config(bad, &ext).is_err());
+        assert!(append_openai_provider_config(bad, &ext, &openai_candidate_id(&ext.model)).is_err());
+    }
+
+    #[test]
+    fn append_openai_provider_config_uses_caller_supplied_candidate_id() {
+        let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
+        let custom_id = "custom-test-id-abc123";
+        let result = append_openai_provider_config(minimal_provider_config(), &ext, custom_id)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            result.contains(&format!("candidate_id: {custom_id}")),
+            "must use the caller-supplied candidate ID, not an internally computed one"
+        );
+        assert!(
+            !result.contains(&openai_candidate_id(&ext.model)),
+            "must not contain the GLB-specific east-provider candidate ID"
+        );
     }
 
     #[test]
@@ -5794,8 +5809,8 @@ admin:
     #[test]
     fn generated_configs_never_contain_token_patterns() {
         let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
-        let provider =
-            append_openai_provider_config(minimal_provider_config(), &ext).unwrap_or_else(|_| std::process::abort());
+        let provider = append_openai_provider_config(minimal_provider_config(), &ext, &openai_candidate_id(&ext.model))
+            .unwrap_or_else(|_| std::process::abort());
         let edge = append_openai_edge_config(minimal_edge_config(), &ext, "172.18.0.6:8443")
             .unwrap_or_else(|_| std::process::abort());
 

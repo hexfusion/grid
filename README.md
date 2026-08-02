@@ -50,7 +50,8 @@ For cluster-local routing without a traffic manager, see the
 For the compact three-cluster topology in which every site contains separate
 consumer and provider gateways, see the
 [Combined-Site Demo](demos/grid-combined-site/README.md). This new standalone
-demo is currently an implementation scaffold, not yet a validated walkthrough.
+demo provides automated runtime proofs for local preference, remote fallback,
+provider lifecycle, security boundaries, convergence, and recovery.
 
 For deploying Grid onto existing clusters with Helm, see
 [examples/helm/existing-clusters/](examples/helm/existing-clusters/README.md).
@@ -65,9 +66,9 @@ fi
 git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.1
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/praxis-proxy/grid-operator:v0.1.1
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/praxis-proxy/grid-mock-providers:v0.1.1
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/praxis-proxy/grid-ai-rollup@sha256:95132eb39c0f568b5361a250002979c5063db427ff0fb63b59a93146fcb7ad31
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/praxis-proxy/grid-operator@sha256:654d9079e13c80e7891dcdd2eed52901ebd733833ae02d776a69a4170c00d9bb
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/praxis-proxy/grid-mock-providers@sha256:60c9ac29782b2ce6c99eb4d82494bd10280ef06b453752486f6933927547d333
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
 cargo build -p forge
