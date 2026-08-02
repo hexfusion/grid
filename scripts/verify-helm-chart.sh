@@ -238,6 +238,31 @@ try_template "$GW_DIR" "gateway with credentials" "${GW_REQ[@]}" \
 try_template "$GW_DIR" "hostile podLabels gateway" "${GW_REQ[@]}" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile'
 
+# ── Example values rendering ────────────────────────────────────────
+echo ""
+echo "=== Example values rendering ==="
+EXAMPLE_DIR="examples/helm/existing-clusters"
+
+for f in "$EXAMPLE_DIR"/dedicated-edge/values/*-operator.yaml; do
+  LABEL="example dedicated-edge $(basename "$f" .yaml)"
+  try_template "$CHART_DIR" "$LABEL" --namespace grid-system -f "$f"
+done
+
+for f in "$EXAMPLE_DIR"/dedicated-edge/values/*-gateway.yaml; do
+  LABEL="example dedicated-edge $(basename "$f" .yaml)"
+  try_template "$GW_DIR" "$LABEL" "${GW_REQ[@]}" --namespace grid-system -f "$f"
+done
+
+for f in "$EXAMPLE_DIR"/combined-site/values/*-operator.yaml; do
+  LABEL="example combined-site $(basename "$f" .yaml)"
+  try_template "$CHART_DIR" "$LABEL" --namespace grid-system -f "$f"
+done
+
+for f in "$EXAMPLE_DIR"/combined-site/values/*-consumer-gateway.yaml "$EXAMPLE_DIR"/combined-site/values/*-provider-gateway.yaml; do
+  LABEL="example combined-site $(basename "$f" .yaml)"
+  try_template "$GW_DIR" "$LABEL" "${GW_REQ[@]}" --namespace grid-system -f "$f"
+done
+
 # ── Verify selector protection ──────────────────────────────────────
 echo ""
 echo "=== Selector protection (gateway) ==="

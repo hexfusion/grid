@@ -277,6 +277,12 @@ spec:
       steps:
         - type: manifest
           path: resources/site-east-edge.yaml
+        # Provider GridSites give the operator region/zone data for
+        # CRDT-discovered providers so locality scoring resolves correctly.
+        - type: manifest
+          path: resources/site-east-provider.yaml
+        - type: manifest
+          path: resources/site-west-provider.yaml
         - type: manifest
           path: policies/provider-access.yaml
         - type: template-manifest
@@ -287,6 +293,10 @@ spec:
       steps:
         - type: manifest
           path: resources/site-west-edge.yaml
+        - type: manifest
+          path: resources/site-east-provider.yaml
+        - type: manifest
+          path: resources/site-west-provider.yaml
         - type: manifest
           path: policies/provider-access.yaml
         - type: template-manifest

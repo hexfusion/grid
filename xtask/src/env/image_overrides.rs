@@ -6,6 +6,8 @@
 
 use std::env;
 
+use super::IngressMode;
+
 // ---------------------------------------------------------------------------
 // Environment Variables
 // ---------------------------------------------------------------------------
@@ -50,6 +52,18 @@ const DEFAULT_GLB_MOCK_PROVIDER_IMAGE: &str = "grid-mock-providers:glb-demo";
 /// Default operator image used by the GLB demo.
 const DEFAULT_GLB_OPERATOR_IMAGE: &str = "grid-operator:glb-demo";
 
+/// Default gateway image for workload-inference demos (v0.1.0 release).
+const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.0";
+
+/// Default mock-provider image for workload-inference demos.
+const DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE: &str = "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.0";
+
+/// Default operator image for workload-inference demos (v0.1.1+: health endpoints).
+const DEFAULT_WORKLOAD_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.1";
+
+/// Default image pull policy for workload-inference demos (registry-backed).
+const DEFAULT_WORKLOAD_IMAGE_PULL_POLICY: &str = "IfNotPresent";
+
 /// Default image pull policy for local images.
 ///
 /// Local workflows load the named images into their clusters. Registry-backed
@@ -81,19 +95,36 @@ pub(crate) fn operator_image() -> String {
     env::var(OPERATOR_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned())
 }
 
-/// Get the GLB demo gateway image, respecting the shared gateway override.
-pub(crate) fn glb_gateway_image() -> String {
-    env::var(GATEWAY_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_GLB_GATEWAY_IMAGE.to_owned())
-}
-
 /// Get the GLB demo mock-provider image, respecting the shared override.
 pub(crate) fn glb_mock_provider_image() -> String {
     env::var(MOCK_PROVIDER_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_GLB_MOCK_PROVIDER_IMAGE.to_owned())
 }
 
-/// Get the GLB demo operator image, respecting the shared override.
-pub(crate) fn glb_operator_image() -> String {
-    env::var(OPERATOR_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_GLB_OPERATOR_IMAGE.to_owned())
+/// Get the demo gateway image for the given ingress mode.
+pub(crate) fn demo_gateway_image(mode: IngressMode) -> String {
+    let default = match mode {
+        IngressMode::Global => DEFAULT_GLB_GATEWAY_IMAGE,
+        IngressMode::Workload => DEFAULT_WORKLOAD_GATEWAY_IMAGE,
+    };
+    env::var(GATEWAY_IMAGE_ENV).unwrap_or_else(|_| default.to_owned())
+}
+
+/// Get the demo mock-provider image for the given ingress mode.
+pub(crate) fn demo_mock_provider_image(mode: IngressMode) -> String {
+    let default = match mode {
+        IngressMode::Global => DEFAULT_GLB_MOCK_PROVIDER_IMAGE,
+        IngressMode::Workload => DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE,
+    };
+    env::var(MOCK_PROVIDER_IMAGE_ENV).unwrap_or_else(|_| default.to_owned())
+}
+
+/// Get the demo operator image for the given ingress mode.
+pub(crate) fn demo_operator_image(mode: IngressMode) -> String {
+    let default = match mode {
+        IngressMode::Global => DEFAULT_GLB_OPERATOR_IMAGE,
+        IngressMode::Workload => DEFAULT_WORKLOAD_OPERATOR_IMAGE,
+    };
+    env::var(OPERATOR_IMAGE_ENV).unwrap_or_else(|_| default.to_owned())
 }
 
 /// Get the image pull policy, respecting environment overrides.
@@ -102,6 +133,15 @@ pub(crate) fn glb_operator_image() -> String {
 /// behavior. When an override is set, uses the override value exactly.
 pub(crate) fn image_pull_policy() -> String {
     env::var(IMAGE_PULL_POLICY_ENV).unwrap_or_else(|_| DEFAULT_IMAGE_PULL_POLICY.to_owned())
+}
+
+/// Get the image pull policy for the given ingress mode.
+pub(crate) fn demo_image_pull_policy(mode: IngressMode) -> String {
+    let default = match mode {
+        IngressMode::Global => DEFAULT_IMAGE_PULL_POLICY,
+        IngressMode::Workload => DEFAULT_WORKLOAD_IMAGE_PULL_POLICY,
+    };
+    env::var(IMAGE_PULL_POLICY_ENV).unwrap_or_else(|_| default.to_owned())
 }
 
 /// Determine if Kind image loading should be skipped.
@@ -146,6 +186,34 @@ mod tests {
         assert_eq!(DEFAULT_GLB_MOCK_PROVIDER_IMAGE, "grid-mock-providers:glb-demo");
         assert_eq!(DEFAULT_GLB_OPERATOR_IMAGE, "grid-operator:glb-demo");
         assert_eq!(DEFAULT_IMAGE_PULL_POLICY, "Never");
+        assert_eq!(
+            DEFAULT_WORKLOAD_GATEWAY_IMAGE,
+            "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.0"
+        );
+        assert_eq!(
+            DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE,
+            "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.0"
+        );
+        assert_eq!(
+            DEFAULT_WORKLOAD_OPERATOR_IMAGE,
+            "ghcr.io/praxis-proxy/grid-operator:v0.1.1"
+        );
+        assert_eq!(DEFAULT_WORKLOAD_IMAGE_PULL_POLICY, "IfNotPresent");
+    }
+
+    #[test]
+    fn workload_mode_defaults_differ_from_global() {
+        if env::var(GATEWAY_IMAGE_ENV).is_err() {
+            assert_ne!(
+                demo_gateway_image(IngressMode::Global),
+                demo_gateway_image(IngressMode::Workload),
+                "workload and global gateway defaults must differ"
+            );
+        }
+        if env::var(IMAGE_PULL_POLICY_ENV).is_err() {
+            assert_eq!(demo_image_pull_policy(IngressMode::Global), "Never");
+            assert_eq!(demo_image_pull_policy(IngressMode::Workload), "IfNotPresent");
+        }
     }
 
     #[test]

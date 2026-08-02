@@ -96,30 +96,21 @@ latency-based edge selection, same-region provider preference, or hard region
 locking. The GTM emulator uses health and a deterministic demo affinity key,
 and all four edge-to-provider combinations remain eligible.
 
-### Workload Inference: Supported Architecture, Not This Walkthrough
+### Workload Inference
 
 **User story:** As a platform workload, I need to submit inference through my
-cluster's local Praxis gateway and let Grid select an eligible local or remote
+cluster's Praxis consumer gateway and let Grid select an eligible local or remote
 provider without first traversing public global ingress.
 
-```mermaid
-flowchart LR
-    Workload[In-cluster workload]
-    LocalGateway[Cluster-local Praxis consumer gateway]
-    Grid[Grid provider selection]
-    LocalProvider[Local provider gateway]
-    RemoteProvider[Remote provider gateway]
+See the [Workload Inference Demo](../grid-workload-inference/README.md) for an
+automated walkthrough that deploys a 4-cluster topology and proves the in-cluster
+request path with runtime assertions. Run it with:
 
-    Workload --> LocalGateway
-    LocalGateway --> Grid
-    Grid --> LocalProvider
-    Grid --> RemoteProvider
+```bash
+cargo xtask env run-grid-glb-demo \
+  --forge-config demos/grid-glb-demo/forge.yaml \
+  --no-ingress --quick --teardown
 ```
-
-This pattern reuses Grid discovery, admission, ranking, session affinity, and
-the authenticated provider boundary. It does not require the public GTM layer.
-The current automated walkthrough does not deploy a separate workload-facing
-consumer gateway or claim runtime proof for this ingress path.
 
 ### Regional Policy Status
 

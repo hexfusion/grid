@@ -11,7 +11,10 @@ use std::{
 
 use serde::Serialize;
 
-use super::{DemoMode, GlbDemoModeOptions, GlbDemoOptions, glb, gtm_emulator, image_overrides, kubectl, operator};
+use super::{
+    DemoMode, GlbDemoModeOptions, GlbDemoOptions, IngressMode, glb, gtm_emulator, image_overrides, kubectl, operator,
+    workload,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,7 +38,7 @@ const FULL_SOAK_PROGRESS_SAMPLES: usize = 12;
 /// Resolved config emitted next to the source config to preserve relative paths.
 const RESOLVED_CONFIG_NAME: &str = ".forge.resolved.yaml";
 
-/// Ordered cluster names in the local scenario environment.
+/// Ordered cluster names in the global-ingress scenario environment.
 const CLUSTERS: &[&str] = &[
     "gtm-emulator",
     "east-edge",
@@ -43,6 +46,9 @@ const CLUSTERS: &[&str] = &[
     "west-edge",
     "west-provider",
 ];
+
+/// Consumer clusters that accept workload requests.
+const CONSUMER_CLUSTERS: &[&str] = &["east-edge", "west-edge"];
 
 /// Clusters that participate in Grid discovery and run an operator.
 const GRID_CLUSTERS: &[&str] = &["east-edge", "east-provider", "west-edge", "west-provider"];
@@ -142,6 +148,8 @@ pub(crate) struct SetupContext {
     resolved_config: PathBuf,
     /// Forge binary path.
     forge_bin: String,
+    /// Ingress topology for this run.
+    ingress_mode: IngressMode,
 }
 
 /// Outcome of the narrated demonstration.
@@ -245,49 +253,104 @@ struct ArtifactPaths {
 ///
 /// Returns an error when config rendering, cluster creation, image loading,
 /// stack application, trust installation, or service startup fails.
-pub(crate) fn setup(forge_config: &Path) -> Result<SetupContext, Box<dyn std::error::Error>> {
-    let context = prepare_setup(forge_config)?;
+pub(crate) fn setup(
+    forge_config: &Path,
+    ingress_mode: IngressMode,
+) -> Result<SetupContext, Box<dyn std::error::Error>> {
+    let context = prepare_setup(forge_config, ingress_mode)?;
     deploy_setup(&context)?;
     Ok(context)
 }
 
 /// Resolve setup inputs before creating any runtime resources.
-fn prepare_setup(forge_config: &Path) -> Result<SetupContext, Box<dyn std::error::Error>> {
+fn prepare_setup(forge_config: &Path, ingress_mode: IngressMode) -> Result<SetupContext, Box<dyn std::error::Error>> {
     Ok(SetupContext {
-        resolved_config: materialize_config(forge_config)?,
+        resolved_config: materialize_config(forge_config, ingress_mode)?,
         forge_bin: glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?,
+        ingress_mode,
     })
 }
 
 /// Deploy the environment using prepared setup inputs.
-#[expect(clippy::too_many_lines, reason = "sequential nine-phase environment deployment")]
+#[expect(clippy::too_many_lines, reason = "sequential mode-aware environment deployment")]
 fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>> {
+    let is_workload = context.ingress_mode == IngressMode::Workload;
+    let total_phases: usize = if is_workload { 7 } else { SETUP_PHASES };
+    let cluster_desc = if is_workload { "four" } else { "five" };
+
     eprintln!();
     eprintln!("{OUTPUT_RULE}");
     eprintln!("ENVIRONMENT SETUP");
     eprintln!("{OUTPUT_RULE}");
-    setup_phase(1, "Staging demo certificates and provider identities");
-    glb::stage_provider_boundary()?;
-    setup_phase(2, "Creating five Kind clusters on one shared cross-cluster network");
+
+    let mut phase = 0_usize;
+    let mut next = || {
+        phase += 1;
+        phase
+    };
+
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{total_phases}] Staging demo certificates and provider identities",
+        next()
+    );
+    glb::stage_provider_boundary_with_mode(context.ingress_mode)?;
+
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{total_phases}] Creating {cluster_desc} Kind clusters on one shared cross-cluster network",
+        next()
+    );
     eprintln!("            Forge will report again after cluster creation completes.");
     run_forge(&context.forge_bin, &context.resolved_config, &["up"])?;
-    setup_phase(3, "Resolving and loading runtime images");
-    print_runtime_images();
-    load_local_images_if_required(&context.forge_bin, &context.resolved_config)?;
-    setup_phase(4, "Installing MetalLB, SWIM services, and Grid operators");
-    apply_foundation_stacks(&context.forge_bin, &context.resolved_config)?;
-    setup_phase(5, "Installing provider trust, credentials, and policy");
-    glb::install_provider_boundary()?;
-    setup_phase(
-        6,
-        "Deploying two provider gateways and three private inference providers",
+
+    eprintln!();
+    eprintln!("[SETUP {}/{total_phases}] Resolving and loading runtime images", next());
+    print_runtime_images(context.ingress_mode);
+    load_local_images_if_required(&context.forge_bin, &context.resolved_config, context.ingress_mode)?;
+
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{total_phases}] Installing MetalLB, SWIM services, and Grid operators",
+        next()
+    );
+    apply_foundation_stacks_with_mode(&context.forge_bin, &context.resolved_config, context.ingress_mode)?;
+
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{total_phases}] Installing provider trust, credentials, and policy",
+        next()
+    );
+    glb::install_provider_boundary_with_mode(context.ingress_mode)?;
+
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{total_phases}] Deploying two provider gateways and three private inference providers",
+        next()
     );
     apply_provider_stacks(&context.forge_bin, &context.resolved_config)?;
-    setup_phase(7, "Configuring edge trust and deploying Praxis edge gateways");
+
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{total_phases}] Configuring edge trust and deploying Praxis edge gateways",
+        next()
+    );
     apply_edge_stacks(&context.forge_bin, &context.resolved_config)?;
-    setup_phase(8, "Deploying the GTM emulator in front of both edges");
-    apply_gtm_emulator_stack(&context.forge_bin, &context.resolved_config)?;
-    setup_phase(9, "Waiting for both edge-local routing overlays to converge");
+
+    if !is_workload {
+        eprintln!();
+        eprintln!(
+            "[SETUP {}/{total_phases}] Deploying the GTM emulator in front of both edges",
+            next()
+        );
+        apply_gtm_emulator_stack(&context.forge_bin, &context.resolved_config)?;
+    }
+
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{total_phases}] Waiting for both edge-local routing overlays to converge",
+        next()
+    );
     explain_overlay_convergence();
     let overlay_evidence = glb::wait_for_edge_overlays_ready()?;
 
@@ -299,18 +362,21 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Print one numbered setup phase.
-fn setup_phase(number: usize, description: &str) {
-    eprintln!();
-    eprintln!("[SETUP {number}/{SETUP_PHASES}] {description}");
-}
-
 /// Print the exact image contract selected by environment overrides.
-fn print_runtime_images() {
-    eprintln!("  gateway:       {}", image_overrides::glb_gateway_image());
-    eprintln!("  operator:      {}", image_overrides::glb_operator_image());
-    eprintln!("  mock provider: {}", image_overrides::glb_mock_provider_image());
-    eprintln!("  pull policy:   {}", image_overrides::image_pull_policy());
+fn print_runtime_images(ingress_mode: IngressMode) {
+    eprintln!("  gateway:       {}", image_overrides::demo_gateway_image(ingress_mode));
+    eprintln!(
+        "  operator:      {}",
+        image_overrides::demo_operator_image(ingress_mode)
+    );
+    eprintln!(
+        "  mock provider: {}",
+        image_overrides::demo_mock_provider_image(ingress_mode)
+    );
+    eprintln!(
+        "  pull policy:   {}",
+        image_overrides::demo_image_pull_policy(ingress_mode)
+    );
 }
 
 /// Explain the control-plane milestone represented by overlay convergence.
@@ -330,6 +396,7 @@ fn explain_overlay_convergence() {
 )]
 pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
+    let ingress_mode = options.ingress_mode();
     let run_id = format_utc_timestamp();
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
@@ -338,10 +405,10 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id);
     fs::create_dir_all(&evidence_dir)?;
 
-    let setup_ctx = prepare_setup(forge_config);
+    let setup_ctx = prepare_setup(forge_config, ingress_mode);
     let mut outcome = match &setup_ctx {
         Ok(context) => match deploy_setup(context) {
-            Ok(()) => demonstrate_inner(&context.resolved_config, mode, &mut narrator),
+            Ok(()) => demonstrate_inner(&context.resolved_config, mode, ingress_mode, &mut narrator),
             Err(error) => failed_outcome(Vec::new(), Vec::new(), "Environment setup", concise_error(error)),
         },
         Err(error) => failed_outcome(Vec::new(), Vec::new(), "Environment preparation", concise_error(error)),
@@ -387,7 +454,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let report = EvidenceReport {
         schema_version: EVIDENCE_SCHEMA_VERSION,
         run_id,
-        mode: mode_label(mode),
+        mode: evidence_mode_label(mode, ingress_mode),
         started_at,
         completed_at,
         duration_secs: elapsed.as_secs_f64(),
@@ -429,8 +496,9 @@ pub(crate) fn demonstrate_with_options(
     options: &GlbDemoModeOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
+    let ingress_mode = options.ingress_mode();
     let mut narrator = Narrator::new();
-    match demonstrate_inner(forge_config, mode, &mut narrator).error {
+    match demonstrate_inner(forge_config, mode, ingress_mode, &mut narrator).error {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
@@ -441,11 +509,24 @@ pub(crate) fn demonstrate_with_options(
 // ---------------------------------------------------------------------------
 
 /// Run narrated scenarios and collect capability results.
+fn demonstrate_inner(
+    forge_config: &Path,
+    mode: DemoMode,
+    ingress_mode: IngressMode,
+    narrator: &mut Narrator,
+) -> DemoOutcome {
+    match ingress_mode {
+        IngressMode::Global => demonstrate_global(forge_config, mode, narrator),
+        IngressMode::Workload => demonstrate_workload(forge_config, mode, narrator),
+    }
+}
+
+/// Global-ingress demonstration: GTM-based path discovery and edge withdrawal.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential scenario narration is clearest in one function"
 )]
-fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrator) -> DemoOutcome {
+fn demonstrate_global(forge_config: &Path, mode: DemoMode, narrator: &mut Narrator) -> DemoOutcome {
     let mut capabilities = Vec::new();
 
     print_introduction(narrator, mode);
@@ -458,7 +539,7 @@ fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrato
         "As an application owner, I need one stable HTTPS endpoint backed by active edges while Grid independently selects an admitted provider.",
     );
 
-    if let Err(error) = glb::verify_grid_routing_with_mode(forge_config, mode) {
+    if let Err(error) = glb::verify_grid_routing_with_mode(forge_config, mode, IngressMode::Global) {
         return failed_outcome(capabilities, Vec::new(), "Active/active routing", concise_error(error));
     }
 
@@ -593,6 +674,122 @@ fn demonstrate_inner(forge_config: &Path, mode: DemoMode, narrator: &mut Narrato
     DemoOutcome {
         capabilities,
         observed_paths,
+        error: None,
+    }
+}
+
+/// Workload-inference demonstration: in-cluster request path, no GTM.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential scenario narration is clearest in one function"
+)]
+fn demonstrate_workload(forge_config: &Path, mode: DemoMode, narrator: &mut Narrator) -> DemoOutcome {
+    let mut capabilities = Vec::new();
+
+    print_workload_introduction(narrator, mode);
+
+    // Scenario 1: Grid routing verification (shared with global mode).
+    print_scenario(
+        narrator,
+        1,
+        "Grid routing and provider boundary",
+        "As a platform operator, I need the Grid mesh to converge, discover providers, and enforce the provider security boundary.",
+    );
+
+    if let Err(error) = glb::verify_grid_routing_with_mode(forge_config, mode, IngressMode::Workload) {
+        return failed_outcome(capabilities, Vec::new(), "Grid routing", concise_error(error));
+    }
+
+    capabilities.push(CapabilityResult {
+        capability: "Observable overlay contract".to_owned(),
+        result: "pass",
+        evidence: if mode == DemoMode::Full {
+            "one revision matched rendered/distributed/accepted/serving evidence; invalid reload retained last-known-good; cold invalid startup failed closed"
+        } else {
+            "one revision matched rendered/distributed/accepted/serving evidence"
+        }
+        .to_owned(),
+    });
+    capabilities.push(CapabilityResult {
+        capability: "Secure provider boundary".to_owned(),
+        result: "pass",
+        evidence: "mTLS, peer auth, NetworkPolicy, credential replacement verified".to_owned(),
+    });
+
+    // Scenario 2: Workload requests from consumer clusters.
+    print_scenario(
+        narrator,
+        2,
+        "In-cluster workload routing",
+        "As a platform workload, I need requests from inside the consumer cluster to reach a Grid-selected provider without any external ingress.",
+    );
+
+    let workload_paths = match discover_workload_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            return failed_outcome(capabilities, Vec::new(), "Workload routing", concise_error(error));
+        },
+    };
+    print_workload_paths(narrator, &workload_paths);
+    capabilities.push(CapabilityResult {
+        capability: "In-cluster workload routing".to_owned(),
+        result: "pass",
+        evidence: format!(
+            "{} consumer cluster(s) routed to provider via in-cluster Jobs",
+            workload_paths.len()
+        ),
+    });
+
+    // Scenario 3: Provider boundary (summarized from scenario 1 verification).
+    print_scenario(
+        narrator,
+        3,
+        "Secure provider boundary",
+        "As a provider and security owner, I need authenticated Grid traffic, exact local policy, private backend isolation, and final-hop credential replacement.",
+    );
+    print_provider_boundary_proof(narrator);
+    print_credential_boundary_proof(narrator);
+
+    // GTM-only capabilities: not applicable in workload mode.
+    capabilities.push(CapabilityResult {
+        capability: "Edge withdrawal and recovery".to_owned(),
+        result: "not_applicable",
+        evidence: "workload mode has no traffic manager".to_owned(),
+    });
+
+    if mode == DemoMode::Full {
+        // Scenario 4: Local preference and remote fallback.
+        print_scenario(
+            narrator,
+            4,
+            "Local provider preference and remote fallback",
+            "As a platform operator, I need workloads to prefer local providers and fall back to remote providers when local capacity is unavailable.",
+        );
+        match prove_workload_local_preference(narrator) {
+            Ok(evidence) => capabilities.push(CapabilityResult {
+                capability: "Local preference and remote fallback".to_owned(),
+                result: "pass",
+                evidence,
+            }),
+            Err(error) => {
+                return failed_outcome(capabilities, workload_paths, "Local preference", concise_error(error));
+            },
+        }
+    } else {
+        capabilities.push(CapabilityResult {
+            capability: "Local preference and remote fallback".to_owned(),
+            result: "skipped",
+            evidence: "quick mode".to_owned(),
+        });
+        narrator.narrate("");
+        narrator.narrate("[SKIP] Local preference/fallback runs only in full mode.");
+    }
+
+    print_workload_boundaries(narrator, mode);
+
+    DemoOutcome {
+        capabilities,
+        observed_paths: workload_paths,
         error: None,
     }
 }
@@ -742,7 +939,408 @@ fn print_boundaries(narrator: &mut Narrator, mode: DemoMode) {
 }
 
 // ---------------------------------------------------------------------------
-// Path discovery and affinity
+// Workload-mode narration
+// ---------------------------------------------------------------------------
+
+/// Print workload-inference architecture and proof policy.
+fn print_workload_introduction(narrator: &mut Narrator, mode: DemoMode) {
+    narrator.banner("PRAXIS GRID WORKLOAD INFERENCE DEMO");
+    narrator.narrate("");
+    narrator.narrate(&format!("Mode: {}", mode_label(mode).to_uppercase()));
+    narrator.wrapped(
+        "Proof policy: ",
+        "              ",
+        "Every PASS comes from a runtime assertion; manifest intent is not counted as proof.",
+    );
+    narrator.narrate("");
+    narrator.narrate("EXPECTED PATH");
+    narrator.narrate("  workload -> local Praxis consumer gateway");
+    narrator.narrate("           -> Grid-selected provider gateway -> private backend");
+    narrator.narrate("");
+    narrator.narrate("No traffic manager or public endpoint involved.");
+}
+
+/// Print workload paths observed from in-cluster Jobs.
+fn print_workload_paths(narrator: &mut Narrator, paths: &[ObservedPathEntry]) {
+    narrator.narrate("");
+    narrator.narrate("OBSERVED WORKLOAD ROUTES");
+    for entry in paths {
+        narrator.narrate(&format!("  [PASS] {} -> {}", entry.edge, entry.provider));
+        narrator.narrate(&format!("         {}", entry.path));
+    }
+}
+
+/// Print workload-mode scope boundaries.
+fn print_workload_boundaries(narrator: &mut Narrator, mode: DemoMode) {
+    narrator.banner("DEMONSTRATED BOUNDARY");
+    narrator.narrate("");
+    narrator.wrapped(
+        "[PROVEN] ",
+        "         ",
+        "In-cluster workloads reached Grid-selected providers through local consumer gateways without external ingress.",
+    );
+    narrator.wrapped(
+        "[PROVEN] ",
+        "         ",
+        "Versioned overlays with provider candidates, plus rendered/distributed/accepted/serving revision evidence.",
+    );
+    if mode == DemoMode::Full {
+        narrator.wrapped(
+            "[PROVEN] ",
+            "         ",
+            "Local provider preference and remote fallback, provider mTLS, peer authorization, and credential replacement.",
+        );
+    } else {
+        narrator.wrapped(
+            "[PROVEN] ",
+            "         ",
+            "Provider mTLS, peer authorization, and credential replacement.",
+        );
+    }
+    narrator.wrapped(
+        "[NOT APPLICABLE] ",
+        "                 ",
+        "Edge withdrawal and GTM steering (workload mode has no traffic manager).",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Workload path discovery
+// ---------------------------------------------------------------------------
+
+/// Request fixture body for in-cluster workload requests.
+const WORKLOAD_REQUEST_BODY: &str =
+    r#"{"model":"sim-model-v1","messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#;
+
+/// Discover routing paths by sending in-cluster requests from each consumer.
+fn discover_workload_paths() -> Result<Vec<ObservedPathEntry>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::new();
+    for cluster in CONSUMER_CLUSTERS {
+        let response = workload::send_workload_request(cluster, WORKLOAD_REQUEST_BODY, None)?;
+        if response.status != 200 {
+            return Err(format!("workload request from {cluster} returned status {}", response.status).into());
+        }
+        let provider = if response.provider.is_empty() {
+            extract_provider_from_response(&response.body)?
+        } else {
+            response.provider.clone()
+        };
+        paths.push(ObservedPathEntry {
+            edge: (*cluster).to_owned(),
+            provider: provider.clone(),
+            path: format!(
+                "workload -> {cluster} consumer gateway -> {} gateway -> {provider} backend",
+                provider_gateway_for_backend(&provider)
+            ),
+        });
+    }
+    Ok(paths)
+}
+
+/// Extract provider identity from the workload response body.
+///
+/// Returns an error when the response is not valid JSON or lacks a
+/// `model` field — missing attribution must fail the proof rather than
+/// silently substituting a placeholder.
+fn extract_provider_from_response(body: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("response is not valid JSON: {e}"))?;
+    value
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| "response JSON missing 'model' field for provider attribution".into())
+}
+
+/// Maximum time to wait for overlay convergence during drain/restore.
+const OVERLAY_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Interval between overlay convergence polls.
+const OVERLAY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Overlay `ConfigMap` name used by the edge gateways.
+const EDGE_OVERLAY_CONFIGMAP: &str = "grid-overlay-glb-demo-edge-gateway";
+
+/// Prove locality preference and remote fallback.
+///
+/// Phase 1: send requests from each consumer and require every consumer
+/// to route to its local provider (proving the scoring engine prefers
+/// locality for all sites, not just some).
+///
+/// Phase 2: scale down the provider gateway in east-provider so no east
+/// routing capacity remains, poll the east-edge overlay until east
+/// candidates are absent, send a request from east-edge, and confirm it
+/// routes to a known west provider. Restoration is guarded: the provider
+/// gateway is always restored, overlay recovery verified, and local
+/// routing confirmed before returning.
+#[expect(clippy::too_many_lines, reason = "two-phase preference/fallback proof")]
+fn prove_workload_local_preference(narrator: &mut Narrator) -> Result<String, Box<dyn std::error::Error>> {
+    narrator.narrate("  Phase 1: local preference");
+    let mut local_hits = 0_usize;
+    let total = CONSUMER_CLUSTERS.len();
+
+    for cluster in CONSUMER_CLUSTERS {
+        let response = workload::send_workload_request(cluster, WORKLOAD_REQUEST_BODY, None)?;
+        if response.status != 200 {
+            return Err(format!("local preference: {cluster} returned status {}", response.status).into());
+        }
+        let provider = &response.provider;
+        if provider.is_empty() {
+            return Err(format!("local preference: {cluster} response missing provider header").into());
+        }
+        let region = cluster.strip_suffix("-edge").unwrap_or(cluster);
+        let is_local = provider.starts_with(region);
+        if is_local {
+            local_hits += 1;
+        }
+        narrator.narrate(&format!(
+            "  [{}] {cluster} -> {provider} ({})",
+            if is_local { "PASS" } else { "FAIL" },
+            if is_local { "local" } else { "remote" },
+        ));
+    }
+
+    if local_hits != total {
+        return Err(format!("local preference: {local_hits}/{total} consumers routed locally, expected all").into());
+    }
+
+    narrator.narrate("  Phase 2: remote fallback after east provider drain");
+    let drain_cluster = "east-provider";
+    let drain_context = format!("kind-grid-glb-{drain_cluster}");
+
+    let reload_before = glb::count_overlay_reload_logs("east-edge").unwrap_or(0);
+
+    scale_deployment(&drain_context, "provider-gateway", 0)?;
+    narrator.narrate("  [INFO] east-provider/provider-gateway scaled to 0");
+
+    let drain_result = verify_drain_fallback("east-edge", reload_before, narrator);
+    let restore_result = restore_deployment(&drain_context, "provider-gateway", "east-edge", narrator);
+
+    match (drain_result, restore_result) {
+        (Ok(fallback_provider), Ok(())) => {
+            narrator.narrate(&format!(
+                "  [PASS] east-edge -> {fallback_provider} (remote fallback to west-provider)"
+            ));
+            Ok(format!(
+                "{local_hits}/{total} local, remote fallback to {fallback_provider}"
+            ))
+        },
+        (Err(drain_err), Err(restore_err)) => {
+            Err(format!("{drain_err}; restoration also failed: {restore_err}").into())
+        },
+        (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),
+    }
+}
+
+/// Scale a deployment in `grid-system` to the given replica count.
+fn scale_deployment(context: &str, name: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            "grid-system",
+            "scale",
+            &format!("deployment/{name}"),
+            &format!("--replicas={replicas}"),
+            "--timeout=30s",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not scale {name} to {replicas}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Read the overlay candidates for one edge cluster.
+fn read_overlay_candidates(edge: &str) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let context = format!("kind-grid-glb-{edge}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            "grid-system",
+            "get",
+            "configmap",
+            EDGE_OVERLAY_CONFIGMAP,
+            "-o",
+            r"jsonpath={.data.routing-config\.json}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read overlay from {edge}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let document: serde_json::Value = serde_json::from_str(&raw)?;
+    let candidates = document
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(candidates)
+}
+
+/// Poll until no candidates from `site` appear in the edge overlay.
+fn wait_for_overlay_candidate_absent(edge: &str, site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + OVERLAY_CONVERGENCE_TIMEOUT;
+    loop {
+        let candidates = read_overlay_candidates(edge)?;
+        let has_site = candidates
+            .iter()
+            .any(|c| c.get("site").and_then(serde_json::Value::as_str) == Some(site));
+        if !has_site {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timeout: {edge} overlay still lists {site} candidates after {OVERLAY_CONVERGENCE_TIMEOUT:?}"
+            )
+            .into());
+        }
+        std::thread::park_timeout(OVERLAY_POLL_INTERVAL);
+    }
+}
+
+/// Poll until at least one candidate from `site` appears in the edge overlay.
+fn wait_for_overlay_candidate_present(edge: &str, site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + OVERLAY_CONVERGENCE_TIMEOUT;
+    loop {
+        let candidates = read_overlay_candidates(edge)?;
+        let has_site = candidates
+            .iter()
+            .any(|c| c.get("site").and_then(serde_json::Value::as_str) == Some(site));
+        if has_site {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timeout: {edge} overlay does not list {site} candidates after {OVERLAY_CONVERGENCE_TIMEOUT:?}"
+            )
+            .into());
+        }
+        std::thread::park_timeout(OVERLAY_POLL_INTERVAL);
+    }
+}
+
+/// Wait for a deployment rollout to complete.
+fn wait_for_rollout(context: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let rollout = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            "grid-system",
+            "rollout",
+            "status",
+            &format!("deployment/{name}"),
+            "--timeout=60s",
+        ])
+        .output()?;
+    if !rollout.status.success() {
+        return Err(format!(
+            "{name} did not become ready: {}",
+            String::from_utf8_lossy(&rollout.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Confirm overlay convergence, hot-reload, and remote fallback to a
+/// provider outside the drained site. Returns the fallback provider name.
+fn verify_drain_fallback(
+    consumer_edge: &str,
+    reload_before: usize,
+    narrator: &mut Narrator,
+) -> Result<String, Box<dyn std::error::Error>> {
+    wait_for_overlay_candidate_absent(consumer_edge, "east-provider")?;
+    narrator.narrate(&format!(
+        "  [OK] {consumer_edge} overlay no longer lists east-provider candidates"
+    ));
+
+    glb::check_hot_reload_observed(consumer_edge, reload_before)?;
+    narrator.narrate(&format!("  [OK] {consumer_edge} gateway reloaded overlay after drain"));
+
+    let resp = glb::wait_for_data_plane_convergence("remote fallback routing", || {
+        let resp = workload::send_workload_request(consumer_edge, WORKLOAD_REQUEST_BODY, None)?;
+        if resp.status != 200 {
+            return Err(format!(
+                "remote fallback: {consumer_edge} returned status {} after drain",
+                resp.status
+            )
+            .into());
+        }
+        if resp.provider.is_empty() {
+            return Err(format!("remote fallback: {consumer_edge} response missing provider header").into());
+        }
+        if !resp.provider.starts_with("west") {
+            return Err(format!(
+                "remote fallback: {consumer_edge} routed to {}, expected a west-provider identity",
+                resp.provider
+            )
+            .into());
+        }
+        Ok(resp)
+    })?;
+
+    Ok(resp.provider)
+}
+
+/// Verify a consumer routes to its local provider.
+fn verify_local_routing(consumer_edge: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let verify = workload::send_workload_request(consumer_edge, WORKLOAD_REQUEST_BODY, None)?;
+    if verify.status != 200 {
+        return Err(format!("{consumer_edge} returned status {}", verify.status).into());
+    }
+    let provider = if verify.provider.is_empty() {
+        extract_provider_from_response(&verify.body)?
+    } else {
+        verify.provider.clone()
+    };
+    let region = consumer_edge.strip_suffix("-edge").unwrap_or(consumer_edge);
+    if !provider.starts_with(region) {
+        return Err(format!("{consumer_edge} routed to {provider}, expected local {region} provider").into());
+    }
+    Ok(provider)
+}
+
+/// Restore a deployment to 1 replica, wait for readiness, verify overlay
+/// recovery, and confirm local routing before returning.
+fn restore_deployment(
+    context: &str,
+    name: &str,
+    consumer_edge: &str,
+    narrator: &mut Narrator,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let site = context.strip_prefix("kind-grid-glb-").unwrap_or(context);
+    let reload_before = glb::count_overlay_reload_logs(consumer_edge).unwrap_or(0);
+    scale_deployment(context, name, 1)?;
+    wait_for_rollout(context, name)?;
+    wait_for_overlay_candidate_present(consumer_edge, site)?;
+    narrator.narrate(&format!("  [OK] {site} candidates returned to {consumer_edge} overlay"));
+    glb::check_hot_reload_observed(consumer_edge, reload_before)?;
+    narrator.narrate(&format!(
+        "  [OK] {consumer_edge} gateway reloaded overlay after restoration"
+    ));
+    let provider =
+        glb::wait_for_data_plane_convergence("local routing restoration", || verify_local_routing(consumer_edge))?;
+    narrator.narrate(&format!(
+        "  [OK] {consumer_edge} -> {provider} (local routing restored)"
+    ));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Path discovery and affinity (global mode)
 // ---------------------------------------------------------------------------
 
 /// Discover real edge/provider combinations through the stable HTTPS name.
@@ -1080,14 +1678,24 @@ fn mode_label(mode: DemoMode) -> &'static str {
     }
 }
 
+/// Return a combined label for evidence reports.
+fn evidence_mode_label(mode: DemoMode, ingress_mode: IngressMode) -> &'static str {
+    match (ingress_mode, mode) {
+        (IngressMode::Global, DemoMode::Quick) => "quick",
+        (IngressMode::Global, DemoMode::Full) => "full",
+        (IngressMode::Workload, DemoMode::Quick) => "workload-quick",
+        (IngressMode::Workload, DemoMode::Full) => "workload-full",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Environment setup helpers
 // ---------------------------------------------------------------------------
 
 /// Render image overrides into a Forge config without mutating source files.
-fn materialize_config(source: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn materialize_config(source: &Path, ingress_mode: IngressMode) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
-    let rendered = render_config(&content)?;
+    let rendered = render_config(&content, ingress_mode)?;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     let output = parent.join(RESOLVED_CONFIG_NAME);
     fs::write(&output, rendered)?;
@@ -1095,22 +1703,31 @@ fn materialize_config(source: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
 }
 
 /// Render image overrides into one Forge configuration document.
-fn render_config(content: &str) -> Result<String, Box<dyn std::error::Error>> {
-    validate_image_contract()?;
+fn render_config(content: &str, ingress_mode: IngressMode) -> Result<String, Box<dyn std::error::Error>> {
+    validate_image_contract_for_mode(ingress_mode)?;
     let mut config: serde_yaml::Value = serde_yaml::from_str(content)?;
     let spec = mapping_mut(&mut config, "spec")?;
-    set_cluster_image_properties(spec)?;
+    if ingress_mode == IngressMode::Workload {
+        strip_gtm_cluster(spec)?;
+    }
+    set_cluster_image_properties_for_mode(spec, ingress_mode)?;
     Ok(serde_yaml::to_string(&config)?)
 }
 
-/// Validate the image references and pull policy selected by the environment.
-fn validate_image_contract() -> Result<(), Box<dyn std::error::Error>> {
+/// Validate image references and pull policy for the given ingress mode.
+fn validate_image_contract_for_mode(ingress_mode: IngressMode) -> Result<(), Box<dyn std::error::Error>> {
     for (name, image) in [
-        ("GRID_XTASK_GATEWAY_IMAGE", image_overrides::glb_gateway_image()),
-        ("GRID_XTASK_OPERATOR_IMAGE", image_overrides::glb_operator_image()),
+        (
+            "GRID_XTASK_GATEWAY_IMAGE",
+            image_overrides::demo_gateway_image(ingress_mode),
+        ),
+        (
+            "GRID_XTASK_OPERATOR_IMAGE",
+            image_overrides::demo_operator_image(ingress_mode),
+        ),
         (
             "GRID_XTASK_MOCK_PROVIDER_IMAGE",
-            image_overrides::glb_mock_provider_image(),
+            image_overrides::demo_mock_provider_image(ingress_mode),
         ),
     ] {
         if image.is_empty() || image.chars().any(char::is_whitespace) {
@@ -1118,7 +1735,7 @@ fn validate_image_contract() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let pull_policy = image_overrides::image_pull_policy();
+    let pull_policy = image_overrides::demo_image_pull_policy(ingress_mode);
     if !matches!(pull_policy.as_str(), "Always" | "IfNotPresent" | "Never") {
         return Err(format!(
             "GRID_XTASK_IMAGE_PULL_POLICY must be Always, IfNotPresent, or Never; got {pull_policy:?}"
@@ -1136,10 +1753,13 @@ fn split_image_ref(image: &str) -> (String, String) {
     )
 }
 
-/// Apply environment-selected images to stack template properties.
-fn set_cluster_image_properties(spec: &mut serde_yaml::Mapping) -> Result<(), Box<dyn std::error::Error>> {
-    let gateway_image = image_overrides::glb_gateway_image();
-    let operator_image = image_overrides::glb_operator_image();
+/// Apply mode-selected images to stack template properties.
+fn set_cluster_image_properties_for_mode(
+    spec: &mut serde_yaml::Mapping,
+    ingress_mode: IngressMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let gateway_image = image_overrides::demo_gateway_image(ingress_mode);
+    let operator_image = image_overrides::demo_operator_image(ingress_mode);
     let (gw_repo, gw_tag) = split_image_ref(&gateway_image);
     let (op_repo, op_tag) = split_image_ref(&operator_image);
 
@@ -1150,8 +1770,11 @@ fn set_cluster_image_properties(spec: &mut serde_yaml::Mapping) -> Result<(), Bo
         for (key, value) in [
             ("gatewayImage", gateway_image.clone()),
             ("operatorImage", operator_image.clone()),
-            ("mockProviderImage", image_overrides::glb_mock_provider_image()),
-            ("imagePullPolicy", image_overrides::image_pull_policy()),
+            (
+                "mockProviderImage",
+                image_overrides::demo_mock_provider_image(ingress_mode),
+            ),
+            ("imagePullPolicy", image_overrides::demo_image_pull_policy(ingress_mode)),
             ("gatewayImageRepo", gw_repo.clone()),
             ("gatewayImageTag", gw_tag.clone()),
             ("operatorImageRepo", op_repo.clone()),
@@ -1164,20 +1787,28 @@ fn set_cluster_image_properties(spec: &mut serde_yaml::Mapping) -> Result<(), Bo
 }
 
 /// Load local images into Kind when the pull policy is `Never`.
-fn load_local_images_if_required(forge: &str, config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if image_overrides::should_skip_kind_image_loading() {
+fn load_local_images_if_required(
+    forge: &str,
+    config: &Path,
+    ingress_mode: IngressMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if image_overrides::demo_image_pull_policy(ingress_mode) != "Never" {
         return Ok(());
     }
-    let operator = image_overrides::glb_operator_image();
-    let gateway = image_overrides::glb_gateway_image();
-    let mock = image_overrides::glb_mock_provider_image();
+    let operator = image_overrides::demo_operator_image(ingress_mode);
+    let gateway = image_overrides::demo_gateway_image(ingress_mode);
+    let mock = image_overrides::demo_mock_provider_image(ingress_mode);
     for image in [&operator, &gateway, &mock] {
         require_local_image(image)?;
     }
+    let gateway_clusters = match ingress_mode {
+        IngressMode::Global => CLUSTERS,
+        IngressMode::Workload => GRID_CLUSTERS,
+    };
     for cluster in GRID_CLUSTERS {
         run_forge(forge, config, &["cluster", "load-image", cluster, &operator])?;
     }
-    for cluster in CLUSTERS {
+    for cluster in gateway_clusters {
         run_forge(forge, config, &["cluster", "load-image", cluster, &gateway])?;
     }
     for cluster in PROVIDER_CLUSTERS {
@@ -1186,9 +1817,15 @@ fn load_local_images_if_required(forge: &str, config: &Path) -> Result<(), Box<d
     Ok(())
 }
 
-/// Apply shared infrastructure before any identity-dependent workload.
-fn apply_foundation_stacks(forge: &str, config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    run_forge(forge, config, &["stack", "apply", "gtm-emulator", "metallb"])?;
+/// Apply shared infrastructure, skipping GTM when in workload mode.
+fn apply_foundation_stacks_with_mode(
+    forge: &str,
+    config: &Path,
+    ingress_mode: IngressMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if ingress_mode == IngressMode::Global {
+        run_forge(forge, config, &["stack", "apply", "gtm-emulator", "metallb"])?;
+    }
 
     for cluster in GRID_CLUSTERS {
         run_forge(forge, config, &["stack", "apply", cluster, "metallb"])?;
@@ -1372,6 +2009,37 @@ fn require_local_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ---------------------------------------------------------------------------
+// Workload-mode config stripping
+// ---------------------------------------------------------------------------
+
+/// GTM cluster name removed from the Forge config in workload mode.
+const GTM_CLUSTER_NAME: &str = "gtm-emulator";
+
+/// Remove the GTM emulator cluster and its stacks from the Forge spec.
+///
+/// Retains every other cluster and stack entry unchanged, producing a
+/// four-cluster resolved config for the workload-inference topology.
+fn strip_gtm_cluster(spec: &mut serde_yaml::Mapping) -> Result<(), Box<dyn std::error::Error>> {
+    let clusters = sequence_mut(spec, "clusters")?;
+    clusters.retain(|cluster| {
+        cluster
+            .as_mapping()
+            .and_then(|mapping| mapping.get(yaml_key("name")))
+            .and_then(serde_yaml::Value::as_str)
+            .is_none_or(|name| name != GTM_CLUSTER_NAME)
+    });
+
+    if let Some(stacks) = spec
+        .get_mut(yaml_key("stacks"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    {
+        stacks.remove(yaml_key(GTM_CLUSTER_NAME));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // YAML helpers
 // ---------------------------------------------------------------------------
 
@@ -1440,11 +2108,11 @@ mod setup_tests {
         #[test]
         fn materialized_config_uses_glb_image_contract() -> Result<(), Box<dyn std::error::Error>> {
             let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
-            let rendered = render_config(&fs::read_to_string(source)?)?;
-            assert!(rendered.contains(&image_overrides::glb_gateway_image()));
-            assert!(rendered.contains(&image_overrides::glb_operator_image()));
-            assert!(rendered.contains(&image_overrides::glb_mock_provider_image()));
-            assert!(rendered.contains(&image_overrides::image_pull_policy()));
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global)?;
+            assert!(rendered.contains(&image_overrides::demo_gateway_image(IngressMode::Global)));
+            assert!(rendered.contains(&image_overrides::demo_operator_image(IngressMode::Global)));
+            assert!(rendered.contains(&image_overrides::demo_mock_provider_image(IngressMode::Global)));
+            assert!(rendered.contains(&image_overrides::demo_image_pull_policy(IngressMode::Global)));
             assert!(!rendered.contains("grid-overlay-sync"));
             Ok(())
         }
@@ -1546,7 +2214,65 @@ mod setup_tests {
 
         #[test]
         fn default_glb_image_contract_is_valid() {
-            assert!(validate_image_contract().is_ok());
+            assert!(validate_image_contract_for_mode(IngressMode::Global).is_ok());
+        }
+
+        #[test]
+        fn default_workload_image_contract_is_valid() {
+            assert!(validate_image_contract_for_mode(IngressMode::Workload).is_ok());
+        }
+
+        #[test]
+        fn workload_config_has_four_clusters() -> Result<(), Box<dyn std::error::Error>> {
+            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload)?;
+            let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
+            let clusters = config
+                .get("spec")
+                .and_then(|value| value.get("clusters"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .ok_or("spec.clusters must be a sequence")?;
+            assert_eq!(clusters.len(), 4, "workload mode must have exactly four clusters");
+            let names: Vec<&str> = clusters
+                .iter()
+                .filter_map(|cluster| cluster.get("name").and_then(serde_yaml::Value::as_str))
+                .collect();
+            assert!(
+                !names.contains(&"gtm-emulator"),
+                "workload mode must not contain gtm-emulator cluster"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn global_config_has_five_clusters() -> Result<(), Box<dyn std::error::Error>> {
+            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global)?;
+            let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
+            let clusters = config
+                .get("spec")
+                .and_then(|value| value.get("clusters"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .ok_or("spec.clusters must be a sequence")?;
+            assert_eq!(clusters.len(), 5, "global mode must have exactly five clusters");
+            Ok(())
+        }
+
+        #[test]
+        fn workload_config_strips_gtm_stacks() -> Result<(), Box<dyn std::error::Error>> {
+            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload)?;
+            let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
+            let stacks = config
+                .get("spec")
+                .and_then(|value| value.get("stacks"))
+                .and_then(serde_yaml::Value::as_mapping)
+                .ok_or("spec.stacks must be a mapping")?;
+            assert!(
+                stacks.get(yaml_key("gtm-emulator")).is_none(),
+                "workload mode must not contain gtm-emulator stack"
+            );
+            Ok(())
         }
 
         // ----- New tests for demo runner enhancements -----
@@ -1580,6 +2306,7 @@ mod setup_tests {
                 mode_options: GlbDemoModeOptions {
                     quick: false,
                     full: false,
+                    no_ingress: false,
                 },
                 teardown: false,
                 keep_on_failure: false,
@@ -1594,12 +2321,29 @@ mod setup_tests {
                 mode_options: GlbDemoModeOptions {
                     quick: true,
                     full: false,
+                    no_ingress: false,
                 },
                 teardown: false,
                 keep_on_failure: false,
                 evidence_dir: None,
             };
             assert_eq!(options.mode(), DemoMode::Quick);
+            assert_eq!(options.ingress_mode(), IngressMode::Global);
+        }
+
+        #[test]
+        fn no_ingress_flag_selects_workload_mode() {
+            let options = GlbDemoOptions {
+                mode_options: GlbDemoModeOptions {
+                    quick: true,
+                    full: false,
+                    no_ingress: true,
+                },
+                teardown: false,
+                keep_on_failure: false,
+                evidence_dir: None,
+            };
+            assert_eq!(options.ingress_mode(), IngressMode::Workload);
         }
 
         fn sample_report(mode: &'static str, status: &'static str) -> EvidenceReport {
@@ -1810,6 +2554,47 @@ mod setup_tests {
             ];
             let skipped_count = quick_caps.iter().filter(|c| c.result == "skipped").count();
             assert_eq!(skipped_count, 3, "quick mode must skip 3 capabilities");
+        }
+
+        #[test]
+        fn evidence_mode_labels_encode_ingress_and_demo_mode() {
+            assert_eq!(evidence_mode_label(DemoMode::Quick, IngressMode::Global), "quick");
+            assert_eq!(evidence_mode_label(DemoMode::Full, IngressMode::Global), "full");
+            assert_eq!(
+                evidence_mode_label(DemoMode::Quick, IngressMode::Workload),
+                "workload-quick"
+            );
+            assert_eq!(
+                evidence_mode_label(DemoMode::Full, IngressMode::Workload),
+                "workload-full"
+            );
+        }
+
+        #[test]
+        fn workload_introduction_contains_expected_path() {
+            let mut narrator = Narrator::new();
+            print_workload_introduction(&mut narrator, DemoMode::Quick);
+            let text = narrator.lines.join("\n");
+            assert!(text.contains("WORKLOAD INFERENCE"), "banner must mention workload");
+            assert!(
+                text.contains("consumer gateway"),
+                "path must reference consumer gateway"
+            );
+            assert!(!text.contains("GTM"), "workload narration must not mention GTM");
+            assert!(
+                !text.contains("HTTPS endpoint"),
+                "workload narration must not mention public endpoint"
+            );
+        }
+
+        #[test]
+        fn workload_boundaries_mark_gtm_not_applicable() {
+            let mut narrator = Narrator::new();
+            print_workload_boundaries(&mut narrator, DemoMode::Quick);
+            let text = narrator.lines.join("\n");
+            assert!(text.contains("NOT APPLICABLE"), "must mark GTM as not applicable");
+            let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(collapsed.contains("traffic manager"), "must reference traffic manager");
         }
     }
 }

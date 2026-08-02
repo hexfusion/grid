@@ -37,6 +37,16 @@ helm install grid-operator charts/grid-operator \
   --create-namespace
 ```
 
+## Versioning
+
+The chart follows [Semantic Versioning](https://semver.org/). In
+`Chart.yaml`, `version` identifies the Helm chart package and `appVersion`
+identifies the default Grid operator image. The two versions may advance
+independently, but Grid releases keep them aligned when the chart and operator
+ship together. For example, a backward-compatible fix to the current `0.1.0`
+release uses the patch version `0.1.1`; new backward-compatible functionality
+uses the next minor version.
+
 ## Verify
 
 ```bash

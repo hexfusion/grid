@@ -1,0 +1,29 @@
+# Praxis consumer gateway values for the west consumer site.
+#
+# Install:
+#   helm upgrade --install consumer-gateway ../../../../charts/praxis-gateway \
+#     --kube-context "$WEST_CONSUMER_CONTEXT" \
+#     --namespace grid-system \
+#     --values west-consumer-gateway.yaml
+
+image:
+  repository: ghcr.io/praxis-proxy/grid-ai-rollup
+  tag: v0.1.0
+  pullPolicy: IfNotPresent
+
+config:
+  existingConfigMap: consumer-praxis-config
+  key: praxis.yaml
+
+overlay:
+  enabled: true
+  existingConfigMap: grid-routing-overlay
+
+tls:
+  enabled: true
+  existingSecret: consumer-tls
+
+service:
+  enabled: true
+  type: ClusterIP
+  port: 8080

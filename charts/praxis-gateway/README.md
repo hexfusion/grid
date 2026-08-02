@@ -38,6 +38,10 @@ The default image is the Grid v0.1.0 Praxis AI rollup. Override
 `image.repository`, `image.tag`, or `image.digest` to install another compatible
 Praxis image. Prefer a digest when reproducing a validated deployment.
 
+The chart uses [Semantic Versioning](https://semver.org/). Its `version`
+identifies the chart package, while `appVersion` identifies the default Praxis
+AI image; these values may advance independently.
+
 ## Values
 
 | Key | Type | Default | Description |

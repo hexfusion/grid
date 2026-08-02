@@ -1,0 +1,24 @@
+# Grid Operator values for the west provider site (dedicated-edge topology).
+#
+# Install:
+#   helm upgrade --install grid-operator ../../../../charts/grid-operator \
+#     --kube-context "$WEST_PROVIDER_CONTEXT" \
+#     --namespace grid-system --create-namespace \
+#     --values west-provider-operator.yaml
+
+image:
+  repository: ghcr.io/praxis-proxy/grid-operator
+  tag: v0.1.1
+  pullPolicy: IfNotPresent
+
+swim:
+  siteName: west-provider
+  seeds: "REPLACE_EAST_CONSUMER_SWIM:7946,REPLACE_WEST_CONSUMER_SWIM:7946,REPLACE_EAST_PROVIDER_SWIM:7946"
+  service:
+    enabled: true
+    type: LoadBalancer
+    port: 7946
+
+gateway:
+  serviceName: provider-gateway
+  port: "8443"

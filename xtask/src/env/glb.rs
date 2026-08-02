@@ -17,7 +17,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 use crate::env::{
-    DemoMode, StepResult, StepStatus, certs, kubectl, print_validate_all_table, safe_truncate_str, verify,
+    DemoMode, IngressMode, StepResult, StepStatus, certs, kubectl, print_validate_all_table, safe_truncate_str, verify,
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +183,11 @@ pub(crate) fn prepare_provider_boundary() -> Result<(), Box<dyn std::error::Erro
 /// This phase does not require Kubernetes. It runs before the provider
 /// workload stack so no pod is created with unresolved trust placeholders.
 pub(crate) fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    stage_provider_boundary_with_mode(IngressMode::Global)
+}
+
+/// Generate and stage identities, optionally skipping GTM TLS in workload mode.
+pub(crate) fn stage_provider_boundary_with_mode(ingress_mode: IngressMode) -> Result<(), Box<dyn std::error::Error>> {
     let identities = vec![
         "east-edge".to_owned(),
         "west-edge".to_owned(),
@@ -196,7 +201,9 @@ pub(crate) fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>
         Path::new(GENERATED_CERTS_DIR).join("untrusted-ca.pem"),
         wrong_ca.cert_pem,
     )?;
-    stage_gtm_tls()?;
+    if ingress_mode == IngressMode::Global {
+        stage_gtm_tls()?;
+    }
     let east_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
     let west_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
     stage_provider_configs(&east_edge_digest, &west_edge_digest)?;
@@ -208,11 +215,21 @@ pub(crate) fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>
 /// The `grid-system` namespace must exist. Provider deployments may already
 /// exist or may be applied after this function returns.
 pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    ensure_demo_namespace("gtm-emulator")?;
+    install_provider_boundary_with_mode(IngressMode::Global)
+}
+
+/// Install staged identities and credentials, skipping GTM in workload mode.
+#[expect(clippy::too_many_lines, reason = "mode-branched sequential identity installation")]
+pub(crate) fn install_provider_boundary_with_mode(ingress_mode: IngressMode) -> Result<(), Box<dyn std::error::Error>> {
+    if ingress_mode == IngressMode::Global {
+        ensure_demo_namespace("gtm-emulator")?;
+    }
     for edge in EDGE_CLUSTERS {
         apply_identity_tls_secret(edge, edge, EDGE_TLS_SECRET)?;
     }
-    apply_gtm_tls_secret()?;
+    if ingress_mode == IngressMode::Global {
+        apply_gtm_tls_secret()?;
+    }
     for provider in PROVIDER_CLUSTERS {
         let provider_credential = generate_provider_credential()?;
         apply_provider_config(provider)?;
@@ -228,9 +245,12 @@ pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Erro
         }
         restart_provider_deployments_if_present(provider)?;
     }
-    eprintln!(
-        "grid-routing: edge identities, GTM certificate, provider configs, mTLS material, and credentials installed"
-    );
+    let gtm_note = if ingress_mode == IngressMode::Global {
+        ", GTM certificate"
+    } else {
+        ""
+    };
+    eprintln!("grid-routing: edge identities{gtm_note}, provider configs, mTLS material, and credentials installed");
     Ok(())
 }
 
@@ -580,7 +600,7 @@ fn restart_deployment(provider: &str, deployment: &str) -> Result<(), Box<dyn st
 /// Returns an error if hard prerequisites fail (config, tools,
 /// forge binary) or any verification step is not `PASS`.
 pub(crate) fn verify_grid_routing(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    verify_grid_routing_with_mode(forge_config, DemoMode::Full)
+    verify_grid_routing_with_mode(forge_config, DemoMode::Full, IngressMode::Global)
 }
 
 /// Run the Grid routing and provider-boundary proof with mode gating.
@@ -595,6 +615,7 @@ pub(crate) fn verify_grid_routing(forge_config: &Path) -> Result<(), Box<dyn std
 pub(crate) fn verify_grid_routing_with_mode(
     forge_config: &Path,
     mode: DemoMode,
+    ingress_mode: IngressMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("DETAILED RUNTIME PROOF");
@@ -603,7 +624,7 @@ pub(crate) fn verify_grid_routing_with_mode(
     let ctx = check_prerequisites(forge_config)?;
 
     let mut results: Vec<StepResult> = Vec::new();
-    run_steps(&ctx, mode, &mut results);
+    run_steps(&ctx, mode, ingress_mode, &mut results);
 
     eprintln!();
     eprintln!("RUNTIME PROOF RESULTS");
@@ -930,7 +951,7 @@ fn image_is_latest(image: &str) -> bool {
     clippy::too_many_lines,
     reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
 )]
-fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>) {
+fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, results: &mut Vec<StepResult>) {
     // Forge config validation.
     proof_banner("validating forge config");
     let config_ok = record_step("prerequisites", results, || {
@@ -957,7 +978,9 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, results: &mut Vec<StepResult>)
 
     // All clusters live.
     proof_banner("checking clusters live");
-    let clusters_ok = record_step("clusters live", results, || check_clusters_live(&status_json));
+    let clusters_ok = record_step("clusters live", results, || {
+        check_clusters_live(&status_json, ingress_mode)
+    });
     if !clusters_ok {
         block_remaining("provider gateway IPs", "clusters not live", results);
         return;
@@ -1892,15 +1915,23 @@ pub(crate) fn run_forge_status(
 }
 
 /// Verify all expected clusters are live.
-pub(crate) fn check_clusters_live(status_json: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn check_clusters_live(
+    status_json: &serde_json::Value,
+    ingress_mode: IngressMode,
+) -> Result<String, Box<dyn std::error::Error>> {
     let clusters = status_json
         .get("data")
         .and_then(|d| d.get("clusters"))
         .and_then(serde_json::Value::as_array)
         .ok_or("status JSON missing data.clusters array")?;
 
+    let expected_clusters: &[&str] = match ingress_mode {
+        IngressMode::Global => CLUSTER_NAMES,
+        IngressMode::Workload => GRID_CLUSTERS,
+    };
+
     let mut missing = Vec::new();
-    for expected in CLUSTER_NAMES {
+    for expected in expected_clusters {
         let found = clusters.iter().any(|c| {
             c.get("name").and_then(serde_json::Value::as_str) == Some(expected)
                 && c.get("live").and_then(serde_json::Value::as_bool) == Some(true)
@@ -1911,7 +1942,7 @@ pub(crate) fn check_clusters_live(status_json: &serde_json::Value) -> Result<Str
     }
 
     if missing.is_empty() {
-        Ok(format!("all {} clusters live", CLUSTER_NAMES.len()))
+        Ok(format!("all {} clusters live", expected_clusters.len()))
     } else {
         Err(format!("clusters not live: {}", missing.join(", ")).into())
     }
@@ -2905,7 +2936,7 @@ fn check_same_site_provider_routing() -> Result<String, Box<dyn std::error::Erro
     let first = validate_same_site_response(&first_response)?;
 
     let drain = setup_session_drain(PRIMARY_EDGE, &first)?;
-    let proof = (|| {
+    let proof = wait_for_data_plane_convergence("same-site drain routing", || {
         let second_session = format!("same-site-second-{}", unix_nanos());
         let second_response = curl_edge_request(EDGE_PORT, Some(&second_session))?;
         let second = validate_same_site_response(&second_response)?;
@@ -2913,7 +2944,7 @@ fn check_same_site_provider_routing() -> Result<String, Box<dyn std::error::Erro
             return Err(format!("new session remained on drained same-site provider {first}").into());
         }
         Ok(second)
-    })();
+    });
     let restore = restore_provider_admission(PRIMARY_EDGE, &first);
 
     match (proof, restore) {
@@ -2970,7 +3001,7 @@ fn provider_gateway_site(provider: &str) -> Result<&'static str, Box<dyn std::er
 }
 
 /// Retry a request assertion while a projected overlay reaches the data plane.
-fn wait_for_data_plane_convergence<T>(
+pub(crate) fn wait_for_data_plane_convergence<T>(
     description: &str,
     check: impl FnMut() -> Result<T, Box<dyn std::error::Error>>,
 ) -> Result<T, Box<dyn std::error::Error>> {
@@ -3080,7 +3111,10 @@ fn check_session_drain(port: u16, drained_provider: &str) -> Result<String, Box<
 }
 
 /// Check edge logs for hot-reload evidence.
-fn check_hot_reload_observed(edge: &str, previous_count: usize) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn check_hot_reload_observed(
+    edge: &str,
+    previous_count: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         let current_count = count_overlay_reload_logs(edge)?;
@@ -3099,7 +3133,7 @@ fn check_hot_reload_observed(edge: &str, previous_count: usize) -> Result<String
 }
 
 /// Count overlay reload log entries for a Kubernetes edge pod.
-fn count_overlay_reload_logs(edge: &str) -> Result<usize, Box<dyn std::error::Error>> {
+pub(crate) fn count_overlay_reload_logs(edge: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(count_reload_entries(&edge_gateway_logs(edge)?))
 }
 
@@ -4133,12 +4167,21 @@ clusters:
     }
 
     #[test]
-    fn parses_forge_status_clusters() {
+    fn parses_forge_status_clusters_global() {
         let status = status_with_clusters();
-        let result = check_clusters_live(&status);
+        let result = check_clusters_live(&status, IngressMode::Global);
         assert!(result.is_ok(), "all clusters should be live: {result:?}");
         let evidence = result.unwrap_or_else(|_| std::process::abort());
         assert!(evidence.contains("5"), "should report 5 clusters: {evidence}");
+    }
+
+    #[test]
+    fn parses_forge_status_clusters_workload() {
+        let status = status_with_clusters();
+        let result = check_clusters_live(&status, IngressMode::Workload);
+        assert!(result.is_ok(), "all grid clusters should be live: {result:?}");
+        let evidence = result.unwrap_or_else(|_| std::process::abort());
+        assert!(evidence.contains("4"), "should report 4 clusters: {evidence}");
     }
 
     #[test]

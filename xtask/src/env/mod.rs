@@ -16,6 +16,7 @@ pub(crate) mod operator_overlay;
 pub(crate) mod providers;
 pub(crate) mod trust;
 pub(crate) mod verify;
+pub(crate) mod workload;
 
 use std::{
     path::{Path, PathBuf},
@@ -41,8 +42,21 @@ pub(crate) enum DemoMode {
     Full,
 }
 
+/// Ingress topology for the GLB demo environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IngressMode {
+    /// Five clusters including the GTM emulator (default).
+    Global,
+    /// Four clusters without GTM; workloads originate inside consumer clusters.
+    Workload,
+}
+
 /// Scenario-selection options shared by GLB demo commands.
 #[derive(Debug, clap::Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI flag struct with independent boolean options"
+)]
 pub(crate) struct GlbDemoModeOptions {
     /// Run only discovery, routing, and security boundary scenarios.
     #[arg(long, conflicts_with = "full")]
@@ -51,12 +65,25 @@ pub(crate) struct GlbDemoModeOptions {
     /// Run all scenarios, including restarts and a five-minute soak (default).
     #[arg(long, conflicts_with = "quick")]
     pub(crate) full: bool,
+
+    /// Use workload-inference topology: four clusters, no GTM emulator.
+    #[arg(long)]
+    pub(crate) no_ingress: bool,
 }
 
 impl GlbDemoModeOptions {
     /// Resolve the selected demo mode.
     pub(crate) fn mode(&self) -> DemoMode {
         if self.quick { DemoMode::Quick } else { DemoMode::Full }
+    }
+
+    /// Resolve the selected ingress topology.
+    pub(crate) fn ingress_mode(&self) -> IngressMode {
+        if self.no_ingress {
+            IngressMode::Workload
+        } else {
+            IngressMode::Global
+        }
     }
 }
 
@@ -84,6 +111,11 @@ impl GlbDemoOptions {
     /// Resolve the selected demo mode.
     pub(crate) fn mode(&self) -> DemoMode {
         self.mode_options.mode()
+    }
+
+    /// Resolve the selected ingress topology.
+    pub(crate) fn ingress_mode(&self) -> IngressMode {
+        self.mode_options.ingress_mode()
     }
 }
 
@@ -856,6 +888,10 @@ pub(crate) enum Action {
         /// Path to the source Forge environment config file.
         #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
+
+        /// Use workload-inference topology: four clusters, no GTM emulator.
+        #[arg(long)]
+        no_ingress: bool,
     },
 
     /// Create the environment, then run the narrated GLB scenario collection.
@@ -933,7 +969,17 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::DemonstrateGridGlb { forge_config, options } => {
             glb_demo::demonstrate_with_options(forge_config, options)
         },
-        Action::SetupGridGlb { forge_config } => glb_demo::setup(forge_config).map(|_| ()),
+        Action::SetupGridGlb {
+            forge_config,
+            no_ingress,
+        } => {
+            let ingress_mode = if *no_ingress {
+                IngressMode::Workload
+            } else {
+                IngressMode::Global
+            };
+            glb_demo::setup(forge_config, ingress_mode).map(|_| ())
+        },
         Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
     }
 }

@@ -1,0 +1,26 @@
+# Grid Operator values for the east-a combined site.
+# The operator discovers the consumer gateway on this cluster.
+# The provider gateway is a separate Praxis release on the same cluster.
+#
+# Install:
+#   helm upgrade --install grid-operator ../../../../charts/grid-operator \
+#     --kube-context "$EAST_A_CONTEXT" \
+#     --namespace grid-system --create-namespace \
+#     --values east-a-operator.yaml
+
+image:
+  repository: ghcr.io/praxis-proxy/grid-operator
+  tag: v0.1.1
+  pullPolicy: IfNotPresent
+
+swim:
+  siteName: east-a
+  seeds: "REPLACE_EAST_B_SWIM:7946,REPLACE_WEST_A_SWIM:7946,REPLACE_WEST_B_SWIM:7946"
+  service:
+    enabled: true
+    type: LoadBalancer
+    port: 7946
+
+gateway:
+  serviceName: consumer-gateway
+  port: "8080"

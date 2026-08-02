@@ -44,6 +44,12 @@ active Praxis edges, distinguishes that path from cluster-local workload
 inference, narrates each request and failure scenario, records runtime evidence,
 and tears the environment down when complete.
 
+For cluster-local routing without a traffic manager, see the
+[Workload Inference Demo](demos/grid-workload-inference/README.md).
+
+For deploying Grid onto existing clusters with Helm, see
+[examples/helm/existing-clusters/](examples/helm/existing-clusters/README.md).
+
 ```bash
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |

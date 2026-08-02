@@ -1,0 +1,34 @@
+# Praxis provider gateway values for the east-b site (combined topology).
+#
+# Install:
+#   helm upgrade --install provider-gateway ../../../../charts/praxis-gateway \
+#     --kube-context "$EAST_B_CONTEXT" \
+#     --namespace grid-system \
+#     --values east-b-provider-gateway.yaml
+
+image:
+  repository: ghcr.io/praxis-proxy/grid-ai-rollup
+  tag: v0.1.0
+  pullPolicy: IfNotPresent
+
+config:
+  existingConfigMap: provider-praxis-config
+  key: praxis.yaml
+
+tls:
+  enabled: true
+  existingSecret: provider-tls
+
+credentials:
+  - name: mock-inference-credential
+    mountPath: /etc/praxis/credentials/mock-inference
+    optional: false
+
+port:
+  containerPort: 8443
+  name: https
+
+service:
+  enabled: true
+  type: ClusterIP
+  port: 8443

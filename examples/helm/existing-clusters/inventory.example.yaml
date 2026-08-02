@@ -1,0 +1,47 @@
+# Grid existing-cluster inventory.
+#
+# Copy this file to inventory.yaml (gitignored) and fill in your values.
+# Never commit inventory.yaml — it contains environment-specific details.
+#
+# topology: dedicated-edge | combined-site
+topology: dedicated-edge
+
+sites:
+  east-consumer:
+    # kubectl context name for this cluster
+    context: replace-me
+    # Roles: [consumer] for dedicated-edge, [consumer, provider] for combined-site
+    roles: [consumer]
+    # Externally reachable address for the Praxis consumer gateway
+    gatewayAddress: replace-me
+    # Externally reachable address for the Grid Operator SWIM service
+    swimAddress: replace-me
+
+  west-consumer:
+    context: replace-me
+    roles: [consumer]
+    gatewayAddress: replace-me
+    swimAddress: replace-me
+
+  east-provider:
+    context: replace-me
+    roles: [provider]
+    # Externally reachable address for the Praxis provider gateway
+    gatewayAddress: replace-me
+    swimAddress: replace-me
+
+  west-provider:
+    context: replace-me
+    roles: [provider]
+    gatewayAddress: replace-me
+    swimAddress: replace-me
+
+# Image overrides (optional).
+# When omitted, charts use their default values.
+images:
+  operator:
+    repository: ghcr.io/praxis-proxy/grid-operator
+    tag: v0.1.1
+  gateway:
+    repository: ghcr.io/praxis-proxy/grid-ai-rollup
+    tag: v0.1.0

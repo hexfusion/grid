@@ -1,0 +1,24 @@
+# Grid Operator values for the west-a combined site.
+#
+# Install:
+#   helm upgrade --install grid-operator ../../../../charts/grid-operator \
+#     --kube-context "$WEST_A_CONTEXT" \
+#     --namespace grid-system --create-namespace \
+#     --values west-a-operator.yaml
+
+image:
+  repository: ghcr.io/praxis-proxy/grid-operator
+  tag: v0.1.1
+  pullPolicy: IfNotPresent
+
+swim:
+  siteName: west-a
+  seeds: "REPLACE_EAST_A_SWIM:7946,REPLACE_EAST_B_SWIM:7946,REPLACE_WEST_B_SWIM:7946"
+  service:
+    enabled: true
+    type: LoadBalancer
+    port: 7946
+
+gateway:
+  serviceName: consumer-gateway
+  port: "8080"
