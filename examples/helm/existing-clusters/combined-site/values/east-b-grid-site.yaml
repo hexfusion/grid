@@ -1,0 +1,54 @@
+# Grid site topology resources for the east-b combined site.
+#
+# Install:
+#   helm upgrade --install grid-site ../../../../charts/grid-site \
+#     --kube-context "$REPLACE_EAST_B_CONTEXT" \
+#     --namespace grid-system \
+#     --values east-b-grid-site.yaml
+
+gridNetwork:
+  name: REPLACE_NETWORK_NAME
+  gridId: ""
+  region: us-east-2
+  zone: east-b
+  swim:
+    probeInterval: 5s
+    suspicionTimeout: 15s
+    gossipNodes: 3
+  gatewayRefs:
+    - name: consumer-gateway
+      namespace: grid-system
+      localSiteName: east-b
+
+gridSite:
+  name: east-b
+  region: us-east-2
+  zone: us-east-2a
+  providerSiteLabel: east-b
+
+inferenceProviders:
+  - name: mock-east-b-provider
+    gridNetworkRef: REPLACE_NETWORK_NAME
+    providerKind: simulator
+    backendKind: local_model
+    endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
+    siteSelector:
+      matchLabels:
+        grid.praxis-proxy.io/provider-site: east-b
+    accessPolicy:
+      siteSelector:
+        matchLabels: {}
+    models:
+      - name: sim-model-v1
+        capabilities:
+          - text_generation
+        contextWindow: 4096
+    healthCheck:
+      path: /health
+      interval: 30s
+      timeout: 5s
+    metricsConfig:
+      path: /metrics
+      timeout: 2s
+      signalNames:
+        queueDepth: grid_demo_queue_depth

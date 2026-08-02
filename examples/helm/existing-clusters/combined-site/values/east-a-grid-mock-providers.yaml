@@ -1,0 +1,29 @@
+# Mock inference providers for the east-a combined site.
+# Deploys mock backends as Deployments with per-provider credentials.
+#
+# Install:
+#   helm upgrade --install grid-mock-providers ../../../../charts/grid-mock-providers \
+#     --kube-context "$EAST_A_CONTEXT" \
+#     --namespace grid-system \
+#     --values east-a-grid-mock-providers.yaml
+
+image:
+  repository: ghcr.io/nerdalert/grid-mock-providers
+  tag: v0.1.0
+  pullPolicy: IfNotPresent
+
+providers:
+  - name: a
+    credentialSecret: mock-credential-a
+    credentialKey: token
+    env:
+      MOCK_PROVIDER_SITE: "east-a"
+      MOCK_QUEUE_DEPTH: "0.10"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

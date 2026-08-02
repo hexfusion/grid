@@ -6,6 +6,8 @@
 #     --namespace grid-system \
 #     --values west-provider-gateway.yaml
 
+fullnameOverride: provider-gateway
+
 image:
   repository: ghcr.io/praxis-proxy/grid-ai-rollup
   tag: v0.1.0

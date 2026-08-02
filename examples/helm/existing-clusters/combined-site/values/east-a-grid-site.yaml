@@ -1,0 +1,56 @@
+# Grid site topology resources for the east-a combined site.
+# Creates the GridNetwork, GridSite, and InferenceProvider CRs
+# that the Grid Operator reconciles into a routing overlay.
+#
+# Install:
+#   helm upgrade --install grid-site ../../../../charts/grid-site \
+#     --kube-context "$EAST_A_CONTEXT" \
+#     --namespace grid-system \
+#     --values east-a-grid-site.yaml
+
+gridNetwork:
+  name: REPLACE_NETWORK_NAME
+  gridId: ""
+  region: us-east-1
+  zone: east-a
+  swim:
+    probeInterval: 5s
+    suspicionTimeout: 15s
+    gossipNodes: 3
+  gatewayRefs:
+    - name: consumer-gateway
+      namespace: grid-system
+      localSiteName: east-a
+
+gridSite:
+  name: east-a
+  region: us-east-1
+  zone: us-east-1a
+  providerSiteLabel: east-a
+
+inferenceProviders:
+  - name: mock-east-a-provider
+    gridNetworkRef: REPLACE_NETWORK_NAME
+    providerKind: simulator
+    backendKind: local_model
+    endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
+    siteSelector:
+      matchLabels:
+        grid.praxis-proxy.io/provider-site: east-a
+    accessPolicy:
+      siteSelector:
+        matchLabels: {}
+    models:
+      - name: sim-model-v1
+        capabilities:
+          - text_generation
+        contextWindow: 4096
+    healthCheck:
+      path: /health
+      interval: 30s
+      timeout: 5s
+    metricsConfig:
+      path: /metrics
+      timeout: 2s
+      signalNames:
+        queueDepth: grid_demo_queue_depth

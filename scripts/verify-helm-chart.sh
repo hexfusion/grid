@@ -21,6 +21,8 @@ cleanup() {
   fi
   rm -f /tmp/grid-operator-helm-verify-*.tgz
   rm -f /tmp/praxis-gateway-helm-verify-*.tgz
+  rm -f /tmp/grid-site-helm-verify-*.tgz
+  rm -f /tmp/grid-mock-providers-helm-verify-*.tgz
 }
 trap cleanup EXIT
 
@@ -263,6 +265,38 @@ for f in "$EXAMPLE_DIR"/combined-site/values/*-consumer-gateway.yaml "$EXAMPLE_D
   try_template "$GW_DIR" "$LABEL" "${GW_REQ[@]}" --namespace grid-system -f "$f"
 done
 
+for f in "$EXAMPLE_DIR"/combined-site/values/*-grid-site.yaml; do
+  LABEL="example combined-site $(basename "$f" .yaml)"
+  try_template "charts/grid-site" "$LABEL" --namespace grid-system -f "$f"
+done
+
+for f in "$EXAMPLE_DIR"/combined-site/values/*-grid-mock-providers.yaml; do
+  LABEL="example combined-site $(basename "$f" .yaml)"
+  try_template "charts/grid-mock-providers" "$LABEL" --namespace grid-system -f "$f"
+done
+
+# ── Verify fullnameOverride ──────────────────────────────────────────
+echo ""
+echo "=== fullnameOverride (gateway) ==="
+DEFAULT_SVC_NAME=$(helm template consumer-gateway "$GW_DIR" "${GW_REQ[@]}" \
+  --namespace grid-system --show-only templates/service.yaml 2>/dev/null \
+  | grep 'name:' | head -1 | awk '{print $2}')
+if [ "$DEFAULT_SVC_NAME" = "consumer-gateway-praxis-gateway" ]; then
+  pass "fullname: default is {release}-praxis-gateway"
+else
+  fail "fullname: expected consumer-gateway-praxis-gateway, got '$DEFAULT_SVC_NAME'"
+fi
+
+OVERRIDE_SVC_NAME=$(helm template consumer-gateway "$GW_DIR" "${GW_REQ[@]}" \
+  --set fullnameOverride=consumer-gateway \
+  --namespace grid-system --show-only templates/service.yaml 2>/dev/null \
+  | grep 'name:' | head -1 | awk '{print $2}')
+if [ "$OVERRIDE_SVC_NAME" = "consumer-gateway" ]; then
+  pass "fullname: fullnameOverride produces exact name"
+else
+  fail "fullname: expected consumer-gateway, got '$OVERRIDE_SVC_NAME'"
+fi
+
 # ── Verify selector protection ──────────────────────────────────────
 echo ""
 echo "=== Selector protection (gateway) ==="
@@ -308,7 +342,161 @@ else
 fi
 
 # ======================================================================
-# Kind Tests (both charts)
+# Grid Site Chart
+# ======================================================================
+
+SITE_DIR="charts/grid-site"
+
+echo ""
+echo "======================================================================"
+echo "  Grid Site Chart ($SITE_DIR)"
+echo "======================================================================"
+
+SITE_REQ=(--set gridNetwork.name=test-net --set gridSite.name=test-site)
+
+echo ""
+echo "=== Helm lint (site) ==="
+if helm lint "$SITE_DIR" --strict "${SITE_REQ[@]}" 2>&1; then
+  pass "helm lint --strict (site)"
+else
+  fail "helm lint --strict (site)"
+fi
+
+echo ""
+echo "=== Template rendering (site) ==="
+try_template "$SITE_DIR" "site default" "${SITE_REQ[@]}" --namespace grid-system
+try_template "$SITE_DIR" "site with providers" "${SITE_REQ[@]}" --namespace grid-system \
+  --set 'inferenceProviders[0].name=mock-a' \
+  --set 'inferenceProviders[0].gridNetworkRef=test-net' \
+  --set 'inferenceProviders[0].providerKind=simulator' \
+  --set 'inferenceProviders[0].backendKind=local_model' \
+  --set 'inferenceProviders[0].endpoint=http://mock-a:8080' \
+  --set 'inferenceProviders[1].name=mock-b' \
+  --set 'inferenceProviders[1].gridNetworkRef=test-net' \
+  --set 'inferenceProviders[1].providerKind=simulator' \
+  --set 'inferenceProviders[1].backendKind=local_model' \
+  --set 'inferenceProviders[1].endpoint=http://mock-b:8080'
+try_template "$SITE_DIR" "site with gateway refs" "${SITE_REQ[@]}" --namespace grid-system \
+  --set 'gridNetwork.gatewayRefs[0].name=consumer-gateway' \
+  --set 'gridNetwork.gatewayRefs[0].namespace=grid-system' \
+  --set 'gridNetwork.gatewayRefs[0].localSiteName=east-a'
+try_template "$SITE_DIR" "site with provider-site label" "${SITE_REQ[@]}" --namespace grid-system \
+  --set gridSite.providerSiteLabel=test-site
+
+echo ""
+echo "=== Schema rejection (site) ==="
+try_reject "$SITE_DIR" "missing gridNetwork name" --set gridSite.name=test
+try_reject "$SITE_DIR" "missing gridSite name" --set gridNetwork.name=test
+try_reject "$SITE_DIR" "unknown key (site)" "${SITE_REQ[@]}" --set typoField=true
+
+echo ""
+echo "=== Helm package (site) ==="
+PKG_OUT=$(helm package "$SITE_DIR" -d /tmp 2>&1)
+TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
+if [ -f "$TGZ" ]; then
+  pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
+  CONTENTS=$(tar tzf "$TGZ" 2>&1)
+  for f in Chart.yaml values.yaml values.schema.json templates/gridnetwork.yaml templates/gridsite.yaml templates/inferenceprovider.yaml; do
+    if echo "$CONTENTS" | grep -q "$f"; then
+      pass "package contains: $f"
+    else
+      fail "package missing: $f"
+    fi
+  done
+  rm -f "$TGZ"
+else
+  fail "helm package failed (site)"
+fi
+
+# ======================================================================
+# Grid Mock Providers Chart
+# ======================================================================
+
+MOCK_DIR="charts/grid-mock-providers"
+
+echo ""
+echo "======================================================================"
+echo "  Grid Mock Providers Chart ($MOCK_DIR)"
+echo "======================================================================"
+
+echo ""
+echo "=== Helm lint (mock) ==="
+if helm lint "$MOCK_DIR" --strict 2>&1; then
+  pass "helm lint --strict (mock)"
+else
+  fail "helm lint --strict (mock)"
+fi
+
+echo ""
+echo "=== Template rendering (mock) ==="
+try_template "$MOCK_DIR" "mock default" --namespace grid-system
+try_template "$MOCK_DIR" "mock two providers" --namespace grid-system \
+  --set 'providers[0].name=a,providers[0].credentialSecret=cred-a,providers[0].credentialKey=token' \
+  --set 'providers[1].name=b,providers[1].credentialSecret=cred-b,providers[1].credentialKey=token'
+try_template "$MOCK_DIR" "mock networkpolicy disabled" --namespace grid-system \
+  --set networkPolicy.enabled=false
+try_template "$MOCK_DIR" "mock custom image" --namespace grid-system \
+  --set image.repository=my-registry/mock --set image.tag=v1.0.0
+try_template "$MOCK_DIR" "mock digest image" --namespace grid-system \
+  --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
+try_template "$MOCK_DIR" "hostile podLabels mock" --namespace grid-system \
+  --set-string 'podLabels.app\.kubernetes\.io/name=hostile'
+
+echo ""
+echo "=== Selector protection (mock) ==="
+RENDERED=$(helm template verify-mock-sel "$MOCK_DIR" \
+  --set-string 'podLabels.app\.kubernetes\.io/name=hostile' \
+  --namespace grid-system --show-only templates/deployment.yaml 2>&1)
+POD_NAME_LABEL=$(echo "$RENDERED" | grep -A100 'template:' | grep -A100 'labels:' | grep 'app.kubernetes.io/name:' | head -1 | awk '{print $2}')
+if [ "$POD_NAME_LABEL" = "grid-mock-providers" ]; then
+  pass "selector: mock podLabels cannot override app.kubernetes.io/name"
+else
+  fail "selector: mock podLabels overrode app.kubernetes.io/name to '$POD_NAME_LABEL'"
+fi
+
+echo ""
+echo "=== NetworkPolicy rendering (mock) ==="
+NP_RENDERED=$(helm template verify-np "$MOCK_DIR" --namespace grid-system \
+  --show-only templates/networkpolicy.yaml 2>&1)
+if echo "$NP_RENDERED" | grep -q 'app.kubernetes.io/instance: provider-gateway'; then
+  pass "networkpolicy: allows provider-gateway"
+else
+  fail "networkpolicy: missing provider-gateway ingress"
+fi
+if echo "$NP_RENDERED" | grep -q 'app.kubernetes.io/name: grid-operator'; then
+  pass "networkpolicy: allows grid-operator"
+else
+  fail "networkpolicy: missing grid-operator ingress"
+fi
+
+echo ""
+echo "=== Schema rejection (mock) ==="
+try_reject "$MOCK_DIR" "empty providers" --set-json 'providers=[]'
+try_reject "$MOCK_DIR" "invalid digest (mock)" --set image.digest=invalid
+try_reject "$MOCK_DIR" "unknown key (mock)" --set typoField=true
+try_reject "$MOCK_DIR" "invalid service type (mock)" --set service.type=ExternalName
+
+echo ""
+echo "=== Helm package (mock) ==="
+PKG_OUT=$(helm package "$MOCK_DIR" -d /tmp 2>&1)
+TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
+if [ -f "$TGZ" ]; then
+  pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
+  CONTENTS=$(tar tzf "$TGZ" 2>&1)
+  for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml templates/service.yaml templates/networkpolicy.yaml; do
+    if echo "$CONTENTS" | grep -q "$f"; then
+      pass "package contains: $f"
+    else
+      fail "package missing: $f"
+    fi
+  done
+  rm -f "$TGZ"
+else
+  fail "helm package failed (mock)"
+fi
+
+# ======================================================================
+# Kind Tests (all charts)
 # ======================================================================
 
 if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
@@ -501,6 +689,178 @@ CR_EOF
 
   kind export logs /tmp/helm-kind-logs --name "$KIND_CLUSTER" 2>/dev/null || true
 fi
+
+# ======================================================================
+# Install Script Validation
+# ======================================================================
+
+SCRIPT_DIR="examples/helm/existing-clusters/scripts"
+
+echo ""
+echo "======================================================================"
+echo "  Install Script Validation ($SCRIPT_DIR)"
+echo "======================================================================"
+
+# ── Syntax check ────────────────────────────────────────────────────
+echo ""
+echo "=== Syntax check (bash -n) ==="
+for script in install.sh preflight.sh verify.sh uninstall.sh; do
+  if bash -n "$SCRIPT_DIR/$script" 2>/dev/null; then
+    pass "syntax: $script"
+  else
+    fail "syntax: $script"
+  fi
+done
+
+# ── Cold-install ordering ──────────────────────────────────────────
+echo ""
+echo "=== Cold-install ordering ==="
+INSTALL_ORDER=$(grep -n 'helm upgrade --install' "$SCRIPT_DIR/install.sh" \
+  | sed 's/.*--install \([^ ]*\).*/\1/' | tr '\n' ' ')
+if echo "$INSTALL_ORDER" | grep -q "grid-operator.*grid-mock-providers.*grid-site"; then
+  pass "install order: operator before mock-providers before grid-site"
+else
+  fail "install order: expected operator → mock → site, got: $INSTALL_ORDER"
+fi
+
+# Provider must come after overlay wait, consumer after provider.
+PROVIDER_LINE=$(grep -n 'helm upgrade --install provider-gateway' "$SCRIPT_DIR/install.sh" | head -1 | cut -d: -f1)
+CONSUMER_LINE=$(grep -n 'helm upgrade --install consumer-gateway' "$SCRIPT_DIR/install.sh" | head -1 | cut -d: -f1)
+OVERLAY_WAIT_LINE=$(grep -n 'wait_for_overlay' "$SCRIPT_DIR/install.sh" | grep -v '^[0-9]*:wait_for_overlay()' | head -1 | cut -d: -f1)
+if [[ -n "$OVERLAY_WAIT_LINE" && -n "$PROVIDER_LINE" && -n "$CONSUMER_LINE" ]] \
+   && (( OVERLAY_WAIT_LINE < PROVIDER_LINE )) \
+   && (( PROVIDER_LINE < CONSUMER_LINE )); then
+  pass "install order: overlay wait → provider → consumer"
+else
+  fail "install order: overlay wait ($OVERLAY_WAIT_LINE) → provider ($PROVIDER_LINE) → consumer ($CONSUMER_LINE)"
+fi
+
+# ── Mock opt-in/out ───────────────────────────────────────────────
+echo ""
+echo "=== Mock provider opt-in/out ==="
+if grep -q "if \\[\\[ -f \"\$MOCK_VALUES\" \\]\\]" "$SCRIPT_DIR/install.sh"; then
+  pass "mock install guarded by values file presence"
+else
+  fail "mock install not guarded — always installs"
+fi
+
+# ── Stable IDs from overlay ──────────────────────────────────────
+echo ""
+echo "=== Stable ID handling ==="
+if grep -q 'render_provider_config' "$SCRIPT_DIR/install.sh"; then
+  pass "install.sh uses render_provider_config function"
+else
+  fail "install.sh missing render_provider_config"
+fi
+if grep -q 'routing-config' "$SCRIPT_DIR/install.sh"; then
+  pass "install.sh reads overlay key routing-config.json"
+else
+  fail "install.sh uses wrong overlay data key"
+fi
+if ! grep -qE 'fnv|FNV|hash.*stable' "$SCRIPT_DIR/install.sh"; then
+  pass "install.sh does not duplicate FNV hash computation"
+else
+  fail "install.sh contains shell-based hash computation"
+fi
+
+# ── Prerequisite checks ─────────────────────────────────────────
+echo ""
+echo "=== Prerequisite checks ==="
+for cmd in kubectl helm yq jq python3; do
+  if grep -qw "$cmd" "$SCRIPT_DIR/preflight.sh"; then
+    pass "preflight checks for $cmd"
+  else
+    fail "preflight missing check for $cmd"
+  fi
+done
+
+if grep -q '4.18' "$SCRIPT_DIR/preflight.sh"; then
+  pass "preflight enforces yq >= 4.18.0"
+else
+  fail "preflight missing yq version check"
+fi
+
+# ── Verify script overlay key ───────────────────────────────────
+echo ""
+echo "=== Verify script consistency ==="
+if grep -q 'routing-config' "$SCRIPT_DIR/verify.sh"; then
+  pass "verify.sh uses correct overlay key (routing-config.json)"
+else
+  fail "verify.sh uses wrong overlay key"
+fi
+if ! grep -q 'routing-overlay' "$SCRIPT_DIR/verify.sh"; then
+  pass "verify.sh has no stale routing-overlay references"
+else
+  fail "verify.sh still references routing-overlay.json"
+fi
+if ! grep -q '\.overlay\.candidates' "$SCRIPT_DIR/verify.sh"; then
+  pass "verify.sh uses top-level .candidates[] path"
+else
+  fail "verify.sh still uses nested .overlay.candidates[] path"
+fi
+
+# ── Uninstall reverse order ─────────────────────────────────────
+echo ""
+echo "=== Uninstall reverse order ==="
+UNINSTALL_ORDER=$(grep -n 'helm uninstall' "$SCRIPT_DIR/uninstall.sh" \
+  | sed 's/.*uninstall \([^ ]*\).*/\1/' | tr '\n' ' ')
+if echo "$UNINSTALL_ORDER" | grep -q "grid-mock-providers.*grid-site.*grid-operator"; then
+  pass "uninstall order: mock → site → operator (reverse of install)"
+else
+  fail "uninstall order: expected mock → site → operator, got: $UNINSTALL_ORDER"
+fi
+
+# ── ConfigMap cleanup in uninstall ──────────────────────────────
+echo ""
+echo "=== ConfigMap cleanup ==="
+if grep -q 'provider-praxis-config' "$SCRIPT_DIR/uninstall.sh" \
+   && grep -q 'consumer-praxis-config' "$SCRIPT_DIR/uninstall.sh"; then
+  pass "uninstall.sh cleans up installer-created ConfigMaps"
+else
+  fail "uninstall.sh does not clean up installer-created ConfigMaps"
+fi
+
+# ── Value precedence ────────────────────────────────────────────
+echo ""
+echo "=== Value precedence ==="
+if grep -q 'valuesDir' "$SCRIPT_DIR/install.sh"; then
+  pass "install.sh supports valuesDir from inventory"
+else
+  fail "install.sh missing valuesDir support"
+fi
+if grep -q 'get_override_args' "$SCRIPT_DIR/install.sh"; then
+  pass "install.sh supports --site-values overrides"
+else
+  fail "install.sh missing --site-values support"
+fi
+if grep -q -- '--values.*OPERATOR_OV' "$SCRIPT_DIR/install.sh" || \
+   grep -q 'OPERATOR_OV\[@\]' "$SCRIPT_DIR/install.sh"; then
+  pass "install.sh applies override after base values"
+else
+  fail "install.sh override ordering unclear"
+fi
+
+# ── Example values rendering ───────────────────────────────────
+echo ""
+echo "=== Example values rendering (install scripts) ==="
+if [[ -f "$EXAMPLE_DIR/inventory.example.yaml" ]]; then
+  pass "inventory.example.yaml exists"
+else
+  fail "inventory.example.yaml missing"
+fi
+
+for topo in combined-site dedicated-edge; do
+  if [[ -d "$EXAMPLE_DIR/$topo/values" ]]; then
+    FILE_COUNT=$(find "$EXAMPLE_DIR/$topo/values" -name '*.yaml' | wc -l)
+    if [[ "$FILE_COUNT" -gt 0 ]]; then
+      pass "example values: $topo has $FILE_COUNT files"
+    else
+      fail "example values: $topo directory empty"
+    fi
+  else
+    fail "example values: $topo/values directory missing"
+  fi
+done
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""

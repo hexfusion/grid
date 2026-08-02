@@ -632,13 +632,34 @@ fn append_openai_edge_config(
     Ok(result)
 }
 
+/// Write a credential file with trailing CR/LF stripped to a temporary file.
+///
+/// Returns the [`tempfile::NamedTempFile`] handle — the caller must keep it alive until
+/// the file is no longer needed (e.g., until `kubectl` finishes reading it).
+fn write_trimmed_credential(key_file: &Path) -> Result<tempfile::NamedTempFile, Box<dyn std::error::Error>> {
+    let content = fs::read(key_file).map_err(|e| format!("cannot read key file: {e}"))?;
+    let trimmed = content
+        .strip_suffix(b"\r\n")
+        .or_else(|| content.strip_suffix(b"\n"))
+        .unwrap_or(&content);
+    if trimmed.is_empty() {
+        return Err("key file is empty after trimming trailing newline".into());
+    }
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("cannot create temp file: {e}"))?;
+    std::io::Write::write_all(&mut tmp, trimmed).map_err(|e| format!("cannot write trimmed credential: {e}"))?;
+    Ok(tmp)
+}
+
 /// Create the `OpenAI` API key Secret from the user-supplied key file.
 ///
+/// Strips trailing newlines before passing the file to `kubectl` so that
+/// the Secret value matches what `credential_inject` trims at runtime.
 /// Uses `kubectl create secret --from-file --dry-run=client -o yaml | kubectl apply`
 /// to avoid passing the token in command arguments or environment variables.
 pub(crate) fn apply_openai_credential_from_file(key_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let trimmed = write_trimmed_credential(key_file)?;
     let context = kubectl_context("east-provider");
-    let from_file_arg = format!("--from-file=token={}", key_file.display());
+    let from_file_arg = format!("--from-file=token={}", trimmed.path().display());
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -5741,6 +5762,14 @@ admin:
         assert!(result.contains(&format!("authority: {}", ext.hostname)));
         assert!(result.contains(&format!("sni: {}", ext.sni)));
         assert!(result.contains(&ext.endpoint()));
+        assert!(
+            !result.contains("ca_system"),
+            "external cluster must not use ca_system (not a valid Praxis field)"
+        );
+        assert!(
+            !result.contains("ca_path"),
+            "external cluster must not use ca_path (system trust store is correct for public APIs)"
+        );
 
         let route_pos = result.find("candidate_id:").unwrap_or_else(|| std::process::abort());
         let inject_pos = result
@@ -5843,6 +5872,52 @@ admin:
         assert!(
             !edge.contains("openai"),
             "edge static template must not contain openai references (added programmatically)"
+        );
+    }
+
+    // ── write_trimmed_credential ─────────────────────────────────────
+
+    #[test]
+    fn write_trimmed_credential_strips_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let key = dir.path().join("token");
+        fs::write(&key, b"sk-abc123\n").unwrap_or_else(|_| std::process::abort());
+        let tmp = write_trimmed_credential(&key).unwrap_or_else(|_| std::process::abort());
+        let content = fs::read(tmp.path()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(content, b"sk-abc123", "trailing LF must be stripped");
+    }
+
+    #[test]
+    fn write_trimmed_credential_strips_trailing_crlf() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let key = dir.path().join("token");
+        fs::write(&key, b"sk-abc123\r\n").unwrap_or_else(|_| std::process::abort());
+        let tmp = write_trimmed_credential(&key).unwrap_or_else(|_| std::process::abort());
+        let content = fs::read(tmp.path()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(content, b"sk-abc123", "trailing CRLF must be stripped");
+    }
+
+    #[test]
+    fn write_trimmed_credential_preserves_no_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let key = dir.path().join("token");
+        fs::write(&key, b"sk-abc123").unwrap_or_else(|_| std::process::abort());
+        let tmp = write_trimmed_credential(&key).unwrap_or_else(|_| std::process::abort());
+        let content = fs::read(tmp.path()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            content, b"sk-abc123",
+            "content without trailing newline must be unchanged"
+        );
+    }
+
+    #[test]
+    fn write_trimmed_credential_rejects_empty_after_trim() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let key = dir.path().join("token");
+        fs::write(&key, b"\n").unwrap_or_else(|_| std::process::abort());
+        assert!(
+            write_trimmed_credential(&key).is_err(),
+            "file that is empty after trimming must be rejected"
         );
     }
 }

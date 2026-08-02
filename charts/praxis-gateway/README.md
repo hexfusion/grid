@@ -88,7 +88,7 @@ AI image; these values may advance independently.
 
 ## Security
 
-The chart enforces OpenShift-compatible restricted security defaults:
+The chart enforces Kubernetes restricted security defaults:
 
 - `runAsNonRoot: true` (no fixed UID)
 - `readOnlyRootFilesystem: true`
@@ -113,3 +113,18 @@ with different values:
 - Mounts credential Secrets for backend provider access
 - Requires the `grid.praxis-proxy.io/backend-access` pod label for
   NetworkPolicy
+
+## Resource Names
+
+The chart's fullname template produces `{release}-praxis-gateway` by
+default (e.g., release `consumer-gateway` → Service name
+`consumer-gateway-praxis-gateway`). Set `fullnameOverride` to control
+the exact Service name:
+
+```yaml
+fullnameOverride: consumer-gateway   # Service name = consumer-gateway
+```
+
+The Grid Operator's `gateway.serviceName` must match the consumer
+gateway's Service name. When using `fullnameOverride`, set
+`gateway.serviceName` to the same value in the operator Helm values.

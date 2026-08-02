@@ -1,0 +1,20 @@
+apiVersion: v2
+name: grid-site
+description: Grid site topology resources (GridNetwork, GridSite, InferenceProvider)
+type: application
+version: 0.1.0
+appVersion: "v0.1.0"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/praxis-proxy/grid
+sources:
+  - https://github.com/praxis-proxy/grid
+maintainers:
+  - name: Praxis Proxy
+    url: https://github.com/praxis-proxy
+keywords:
+  - grid
+  - ai
+  - inference
+  - routing
+  - kubernetes
+  - site

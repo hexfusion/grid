@@ -1,0 +1,26 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "grid-mock-providers.fullname" . }}-provider-only
+  labels:
+    {{- include "grid-mock-providers.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "grid-mock-providers.name" . }}
+      app.kubernetes.io/component: mock-inference
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Values.networkPolicy.providerGateway.instanceLabel }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.networkPolicy.gridOperator.nameLabel }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.port }}
+{{- end }}

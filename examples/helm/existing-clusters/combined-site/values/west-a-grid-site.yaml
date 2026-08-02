@@ -1,0 +1,54 @@
+# Grid site topology resources for the west-a combined site.
+#
+# Install:
+#   helm upgrade --install grid-site ../../../../charts/grid-site \
+#     --kube-context "$REPLACE_WEST_A_CONTEXT" \
+#     --namespace grid-system \
+#     --values west-a-grid-site.yaml
+
+gridNetwork:
+  name: REPLACE_NETWORK_NAME
+  gridId: ""
+  region: us-west-1
+  zone: west-a
+  swim:
+    probeInterval: 5s
+    suspicionTimeout: 15s
+    gossipNodes: 3
+  gatewayRefs:
+    - name: consumer-gateway
+      namespace: grid-system
+      localSiteName: west-a
+
+gridSite:
+  name: west-a
+  region: us-west-1
+  zone: us-west-1a
+  providerSiteLabel: west-a
+
+inferenceProviders:
+  - name: mock-west-a-provider
+    gridNetworkRef: REPLACE_NETWORK_NAME
+    providerKind: simulator
+    backendKind: local_model
+    endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
+    siteSelector:
+      matchLabels:
+        grid.praxis-proxy.io/provider-site: west-a
+    accessPolicy:
+      siteSelector:
+        matchLabels: {}
+    models:
+      - name: sim-model-v1
+        capabilities:
+          - text_generation
+        contextWindow: 4096
+    healthCheck:
+      path: /health
+      interval: 30s
+      timeout: 5s
+    metricsConfig:
+      path: /metrics
+      timeout: 2s
+      signalNames:
+        queueDepth: grid_demo_queue_depth

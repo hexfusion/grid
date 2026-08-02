@@ -1,0 +1,100 @@
+{{- include "grid-mock-providers.validateDigest" . }}
+{{- $fullname := include "grid-mock-providers.fullname" . }}
+{{- $chartName := include "grid-mock-providers.name" . }}
+{{- $chartLabels := include "grid-mock-providers.labels" . }}
+{{- $image := include "grid-mock-providers.image" . }}
+{{- range .Values.providers }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-inference-{{ .name }}
+  labels:
+    {{- $chartLabels | nindent 4 }}
+    app.kubernetes.io/component: mock-inference
+spec:
+  replicas: {{ $.Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $chartName }}
+      app.kubernetes.io/component: mock-inference
+      app.kubernetes.io/instance: {{ .name }}
+  template:
+    metadata:
+      labels:
+        {{- $selectorLabels := dict "app.kubernetes.io/name" $chartName "app.kubernetes.io/component" "mock-inference" "app.kubernetes.io/instance" .name }}
+        {{- $podLabels := mustMergeOverwrite (dict) ($.Values.podLabels | default dict) $selectorLabels }}
+        {{- toYaml $podLabels | nindent 8 }}
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mock-inference
+          image: {{ $image }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy | quote }}
+          {{- with $.Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: MOCK_EXPECTED_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .credentialSecret }}
+                  key: {{ .credentialKey }}
+            {{- range $key, $val := .env }}
+            - name: {{ $key }}
+              value: {{ $val | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: {{ $.Values.healthPath }}
+              port: {{ $.Values.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          {{- with $.Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,23 @@
+{{- $chartName := include "grid-mock-providers.name" . }}
+{{- $chartLabels := include "grid-mock-providers.labels" . }}
+{{- range .Values.providers }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-inference-{{ .name }}
+  labels:
+    {{- $chartLabels | nindent 4 }}
+    app.kubernetes.io/component: mock-inference
+spec:
+  type: {{ $.Values.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ $chartName }}
+    app.kubernetes.io/component: mock-inference
+    app.kubernetes.io/instance: {{ .name }}
+  ports:
+    - name: http
+      port: {{ $.Values.port }}
+      targetPort: {{ $.Values.port }}
+      protocol: TCP
+{{- end }}

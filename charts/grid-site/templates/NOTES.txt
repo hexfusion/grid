@@ -1,0 +1,17 @@
+Grid site topology resources installed.
+
+{{- if .Values.gridNetwork.name }}
+GridNetwork: {{ .Values.gridNetwork.name }}
+{{- end }}
+{{- if .Values.gridSite.name }}
+GridSite:    {{ .Values.gridSite.name }}
+{{- end }}
+{{- if .Values.inferenceProviders }}
+InferenceProviders:
+{{- range .Values.inferenceProviders }}
+  - {{ .name }}
+{{- end }}
+{{- end }}
+
+These are cluster-scoped resources managed by this Helm release.
+The Grid Operator must be running to reconcile them.

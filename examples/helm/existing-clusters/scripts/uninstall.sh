@@ -16,15 +16,15 @@ if [[ ! -f "$INVENTORY" ]]; then
   exit 1
 fi
 
-TOPOLOGY=$(yq '.topology' "$INVENTORY")
-SITE_NAMES=$(yq '.sites | keys | .[]' "$INVENTORY")
+TOPOLOGY=$(yq eval '.topology' "$INVENTORY")
+SITE_NAMES=$(yq eval '.sites | keys | .[]' "$INVENTORY")
 
 echo "Uninstalling Grid components"
 echo "  Topology: $TOPOLOGY"
 echo ""
 
 for SITE in $SITE_NAMES; do
-  CONTEXT=$(yq ".sites.${SITE}.context" "$INVENTORY")
+  CONTEXT=$(yq eval ".sites.${SITE}.context" "$INVENTORY")
   echo "--- Site: $SITE (context: $CONTEXT) ---"
 
   if [[ "$TOPOLOGY" == "combined-site" ]]; then
@@ -51,11 +51,29 @@ for SITE in $SITE_NAMES; do
     done
   fi
 
+  echo "  Removing grid-mock-providers..."
+  helm uninstall grid-mock-providers \
+    --kube-context "$CONTEXT" \
+    --namespace grid-system \
+    --wait 2>/dev/null || echo "  (not installed)"
+
+  echo "  Removing grid-site..."
+  helm uninstall grid-site \
+    --kube-context "$CONTEXT" \
+    --namespace grid-system \
+    --wait 2>/dev/null || echo "  (not installed)"
+
   echo "  Removing grid-operator..."
   helm uninstall grid-operator \
     --kube-context "$CONTEXT" \
     --namespace grid-system \
     --wait 2>/dev/null || echo "  (not installed)"
+
+  echo "  Removing installer-created ConfigMaps..."
+  for CM in provider-praxis-config consumer-praxis-config; do
+    kubectl --context "$CONTEXT" -n grid-system delete configmap "$CM" \
+      --ignore-not-found 2>/dev/null || true
+  done
 
   echo "  Removing test Jobs..."
   kubectl --context "$CONTEXT" -n grid-system delete jobs \

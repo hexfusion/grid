@@ -1,0 +1,20 @@
+gridNetwork:
+  name: ""
+  gridId: ""
+  region: ""
+  zone: ""
+  swim: {}
+  tls: {}
+  gatewayRefs: []
+
+gridSite:
+  name: ""
+  region: ""
+  zone: ""
+  providerSiteLabel: ""
+
+inferenceProviders: []
+
+nameOverride: ""
+fullnameOverride: ""
+commonLabels: {}

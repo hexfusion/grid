@@ -27,17 +27,19 @@ isolation.
 
 ## Values files
 
-Each site has three values files:
+Each site has five values files:
 
 | File | Helm chart | Description |
 |------|-----------|-------------|
 | `<site>-operator.yaml` | `grid-operator` | SWIM identity, seeds, consumer gateway discovery |
+| `<site>-grid-site.yaml` | `grid-site` | GridNetwork, GridSite, InferenceProvider CRs |
+| `<site>-grid-mock-providers.yaml` | `grid-mock-providers` | Mock backends, Services, NetworkPolicy |
 | `<site>-consumer-gateway.yaml` | `praxis-gateway` | Consumer role, overlay, port 8080 |
 | `<site>-provider-gateway.yaml` | `praxis-gateway` | Provider role, credentials, port 8443 |
 
 The operator discovers the consumer gateway for routing overlay
-delivery. The provider gateway is a separate Helm release on the
-same cluster with its own Service and Secret mounts.
+delivery. Grid topology CRs and mock inference backends are
+managed by their own Helm releases for lifecycle independence.
 
 ## Installation
 
@@ -47,29 +49,59 @@ Use the shared installer with `topology: combined-site` in your inventory:
 ../scripts/install.sh inventory.yaml
 ```
 
-Or install manually per site:
+With per-site overrides (values files are applied after example defaults):
 
 ```bash
-# 1. Grid operator
-helm upgrade --install grid-operator ../../../charts/grid-operator \
+../scripts/install.sh inventory.yaml \
+  --site-values east-a:operator:/path/to/operator-overrides.yaml \
+  --site-values east-a:consumer:/path/to/consumer-overrides.yaml
+```
+
+Or install manually per site. **Order matters** — CRs and mock
+backends must exist before the operator can produce the overlay
+that the consumer mounts:
+
+```bash
+# 1. Grid operator (installs CRDs)
+helm upgrade --install grid-operator ../../../../charts/grid-operator \
   --kube-context "$EAST_A_CONTEXT" \
   --namespace grid-system --create-namespace \
   --values values/east-a-operator.yaml
 
-# 2. Consumer gateway
-helm upgrade --install consumer-gateway ../../../charts/praxis-gateway \
+# 2. Grid site topology CRs
+helm upgrade --install grid-site ../../../../charts/grid-site \
   --kube-context "$EAST_A_CONTEXT" \
   --namespace grid-system \
-  --values values/east-a-consumer-gateway.yaml
+  --values values/east-a-grid-site.yaml
 
-# 3. Provider gateway
-helm upgrade --install provider-gateway ../../../charts/praxis-gateway \
+# 3. Mock inference backends
+helm upgrade --install grid-mock-providers ../../../../charts/grid-mock-providers \
+  --kube-context "$EAST_A_CONTEXT" \
+  --namespace grid-system \
+  --values values/east-a-grid-mock-providers.yaml
+
+# 4. Provider gateway
+helm upgrade --install provider-gateway ../../../../charts/praxis-gateway \
   --kube-context "$EAST_A_CONTEXT" \
   --namespace grid-system \
   --values values/east-a-provider-gateway.yaml
+
+# 5. Wait for overlay ConfigMap
+kubectl --context "$EAST_A_CONTEXT" -n grid-system \
+  wait --for=jsonpath='{.metadata.name}' \
+  configmap -l grid.praxis-proxy.io/network --timeout=120s
+
+# 6. Consumer gateway
+helm upgrade --install consumer-gateway ../../../../charts/praxis-gateway \
+  --kube-context "$EAST_A_CONTEXT" \
+  --namespace grid-system \
+  --values values/east-a-consumer-gateway.yaml
 ```
 
 Repeat for each site.
+
+See the [parent README](../README.md) for configuration layers, common
+customizations, and troubleshooting.
 
 ## Compared to dedicated-edge topology
 

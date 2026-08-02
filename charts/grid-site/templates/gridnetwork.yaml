@@ -1,0 +1,30 @@
+{{- if .Values.gridNetwork.name }}
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: {{ .Values.gridNetwork.name }}
+  labels:
+    {{- include "grid-site.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.gridNetwork.gridId }}
+  gridId: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gridNetwork.region }}
+  region: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gridNetwork.zone }}
+  zone: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gridNetwork.swim }}
+  swim:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.gridNetwork.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.gridNetwork.gatewayRefs }}
+  gatewayRefs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

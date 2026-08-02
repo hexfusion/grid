@@ -1,0 +1,54 @@
+# Grid site topology resources for the west-b combined site.
+#
+# Install:
+#   helm upgrade --install grid-site ../../../../charts/grid-site \
+#     --kube-context "$REPLACE_WEST_B_CONTEXT" \
+#     --namespace grid-system \
+#     --values west-b-grid-site.yaml
+
+gridNetwork:
+  name: REPLACE_NETWORK_NAME
+  gridId: ""
+  region: us-west-2
+  zone: west-b
+  swim:
+    probeInterval: 5s
+    suspicionTimeout: 15s
+    gossipNodes: 3
+  gatewayRefs:
+    - name: consumer-gateway
+      namespace: grid-system
+      localSiteName: west-b
+
+gridSite:
+  name: west-b
+  region: us-west-2
+  zone: us-west-2a
+  providerSiteLabel: west-b
+
+inferenceProviders:
+  - name: mock-west-b-provider
+    gridNetworkRef: REPLACE_NETWORK_NAME
+    providerKind: simulator
+    backendKind: local_model
+    endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
+    siteSelector:
+      matchLabels:
+        grid.praxis-proxy.io/provider-site: west-b
+    accessPolicy:
+      siteSelector:
+        matchLabels: {}
+    models:
+      - name: sim-model-v1
+        capabilities:
+          - text_generation
+        contextWindow: 4096
+    healthCheck:
+      path: /health
+      interval: 30s
+      timeout: 5s
+    metricsConfig:
+      path: /metrics
+      timeout: 2s
+      signalNames:
+        queueDepth: grid_demo_queue_depth

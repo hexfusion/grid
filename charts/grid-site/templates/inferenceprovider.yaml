@@ -1,0 +1,45 @@
+{{- range .Values.inferenceProviders }}
+---
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: {{ required "inferenceProviders[].name is required" .name }}
+  labels:
+    {{- include "grid-site.labels" $ | nindent 4 }}
+spec:
+  gridNetworkRef: {{ required "inferenceProviders[].gridNetworkRef is required" .gridNetworkRef }}
+  providerKind: {{ required "inferenceProviders[].providerKind is required" .providerKind }}
+  backendKind: {{ required "inferenceProviders[].backendKind is required" .backendKind }}
+  endpoint: {{ required "inferenceProviders[].endpoint is required" .endpoint | quote }}
+  {{- with .routingClusterRef }}
+  routingClusterRef: {{ . | quote }}
+  {{- end }}
+  {{- with .siteSelector }}
+  siteSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .accessPolicy }}
+  accessPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .models }}
+  models:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .auth }}
+  auth:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .cost }}
+  cost:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .healthCheck }}
+  healthCheck:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .metricsConfig }}
+  metricsConfig:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

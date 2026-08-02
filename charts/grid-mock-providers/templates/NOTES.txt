@@ -1,0 +1,12 @@
+Mock inference providers deployed:
+
+{{- range .Values.providers }}
+  - mock-inference-{{ .name }} (credential: {{ .credentialSecret }})
+{{- end }}
+
+{{- if .Values.networkPolicy.enabled }}
+NetworkPolicy restricts backend access to provider-gateway and grid-operator.
+{{- end }}
+
+Test with:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name={{ include "grid-mock-providers.name" . }}

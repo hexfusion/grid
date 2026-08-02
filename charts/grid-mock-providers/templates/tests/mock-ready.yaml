@@ -1,0 +1,23 @@
+{{- if .Values.providers }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "grid-mock-providers.fullname" . }}-test
+  labels:
+    {{- include "grid-mock-providers.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: connectivity-check
+      image: busybox:1.37
+      command:
+        - sh
+        - -c
+        - |
+          {{- range .Values.providers }}
+          nc -z -w5 mock-inference-{{ .name }} {{ $.Values.port }}
+          {{- end }}
+{{- end }}

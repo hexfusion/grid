@@ -6,6 +6,8 @@
 #     --namespace grid-system \
 #     --values east-consumer-gateway.yaml
 
+fullnameOverride: consumer-gateway
+
 image:
   repository: ghcr.io/praxis-proxy/grid-ai-rollup
   tag: v0.1.0
@@ -17,7 +19,8 @@ config:
 
 overlay:
   enabled: true
-  existingConfigMap: grid-routing-overlay
+  # Name: grid-overlay-{GridNetwork name}-{gateway service name}
+  existingConfigMap: grid-overlay-NETWORK-consumer-gateway
 
 tls:
   enabled: true

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "gridNetwork": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gridId": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "zone": {
+          "type": "string"
+        },
+        "swim": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "probeInterval": { "type": "string" },
+            "suspicionTimeout": { "type": "string" },
+            "gossipNodes": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "gatewayRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["name", "namespace"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "namespace": { "type": "string", "minLength": 1 },
+              "localSiteName": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "gridSite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "region": {
+          "type": "string"
+        },
+        "zone": {
+          "type": "string"
+        },
+        "providerSiteLabel": {
+          "type": "string"
+        }
+      }
+    },
+    "inferenceProviders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["name", "gridNetworkRef", "providerKind", "backendKind", "endpoint"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "gridNetworkRef": { "type": "string", "minLength": 1 },
+          "providerKind": { "type": "string", "minLength": 1 },
+          "backendKind": { "type": "string", "minLength": 1 },
+          "endpoint": { "type": "string", "minLength": 1 },
+          "routingClusterRef": { "type": "string" }
+        }
+      }
+    },
+    "nameOverride": {
+      "type": "string"
+    },
+    "fullnameOverride": {
+      "type": "string"
+    },
+    "commonLabels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}
