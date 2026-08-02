@@ -390,7 +390,7 @@ The `grid-mock-providers` image requires startup arguments:
 ```yaml
 containers:
   - name: mock-inference
-    image: ghcr.io/nerdalert/grid-mock-providers@sha256:...
+    image: ghcr.io/praxis-proxy/grid-mock-providers:v0.1.1
     args: ["--provider", "openai", "--port", "8080"]
     env:
       - name: MOCK_PROVIDER_PORT
@@ -649,7 +649,7 @@ Use `image.digest` for immutable deployments:
 
 ```yaml
 image:
-  repository: ghcr.io/nerdalert/grid-operator
+  repository: ghcr.io/praxis-proxy/grid-operator
   digest: "sha256:f09712fb99d54357e0e73be5973bd865764ee9c846e076cf994c215bf4410bf4"
 ```
 

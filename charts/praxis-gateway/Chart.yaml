@@ -5,8 +5,8 @@ description: >-
   Deploys the Praxis process directly — not an operator. Long-term ownership
   moves to the future Praxis/Gateway Operator repository.
 type: application
-version: 0.1.0
-appVersion: "v0.1.0"
+version: 0.1.1
+appVersion: "v0.1.1"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/praxis-proxy/grid
 sources:

@@ -8,8 +8,8 @@
 #     --values east-a-grid-mock-providers.yaml
 
 image:
-  repository: ghcr.io/nerdalert/grid-mock-providers
-  tag: v0.1.0
+  repository: ghcr.io/praxis-proxy/grid-mock-providers
+  tag: v0.1.1
   pullPolicy: IfNotPresent
 
 providers:
