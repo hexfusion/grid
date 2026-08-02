@@ -20,6 +20,14 @@ submit requests through their cluster-local consumer gateway, which uses
 Grid to select an eligible provider. No traffic manager and no public
 endpoint are involved.
 
+## Combined Sites
+
+The [Combined-Site Demo](grid-combined-site/README.md) defines a compact
+three-cluster workload-inference topology. West, central, and east each run a
+consumer gateway, a separately secured provider gateway, and a private
+inference endpoint. The directory currently records the standalone demo
+contract and is not yet a validated runnable environment.
+
 ## Existing-Cluster Installation
 
 For deploying Grid onto existing Kubernetes clusters (rather than disposable

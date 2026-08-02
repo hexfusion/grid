@@ -5,21 +5,39 @@ inference through Grid provider selection. Workloads submit requests from
 inside consumer clusters through their local Praxis consumer gateway; no public
 endpoint, GTM emulator, or external ingress is involved.
 
+See the architecture overview's
+[Deployment Topologies](../../docs/architecture/overview.md#deployment-topologies)
+section for the general topology, security boundaries, and tradeoffs between
+the dedicated clusters used here and combined consumer/provider sites.
+
 ## Architecture
 
 ```text
-east consumer cluster              west consumer cluster
-  Grid Operator                      Grid Operator
-  Praxis consumer gateway            Praxis consumer gateway
-  workload Job (curl)                workload Job (curl)
-           |                                  |
-           +------- Grid selection -----------+
-                      |             |
-                      v             v
-east provider cluster              west provider cluster
-  Grid Operator                      Grid Operator
-  Praxis provider gateway            Praxis provider gateway
-  simulated inference                simulated inference
++----------------------------+  +----------------------------+
+| east consumer cluster      |  | west consumer cluster      |
+|                            |  |                            |
+| workload Job               |  | workload Job               |
+|      |                     |  |      |                     |
+|      v                     |  |      v                     |
+| Praxis consumer gateway    |  | Praxis consumer gateway    |
+| Grid operator and overlay  |  | Grid operator and overlay  |
++-------------+--------------+  +--------------+-------------+
+              |                                |
+              +--------- Grid selection -------+
+                               |
+                    +----------+----------+
+                    |                     |
+                    v                     v
++----------------------------+  +----------------------------+
+| east provider cluster      |  | west provider cluster      |
+|                            |  |                            |
+| Praxis provider gateway    |  | Praxis provider gateway    |
+|      |                     |  |      |                     |
+|      v                     |  |      v                     |
+| private simulated          |  | private simulated          |
+| inference endpoint         |  | inference endpoint         |
+| Grid operator              |  | Grid operator              |
++----------------------------+  +----------------------------+
 ```
 
 Each consumer cluster runs a Praxis consumer gateway that receives requests from
@@ -61,9 +79,9 @@ chart's liveness and readiness probes.
 
 | Component       | Default Image                                      | Min Version |
 |-----------------|----------------------------------------------------| ----------- |
-| Gateway         | `ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.0`      | v0.1.0      |
+| Gateway         | `ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.1`      | v0.1.1      |
 | Operator        | `ghcr.io/praxis-proxy/grid-operator:v0.1.1`        | v0.1.1      |
-| Mock providers  | `ghcr.io/praxis-proxy/grid-mock-providers:v0.1.0`  | v0.1.0      |
+| Mock providers  | `ghcr.io/praxis-proxy/grid-mock-providers:v0.1.1`  | v0.1.1      |
 
 Override with environment variables:
 

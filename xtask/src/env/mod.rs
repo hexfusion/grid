@@ -1,6 +1,7 @@
 //! Multi-cluster test environment management.
 
 pub(crate) mod certs;
+pub(crate) mod combined_site_demo;
 pub(crate) mod config;
 pub(crate) mod consumer;
 pub(crate) mod external_provider;
@@ -126,6 +127,10 @@ pub(crate) struct GlbDemoOptions {
     /// Model to use with the external provider.
     #[arg(long, requires = "external_provider")]
     pub(crate) external_provider_model: Option<String>,
+
+    /// Site where the external provider should be deployed (for combined-site demo).
+    #[arg(long, requires = "external_provider")]
+    pub(crate) external_provider_site: Option<String>,
 }
 
 impl GlbDemoOptions {
@@ -924,6 +929,16 @@ pub(crate) enum Action {
         #[command(flatten)]
         options: GlbDemoOptions,
     },
+
+    /// Create the environment, then run the narrated combined-site scenario collection.
+    RunGridCombinedSiteDemo {
+        /// Path to the source Forge environment config file.
+        #[arg(long, default_value = "demos/grid-combined-site/forge.yaml")]
+        forge_config: PathBuf,
+        /// Demo mode and lifecycle options.
+        #[command(flatten)]
+        options: GlbDemoOptions,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1017,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             glb_demo::setup(forge_config, ingress_mode).map(|_| ())
         },
         Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
+        Action::RunGridCombinedSiteDemo { forge_config, options } => combined_site_demo::run(forge_config, options),
     }
 }
 
@@ -5842,7 +5858,7 @@ mod validate_all_tests {
 fn env_gridsite_fingerprint(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pem = operator::read_gridsite_public_cert_pem(context, site_name)
         .ok_or_else(|| format!("GridSite {site_name:?} has no publicCertPem in status"))?;
-    let fp = glb::pem_to_canonical_fingerprint(&pem);
+    let fp = certs::pem_to_canonical_fingerprint(&pem);
     if fp.is_empty() {
         return Err(
             format!("GridSite {site_name:?}: failed to compute canonical fingerprint from publicCertPem").into(),

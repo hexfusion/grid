@@ -73,6 +73,133 @@ contract and the
 [Global Ingress Demo](../../demos/grid-glb-demo/README.md) for automated
 runtime proof of the principal flows and failure cases.
 
+## Deployment Topologies
+
+Grid does not require consumer and provider gateways to run in separate
+clusters. Operators can choose dedicated gateway clusters for stronger
+infrastructure isolation or combined sites when reducing cluster count is more
+important. The request and authorization contracts remain the same in both
+topologies.
+
+### Dedicated Consumer Or Edge And Provider Clusters
+
+```text
+workload or external client
+             |
+             v
++-----------------------------+
+| consumer or edge cluster    |
+|                             |
+| Praxis consumer/edge gateway|
++-----------------------------+
+             |
+             | authenticated provider hop
+             | gateway-to-gateway mTLS
+             v
++-----------------------------+
+| provider cluster            |
+|                             |
+| Praxis provider gateway     |
+|             |               |
+|             v               |
+| private inference endpoint  |
++-----------------------------+
+```
+
+- **Security boundary:** Provider credentials, private backend addresses, and
+  provider-side authorization remain in a cluster that does not host
+  workload-facing gateways. A compromise of the consumer cluster does not by
+  itself grant access to provider Secrets or the provider control plane.
+- **Failure domains:** Consumer and provider roles use separate Kubernetes
+  control planes, nodes, and cluster networks. A cluster outage or failed
+  upgrade affects one role without necessarily removing the other role's
+  capacity.
+- **Network isolation:** Provider clusters can reside on restricted network
+  segments that are reachable only through authenticated provider gateways.
+  Consumers never require direct connectivity to private inference endpoints.
+- **Ownership and compliance:** Different teams can own the consumer and
+  provider environments, certificates, policies, audit records, and
+  maintenance schedules. Regulated providers can remain outside a general
+  workload cluster's administrative boundary.
+- **Scaling and operations:** Consumer gateways and provider capacity scale
+  independently and can use different node types, quotas, availability goals,
+  and rollout schedules. This flexibility adds clusters, certificates,
+  network paths, capacity planning, and operational coordination.
+- **When to choose it:** Use dedicated clusters when control-plane separation,
+  credential isolation, restricted provider reachability, independent failure
+  budgets, or a smaller configuration blast radius justify the additional
+  infrastructure.
+
+The separated-role workload demo and global-ingress demo provide runtime proof
+for dedicated gateway paths.
+
+### Combined Consumer And Provider Sites
+
+```text
+local workload
+      |
+      v
++-----------------------------------+
+| combined-site Kubernetes cluster  |
+|                                   |
+| Praxis consumer gateway           |
+|      |                            |
+|      | separate identity, policy, |
+|      | and Service boundary       |
+|      v                            |
+| Praxis provider gateway           |
+|      |                            |
+|      v                            |
+| private inference endpoint        |
++-----------------------------------+
+      |
+      +---- eligible remote provider gateways at peer sites
+```
+
+- **Logical separation:** Consumer and provider gateways remain separate
+  Deployments and Services with distinct Praxis configuration, TLS identities,
+  ServiceAccounts, authorization policies, and Secret mounts. Combining a site
+  does not mean combining both roles into one process.
+- **Credential isolation:** Provider credentials are mounted only in the
+  provider gateway. NetworkPolicy and provider-route authorization prevent the
+  consumer gateway and ordinary workloads from bypassing the provider gateway
+  to reach the private inference endpoint.
+- **Shared failure domain:** Both roles share a Kubernetes control plane,
+  cluster network, and potentially the same nodes. A cluster-wide outage,
+  administrative compromise, or disruptive maintenance event can affect both
+  consumer and provider paths at once.
+- **Resource efficiency:** One cluster can supply local workload access and
+  local provider capacity, reducing control-plane count and infrastructure
+  cost. Separate resource requests, limits, scheduling rules, and disruption
+  policies should still prevent one role from starving the other.
+- **Operational fit:** Combined sites suit development, compact environments,
+  branch locations, and platforms where the same team owns both roles and the
+  Kubernetes security boundary satisfies policy requirements.
+- **When not to choose it:** Do not consolidate when provider credentials or
+  networks must be outside workload-cluster administration, when roles require
+  separate compliance domains, or when sharing a cluster creates an
+  unacceptable failure or change blast radius.
+
+The three-cluster combined-site demo is under implementation and validation.
+Do not treat that topology as runtime-proven until its automated security,
+local-routing, remote-fallback, restoration, and cleanup assertions pass.
+
+### Routing And Failover In Either Topology
+
+- **Provider selection:** Grid may select any eligible local or remote provider
+  gateway represented in the consumer's accepted routing overlay. Physical
+  colocation does not make a provider automatically eligible.
+- **Backend boundary:** Consumer and edge gateways route to provider gateways,
+  never directly to private inference endpoints. The provider gateway remains
+  responsible for peer authentication, exact route authorization, and
+  final-hop credential injection.
+- **Policy preservation:** Failover must remain within the candidate set
+  authorized for the tenant, trust domain, compliance boundary, workload
+  class, and provider network. Reachability alone is not authorization.
+- **High availability:** Multiple replicas behind one logical gateway provide
+  process or node availability. Multiple logical gateways or sites provide a
+  separate routing and failure boundary; they are not interchangeable concepts.
+
 ## The Stack
 
 Grid sits above the Praxis data plane:

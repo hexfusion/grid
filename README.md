@@ -47,6 +47,11 @@ and tears the environment down when complete.
 For cluster-local routing without a traffic manager, see the
 [Workload Inference Demo](demos/grid-workload-inference/README.md).
 
+For the compact three-cluster topology in which every site contains separate
+consumer and provider gateways, see the
+[Combined-Site Demo](demos/grid-combined-site/README.md). This new standalone
+demo is currently an implementation scaffold, not yet a validated walkthrough.
+
 For deploying Grid onto existing clusters with Helm, see
 [examples/helm/existing-clusters/](examples/helm/existing-clusters/README.md).
 
@@ -60,9 +65,9 @@ fi
 git clone https://github.com/praxis-proxy/grid.git
 cd grid
 
-export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/nerdalert/praxis-ai@sha256:2039ef5dd958c55369b4df7b41dc80a772b4ff216908da724d1e5135e396d319
-export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/nerdalert/grid-operator@sha256:b1c87cfb895e5dd717cb2c79a7df4821703c4cbd8a9e3872d4c92cf33958711d
-export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/nerdalert/grid-mock-providers@sha256:deac6f257a712d6b5cdf12171f85ecd10fcd6a1f5ead324bf956449fcfbb1d86
+export GRID_XTASK_GATEWAY_IMAGE=ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.1
+export GRID_XTASK_OPERATOR_IMAGE=ghcr.io/praxis-proxy/grid-operator:v0.1.1
+export GRID_XTASK_MOCK_PROVIDER_IMAGE=ghcr.io/praxis-proxy/grid-mock-providers:v0.1.1
 export GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent
 
 cargo build -p forge

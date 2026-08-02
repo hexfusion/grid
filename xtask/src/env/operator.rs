@@ -6563,6 +6563,78 @@ pub(crate) fn gridsite_phase_index(phase: &str) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Identity trust bootstrap
+// ---------------------------------------------------------------------------
+
+/// Wait for certificate gossip to deliver the expected provider certificate.
+///
+/// Compares the canonical DER-based SHA-256 fingerprint of the SWIM-advertised
+/// certificate against the out-of-band staged identity.
+pub(crate) fn wait_for_expected_site_certificate(
+    context: &str,
+    site_name: &str,
+    expected_canonical_fp: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if read_gridsite_public_cert_pem(context, site_name)
+            .is_some_and(|pem| super::certs::pem_to_canonical_fingerprint(&pem) == expected_canonical_fp)
+        {
+            eprintln!("  [OK] GridSite {site_name:?}: advertised certificate matches the staged identity");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("timeout waiting for GridSite {site_name:?} to advertise its expected certificate").into(),
+            );
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "bounded polling for asynchronous SWIM certificate propagation"
+        )]
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Patch a `GridSite` with canonical fingerprint and server name for identity-aware probing.
+pub(crate) fn patch_gridsite_identity_trust(
+    context: &str,
+    site_name: &str,
+    canonical_fp: &str,
+    server_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::json!({
+        "spec": {
+            "egress": { "tls": { "mode": "Mutual", "serverName": server_name } },
+            "trust": { "canonicalFingerprints": [canonical_fp] }
+        }
+    })
+    .to_string();
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridsites",
+            site_name,
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl patch gridsite {site_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    eprintln!("  [OK] GridSite {site_name:?}: canonicalFingerprints + serverName={server_name:?} patched");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Failover / lost-peer helpers
 // ---------------------------------------------------------------------------
 

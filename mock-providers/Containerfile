@@ -34,6 +34,6 @@ LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
     org.opencontainers.image.licenses="MIT"
 RUN adduser -D -u 1000 app
 COPY --from=builder /build/target/release/mock-providers /usr/local/bin/
-USER app
+USER 1000:1000
 EXPOSE 8080
 ENTRYPOINT ["mock-providers"]

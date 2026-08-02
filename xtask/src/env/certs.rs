@@ -1,8 +1,12 @@
 //! Certificate generation and distribution for the test environment.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use certs::{DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_site_cert, load_ca};
+use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -83,6 +87,39 @@ pub(crate) fn cleanup() -> Result<(), Box<dyn std::error::Error>> {
 /// Check whether the certificates directory exists and has a CA cert.
 pub(crate) fn certs_exist() -> bool {
     Path::new(CERTS_DIR).join("ca.pem").exists()
+}
+
+/// Compute the DER-based SHA-256 fingerprint of a PEM certificate file.
+///
+/// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
+pub(crate) fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("openssl")
+        .args(["x509", "-in", &cert_path.display().to_string(), "-outform", "DER"])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to decode certificate: {}", stderr.trim()).into());
+    }
+    Ok(format!("{:x}", Sha256::digest(output.stdout)))
+}
+
+/// Compute the canonical fingerprint for a generated site certificate.
+pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn std::error::Error>> {
+    certificate_sha256(&Path::new(CERTS_DIR).join(format!("{site}-cert.pem")))
+}
+
+/// Compute the canonical fingerprint from a PEM certificate string.
+///
+/// Used to compare a SWIM-advertised `publicCertPem` against a staged identity.
+pub(crate) fn pem_to_canonical_fingerprint(pem: &str) -> String {
+    let tmp = match tempfile::NamedTempFile::new() {
+        Ok(f) => f,
+        Err(_err) => return String::new(),
+    };
+    if std::fs::write(tmp.path(), pem.trim()).is_err() {
+        return String::new();
+    }
+    certificate_sha256(tmp.path()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

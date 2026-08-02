@@ -14,8 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sha2::{Digest as _, Sha256};
-
 use crate::env::{
     DemoMode, IngressMode, StepResult, StepStatus, certs, external_provider::ExternalProviderDescriptor, kubectl,
     print_validate_all_table, safe_truncate_str, verify,
@@ -217,8 +215,8 @@ pub(crate) fn stage_provider_boundary_with_mode_and_external(
     if ingress_mode == IngressMode::Global {
         stage_gtm_tls()?;
     }
-    let east_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
-    let west_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
+    let east_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
+    let west_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
     stage_provider_configs_with_external(&east_edge_digest, &west_edge_digest, external)?;
     Ok(())
 }
@@ -321,46 +319,6 @@ fn deployment_exists(context: &str, deployment: &str) -> Result<bool, Box<dyn st
         .into());
     }
     Ok(!output.stdout.is_empty())
-}
-
-/// Compute the SHA-256 fingerprint of a PEM certificate.
-fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("openssl")
-        .args(["x509", "-in", &cert_path.display().to_string(), "-outform", "DER"])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("failed to decode edge certificate: {}", stderr.trim()).into());
-    }
-    Ok(format!("{:x}", Sha256::digest(output.stdout)))
-}
-
-/// Compute the canonical DER-based SHA-256 fingerprint for a generated site certificate.
-///
-/// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
-/// This matches the `canonicalFingerprints` format used by the `GridSite`
-/// trust policy for identity-aware gateway probes.
-pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn std::error::Error>> {
-    certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join(format!("{site}-cert.pem")))
-}
-
-/// Compute the canonical DER-based fingerprint from a PEM certificate string.
-///
-/// Used to compare a SWIM-advertised `publicCertPem` against a staged identity.
-/// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
-///
-/// Writes the PEM to a temporary file and delegates to `openssl x509` for
-/// the PEM→DER conversion, matching the same approach used by
-/// [`certificate_sha256`].
-pub(crate) fn pem_to_canonical_fingerprint(pem: &str) -> String {
-    let tmp = match tempfile::NamedTempFile::new() {
-        Ok(f) => f,
-        Err(_err) => return String::new(),
-    };
-    if fs::write(tmp.path(), pem.trim()).is_err() {
-        return String::new();
-    }
-    certificate_sha256(tmp.path()).unwrap_or_default()
 }
 
 /// Render provider gateway configs with the edge certificate digest.

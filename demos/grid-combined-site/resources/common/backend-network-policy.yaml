@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mock-inference-backend
+  namespace: grid-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mock-inference
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              grid.praxis-proxy.io/backend-access: "provider-gateway"
+      ports:
+        - protocol: TCP
+          port: 8080
