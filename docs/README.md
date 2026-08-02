@@ -21,10 +21,18 @@
 
 ## Operations
 
+- [Adding an Inference Provider](adding-provider.md) — step-by-step
+  workflow for in-cluster, existing-service, and external HTTPS providers.
 - [Operations](architecture/operations.md) — local environment setup,
   validation commands, and operator workflows.
 - [CI Kind E2E](architecture/ci-kind-e2e.md) — validation tiers, gate sequence,
   sequencing requirements, and environment dependencies.
+
+## Demos
+
+- [Demonstrations](../demos/README.md) — deployable environments with automated
+  runtime proof covering global ingress, workload inference, and combined-site
+  topologies.
 
 ## Development
 

@@ -6,6 +6,12 @@ same charts and installer scripts. The workflow has been validated through
 chart rendering, disposable local clusters, and existing single-node
 Kubernetes clusters.
 
+## Guides
+
+- **[Adding an Inference Provider](../../../docs/adding-provider.md)** —
+  step-by-step workflow for adding in-cluster, existing-service, or
+  external HTTPS providers to a running Grid installation.
+
 ## Topologies
 
 ### Dedicated Logical Edge Gateways

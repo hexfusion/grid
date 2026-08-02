@@ -840,6 +840,117 @@ else
   fail "install.sh override ordering unclear"
 fi
 
+# ── Provider workflow tests ────────────────────────────────────
+echo ""
+echo "=== Provider workflow ==="
+
+# Three-provider template rendering
+try_template "$SITE_DIR" "three providers" --namespace grid-system \
+  --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
+  --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
+  --set-json 'inferenceProviders=[
+    {"name":"prov-a","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://a:8080"},
+    {"name":"prov-b","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://b:8080"},
+    {"name":"prov-c","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://c:8080"}
+  ]'
+
+# Duplicate provider name renders (Helm doesn't enforce uniqueness — K8s API does)
+DUPE_RENDER=$(helm template verify-dupe "$SITE_DIR" --namespace grid-system \
+  --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
+  --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
+  --set-json 'inferenceProviders=[
+    {"name":"same-name","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://a:8080"},
+    {"name":"same-name","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://b:8080"}
+  ]' 2>&1)
+DUPE_COUNT=$(echo "$DUPE_RENDER" | grep -c 'name: same-name' || true)
+if [ "$DUPE_COUNT" -eq 2 ]; then
+  pass "duplicate provider names: both render (K8s API rejects at apply time)"
+else
+  fail "duplicate provider names: expected 2 CRs, got $DUPE_COUNT"
+fi
+
+# Missing endpoint rejection
+try_reject "$SITE_DIR" "missing endpoint" \
+  --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
+  --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
+  --set-json 'inferenceProviders=[
+    {"name":"no-ep","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock"}
+  ]'
+
+# Provider removal: template with 1 provider (down from 2)
+ONE_PROV=$(helm template verify-removal "$SITE_DIR" --namespace grid-system \
+  --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
+  --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
+  --set-json 'inferenceProviders=[
+    {"name":"prov-a","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://a:8080"}
+  ]' 2>&1)
+PROV_COUNT=$(echo "$ONE_PROV" | grep -c 'kind: InferenceProvider' || true)
+if [ "$PROV_COUNT" -eq 1 ]; then
+  pass "provider removal: 1 provider renders exactly 1 CR"
+else
+  fail "provider removal: expected 1 CR, got $PROV_COUNT"
+fi
+
+# Multi-provider mock chart still allows both gateway and operator
+try_template "$MOCK_DIR" "mock three providers" --namespace grid-system \
+  --set 'providers[0].name=a,providers[0].credentialSecret=cred-a,providers[0].credentialKey=token' \
+  --set 'providers[1].name=b,providers[1].credentialSecret=cred-b,providers[1].credentialKey=token' \
+  --set 'providers[2].name=c,providers[2].credentialSecret=cred-c,providers[2].credentialKey=token'
+
+MULTI_NP=$(helm template verify-multi-np "$MOCK_DIR" --namespace grid-system \
+  --set 'providers[0].name=a,providers[0].credentialSecret=cred-a,providers[0].credentialKey=token' \
+  --set 'providers[1].name=b,providers[1].credentialSecret=cred-b,providers[1].credentialKey=token' \
+  --show-only templates/networkpolicy.yaml 2>&1)
+if echo "$MULTI_NP" | grep -q 'app.kubernetes.io/instance: provider-gateway' \
+   && echo "$MULTI_NP" | grep -q 'app.kubernetes.io/name: grid-operator'; then
+  pass "multi-provider networkpolicy: allows both gateway and operator"
+else
+  fail "multi-provider networkpolicy: missing ingress rules"
+fi
+
+# Overlay wait timeout exists
+if grep -q 'OVERLAY_TIMEOUT\|120' "$SCRIPT_DIR/install.sh" \
+   && grep -q 'wait_for_overlay' "$SCRIPT_DIR/install.sh"; then
+  pass "install.sh has overlay wait with timeout"
+else
+  fail "install.sh missing overlay wait timeout"
+fi
+
+# Documentation exists
+if [[ -f "docs/adding-provider.md" ]]; then
+  pass "docs/adding-provider.md exists"
+  if grep -q 'fullnameOverride' docs/adding-provider.md; then
+    pass "docs: recommends fullnameOverride"
+  else
+    fail "docs: missing fullnameOverride recommendation"
+  fi
+  if grep -q 'External HTTPS' docs/adding-provider.md; then
+    pass "docs: covers external HTTPS providers"
+  else
+    fail "docs: missing external HTTPS provider section"
+  fi
+  if grep -q 'Removing a Provider' docs/adding-provider.md; then
+    pass "docs: covers provider removal"
+  else
+    fail "docs: missing provider removal section"
+  fi
+  if grep -q 'ca.crt.*tls.crt.*tls.key\|tls.crt.*tls.key.*ca.crt' docs/adding-provider.md \
+     || grep -q 'TLS Secret Key Contract' docs/adding-provider.md; then
+    pass "docs: covers TLS Secret key contract"
+  else
+    fail "docs: missing TLS Secret key contract"
+  fi
+else
+  fail "docs/adding-provider.md does not exist"
+fi
+
+# Docs linked from index
+if grep -q 'adding-provider' docs/README.md; then
+  pass "docs/README.md links adding-provider.md"
+else
+  fail "docs/README.md missing adding-provider link"
+fi
+
 # ── Example values rendering ───────────────────────────────────
 echo ""
 echo "=== Example values rendering (install scripts) ==="
