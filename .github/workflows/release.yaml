@@ -229,9 +229,12 @@ jobs:
 
       - name: Lint charts
         run: |
-          for chart in grid-operator praxis-gateway grid-site grid-mock-providers; do
+          for chart in grid-operator praxis-gateway grid-mock-providers; do
             helm lint "charts/${chart}" --strict
           done
+          helm lint charts/grid-site --strict \
+            --set gridNetwork.name=release-lint \
+            --set gridSite.name=release-lint
 
       - name: Package charts
         run: |
