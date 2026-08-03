@@ -18,7 +18,7 @@ release ownership exist. Do not treat this as a permanent Grid responsibility.
 - Kubernetes >= 1.26
 - Helm >= 3.12
 - A Praxis configuration ConfigMap already created in the target namespace
-- A compatible Praxis AI image (the current rollup contains open routing PRs)
+- A compatible Praxis AI image (default: Grid v0.1.1 rollup)
 
 ## Install
 
@@ -57,7 +57,7 @@ AI image; these values may advance independently.
 | `commonLabels` | object | `{}` | Labels added to all resources. |
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
-| `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`). |
+| `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
 | `config.existingConfigMap` | string | **required** | Name of an existing ConfigMap with the Praxis config. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
@@ -111,8 +111,9 @@ with different values:
 - Listens on port 8443 (mTLS)
 - Mounts a TLS Secret for client authentication
 - Mounts credential Secrets for backend provider access
-- Requires the `grid.praxis-proxy.io/backend-access` pod label for
-  NetworkPolicy
+- Helm release name must match the mock-providers
+  `networkPolicy.providerGateway.instanceLabel` (default: `provider-gateway`)
+  so the NetworkPolicy allows traffic
 
 ## Resource Names
 

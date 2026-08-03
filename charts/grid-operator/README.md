@@ -10,7 +10,7 @@ for Kubernetes.
 
 ## Install
 
-By semantic version (OCI installation available from the next Grid release):
+By semantic version (OCI):
 
 ```bash
 helm install grid-operator \
@@ -20,7 +20,7 @@ helm install grid-operator \
   --create-namespace
 ```
 
-By immutable digest (from the GitHub release notes):
+By immutable digest (requires Helm >= 3.13):
 
 ```bash
 helm install grid-operator \
@@ -43,9 +43,7 @@ The chart follows [Semantic Versioning](https://semver.org/). In
 `Chart.yaml`, `version` identifies the Helm chart package and `appVersion`
 identifies the default Grid operator image. The two versions may advance
 independently, but Grid releases keep them aligned when the chart and operator
-ship together. For example, a backward-compatible fix to the current `0.1.0`
-release uses the patch version `0.1.1`; new backward-compatible functionality
-uses the next minor version.
+ship together.
 
 ## Verify
 
@@ -62,9 +60,10 @@ helm uninstall grid-operator -n grid-system
 ```
 
 Helm removes all namespaced resources (Deployment, ServiceAccount, Services,
-RoleBindings) but **does not remove CRDs or custom resources**. This is
-standard Helm CRD behavior. Existing GridNetworks, GridSites, and
-InferenceProviders survive uninstall.
+RoleBindings) but **does not remove CRDs**. This is standard Helm CRD
+behavior. Custom resources (GridNetworks, GridSites, InferenceProviders)
+created by other chart releases (e.g., grid-site) are not affected by
+operator uninstall.
 
 To remove CRDs and all custom resources:
 
@@ -127,7 +126,7 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 | `podLabels` | object | `{}` | Labels on the operator pod. |
 | `podAnnotations` | object | `{}` | Annotations on the operator pod. |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount. |
-| `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname. |
+| `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname when `create` is true, `"default"` when false. |
 | `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations (e.g. IAM role binding). |
 | `rbac.create` | bool | `true` | Create RBAC resources. |
 | `resourceNamespaces` | list | `[]` | Additional namespaces for resource access. The release namespace is always included. |
@@ -146,9 +145,9 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 | `swim.service.annotations` | object | `{}` | SWIM Service annotations. |
 | `swim.service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
 | `swim.service.externalTrafficPolicy` | string | `""` | External traffic policy. Defaults to Local for LoadBalancer. |
-| `gateway.address` | string | `""` | Advertised gateway address override. |
-| `gateway.serviceName` | string | `""` | Gateway Kubernetes Service name for discovery. |
-| `gateway.port` | string | `""` | Gateway port for discovery. |
+| `gateway.address` | string | `""` | Advertised gateway address override. Maps to `GRID_GATEWAY_ADDRESS`. |
+| `gateway.serviceName` | string | `""` | Provider gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
+| `gateway.port` | string | `""` | Provider gateway Service port advertised to remote sites. Maps to `GRID_GATEWAY_PORT`. |
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
 | `health.readiness.initialDelaySeconds` | int | `5` | Readiness probe initial delay. |
@@ -169,10 +168,12 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 
 The chart creates two ClusterRoles:
 
-1. **CRD access** (`<release>-crd`): cluster-wide watch/patch on GridNetworks,
-   GridSites, and InferenceProviders.
-2. **Resource access** (`<release>-resources`): namespace-scoped
-   get/create/patch on Secrets, Services, ConfigMaps, and Events.
+1. **CRD access** (`<release>-crd`): cluster-wide get/list/watch/patch on
+   GridNetworks and InferenceProviders; get/list/watch/patch/create/update on
+   GridSites; get/patch on all three status subresources.
+2. **Resource access** (`<release>-resources`): get/create/patch on Secrets;
+   get on Services; create/patch on Events (`events.k8s.io`);
+   get/create/patch/update on ConfigMaps.
 
 Resource access is bound via RoleBindings. The release namespace always gets
 a RoleBinding. Additional namespaces are added through `resourceNamespaces`:

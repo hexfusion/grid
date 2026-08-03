@@ -68,17 +68,17 @@ helm upgrade --install grid-operator ../../../../charts/grid-operator \
   --namespace grid-system --create-namespace \
   --values values/east-a-operator.yaml
 
-# 2. Grid site topology CRs
-helm upgrade --install grid-site ../../../../charts/grid-site \
-  --kube-context "$EAST_A_CONTEXT" \
-  --namespace grid-system \
-  --values values/east-a-grid-site.yaml
-
-# 3. Mock inference backends
+# 2. Mock inference backends (must be healthy before CRs trigger health checks)
 helm upgrade --install grid-mock-providers ../../../../charts/grid-mock-providers \
   --kube-context "$EAST_A_CONTEXT" \
   --namespace grid-system \
   --values values/east-a-grid-mock-providers.yaml
+
+# 3. Grid site topology CRs
+helm upgrade --install grid-site ../../../../charts/grid-site \
+  --kube-context "$EAST_A_CONTEXT" \
+  --namespace grid-system \
+  --values values/east-a-grid-site.yaml
 
 # 4. Provider gateway
 helm upgrade --install provider-gateway ../../../../charts/praxis-gateway \

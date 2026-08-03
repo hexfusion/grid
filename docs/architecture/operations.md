@@ -15,7 +15,7 @@ Grid provides a Helm chart and Kustomize manifests for the operator and CRDs.
 ```console
 helm install grid-operator \
   oci://ghcr.io/praxis-proxy/charts/grid-operator \
-  --version 0.1.0 \
+  --version <version> \
   --namespace grid-system \
   --create-namespace
 ```
@@ -38,8 +38,9 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
   --version <new-version> --namespace grid-system
 ```
 
-Uninstalling the chart removes namespaced resources but retains CRDs and
-custom resources. See the [chart README](../../charts/grid-operator/README.md)
+Uninstalling the chart removes namespaced resources but retains CRDs.
+Custom resources created by other chart releases (e.g., grid-site) are
+not affected. See the [chart README](../../charts/grid-operator/README.md)
 for the full values reference.
 
 **Option 2: Kustomize**

@@ -97,8 +97,8 @@ providers:
       MOCK_QUEUE_DEPTH: "0.15"
 ```
 
-The chart creates a Deployment (`mock-inference-{name}`), Service
-(`mock-inference-{name}`), and NetworkPolicy per provider.
+The chart creates a Deployment (`mock-inference-{name}`) and Service
+(`mock-inference-{name}`) per provider, and one shared NetworkPolicy.
 
 Skip this step for existing in-cluster services or external APIs.
 

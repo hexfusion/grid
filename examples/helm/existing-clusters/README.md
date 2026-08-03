@@ -399,9 +399,7 @@ containers:
     image: ghcr.io/praxis-proxy/grid-mock-providers:v0.1.1
     args: ["--provider", "openai", "--port", "8080"]
     env:
-      - name: MOCK_PROVIDER_PORT
-        value: "8080"
-      - name: MOCK_AUTH_TOKEN
+      - name: MOCK_EXPECTED_BEARER_TOKEN
         valueFrom:
           secretKeyRef:
             name: mock-inference-credential
@@ -521,10 +519,10 @@ them independently:
 | A | `mock-inference-a` | `mock-inference-a` | 8080 |
 | B | `mock-inference-b` | `mock-inference-b` | 8080 |
 
-Use the label `app.kubernetes.io/name: mock-inference` on both
-Deployments for shared NetworkPolicy selection, and
-`app.kubernetes.io/instance: mock-a` / `mock-b` for per-backend
-selectors.
+The chart sets `app.kubernetes.io/name: grid-mock-providers` and
+`app.kubernetes.io/component: mock-inference` on both Deployments for
+shared NetworkPolicy selection, and `app.kubernetes.io/instance: a` /
+`b` (the provider `name`) for per-backend selectors.
 
 ### Consumer Hop Clusters
 
@@ -572,7 +570,8 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: mock-inference
+      app.kubernetes.io/name: grid-mock-providers
+      app.kubernetes.io/component: mock-inference
   policyTypes:
     - Ingress
   ingress:
@@ -782,13 +781,17 @@ kubectl create secret generic provider-tls \
 
 ### NetworkPolicy
 
-```yaml
-podLabels:
-  grid.praxis-proxy.io/backend-access: "provider-gateway"
-```
+The `grid-mock-providers` chart creates a NetworkPolicy that allows
+ingress from pods matching `app.kubernetes.io/instance: provider-gateway`
+and `app.kubernetes.io/name: grid-operator`. To override the provider
+gateway instance label:
 
-Then create a NetworkPolicy referencing this label for your
-environment-specific CIDRs.
+```yaml
+# grid-mock-providers overrides
+networkPolicy:
+  providerGateway:
+    instanceLabel: my-provider-gateway
+```
 
 ### ServiceMonitor
 

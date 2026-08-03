@@ -5,13 +5,20 @@ Grid is the Kubernetes control plane for multi-site AI routing with
 
 ## What Grid does
 
-- Reconciles `GridNetwork`, `GridSite`, and provider CRDs.
-- Forms site membership with SWIM and propagates provider state with CRDTs.
-- Manages Grid trust material for mTLS between sites.
-- Scrapes configured provider metrics and scores routing candidates.
-- Renders Praxis routing overlay `ConfigMap`s consumed by gateway deployments.
-- Projects provider credential references into overlays without writing token
-  values into Grid routing data.
+- Reconciles `GridNetwork`, `GridSite`, `InferenceProvider`,
+  `AgentToolProvider`, and `AgentToAgentProvider` resources.
+- Discovers sites with SWIM and propagates provider state with CRDTs.
+- Advertises provider-gateway endpoints and manages trust metadata for
+  authenticated, encrypted communication between sites.
+- Health-checks providers and excludes stale or unavailable candidates.
+- Scrapes configured provider metrics and deterministically scores candidates
+  using locality, rank, health, capacity, and latency signals.
+- Renders Praxis routing overlay `ConfigMap`s and retains the last-known-good
+  state when a replacement cannot be safely applied.
+- Projects provider credential references into overlays without placing token
+  values in Grid routing data.
+- Reports site, provider, reconciliation, and overlay revision status through
+  Kubernetes status and Prometheus metrics.
 
 ## What Grid does not do
 
@@ -38,20 +45,10 @@ For Kustomize or raw manifests, see [deploy/](deploy/README.md).
 
 ## Getting started
 
-Start with the [Global Ingress Demo](demos/grid-glb-demo/README.md).
-It provides a copy-and-paste deployment for external client inference through
-active Praxis edges, distinguishes that path from cluster-local workload
-inference, narrates each request and failure scenario, records runtime evidence,
-and tears the environment down when complete.
-
-For cluster-local routing without a traffic manager, see the
-[Workload Inference Demo](demos/grid-workload-inference/README.md).
-
-For the compact three-cluster topology in which every site contains separate
-consumer and provider gateways, see the
-[Combined-Site Demo](demos/grid-combined-site/README.md). This new standalone
-demo provides automated runtime proofs for local preference, remote fallback,
-provider lifecycle, security boundaries, convergence, and recovery.
+Explore the [deployable demonstrations](demos/README.md) for automated runtime
+proofs of routing, security boundaries, provider lifecycle, convergence, and
+recovery. Use the [deployment topology guide](docs/architecture/overview.md#deployment-topologies)
+to choose the model that fits your environment.
 
 For deploying Grid onto existing clusters with Helm, see
 [examples/helm/existing-clusters/](examples/helm/existing-clusters/README.md).
