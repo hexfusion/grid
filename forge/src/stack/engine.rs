@@ -254,7 +254,7 @@ fn execute_step(
             let output = runner.run(&spec)?;
             steps::check_success(&output, "kubectl wait").map(|()| 1)
         },
-        StepSpec::Exec { command } => execute_exec(runner, command).map(|()| 1),
+        StepSpec::Exec { command, env } => execute_exec(runner, command, env, &sc.config_dir).map(|()| 1),
         StepSpec::ForEach { property, steps: sub } => execute_foreach(runner, property, sub, tpl, sc),
         StepSpec::MetallbAutoPool { name } => execute_metallb(runner, name, sc).map(|()| 1),
         StepSpec::CoreDnsForward { .. } => execute_coredns_forward(runner, step, sc).map(|()| 1),
@@ -352,10 +352,50 @@ fn execute_service(
 }
 
 /// Execute an arbitrary command.
-fn execute_exec(runner: &dyn CommandRunner, command: &[String]) -> Result<(), ForgeError> {
-    let spec = steps::exec_spec(command)?;
+fn execute_exec(
+    runner: &dyn CommandRunner,
+    command: &[String],
+    env: &BTreeMap<String, String>,
+    config_dir: &Path,
+) -> Result<(), ForgeError> {
+    let resolved = resolve_exec_args(command, config_dir)?;
+    let spec = steps::exec_spec(&resolved, env)?;
     let output = runner.run(&spec)?;
     steps::check_success(&output, "exec")
+}
+
+/// Resolve relative path arguments in an exec step against the config directory.
+///
+/// Bare program names stay on `PATH`. Relative paths that exist under
+/// `config_dir` become absolute so stacks work regardless of process cwd.
+/// Path escape (`..`) is rejected.
+fn resolve_exec_args(command: &[String], config_dir: &Path) -> Result<Vec<String>, ForgeError> {
+    command
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| resolve_exec_arg(idx, arg, config_dir))
+        .collect()
+}
+
+/// Resolve one exec argument, optionally absolutizing relative paths.
+fn resolve_exec_arg(idx: usize, arg: &str, config_dir: &Path) -> Result<String, ForgeError> {
+    if idx == 0 && !arg.contains('/') {
+        return Ok(arg.to_owned());
+    }
+    if Path::new(arg).is_absolute() || arg.starts_with('-') {
+        return Ok(arg.to_owned());
+    }
+    if arg.split('/').any(|part| part == "..") {
+        return Err(ForgeError::Config(format!(
+            "exec path '{arg}' must not escape the config root"
+        )));
+    }
+    let candidate = config_dir.join(arg);
+    if candidate.exists() {
+        Ok(candidate.to_string_lossy().into_owned())
+    } else {
+        Ok(arg.to_owned())
+    }
 }
 
 /// Capture a kubectl jsonpath result into pending state.
@@ -625,8 +665,9 @@ fn render_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, Forge
         StepSpec::Deployment { .. } => render_deployment_step(step, tpl),
         StepSpec::Service { name, port, namespace } => render_service_step(name, *port, namespace, tpl),
         StepSpec::Wait { .. } => render_wait_step(step, tpl),
-        StepSpec::Exec { command } => Ok(StepSpec::Exec {
+        StepSpec::Exec { command, env } => Ok(StepSpec::Exec {
             command: render_vec(command, tpl)?,
+            env: render_string_map(env, tpl)?,
         }),
         StepSpec::ForEach { property, steps: sub } => render_foreach_step(property, sub, tpl),
         StepSpec::CoreDnsForward { .. } => render_coredns_forward_step(step, tpl),
@@ -639,12 +680,23 @@ fn render_path(value: &str, tpl: &TemplateContext) -> Result<String, ForgeError>
     template::render(value, tpl)
 }
 
-/// Render a URL step's url field (sha256 is passed through).
+/// Render a URL step's url and sha256 fields.
 fn render_url_step(url: &str, sha256: &str, tpl: &TemplateContext) -> Result<StepSpec, ForgeError> {
     Ok(StepSpec::Url {
         url: template::render(url, tpl)?,
-        sha256: sha256.to_owned(),
+        sha256: template::render(sha256, tpl)?,
     })
+}
+
+/// Render template expressions in a string map (keys are fixed; values are templated).
+fn render_string_map(
+    values: &BTreeMap<String, String>,
+    tpl: &TemplateContext,
+) -> Result<BTreeMap<String, String>, ForgeError> {
+    values
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), template::render(value, tpl)?)))
+        .collect()
 }
 
 /// Render a for-each step's property field.
@@ -1093,6 +1145,100 @@ mod tests {
         let result = execute_steps(&runner, &steps, &tpl, &mut sc);
         assert!(result.is_err(), "rendered path escape must fail");
         assert_eq!(runner.call_count(), 0, "must fail before kubectl");
+    }
+
+    #[test]
+    fn exec_resolves_relative_script_against_config_dir() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap_or_else(|_| std::process::abort());
+        let script = scripts.join("install.sh");
+        std::fs::write(&script, "#!/bin/true\n").unwrap_or_else(|_| std::process::abort());
+
+        let mut runner = MockRunner::new();
+        runner.respond("bash", ok_output());
+        let command = vec![
+            "bash".to_owned(),
+            "scripts/install.sh".to_owned(),
+            "kind-maas-ipp-local".to_owned(),
+        ];
+        execute_exec(&runner, &command, &BTreeMap::new(), dir.path()).unwrap_or_else(|_| std::process::abort());
+
+        let calls = runner.calls();
+        let call = calls.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(call.program, "bash");
+        assert_eq!(
+            call.args.first().map(|a| a.to_string_lossy().into_owned()),
+            Some(script.to_string_lossy().into_owned()),
+            "script path must resolve under config_dir"
+        );
+        assert_eq!(
+            call.args.get(1).map(|a| a.to_string_lossy().into_owned()).as_deref(),
+            Some("kind-maas-ipp-local"),
+            "non-path args must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn exec_passes_templated_env_to_command() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let mut runner = MockRunner::new();
+        runner.respond("bash", ok_output());
+        let env = BTreeMap::from([("GIE_VERSION".to_owned(), "v1.5.0".to_owned())]);
+        let command = vec!["bash".to_owned(), "-c".to_owned(), "true".to_owned()];
+        execute_exec(&runner, &command, &env, dir.path()).unwrap_or_else(|_| std::process::abort());
+        let call = runner
+            .calls()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            call.env.get(std::ffi::OsStr::new("GIE_VERSION")),
+            Some(&std::ffi::OsString::from("v1.5.0")),
+            "exec env must be forwarded to CommandSpec"
+        );
+    }
+
+    #[test]
+    fn render_exec_env_and_url_sha256_from_properties() {
+        let mut tpl = make_template_context();
+        tpl.properties
+            .insert("gieVersion".to_owned(), serde_json::json!("v1.5.0"));
+        tpl.properties
+            .insert("gatewayApiSha256".to_owned(), serde_json::json!("abc123"));
+        let exec = StepSpec::Exec {
+            command: vec!["bash".to_owned(), "scripts/install-gie-crds.sh".to_owned()],
+            env: BTreeMap::from([(
+                "GIE_VERSION".to_owned(),
+                "{{ cluster.properties.gieVersion }}".to_owned(),
+            )]),
+        };
+        let rendered = render_step(&exec, &tpl).unwrap_or_else(|_| std::process::abort());
+        let StepSpec::Exec { env, .. } = rendered else {
+            std::process::abort();
+        };
+        assert_eq!(env.get("GIE_VERSION").map(String::as_str), Some("v1.5.0"));
+
+        let url = StepSpec::Url {
+            url: "https://example.test/v{{ cluster.properties.gieVersion }}/x.yaml".to_owned(),
+            sha256: "{{ cluster.properties.gatewayApiSha256 }}".to_owned(),
+        };
+        let rendered_url = render_step(&url, &tpl).unwrap_or_else(|_| std::process::abort());
+        let StepSpec::Url { url, sha256 } = rendered_url else {
+            std::process::abort();
+        };
+        assert_eq!(url, "https://example.test/vv1.5.0/x.yaml");
+        assert_eq!(sha256, "abc123");
+    }
+
+    #[test]
+    fn exec_rejects_path_escape() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let command = vec!["bash".to_owned(), "../outside.sh".to_owned()];
+        let Err(err) = resolve_exec_args(&command, dir.path()) else {
+            std::process::abort();
+        };
+        assert!(err.to_string().contains("must not escape"), "unexpected error: {err}");
     }
 
     #[test]
