@@ -14,6 +14,33 @@ two Kind clusters.
 > that overlay to route requests. No scoring logic is reimplemented in
 > the demo harness.
 
+## What This Demo Shows
+
+- **llm-d supplies pool-level inference telemetry.** Two inference simulators
+  per cluster expose vLLM-compatible queue and KV-cache gauges. The local llm-d
+  EPP aggregates those simulator values into one metrics view for the pool.
+- **Grid consumes EPP metrics rather than individual simulator metrics.** Each
+  `InferenceProvider` points to its pool's EPP metrics endpoint and identifies
+  the expected pool label and queue capacity.
+- **Raw telemetry becomes comparable routing signals.** Grid maps the EPP
+  metric names, normalizes the waiting-request count by the configured queue
+  capacity, and combines queue and KV-cache pressure with the other scoring
+  inputs.
+- **Metrics can override locality when explicitly enabled.** The demo uses the
+  opt-in `scoreFirst` policy. As Pool A becomes busy, Pool B's higher score
+  moves it ahead of the initially preferred local pool.
+- **The complete routing transition is observable.** The narrated scorecard
+  prints both pools' raw metrics, weighted scores, ranks, and selected pool at
+  baseline, under pressure, and after recovery.
+- **The data plane follows the published decision without restarting.** Grid
+  publishes a content-addressed overlay, `grid-overlay-sync` validates and
+  delivers it, and Praxis hot-reloads it. Fresh inference requests prove the
+  A-to-B-to-A transition through gateway and provider attribution.
+- **The telemetry stimulus is controlled, but the decision path is real.** The
+  simulator values are generated predictably so the demonstration is
+  repeatable. EPP aggregation, Grid scraping and scoring, overlay delivery,
+  Praxis routing, and inference requests all use their normal runtime paths.
+
 ## Topology
 
 ```
