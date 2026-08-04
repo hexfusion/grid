@@ -93,15 +93,29 @@ pub struct InferenceProviderSpec {
 
 /// Prometheus metrics scraping configuration for an `InferenceProvider`.
 ///
-/// The operator scrapes `{spec.endpoint}{path}` and parses the Prometheus text
-/// using the `signal_names` mapping.  Signals without a configured name receive
-/// the neutral default (`0.5`) in scoring.  Scrape failures are non-fatal:
-/// the provider falls back to locality and cost scoring.
+/// The operator scrapes `{spec.endpoint}{path}` (or `{metrics_endpoint}{path}`
+/// when set) and parses the Prometheus text using the `signal_names` mapping.
+/// Signals without a configured name receive the neutral default (`0.5`) in
+/// scoring.  Scrape failures are non-fatal: the provider falls back to
+/// locality and cost scoring.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsConfig {
-    /// HTTP path for the Prometheus metrics endpoint, relative to `spec.endpoint`.
+    /// Base URL for the metrics endpoint, independent of `spec.endpoint`.
     ///
+    /// When set, the scrape URL is `{metrics_endpoint}{path}` instead of
+    /// `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
+    /// service (such as an llm-d EPP) while the provider inference endpoint
+    /// points at the pool's request path.
+    ///
+    /// When absent, the scrape URL uses `spec.endpoint` as before.
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_endpoint: Option<String>,
+
+    /// HTTP path for the Prometheus metrics endpoint.
+    ///
+    /// Appended to `metrics_endpoint` (when set) or `spec.endpoint`.
     /// Defaults to `"/metrics"` when absent.
     #[serde(default = "default_metrics_path")]
     pub path: String,
@@ -116,10 +130,39 @@ pub struct MetricsConfig {
     /// Mapping from scoring signal names to Prometheus metric names.
     ///
     /// Signals without a configured name are skipped during parsing and receive the
-    /// neutral default value (`0.5`) in scoring.  The operator does not normalise raw
-    /// queue counts — `queueDepth` must be pre-normalised to 0.0–1.0 by the exporter.
+    /// neutral default value (`0.5`) in scoring.
     #[serde(default)]
     pub signal_names: MetricSignalNames,
+
+    /// Expected Prometheus `name` label value for pool-level metric selection.
+    ///
+    /// When set, the parser only matches metric samples whose `name` label
+    /// equals this value.  This is required when scraping an endpoint that
+    /// exposes metrics for multiple pools (such as an llm-d EPP), ensuring
+    /// the configured pool is selected deterministically.
+    ///
+    /// The parser rejects the scrape when the expected pool series is absent
+    /// or when a metric sample has no `name` label and this field is set.
+    ///
+    /// When absent, labels are stripped before matching as in v1 (backward
+    /// compatible).
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_name: Option<String>,
+
+    /// Maximum queue slot count for normalising a raw queue-size metric to
+    /// 0.0–1.0.
+    ///
+    /// When set, the `queue_depth` signal value is divided by this capacity
+    /// and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
+    /// average queue-size metrics (such as `llm_d_router_epp_average_queue_size`)
+    /// without requiring the exporter to pre-normalise.
+    ///
+    /// When absent, the `queue_depth` signal must already be normalised to
+    /// 0.0–1.0 by the exporter (backward compatible).
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_capacity: Option<u32>,
 
     /// Maximum age in seconds for which a previously-scraped metric sample may be
     /// used when the current scrape fails.
@@ -491,6 +534,9 @@ mod tests {
             timeout: "2s".to_owned(),
             signal_names: MetricSignalNames::default(),
             stale_metrics_seconds: None,
+            metrics_endpoint: None,
+            pool_name: None,
+            queue_capacity: None,
         };
         let serialised = serde_json::to_value(&mc).unwrap_or_else(|_| std::process::abort());
         assert!(

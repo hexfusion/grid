@@ -37,5 +37,5 @@ mod state;
 pub use backend::{BackendConfig, BackendKind, ProviderKind};
 pub use error::CoreError;
 pub use metrics::BackendMetrics;
-pub use scoring::{ScoredBackend, ScoringWeights, locality_score, score_backends};
+pub use scoring::{ScoreBreakdown, ScoredBackend, ScoringWeights, locality_score, score_backends};
 pub use state::GridState;

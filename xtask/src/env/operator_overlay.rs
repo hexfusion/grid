@@ -87,6 +87,28 @@ pub(crate) struct ProjectedCredential {
     pub(crate) secret_ref: ProjectedCredentialRef,
 }
 
+/// Per-signal weighted contributions from the production scoring engine.
+///
+/// Mirrors `scoring::ScoreBreakdown` for JSON deserialization without
+/// importing the `scoring` crate.
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+pub(crate) struct ScoreBreakdown {
+    /// Locality contribution.
+    pub(crate) locality: f64,
+    /// Queue depth contribution.
+    pub(crate) queue_depth: f64,
+    /// KV cache contribution.
+    pub(crate) kv_cache: f64,
+    /// Prefix cache contribution.
+    pub(crate) prefix_cache: f64,
+    /// Latency contribution.
+    pub(crate) latency: f64,
+    /// Cost contribution.
+    pub(crate) cost: f64,
+    /// Sum of all weighted contributions.
+    pub(crate) total: f64,
+}
+
 /// A single routing candidate from the routing overlay.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct RoutingCandidate {
@@ -116,6 +138,21 @@ pub(crate) struct RoutingCandidate {
     /// The xtask uses this to resolve the token from the referenced Secret.
     #[serde(default)]
     pub(crate) credential: Option<ProjectedCredential>,
+
+    /// Weighted score from the production scoring engine.
+    #[serde(default)]
+    #[expect(dead_code, reason = "deserialized from overlay JSON; read by llmd_pool_metrics_demo")]
+    pub(crate) score: Option<f64>,
+
+    /// Per-signal weighted contributions from the scoring engine.
+    #[serde(default)]
+    #[expect(dead_code, reason = "deserialized from overlay JSON; read by llmd_pool_metrics_demo")]
+    pub(crate) score_breakdown: Option<ScoreBreakdown>,
+
+    /// Zero-based position in the final sorted overlay.
+    #[serde(default)]
+    #[expect(dead_code, reason = "deserialized from overlay JSON; read by llmd_pool_metrics_demo")]
+    pub(crate) rank: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------

@@ -73,6 +73,14 @@ AI image; these values may advance independently.
 | `overlay.existingConfigMap` | string | `""` | Name of the overlay ConfigMap. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |
 | `overlay.items` | list | routing-config.json, routing-overlay.json | Items to project. |
+| `overlay.sidecar.enabled` | bool | `false` | Deliver validated overlays through an API-watch sidecar instead of kubelet ConfigMap projection. |
+| `overlay.sidecar.image.repository` | string | `grid-overlay-sync` | Overlay-sync image repository. Use a published or locally built image appropriate to the deployment. |
+| `overlay.sidecar.image.tag` | string | `latest` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
+| `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
+| `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
+| `overlay.sidecar.expectedNetwork` | string | `""` | Required GridNetwork scope when the sidecar is enabled. |
+| `overlay.sidecar.expectedLocalSite` | string | `""` | Required local-site scope when the sidecar is enabled. |
+| `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
 | `tls.enabled` | bool | `false` | Mount a TLS Secret. |
 | `tls.existingSecret` | string | `""` | Name of the TLS Secret. |
 | `tls.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
@@ -96,6 +104,79 @@ The chart enforces Kubernetes restricted security defaults:
 - All Linux capabilities dropped
 - `seccompProfile.type: RuntimeDefault`
 - `automountServiceAccountToken: false`
+
+When overlay-sync is enabled, the pod uses a dedicated ServiceAccount, but
+automatic token mounting remains disabled. A short-lived projected token is
+mounted only into the overlay-sync init and sidecar containers. The Praxis
+container has no Kubernetes API credential and mounts the delivered overlay
+directory read-only.
+
+## Routing Overlay Delivery
+
+Praxis can hot-reload a routing overlay as soon as its file changes. A normal
+ConfigMap volume, however, is updated by the kubelet on an eventual refresh
+cycle. That delay can be longer than a temporary provider-pressure event, so a
+gateway may continue serving an old preference even though Grid has already
+published a new overlay.
+
+Enable `grid-overlay-sync` when prompt routing convergence matters:
+
+```text
+Grid operator updates ConfigMap
+             |
+             | Kubernetes API watch
+             v
+      overlay-sync sidecar
+        validate envelope
+        atomic file replace
+        retain last-known-good on failure
+             |
+             | shared emptyDir
+             v
+       Praxis hot reload
+```
+
+Example values:
+
+```yaml
+overlay:
+  enabled: true
+  existingConfigMap: grid-overlay-production-consumer-gateway
+  mountPath: /etc/praxis/routing
+  sidecar:
+    enabled: true
+    image:
+      repository: registry.example.com/grid-overlay-sync
+      tag: <version>
+      pullPolicy: IfNotPresent
+    dataKey: routing-overlay.json
+    expectedNetwork: production
+    expectedLocalSite: us-east-edge
+```
+
+When enabled, the chart creates:
+
+- an `overlay-sync-init` init container that waits for the first valid overlay
+  before Praxis starts;
+- an `overlay-sync` sidecar that watches one named ConfigMap;
+- a shared `emptyDir` used for atomic file publication;
+- a dedicated ServiceAccount, Role, and RoleBinding; and
+- sidecar readiness and liveness probes on port `9091`.
+
+The sidecar validates maximum size, schema version, destination scope,
+content-addressed revision, and SHA-256 digest. Invalid replacements do not
+touch the serving file. ConfigMap deletion or temporary API loss marks the
+sidecar degraded while retaining the last-known-good overlay.
+
+This mechanism removes kubelet projection latency only after Grid applies a
+ConfigMap. Total route-change time still includes metrics publication, the
+provider scrape, Grid reconciliation, ConfigMap application, sidecar delivery,
+and Praxis hot reload. Overlay-sync does not change the scrape or reconcile
+intervals.
+
+With `overlay.sidecar.enabled: false`, the chart retains the simpler direct
+ConfigMap mount. Use that compatibility mode for static configuration or when
+kubelet-controlled refresh latency is acceptable.
 
 ## Edge vs Provider Gateway
 

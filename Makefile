@@ -18,7 +18,7 @@ endif
 	coverage coverage-check \
 	require-container-engine \
 	images container operator-image \
-	mock-providers-image glb-demo-images \
+	mock-providers-image overlay-sync-image glb-demo-images \
 	kind-up kind-down \
 	dev-env dev-push dev-integration \
 	setup-hooks \
@@ -107,6 +107,9 @@ operator-image: | require-container-engine
 
 mock-providers-image: | require-container-engine
 	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:latest .
+
+overlay-sync-image: | require-container-engine
+	$(CONTAINER_ENGINE) build -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
@@ -200,6 +203,7 @@ help:
 	@echo "  images               build container image"
 	@echo "  operator-image       build operator container image"
 	@echo "  mock-providers-image build mock-providers container image"
+	@echo "  overlay-sync-image   build overlay-sync sidecar image"
 	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"
 	@echo ""
 	@echo "KIND:"

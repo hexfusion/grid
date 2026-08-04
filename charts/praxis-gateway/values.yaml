@@ -76,12 +76,40 @@ overlay:
   existingConfigMap: ""
   # -- Mount path for overlay files.
   mountPath: "/etc/praxis/routing"
-  # -- Items to project from the ConfigMap.
+  # -- Items to project from the ConfigMap (used when sidecar is disabled).
   items:
     - key: "routing-config.json"
       path: "routing-config.json"
     - key: "routing-overlay.json"
       path: "routing-overlay.json"
+  # -- Overlay sync sidecar settings. When enabled, the sidecar watches the
+  # ConfigMap via the Kubernetes API and writes validated overlays to a shared
+  # emptyDir, replacing the kubelet volume sync.
+  sidecar:
+    # -- Enable the overlay-sync sidecar.
+    enabled: false
+    # -- Sidecar container image.
+    image:
+      # -- Image repository.
+      repository: grid-overlay-sync
+      # -- Image tag.
+      tag: latest
+      # -- Image pull policy.
+      pullPolicy: IfNotPresent
+    # -- ConfigMap data key containing the overlay envelope.
+    dataKey: "routing-overlay.json"
+    # -- Expected GridNetwork name for scope validation.
+    expectedNetwork: ""
+    # -- Expected local site name for scope validation.
+    expectedLocalSite: ""
+    # -- Sidecar resource requests and limits.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        cpu: 50m
+        memory: 32Mi
 
 # -- TLS Secret mount.
 tls:

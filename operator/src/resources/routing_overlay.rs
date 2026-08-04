@@ -267,6 +267,8 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             stable_id: None,
             admission_state: None,
             selection_tier: None,
+            score: None,
+            score_breakdown: None,
             rank: None,
         })
         .collect()
@@ -517,19 +519,31 @@ pub(crate) fn apply_stale_gc_filter(
         .collect()
 }
 
-/// Compute the score equivalent to what [`scoring::score_backends`] would
-/// assign to a provider whose `backend_kind` cannot be parsed.
+/// Compute the score breakdown equivalent to what [`scoring::score_backends`]
+/// would assign to a provider whose `backend_kind` cannot be parsed.
 ///
 /// Applies [`scoring::ScoringWeights::default`] with neutral runtime signals
 /// (0.5, the scoring crate's default for missing metrics) and no cost (treated
 /// as free → cost signal = 1.0).  This places unmapped providers on the same
 /// numeric scale as scored providers so they can be sorted in a single pass.
-fn unmapped_provider_score(backend_kind: &str) -> f64 {
+fn unmapped_provider_breakdown(backend_kind: &str) -> scoring::ScoreBreakdown {
     let w = scoring::ScoringWeights::default();
-    // 1.0: cost_score(0.0) — providers with no cost data are treated as free.
-    w.locality * backend_locality_score(backend_kind)
-        + w.cost * 1.0
-        + (w.queue_depth + w.kv_cache + w.latency + w.prefix_cache) * UNMAPPED_NEUTRAL_SIGNAL
+    let locality = w.locality * backend_locality_score(backend_kind);
+    let cost = w.cost * 1.0;
+    let queue_depth = w.queue_depth * UNMAPPED_NEUTRAL_SIGNAL;
+    let kv_cache = w.kv_cache * UNMAPPED_NEUTRAL_SIGNAL;
+    let latency = w.latency * UNMAPPED_NEUTRAL_SIGNAL;
+    let prefix_cache = w.prefix_cache * UNMAPPED_NEUTRAL_SIGNAL;
+    let total = locality + cost + queue_depth + kv_cache + latency + prefix_cache;
+    scoring::ScoreBreakdown {
+        locality,
+        queue_depth,
+        kv_cache,
+        prefix_cache,
+        latency,
+        cost,
+        total,
+    }
 }
 
 /// Compute per-provider ordering scores for overlay candidate sorting.
@@ -538,7 +552,7 @@ fn unmapped_provider_score(backend_kind: &str) -> f64 {
 /// to a [`scoring::BackendConfig`], the score is produced by
 /// [`scoring::score_backends`] using [`scoring::ScoringWeights::default`]
 /// and the network's `local_region`.  Providers whose `backend_kind` cannot
-/// be parsed fall back to [`unmapped_provider_score`], which is on the same
+/// be parsed fall back to [`unmapped_provider_breakdown`], which is on the same
 /// numeric scale.
 ///
 /// Remote CRDT providers are also scored and included in the result map.
@@ -559,22 +573,21 @@ fn provider_ordering_scores(
     remote_crdt_providers: &[crdt::ProviderState],
     local_region: Option<&str>,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
-) -> HashMap<String, f64> {
+) -> HashMap<String, scoring::ScoreBreakdown> {
     let state = build_grid_state_with_metrics(network_name, providers, remote_crdt_providers, metrics);
     let scored = scoring::score_backends(&state, &scoring::ScoringWeights::default(), local_region);
-    // `from_engine` is keyed by routing_identity (BackendConfig.name), which matches candidate.cluster.
-    let from_engine: HashMap<String, f64> = scored.into_iter().map(|sb| (sb.name, sb.score)).collect();
+    let from_engine: HashMap<String, scoring::ScoreBreakdown> =
+        scored.into_iter().map(|sb| (sb.name, sb.breakdown)).collect();
 
-    let mut result: HashMap<String, f64> = providers
+    let mut result: HashMap<String, scoring::ScoreBreakdown> = providers
         .iter()
         .filter_map(|p| {
-            // Use routing_identity so the key matches candidate.cluster in the sort.
             let cluster = routing_identity(p)?.to_owned();
-            let score = from_engine
+            let breakdown = from_engine
                 .get(cluster.as_str())
-                .copied()
-                .unwrap_or_else(|| unmapped_provider_score(&p.spec.backend_kind));
-            Some((cluster, score))
+                .cloned()
+                .unwrap_or_else(|| unmapped_provider_breakdown(&p.spec.backend_kind));
+            Some((cluster, breakdown))
         })
         .collect();
 
@@ -582,8 +595,8 @@ fn provider_ordering_scores(
         result.entry(provider.routing_cluster.clone()).or_insert_with(|| {
             from_engine
                 .get(provider.routing_cluster.as_str())
-                .copied()
-                .unwrap_or_else(|| unmapped_provider_score(&provider.backend_kind))
+                .cloned()
+                .unwrap_or_else(|| unmapped_provider_breakdown(&provider.backend_kind))
         });
     }
 
@@ -788,7 +801,7 @@ pub struct ProjectedCredential {
 /// Each candidate represents one (model, site) pair offered by a provider.
 /// Praxis uses the candidate list to select a backend cluster for each
 /// inference request.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RoutingCandidate {
     /// Candidate kind.  `"inference_model"` for inference providers; other
     /// variants (e.g. `"mcp_tool"`) are defined by Praxis `intelligent_route`.
@@ -848,6 +861,14 @@ pub struct RoutingCandidate {
     /// Locality tier between the consumer gateway and this candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_tier: Option<LocalityTier>,
+
+    /// Weighted score from the production scoring engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+
+    /// Per-signal weighted contributions from the scoring engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_breakdown: Option<scoring::ScoreBreakdown>,
 
     /// Zero-based position in the final sorted overlay.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1012,19 +1033,27 @@ fn locality_sort_key(tier: Option<LocalityTier>) -> u8 {
 /// existing behavior).
 ///
 /// Candidates are enriched, filtered, and sorted before being written. The
-/// final order is:
+/// final order depends on the network's
+/// [`RoutingPolicy`](crate::crd::grid_network::RoutingPolicy):
+///
+/// **`GeographyFirst`** (default):
 /// 1. admission state: `new_and_existing` before `existing_only`;
-/// 2. geography tier: same site, same zone, same region, cross region, unknown;
+/// 2. geography tier: same site, same zone, same region, cross region;
 /// 3. scoring engine score, descending;
 /// 4. `fresh=true` before `fresh=false`;
 /// 5. deterministic `(site, name, cluster)` tiebreak.
 ///
+/// **`ScoreFirst`**:
+/// 1. admission state: `new_and_existing` before `existing_only`;
+/// 2. `fresh=true` before `fresh=false`;
+/// 3. scoring engine score, descending (metrics can outrank locality);
+/// 4. geography tier tiebreak: same site, same zone, same region, cross region;
+/// 5. deterministic `(site, name, cluster)` tiebreak.
+///
 /// Scores are computed by [`scoring::score_backends`] using
 /// [`scoring::ScoringWeights::default`] and the network's `spec.region` as the
-/// locality context. Within the same admission and geography class, providers
-/// with lower-cost configurations rank ahead of equal-locality peers that have
-/// higher cost. Providers whose `backend_kind` cannot be parsed fall back to an
-/// equivalent same-scale locality estimate.
+/// locality context.  Providers whose `backend_kind` cannot be parsed fall back
+/// to an equivalent same-scale locality estimate.
 ///
 /// The `metrics` parameter accepts a map from provider routing identity
 /// (the value of `spec.routingClusterRef`, or `metadata.name` when absent) to
@@ -1127,20 +1156,37 @@ pub fn render_routing_overlay(
     enrich_candidates(&mut candidates, local_site, sites, network_name, &admission_map);
     candidates.retain(|c| c.admission_state != Some(AdmissionState::Excluded));
 
-    candidates.sort_by(|a, b| {
-        admission_sort_key(a.admission_state)
-            .cmp(&admission_sort_key(b.admission_state))
-            .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
-            .then_with(|| {
-                let sa = ordering.get(a.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
-                let sb = ordering.get(b.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
-                sb.total_cmp(&sa)
-            })
-            .then(b.fresh.cmp(&a.fresh))
-            .then(a.site.cmp(&b.site))
-            .then(a.name.cmp(&b.name))
-            .then(a.cluster.cmp(&b.cluster))
-    });
+    let policy = network
+        .spec
+        .routing_policy
+        .unwrap_or(crate::crd::grid_network::RoutingPolicy::GeographyFirst);
+    let score_of = |cluster: &str| ordering.get(cluster).map_or(DEFAULT_LOCALITY, |bd| bd.total);
+    match policy {
+        crate::crd::grid_network::RoutingPolicy::GeographyFirst => {
+            candidates.sort_by(|a, b| {
+                admission_sort_key(a.admission_state)
+                    .cmp(&admission_sort_key(b.admission_state))
+                    .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
+                    .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
+                    .then(b.fresh.cmp(&a.fresh))
+                    .then(a.site.cmp(&b.site))
+                    .then(a.name.cmp(&b.name))
+                    .then(a.cluster.cmp(&b.cluster))
+            });
+        },
+        crate::crd::grid_network::RoutingPolicy::ScoreFirst => {
+            candidates.sort_by(|a, b| {
+                admission_sort_key(a.admission_state)
+                    .cmp(&admission_sort_key(b.admission_state))
+                    .then(b.fresh.cmp(&a.fresh))
+                    .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
+                    .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
+                    .then(a.site.cmp(&b.site))
+                    .then(a.name.cmp(&b.name))
+                    .then(a.cluster.cmp(&b.cluster))
+            });
+        },
+    }
     candidates.dedup_by(|a, b| a.kind == b.kind && a.name == b.name && a.site == b.site && a.cluster == b.cluster);
 
     for (i, candidate) in candidates.iter_mut().enumerate() {
@@ -1150,6 +1196,10 @@ pub fn render_routing_overlay(
         )]
         let rank = i as u32;
         candidate.rank = Some(rank);
+        if let Some(bd) = ordering.get(candidate.cluster.as_str()) {
+            candidate.score = Some(bd.total);
+            candidate.score_breakdown = Some(bd.clone());
+        }
     }
 
     Ok(RoutingOverlay {
@@ -1348,6 +1398,8 @@ fn candidates_from_provider(
                 stable_id: None,
                 admission_state: None,
                 selection_tier: None,
+                score: None,
+                score_breakdown: None,
                 rank: None,
             });
         }
@@ -1550,6 +1602,16 @@ mod tests {
             "kind": "GridNetwork",
             "metadata": { "name": name },
             "spec": { "seeds": [] }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_network_score_first(name: &str) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": name },
+            "spec": { "seeds": [], "routingPolicy": "scoreFirst" }
         }))
         .unwrap_or_else(|_| std::process::abort())
     }
@@ -2102,9 +2164,9 @@ mod tests {
         // provider is also unavailable, but its fresh=false signals that its
         // metrics are stale.
         //
-        // Ordering: Degraded local (locality ≈8.5) still outscores API provider
-        // (≈5.8) under default weights.  Praxis may deprioritise the stale local
-        // candidate via its own freshness penalty, but the overlay carries both.
+        // Default GeographyFirst sort: admission → locality → score → fresh → tiebreak.
+        // The degraded local (SameSite, fresh=false) outranks the fresh API
+        // (CrossRegion, fresh=true) because geography sorts above freshness.
         let network = test_network("fallback-net");
         let local_degraded =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Degraded");
@@ -2129,11 +2191,10 @@ mod tests {
             .unwrap_or_else(|| std::process::abort());
         assert!(!local_c.fresh, "Degraded local candidate must have fresh=false");
         assert!(api_c.fresh, "API provider with absent status must have fresh=true");
-        // Degraded local still outranks API provider by locality score.
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("provider-local"),
-            "Degraded local (high locality) must still rank before API provider"
+            "Degraded local must rank before API (GeographyFirst: locality outranks freshness)"
         );
     }
 
@@ -3222,8 +3283,8 @@ mod tests {
         let providers_for_ordering = [provider_busy, provider_idle];
         let ordering = provider_ordering_scores("net", &providers_for_ordering, &[], None, Some(&metrics));
 
-        let busy_score = ordering["provider-busy"];
-        let idle_score = ordering["provider-idle"];
+        let busy_score = ordering["provider-busy"].total;
+        let idle_score = ordering["provider-idle"].total;
         assert!(
             idle_score > busy_score,
             "idle provider (queue 0.1) must score higher than busy provider (queue 0.9), \
@@ -3242,11 +3303,11 @@ mod tests {
         let ps_empty = [local, api];
         let ordering_no_metrics = provider_ordering_scores("net", &ps_empty, &[], None, Some(&HashMap::new()));
         assert_eq!(
-            ordering_static["prov-local"], ordering_no_metrics["prov-local"],
+            ordering_static["prov-local"].total, ordering_no_metrics["prov-local"].total,
             "empty metrics map must yield same score as None"
         );
         assert_eq!(
-            ordering_static["prov-api"], ordering_no_metrics["prov-api"],
+            ordering_static["prov-api"].total, ordering_no_metrics["prov-api"].total,
             "empty metrics map must yield same score as None"
         );
     }
@@ -3363,7 +3424,7 @@ mod tests {
         };
 
         for input in malformed_inputs {
-            let partial = crate::metrics_parser::parse_prometheus_text(input, &names);
+            let partial = crate::metrics_parser::parse_prometheus_text(input, &names).unwrap();
             let bm = partial.into_backend_metrics();
             // Non-finite metrics must not reach the scoring engine.
             assert!(
@@ -3379,6 +3440,201 @@ mod tests {
                 "malformed input {input:?} produced non-finite latency_p99_ms"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Score-driven routing algorithm — sort order proofs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metrics_pressure_outranks_locality() {
+        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let network = test_network_score_first("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-local",
+            scoring::BackendMetrics::new(0.0, true, 0.85, 0.0, 0.0, 0.9),
+        );
+        metrics.insert(
+            "prov-remote",
+            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
+        );
+
+        let overlay = render_routing_overlay(&network, &[], &[local, remote], &[], "gw", Some(&metrics), None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-remote"),
+            "remote provider with low pressure must outrank local provider with high pressure"
+        );
+    }
+
+    #[test]
+    fn equal_metrics_prefers_local() {
+        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let network = test_network("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-local",
+            scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.3),
+        );
+        metrics.insert(
+            "prov-remote",
+            scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.3),
+        );
+
+        let overlay = render_routing_overlay(&network, &[], &[local, remote], &[], "gw", Some(&metrics), None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-local"),
+            "with equal metrics, local provider must rank first via locality score advantage"
+        );
+    }
+
+    #[test]
+    fn fresh_outranks_score() {
+        let local = test_provider_with_backend_kind_and_phase("prov-local", "net", "local", "Degraded");
+        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let network = test_network_score_first("net");
+
+        let overlay = render_routing_overlay(&network, &[], &[local, api], &[], "gw", None, None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let first = &overlay.candidates[0];
+        assert!(first.fresh, "first candidate must be fresh");
+        assert_eq!(
+            first.cluster.as_str(),
+            "prov-api",
+            "fresh API provider must outrank degraded local (fresh beats score)"
+        );
+    }
+
+    #[test]
+    fn admission_outranks_everything() {
+        let healthy = test_provider_with_backend_kind("prov-healthy", "net", "api_provider");
+        let saturated = test_provider_with_backend_kind("prov-saturated", "net", "local");
+        let network = test_network("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-saturated",
+            scoring::BackendMetrics::new(0.0, true, 0.95, 0.0, 0.0, 0.95),
+        );
+        metrics.insert(
+            "prov-healthy",
+            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
+        );
+
+        let overlay = render_routing_overlay(&network, &[], &[saturated, healthy], &[], "gw", Some(&metrics), None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-healthy"),
+            "ExistingOnly candidate must rank below NewAndExisting regardless of locality"
+        );
+        assert_eq!(
+            overlay.candidates[0].admission_state,
+            Some(AdmissionState::NewAndExisting),
+            "first candidate must be NewAndExisting"
+        );
+        assert_eq!(
+            overlay.candidates[1].admission_state,
+            Some(AdmissionState::ExistingOnly),
+            "second candidate must be ExistingOnly"
+        );
+    }
+
+    #[test]
+    fn score_breakdown_populates_on_candidates() {
+        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let network = test_network("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-local",
+            scoring::BackendMetrics::new(0.0, true, 0.3, 500.0, 0.4, 0.2),
+        );
+
+        let overlay = render_routing_overlay(&network, &[], &[local], &[], "gw", Some(&metrics), None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let c = &overlay.candidates[0];
+        assert!(c.score.is_some(), "candidate must have a score");
+        let bd = c.score_breakdown.as_ref().unwrap_or_else(|| std::process::abort());
+        assert!(bd.locality > 0.0, "locality must be positive for local provider");
+        assert!(bd.queue_depth > 0.0, "queue_depth must be positive");
+        assert!(bd.kv_cache > 0.0, "kv_cache must be positive");
+        assert!(
+            (bd.total - c.score.unwrap_or(0.0)).abs() < 1e-10,
+            "breakdown.total must equal candidate.score"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing policy — backward compatibility and serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn geography_first_produces_same_order_as_absent_policy() {
+        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+
+        let no_policy = test_network("net");
+        let geo_policy: GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": { "seeds": [], "routingPolicy": "geographyFirst" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+
+        let providers = [local, remote, api];
+        let overlay_default = render_routing_overlay(&no_policy, &[], &providers, &[], "gw", None, None)
+            .unwrap_or_else(|_| std::process::abort());
+        let overlay_geo = render_routing_overlay(&geo_policy, &[], &providers, &[], "gw", None, None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let order_default: Vec<&str> = overlay_default.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        let order_geo: Vec<&str> = overlay_geo.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert_eq!(
+            order_default, order_geo,
+            "absent routingPolicy and explicit geographyFirst must produce the same order"
+        );
+    }
+
+    #[test]
+    fn absent_routing_policy_preserves_geography_above_score() {
+        let local = test_provider_with_backend_kind("local-site", "net", "local");
+        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let network = test_network("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "local-site",
+            scoring::BackendMetrics::new(0.0, true, 0.70, 0.0, 0.0, 0.80),
+        );
+        metrics.insert(
+            "prov-remote",
+            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
+        );
+
+        let overlay = render_routing_overlay(&network, &[], &[local, remote], &[], "local-site", Some(&metrics), None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("local-site"),
+            "default policy: local must rank first despite worse metrics (geography above score)"
+        );
     }
 
     // -----------------------------------------------------------------------

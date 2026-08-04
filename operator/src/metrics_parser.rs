@@ -45,11 +45,11 @@ const SCORING_MAX_LATENCY_MS: f64 = 5000.0;
 // ---------------------------------------------------------------------------
 
 /// Configurable mapping from [`BackendMetrics`] fields to Prometheus metric
-/// names.
+/// names, plus optional pool-selection and normalisation parameters.
 ///
-/// Every field is `Option<String>`.  A `None` value means that signal is not
-/// scraped; its corresponding field in [`PartialMetrics`] will remain `None`
-/// and will be replaced by a neutral default when converting to
+/// Every signal-name field is `Option<String>`.  A `None` value means that
+/// signal is not scraped; its corresponding field in [`PartialMetrics`] will
+/// remain `None` and will be replaced by a neutral default when converting to
 /// [`BackendMetrics`].
 ///
 /// # Defaults
@@ -84,10 +84,26 @@ pub struct MetricNames {
 
     /// Metric name for normalised queue depth (0.0–1.0).
     ///
-    /// The caller is responsible for normalisation.  Raw integer queue lengths
-    /// must be normalised before being exposed as this metric, or via a
-    /// recording rule.
+    /// When [`MetricNames::queue_capacity`] is set, the raw value from this
+    /// metric is divided by the capacity and clamped.  Otherwise the exporter
+    /// must pre-normalise to 0.0–1.0.
     pub queue_depth: Option<String>,
+
+    /// Expected Prometheus `name` label value for pool-level metric selection.
+    ///
+    /// When set, only metric samples whose `name` label equals this value are
+    /// matched.  This is required when scraping an endpoint that exposes
+    /// metrics for multiple pools (e.g. an llm-d EPP).
+    ///
+    /// When absent, labels are stripped before matching (v1 behaviour).
+    pub pool_name: Option<String>,
+
+    /// Capacity denominator for raw queue-size normalisation.
+    ///
+    /// When set, the parsed `queue_depth` value is divided by this capacity
+    /// and clamped to `[0.0, 1.0]`.  Zero, negative, and non-finite values
+    /// are treated as absent.
+    pub queue_capacity: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,24 +183,48 @@ impl PartialMetrics {
 
 /// Parse Prometheus text exposition format and extract configured metric values.
 ///
-/// Reads each non-comment line in `text`, strips label selectors, and matches
-/// the metric name against entries in `names`.  The first sample matching a
-/// configured name is used; subsequent samples with the same name are ignored
-/// (first-wins semantics, independent of label values).
+/// Reads each non-comment line in `text`, matches the metric name against
+/// entries in `names`, and respects optional pool-name label filtering and
+/// queue-capacity normalisation.
+///
+/// ## Label selection
+///
+/// When [`MetricNames::pool_name`] is set, only samples whose `name` label
+/// matches the configured pool name are considered.  Samples without labels
+/// or with a different `name` label are skipped for that metric.  When
+/// `pool_name` is absent, labels are stripped before matching (v1 behaviour).
+///
+/// ## Queue normalisation
+///
+/// When [`MetricNames::queue_capacity`] is set and positive, the raw
+/// `queue_depth` value is divided by the capacity and clamped to `[0.0, 1.0]`.
+///
+/// ## First-sample semantics
+///
+/// The first sample matching a configured name (and pool name, when set) is
+/// used; subsequent samples with the same name are ignored.
 ///
 /// Malformed lines — those that lack a parseable float value — are silently
-/// skipped.  They are not treated as errors.
+/// skipped.
 ///
 /// # Returns
 ///
-/// A [`PartialMetrics`] where each field is `Some(value)` if the corresponding
+/// `Ok(PartialMetrics)` where each field is `Some(value)` if the corresponding
 /// name was configured and found, or `None` otherwise.
+///
+/// # Errors
+///
+/// Returns `Err` when `pool_name` is configured but no configured signal
+/// matched a series carrying that pool name.  An unrelated metric with the
+/// right pool label does **not** count — at least one routing-relevant signal
+/// must match.
 #[expect(
     clippy::too_many_lines,
     reason = "six assign-and-match calls read as a table; extraction would obscure intent"
 )]
-pub fn parse_prometheus_text(text: &str, names: &MetricNames) -> PartialMetrics {
+pub fn parse_prometheus_text(text: &str, names: &MetricNames) -> Result<PartialMetrics, String> {
     let mut result = PartialMetrics::default();
+    let mut pool_signal_matched = false;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -202,6 +242,20 @@ pub fn parse_prometheus_text(text: &str, names: &MetricNames) -> PartialMetrics 
         else {
             continue;
         };
+        if let Some(expected_pool) = &names.pool_name
+            && !has_label_value(name_part, "name", expected_pool)
+        {
+            continue;
+        }
+        let before = &result;
+        let prev = (
+            before.queue_depth,
+            before.kv_cache_utilization,
+            before.prefix_cache_hit_ratio,
+            before.latency_p99_ms,
+            before.error_rate,
+            before.healthy,
+        );
         apply_if_match(&mut result.queue_depth, &names.queue_depth, metric_name, value);
         apply_if_match(
             &mut result.kv_cache_utilization,
@@ -218,8 +272,32 @@ pub fn parse_prometheus_text(text: &str, names: &MetricNames) -> PartialMetrics 
         apply_if_match(&mut result.latency_p99_ms, &names.latency_p99_ms, metric_name, value);
         apply_if_match(&mut result.error_rate, &names.error_rate, metric_name, value);
         apply_if_match(&mut result.healthy, &names.healthy, metric_name, value);
+        if names.pool_name.is_some() {
+            let after = (
+                result.queue_depth,
+                result.kv_cache_utilization,
+                result.prefix_cache_hit_ratio,
+                result.latency_p99_ms,
+                result.error_rate,
+                result.healthy,
+            );
+            if prev != after {
+                pool_signal_matched = true;
+            }
+        }
     }
-    result
+    if let Some(cap) = names.queue_capacity.filter(|c| c.is_finite() && *c > 0.0)
+        && let Some(raw) = result.queue_depth
+    {
+        result.queue_depth = Some((raw / cap).clamp(0.0, 1.0));
+    }
+    if names.pool_name.is_some() && !pool_signal_matched {
+        return Err(format!(
+            "pool {:?} matched no configured signal in scrape response",
+            names.pool_name.as_deref().unwrap_or("?"),
+        ));
+    }
+    Ok(result)
 }
 
 /// Strip a Prometheus label selector from a metric name token.
@@ -230,6 +308,29 @@ fn strip_labels(name_with_labels: &str) -> &str {
     name_with_labels
         .split_once('{')
         .map_or(name_with_labels, |(name, _)| name)
+}
+
+/// Check whether a metric name token contains a specific label key-value pair.
+///
+/// `has_label_value("my_metric{name=\"pool-a\",zone=\"us\"}", "name", "pool-a")` → `true`.
+///
+/// Returns `false` when the token has no labels or the label is absent/mismatched.
+fn has_label_value(name_with_labels: &str, label_key: &str, expected_value: &str) -> bool {
+    let Some((_, labels_with_brace)) = name_with_labels.split_once('{') else {
+        return false;
+    };
+    let labels = labels_with_brace.trim_end_matches('}');
+    for pair in labels.split(',') {
+        let pair = pair.trim();
+        if let Some((key, raw_val)) = pair.split_once('=') {
+            let key = key.trim();
+            let val = raw_val.trim().trim_matches('"');
+            if key == label_key && val == expected_value {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Assign `value` to `target` if `configured` matches `metric_name` and
@@ -258,6 +359,8 @@ mod tests {
             latency_p99_ms: Some("test_latency_p99_ms".to_owned()),
             prefix_cache_hit_ratio: Some("test_prefix_cache".to_owned()),
             queue_depth: Some("test_queue_depth".to_owned()),
+            pool_name: None,
+            queue_capacity: None,
         }
     }
 
@@ -272,7 +375,7 @@ mod tests {
             queue_depth: Some("test_queue_depth".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(result.queue_depth, Some(0.75_f64), "queue depth must be parsed");
         assert!(result.kv_cache_utilization.is_none(), "other fields must be absent");
     }
@@ -284,7 +387,7 @@ mod tests {
             kv_cache_utilization: Some("test_kv_cache".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result.kv_cache_utilization,
             Some(0.42_f64),
@@ -299,7 +402,7 @@ mod tests {
             prefix_cache_hit_ratio: Some("test_prefix_cache".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result.prefix_cache_hit_ratio,
             Some(0.88_f64),
@@ -314,7 +417,7 @@ mod tests {
             latency_p99_ms: Some("test_latency_p99_ms".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(result.latency_p99_ms, Some(123.4_f64), "P99 latency must be parsed");
     }
 
@@ -322,7 +425,7 @@ mod tests {
     fn parses_error_rate_and_healthy_metrics() {
         let text = "test_error_rate 0.05\ntest_healthy 1\n";
         let names = names_for_all_signals();
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(result.error_rate, Some(0.05_f64));
         assert_eq!(result.healthy, Some(1.0_f64));
     }
@@ -331,7 +434,7 @@ mod tests {
     fn missing_metrics_are_absent_in_partial() {
         let text = "test_queue_depth 0.5\n";
         let names = names_for_all_signals();
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(result.queue_depth, Some(0.5_f64), "configured and present → Some");
         assert!(result.kv_cache_utilization.is_none(), "not in text → None");
         assert!(result.latency_p99_ms.is_none(), "not in text → None");
@@ -352,7 +455,7 @@ mod tests {
             kv_cache_utilization: Some("test_kv_cache".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert!(
             result.queue_depth.is_none(),
             "unparseable queue depth value must be skipped"
@@ -373,7 +476,7 @@ mod tests {
             queue_depth: Some("test_queue_depth".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result.queue_depth,
             Some(0.1_f64),
@@ -388,7 +491,7 @@ mod tests {
             kv_cache_utilization: Some("test_kv_cache".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result.kv_cache_utilization,
             Some(0.5_f64),
@@ -411,7 +514,7 @@ test_kv_cache{model="llama"} 0.3
             kv_cache_utilization: Some("test_kv_cache".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result.queue_depth,
             Some(0.6_f64),
@@ -431,7 +534,7 @@ test_kv_cache{model="llama"} 0.3
             queue_depth: Some("test_queue_depth".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result.queue_depth,
             Some(0.44_f64),
@@ -447,7 +550,7 @@ test_kv_cache{model="llama"} 0.3
             kv_cache_utilization: Some("test_kv_cache".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert!(result.queue_depth.is_none(), "NaN values must be skipped");
         assert!(result.kv_cache_utilization.is_none(), "infinite values must be skipped");
     }
@@ -461,7 +564,7 @@ test_kv_cache{model="llama"} 0.3
             queue_depth: Some("test_queue_depth".to_owned()),
             ..Default::default()
         };
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result.queue_depth,
             Some(0.55_f64),
@@ -471,7 +574,7 @@ test_kv_cache{model="llama"} 0.3
 
     #[test]
     fn empty_text_returns_all_absent() {
-        let result = parse_prometheus_text("", &names_for_all_signals());
+        let result = parse_prometheus_text("", &names_for_all_signals()).unwrap();
         assert_eq!(
             result,
             PartialMetrics::default(),
@@ -483,7 +586,7 @@ test_kv_cache{model="llama"} 0.3
     fn unconfigured_names_do_not_match_anything() {
         let text = "test_queue_depth 0.5\n";
         let names = MetricNames::default(); // all None
-        let result = parse_prometheus_text(text, &names);
+        let result = parse_prometheus_text(text, &names).unwrap();
         assert_eq!(
             result,
             PartialMetrics::default(),
@@ -607,7 +710,7 @@ test_kv_cache{model="llama"} 0.3
         let text = "test_queue_depth 0.3\ntest_kv_cache 0.6\ntest_prefix_cache 0.9\n\
                     test_latency_p99_ms 250.0\ntest_error_rate 0.02\ntest_healthy 1\n";
         let names = names_for_all_signals();
-        let partial = parse_prometheus_text(text, &names);
+        let partial = parse_prometheus_text(text, &names).unwrap();
         let metrics = partial.into_backend_metrics();
         assert_eq!(metrics.queue_depth, 0.3);
         assert_eq!(metrics.kv_cache_utilization, 0.6);
@@ -615,5 +718,262 @@ test_kv_cache{model="llama"} 0.3
         assert_eq!(metrics.latency_p99_ms, 250.0);
         assert_eq!(metrics.error_rate, 0.02);
         assert!(metrics.healthy);
+    }
+
+    // -----------------------------------------------------------------------
+    // has_label_value — label selector
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_label_value_matches_single_label() {
+        assert!(
+            has_label_value(r#"my_metric{name="pool-a"}"#, "name", "pool-a"),
+            "must match exact label"
+        );
+    }
+
+    #[test]
+    fn has_label_value_matches_among_multiple_labels() {
+        assert!(
+            has_label_value(r#"my_metric{zone="us",name="pool-a",host="h1"}"#, "name", "pool-a"),
+            "must match label among multiple"
+        );
+    }
+
+    #[test]
+    fn has_label_value_rejects_wrong_value() {
+        assert!(
+            !has_label_value(r#"my_metric{name="pool-b"}"#, "name", "pool-a"),
+            "must reject mismatched value"
+        );
+    }
+
+    #[test]
+    fn has_label_value_rejects_no_labels() {
+        assert!(
+            !has_label_value("my_metric", "name", "pool-a"),
+            "must reject when no labels present"
+        );
+    }
+
+    #[test]
+    fn has_label_value_rejects_absent_key() {
+        assert!(
+            !has_label_value(r#"my_metric{zone="us"}"#, "name", "pool-a"),
+            "must reject when label key is absent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_prometheus_text — pool name label selection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pool_name_selects_matching_labeled_series() {
+        let text = r#"# EPP metrics
+llm_d_router_epp_average_kv_cache_utilization{name="pool-a"} 0.25
+llm_d_router_epp_average_queue_size{name="pool-a"} 3.5
+llm_d_router_epp_ready_endpoints{name="pool-a"} 2
+"#;
+        let names = MetricNames {
+            kv_cache_utilization: Some("llm_d_router_epp_average_kv_cache_utilization".to_owned()),
+            queue_depth: Some("llm_d_router_epp_average_queue_size".to_owned()),
+            healthy: Some("llm_d_router_epp_ready_endpoints".to_owned()),
+            pool_name: Some("pool-a".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(result.kv_cache_utilization, Some(0.25), "kv cache must be extracted");
+        assert_eq!(result.queue_depth, Some(3.5), "queue size must be extracted");
+        assert_eq!(result.healthy, Some(2.0), "ready endpoints must be extracted");
+    }
+
+    #[test]
+    fn pool_name_rejects_wrong_pool_label() {
+        let text = r#"llm_d_router_epp_average_kv_cache_utilization{name="pool-b"} 0.8
+"#;
+        let names = MetricNames {
+            kv_cache_utilization: Some("llm_d_router_epp_average_kv_cache_utilization".to_owned()),
+            pool_name: Some("pool-a".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names);
+        assert!(result.is_err(), "wrong pool label with configured signal must be Err");
+    }
+
+    #[test]
+    fn pool_name_rejects_unlabeled_metric() {
+        let text = "test_queue_depth 0.5\n";
+        let names = MetricNames {
+            queue_depth: Some("test_queue_depth".to_owned()),
+            pool_name: Some("pool-a".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names);
+        assert!(result.is_err(), "unlabeled metric with pool_name must be Err");
+    }
+
+    #[test]
+    fn pool_name_absent_allows_any_label() {
+        let text = r#"test_kv{name="pool-b"} 0.4
+"#;
+        let names = MetricNames {
+            kv_cache_utilization: Some("test_kv".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(
+            result.kv_cache_utilization,
+            Some(0.4),
+            "without pool_name, any labeled series must match"
+        );
+    }
+
+    #[test]
+    fn pool_name_selects_correct_pool_from_multiple() {
+        let text = r#"my_metric{name="pool-x"} 0.1
+my_metric{name="pool-y"} 0.9
+"#;
+        let names = MetricNames {
+            queue_depth: Some("my_metric".to_owned()),
+            pool_name: Some("pool-y".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(
+            result.queue_depth,
+            Some(0.9),
+            "must select pool-y, not first-wins pool-x"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_prometheus_text — queue capacity normalisation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn queue_capacity_normalises_raw_value() {
+        let text = "test_queue 5.0\n";
+        let names = MetricNames {
+            queue_depth: Some("test_queue".to_owned()),
+            queue_capacity: Some(10.0),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(result.queue_depth, Some(0.5), "raw 5.0 / capacity 10.0 = 0.5");
+    }
+
+    #[test]
+    fn queue_capacity_clamps_to_one() {
+        let text = "test_queue 15.0\n";
+        let names = MetricNames {
+            queue_depth: Some("test_queue".to_owned()),
+            queue_capacity: Some(10.0),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(
+            result.queue_depth,
+            Some(1.0),
+            "raw 15.0 / capacity 10.0 must clamp to 1.0"
+        );
+    }
+
+    #[test]
+    fn queue_capacity_zero_treated_as_absent() {
+        let text = "test_queue 5.0\n";
+        let names = MetricNames {
+            queue_depth: Some("test_queue".to_owned()),
+            queue_capacity: Some(0.0),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(
+            result.queue_depth,
+            Some(5.0),
+            "zero capacity must not divide: raw value passes through"
+        );
+    }
+
+    #[test]
+    fn queue_capacity_negative_treated_as_absent() {
+        let text = "test_queue 5.0\n";
+        let names = MetricNames {
+            queue_depth: Some("test_queue".to_owned()),
+            queue_capacity: Some(-10.0),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(
+            result.queue_depth,
+            Some(5.0),
+            "negative capacity must not divide: raw value passes through"
+        );
+    }
+
+    #[test]
+    fn queue_capacity_absent_passes_through() {
+        let text = "test_queue 0.3\n";
+        let names = MetricNames {
+            queue_depth: Some("test_queue".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(result.queue_depth, Some(0.3), "no capacity → raw value passes through");
+    }
+
+    #[test]
+    fn pool_name_and_queue_capacity_combined() {
+        let text = r#"llm_d_router_epp_average_queue_size{name="my-pool"} 4.0
+llm_d_router_epp_average_kv_cache_utilization{name="my-pool"} 0.35
+"#;
+        let names = MetricNames {
+            queue_depth: Some("llm_d_router_epp_average_queue_size".to_owned()),
+            kv_cache_utilization: Some("llm_d_router_epp_average_kv_cache_utilization".to_owned()),
+            pool_name: Some("my-pool".to_owned()),
+            queue_capacity: Some(8.0),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names).unwrap();
+        assert_eq!(result.queue_depth, Some(0.5), "raw 4.0 / capacity 8.0 = 0.5");
+        assert_eq!(
+            result.kv_cache_utilization,
+            Some(0.35),
+            "kv cache passes through unchanged"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_prometheus_text — pool name miss detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pool_name_miss_returns_error_even_with_unrelated_metric() {
+        let text = r#"unrelated_metric{name="pool-a"} 42.0
+other_metric{name="pool-a"} 1.0
+"#;
+        let names = MetricNames {
+            kv_cache_utilization: Some("llm_d_router_epp_average_kv_cache_utilization".to_owned()),
+            queue_depth: Some("llm_d_router_epp_average_queue_size".to_owned()),
+            pool_name: Some("pool-a".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names);
+        assert!(
+            result.is_err(),
+            "unrelated metric with matching pool label must not count as a signal match"
+        );
+    }
+
+    #[test]
+    fn pool_name_miss_no_series_at_all() {
+        let text = "";
+        let names = MetricNames {
+            queue_depth: Some("test_queue".to_owned()),
+            pool_name: Some("pool-a".to_owned()),
+            ..Default::default()
+        };
+        let result = parse_prometheus_text(text, &names);
+        assert!(result.is_err(), "empty response with pool_name must be Err");
     }
 }

@@ -13,6 +13,7 @@ pub(crate) mod image_overrides;
 pub(crate) mod images;
 pub(crate) mod kind;
 pub(crate) mod kubectl;
+pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
 pub(crate) mod providers;
@@ -939,6 +940,16 @@ pub(crate) enum Action {
         #[command(flatten)]
         options: GlbDemoOptions,
     },
+
+    /// Run the llm-d pool-metrics routing demo with two clusters.
+    RunGridLlmdPoolMetricsDemo {
+        /// Path to the source Forge environment config file.
+        #[arg(long, default_value = "demos/grid-llmd-pool-metrics/forge.yaml")]
+        forge_config: PathBuf,
+        /// Demo mode and lifecycle options.
+        #[command(flatten)]
+        options: GlbDemoOptions,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,6 +1029,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         },
         Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
         Action::RunGridCombinedSiteDemo { forge_config, options } => combined_site_demo::run(forge_config, options),
+        Action::RunGridLlmdPoolMetricsDemo { forge_config, options } => {
+            llmd_pool_metrics_demo::run(forge_config, options)
+        },
     }
 }
 

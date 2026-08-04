@@ -195,6 +195,42 @@
             }
           },
           "description": "Items to project from the ConfigMap."
+        },
+        "sidecar": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Overlay sync sidecar settings.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the overlay-sync sidecar."
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": { "type": "string", "description": "Sidecar image repository." },
+                "tag": { "type": "string", "description": "Sidecar image tag." },
+                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"], "description": "Sidecar image pull policy." }
+              }
+            },
+            "dataKey": {
+              "type": "string",
+              "description": "ConfigMap data key containing the overlay envelope."
+            },
+            "expectedNetwork": {
+              "type": "string",
+              "description": "Expected GridNetwork name for scope validation."
+            },
+            "expectedLocalSite": {
+              "type": "string",
+              "description": "Expected local site name for scope validation."
+            },
+            "resources": {
+              "type": "object",
+              "description": "Sidecar resource requests and limits."
+            }
+          }
         }
       }
     },

@@ -28,6 +28,7 @@ env:
     ghcr.io/praxis-proxy/grid-ai-rollup@sha256:95132eb39c0f568b5361a250002979c5063db427ff0fb63b59a93146fcb7ad31
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
+  OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
 
 jobs:
   # ----------------------------------------------------------------------------
@@ -131,6 +132,7 @@ jobs:
     outputs:
       operator_digest: ${{ steps.operator.outputs.digest }}
       mock_providers_digest: ${{ steps.mock_providers.outputs.digest }}
+      overlay_sync_digest: ${{ steps.overlay_sync.outputs.digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -184,6 +186,25 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
           cache-from: type=gha,scope=release-mock-providers
           cache-to: type=gha,mode=max,scope=release-mock-providers
+          provenance: mode=max
+          sbom: true
+
+      - name: Build and push overlay-sync
+        id: overlay_sync
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: overlay-sync/Containerfile
+          push: true
+          tags: |
+            ${{ env.OVERLAY_SYNC_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
+            ${{ env.OVERLAY_SYNC_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          cache-from: type=gha,scope=release-overlay-sync
+          cache-to: type=gha,mode=max,scope=release-overlay-sync
           provenance: mode=max
           sbom: true
 
@@ -288,6 +309,7 @@ jobs:
         env:
           OPERATOR_DIGEST: ${{ needs.container.outputs.operator_digest }}
           MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
+          OVERLAY_SYNC_DIGEST: ${{ needs.container.outputs.overlay_sync_digest }}
           CHART_DIGEST: ${{ needs.chart.outputs.chart_digest }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
           VERSION: ${{ needs.validate.outputs.version }}
@@ -299,6 +321,7 @@ jobs:
           ${AI_ROLLUP_IMAGE}
           ${OPERATOR_IMAGE_NAME}@${OPERATOR_DIGEST}
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
+          ${OVERLAY_SYNC_IMAGE_NAME}@${OVERLAY_SYNC_DIGEST}
           \`\`\`
 
           ## Helm Chart

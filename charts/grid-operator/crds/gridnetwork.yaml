@@ -212,6 +212,18 @@ spec:
                   description: Region where this site is deployed.
                   nullable: true
                   type: string
+                routingPolicy:
+                  description: |-
+                    Candidate ordering policy for the routing overlay.
+
+                    Controls whether geography (locality tier) or the scoring engine's
+                    weighted total score is the primary differentiator when ranking
+                    candidates after admission state and freshness.
+                  enum:
+                    - geographyFirst
+                    - scoreFirst
+                  nullable: true
+                  type: string
                 seeds:
                   default: []
                   description: Initial SWIM seed peer addresses.

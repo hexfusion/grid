@@ -427,14 +427,38 @@ Grid does not copy Secret values across clusters.
 Rendering a new `ConfigMap` is not enough by itself.  Kubernetes can project the
 new file into a pod, but the running gateway still has to consume it.
 
+The recommended production handoff uses the `grid-overlay-sync` container:
+
+```text
+Grid operator
+  -> applies a scoped, content-addressed overlay ConfigMap
+Kubernetes API watch
+  -> overlay-sync receives the new resource version
+overlay-sync
+  -> validates size, schema, scope, revision, and digest
+  -> atomically replaces the file in a shared emptyDir
+Praxis AI
+  -> observes the file change and hot-reloads the accepted snapshot
+```
+
+Praxis hot reload is already fast after the file changes. The sidecar exists
+because a directly projected ConfigMap is refreshed by the kubelet on an
+eventual schedule. Runtime testing observed delays long enough for a temporary
+routing preference to change and recover before the gateway saw either update.
+Watching the Kubernetes API removes that projected-volume delay from the
+normal path. The remaining time is primarily operator scrape/reconciliation
+plus API-watch and Praxis file-watch processing; the sidecar does not make the
+operator reconcile more frequently.
+
 The current handoff boundary is:
 
 | Owner | Responsibility |
 |---|---|
 | Grid operator | Render a content-addressed envelope, apply the consumer `ConfigMap`, and report rendered and distributed revisions |
-| Kubernetes | Project the updated `ConfigMap` into the Praxis AI pod filesystem |
+| `grid-overlay-sync` init container | Wait for the first valid operator overlay, validate it, and write it before Praxis starts |
+| `grid-overlay-sync` sidecar | Watch one named `ConfigMap`, reject invalid replacements, atomically write valid revisions, retain the last-known-good file, and report delivery health |
 | Praxis AI | Strictly validate the projected envelope and atomically replace the accepted in-memory routing snapshot |
-| Deployment owner | Mount the overlay directory, configure reload policy and expected scope, and monitor accepted and serving revisions, rejection, and age |
+| Deployment owner | Configure expected scope, sidecar image, reload policy, and monitoring for distributed, written, accepted, and serving revisions |
 
 This keeps Grid outside the request path and outside the gateway deployment
 lifecycle. Grid updates desired routing configuration; Praxis AI can load a
@@ -442,6 +466,16 @@ valid update without a pod restart and retains its last-known-good snapshot
 when a replacement is invalid. Grid does not restart Praxis pods, and an
 applied `ConfigMap` alone is not proof that the gateway accepted its newest
 revision.
+
+The sidecar also creates a deliberate security boundary. A dedicated
+ServiceAccount receives namespaced `get`, `list`, and `watch` access for the
+configured overlay `ConfigMap`. Only the init and sidecar containers mount its
+projected token. The Praxis container mounts the resulting overlay directory
+read-only and receives no Kubernetes API credential.
+
+Direct ConfigMap projection remains an opt-out compatibility mode. It has fewer
+components, but delivery latency is controlled by the kubelet and the handoff
+does not expose sidecar validation, last-known-good, or delivery-status metrics.
 
 The revision lifecycle uses four distinct terms:
 

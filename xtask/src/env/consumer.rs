@@ -2609,6 +2609,9 @@ mod tests {
                         key: "token".to_owned(),
                     },
                 }),
+                score: None,
+                score_breakdown: None,
+                rank: None,
             }],
         }
     }

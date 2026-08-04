@@ -912,6 +912,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "grid-overlay-sync"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "clap",
+ "futures",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

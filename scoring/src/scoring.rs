@@ -79,6 +79,38 @@ impl Default for ScoringWeights {
 }
 
 // ---------------------------------------------------------------------------
+// Score Breakdown
+// ---------------------------------------------------------------------------
+
+/// Per-signal weighted contributions that compose a backend's total score.
+///
+/// Each field holds `weight × signal_value`, not the raw signal.
+/// `total` is the sum of all fields.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ScoreBreakdown {
+    /// Locality contribution (`weight_locality × locality_signal`).
+    pub locality: f64,
+
+    /// Queue depth contribution (`weight_queue × (1 - queue_depth)`).
+    pub queue_depth: f64,
+
+    /// KV cache contribution (`weight_kv × (1 - kv_utilization)`).
+    pub kv_cache: f64,
+
+    /// Prefix cache contribution (`weight_prefix × hit_ratio`).
+    pub prefix_cache: f64,
+
+    /// Latency contribution (`weight_latency × (1 - latency/max)`).
+    pub latency: f64,
+
+    /// Cost contribution (`weight_cost × (1 - cost/max)`).
+    pub cost: f64,
+
+    /// Sum of all weighted contributions.
+    pub total: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Scored Backend
 // ---------------------------------------------------------------------------
 
@@ -98,17 +130,21 @@ pub struct ScoredBackend {
 
     /// Computed score (higher is better).
     pub score: f64,
+
+    /// Per-signal weighted contributions.
+    pub breakdown: ScoreBreakdown,
 }
 
 impl ScoredBackend {
     /// Creates a scored backend entry.
     #[must_use]
-    pub fn new(name: String, endpoint: String, provider: ProviderKind, score: f64) -> Self {
+    pub fn new(name: String, endpoint: String, provider: ProviderKind, breakdown: ScoreBreakdown) -> Self {
         Self {
             name,
             endpoint,
             provider,
-            score,
+            score: breakdown.total,
+            breakdown,
         }
     }
 }
@@ -209,18 +245,27 @@ fn score_one(
     weights: &ScoringWeights,
     local_region: Option<&str>,
 ) -> ScoredBackend {
-    let loc = weights.locality * locality_score(backend.kind, backend.region.as_deref(), local_region);
-    let cost = weights.cost * cost_score(backend.cost_per_1k_input);
-    let lat = weights.latency * latency_score(metrics);
-    let queue = weights.queue_depth * queue_score(metrics);
-    let kv = weights.kv_cache * kv_cache_score(metrics);
-    let prefix = weights.prefix_cache * prefix_cache_score(metrics);
+    let breakdown = ScoreBreakdown {
+        locality: weights.locality * locality_score(backend.kind, backend.region.as_deref(), local_region),
+        cost: weights.cost * cost_score(backend.cost_per_1k_input),
+        latency: weights.latency * latency_score(metrics),
+        queue_depth: weights.queue_depth * queue_score(metrics),
+        kv_cache: weights.kv_cache * kv_cache_score(metrics),
+        prefix_cache: weights.prefix_cache * prefix_cache_score(metrics),
+        total: 0.0,
+    };
+    let total = breakdown.locality
+        + breakdown.cost
+        + breakdown.latency
+        + breakdown.queue_depth
+        + breakdown.kv_cache
+        + breakdown.prefix_cache;
 
     ScoredBackend::new(
         backend.name.clone(),
         backend.endpoint.clone(),
         backend.provider,
-        loc + cost + lat + queue + kv + prefix,
+        ScoreBreakdown { total, ..breakdown },
     )
 }
 
@@ -490,6 +535,108 @@ mod tests {
     fn cost_score_expensive_is_low() {
         let score = cost_score(0.09);
         assert!(score < 0.2, "expensive should score low: {score}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Score Breakdown Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn breakdown_fields_sum_to_total() {
+        let mut state = GridState::new();
+        add(&mut state, "b", BackendKind::Local, 0.01);
+        state.set_metrics("b".to_owned(), BackendMetrics::new(0.0, true, 0.3, 500.0, 0.4, 0.2));
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        let sb = result.first().unwrap_or_else(|| std::process::abort());
+        let bd = &sb.breakdown;
+        let sum = bd.locality + bd.queue_depth + bd.kv_cache + bd.prefix_cache + bd.latency + bd.cost;
+        assert!(
+            (sum - bd.total).abs() < 1e-10,
+            "sum of fields ({sum}) must equal total ({})",
+            bd.total
+        );
+        assert!(
+            (sb.score - bd.total).abs() < 1e-10,
+            "ScoredBackend.score must equal breakdown.total"
+        );
+    }
+
+    #[test]
+    fn breakdown_locality_reflects_kind() {
+        let mut state = GridState::new();
+        add(&mut state, "local", BackendKind::Local, 0.01);
+        add(&mut state, "api", BackendKind::ApiProvider, 0.01);
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        let local_bd = &result
+            .iter()
+            .find(|b| b.name == "local")
+            .unwrap_or_else(|| std::process::abort())
+            .breakdown;
+        let api_bd = &result
+            .iter()
+            .find(|b| b.name == "api")
+            .unwrap_or_else(|| std::process::abort())
+            .breakdown;
+        let expected_diff = ScoringWeights::default().locality * (1.0 - 0.1);
+        assert!(
+            (local_bd.locality - api_bd.locality - expected_diff).abs() < f64::EPSILON,
+            "locality difference must equal weight * (1.0 - 0.1)"
+        );
+    }
+
+    #[test]
+    fn breakdown_queue_pressure_reduces_queue_field() {
+        let mut state = GridState::new();
+        add(&mut state, "busy", BackendKind::Local, 0.01);
+        state.set_metrics("busy".to_owned(), BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.9));
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        let bd = &result.first().unwrap_or_else(|| std::process::abort()).breakdown;
+        let expected = ScoringWeights::default().queue_depth * (1.0 - 0.9);
+        assert!(
+            (bd.queue_depth - expected).abs() < f64::EPSILON,
+            "queue_depth field must be {expected}, got {}",
+            bd.queue_depth
+        );
+    }
+
+    #[test]
+    fn breakdown_kv_cache_pressure_reduces_kv_field() {
+        let mut state = GridState::new();
+        add(&mut state, "full", BackendKind::Local, 0.01);
+        state.set_metrics("full".to_owned(), BackendMetrics::new(0.0, true, 0.8, 0.0, 0.0, 0.0));
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        let bd = &result.first().unwrap_or_else(|| std::process::abort()).breakdown;
+        let expected = ScoringWeights::default().kv_cache * (1.0 - 0.8);
+        assert!(
+            (bd.kv_cache - expected).abs() < f64::EPSILON,
+            "kv_cache field must be {expected}, got {}",
+            bd.kv_cache
+        );
+    }
+
+    #[test]
+    fn breakdown_missing_metrics_uses_default() {
+        let mut state = GridState::new();
+        add(&mut state, "no_metrics", BackendKind::Local, 0.01);
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        let bd = &result.first().unwrap_or_else(|| std::process::abort()).breakdown;
+        let w = ScoringWeights::default();
+        assert!(
+            (bd.queue_depth - w.queue_depth * DEFAULT_SIGNAL_SCORE).abs() < f64::EPSILON,
+            "queue_depth must use default signal score"
+        );
+        assert!(
+            (bd.kv_cache - w.kv_cache * DEFAULT_SIGNAL_SCORE).abs() < f64::EPSILON,
+            "kv_cache must use default signal score"
+        );
+        assert!(
+            (bd.latency - w.latency * DEFAULT_SIGNAL_SCORE).abs() < f64::EPSILON,
+            "latency must use default signal score"
+        );
+        assert!(
+            (bd.prefix_cache - w.prefix_cache * DEFAULT_SIGNAL_SCORE).abs() < f64::EPSILON,
+            "prefix_cache must use default signal score"
+        );
     }
 
     // -----------------------------------------------------------------------

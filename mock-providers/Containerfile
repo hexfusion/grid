@@ -16,14 +16,16 @@ COPY certs/Cargo.toml certs/Cargo.toml
 COPY crdt/Cargo.toml crdt/Cargo.toml
 COPY forge/Cargo.toml forge/Cargo.toml
 COPY operator/Cargo.toml operator/Cargo.toml
+COPY overlay-sync/Cargo.toml overlay-sync/Cargo.toml
 COPY scoring/Cargo.toml scoring/Cargo.toml
 COPY swim/Cargo.toml swim/Cargo.toml
 # Create stub source files so cargo can validate each workspace member manifest
 # without compiling them. Only mock-providers is actually built.
-RUN mkdir -p certs/src crdt/src forge/src operator/src \
+RUN mkdir -p certs/src crdt/src forge/src operator/src overlay-sync/src \
              scoring/src swim/src && \
     touch certs/src/lib.rs crdt/src/lib.rs forge/src/lib.rs operator/src/lib.rs \
-          scoring/src/lib.rs swim/src/lib.rs
+          scoring/src/lib.rs swim/src/lib.rs && \
+    printf 'fn main() {}\n' > overlay-sync/src/main.rs
 COPY mock-providers mock-providers
 COPY xtask xtask
 RUN cargo build --release --package mock-providers

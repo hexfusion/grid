@@ -252,21 +252,24 @@ in two phases:
    neutral metric scores.
 
 2. **Enrichment and ordering.** Each candidate is enriched with admission
-   state, locality tier, stable ID, and rank. Candidates whose admission
-   state is `"none"` (unhealthy) are removed. Remaining candidates are
-   sorted by:
-   - Admission state: `new_and_existing` before `existing_only`.
-   - Locality tier: `same_site` < `same_zone` < `same_region` < `cross_region` < `unknown`.
-   - Score (descending): within the same admission and locality class, higher-scoring candidates first.
-   - Freshness: `fresh=true` before `fresh=false`.
-   - Alphabetical tiebreak: `(site, name, cluster)`.
+   state, locality tier, stable ID, score, score breakdown, and rank.
+   Candidates whose admission state is `"none"` (unhealthy) are removed.
+   `GridNetwork.spec.routingPolicy` then selects one of two orderings:
 
-   After deduplication, each candidate receives a zero-based `rank`.
+   | Policy | Order |
+   |---|---|
+   | `geographyFirst` (default) | admission, locality, score descending, freshness, deterministic tie-break |
+   | `scoreFirst` | admission, freshness, score descending, locality, deterministic tie-break |
 
-This ordering ensures that a healthy cross-region provider (`new_and_existing`)
-always ranks before an overloaded same-region provider (`existing_only`).
-Admission state takes priority over locality so that capacity pressure triggers
-fallback to more distant but available providers.
+   The deterministic tie-break is `(site, name, cluster)`. After
+   deduplication, each candidate receives a zero-based `rank`.
+
+Both policies ensure that a healthy cross-region provider
+(`new_and_existing`) ranks before an overloaded same-region provider
+(`existing_only`). Admission state takes priority over locality and score.
+`scoreFirst` additionally allows comparable runtime metrics to move a remote
+provider ahead of a local provider before either reaches an admission
+threshold.
 
 The enrichment and ordering phase runs after existing hard constraints (auth,
 capability, access policy, freshness, phase filters). It does not override
@@ -708,16 +711,17 @@ responsibility at each layer:
 | `kv_cache_utilization` | `[0.0, 1.0]` (ratio) | Prometheus exporter; clamped in the operator ingestion layer |
 | `latency_p99_ms` | `≥ 0.0 ms` (raw milliseconds) | Prometheus exporter exposes a pre-computed P99 gauge; the **scoring engine** normalizes internally using `MAX_LATENCY = 5000 ms` |
 | `prefix_cache_hit_ratio` | `[0.0, 1.0]` (ratio) | Prometheus exporter; clamped in the scoring engine |
-| `queue_depth` | `[0.0, 1.0]` (ratio) | **Must be pre-normalized by the exporter or recording rule**; raw integer queue counts are not accepted |
+| `queue_depth` | `[0.0, 1.0]` (ratio) | Exporter or recording rule; alternatively Grid divides a raw count by `metricsConfig.queueCapacity` |
 
 ### Destination-normalized metrics preferred
 
 Sites and clusters should normalize their own capability metrics where
 possible: the Prometheus exporter (or a recording rule on the destination)
-is responsible for converting raw queue depths to a `[0.0, 1.0]` ratio.
-This is the preferred pattern because heterogeneous sites can adapt
-normalization to their local context (different maximum queue depths,
-different latency budgets).
+converts raw queue depths to a `[0.0, 1.0]` ratio. This remains the preferred
+pattern because heterogeneous sites can adapt normalization to their local
+context. When an llm-d EPP exposes an absolute average queue size, set
+`metricsConfig.queueCapacity`; Grid divides the raw value by that capacity and
+clamps the result to `[0.0, 1.0]`.
 
 For cloud-managed providers and third-party APIs where the destination
 cannot export normalized metrics, the Grid operator may apply an adapter
@@ -795,10 +799,21 @@ operator's next reconciliation loop observes the new SWIM/member/provider state
 and re-renders.
 
 Rendering or distributing a new `ConfigMap` does not mean the gateway accepted
-it. Praxis AI `intelligent_route` can watch a projected `routing-overlay.json`, validate
-the replacement, and atomically install a new snapshot without a pod restart.
-The deployment must mount the full projected directory rather than a
-`subPath`, enable overlay-file reload, and configure its expected scope.
+it. The recommended deployment uses `grid-overlay-sync` to watch the named
+`ConfigMap` through the Kubernetes API, validate each content-addressed
+envelope, and atomically write accepted revisions into a shared `emptyDir`.
+Praxis watches that file and installs the new snapshot without a pod restart.
+
+This avoids depending on kubelet's eventual projected-ConfigMap refresh loop,
+which can leave the gateway serving an older route after the operator has
+published a new preference. It also adds validation, atomic writes,
+last-known-good retention, delivery health, and revision metrics at the handoff
+boundary. See [Architecture Overview](overview.md#configmap-handoff) and the
+[Praxis gateway chart](../../charts/praxis-gateway/README.md#routing-overlay-delivery).
+
+Direct ConfigMap projection remains available when
+`overlay.sidecar.enabled=false`, but its delivery latency is controlled by the
+kubelet and it does not provide the sidecar's validation or delivery status.
 
 Consumers that do not enable overlay-file reload still require a rollout or
 another deployment-owned reload mechanism. See

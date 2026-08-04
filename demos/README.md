@@ -28,6 +28,14 @@ consumer gateway, a separately secured provider gateway, and a private
 inference endpoint. The directory currently records the standalone demo
 contract in a validated, runnable environment.
 
+## llm-d Pool Metrics
+
+The [llm-d Pool Metrics Demo](grid-llmd-pool-metrics/README.md) runs two
+inference pools and proves metrics-driven capacity failover. Grid scrapes
+pool-level llm-d EPP telemetry, scores both candidates, publishes a routing
+overlay, and moves live Praxis requests from the preferred local pool to the
+healthier remote pool and back again without restarting the gateways.
+
 ## MaaS IPP lab
 
 The [MaaS IPP lab](maas-ipp/README.md) is a single-cluster Forge environment

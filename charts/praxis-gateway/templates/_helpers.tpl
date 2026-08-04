@@ -86,6 +86,12 @@ Validate enabled mounts have a non-empty resource name.
 {{- if and .Values.overlay.enabled (not .Values.overlay.existingConfigMap) }}
 {{- fail "overlay.existingConfigMap is required when overlay.enabled is true" }}
 {{- end }}
+{{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedNetwork) }}
+{{- fail "overlay.sidecar.expectedNetwork is required when overlay sidecar is enabled" }}
+{{- end }}
+{{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedLocalSite) }}
+{{- fail "overlay.sidecar.expectedLocalSite is required when overlay sidecar is enabled" }}
+{{- end }}
 {{- if and .Values.tls.enabled (not .Values.tls.existingSecret) }}
 {{- fail "tls.existingSecret is required when tls.enabled is true" }}
 {{- end }}

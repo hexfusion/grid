@@ -83,11 +83,16 @@ pub(crate) fn metrics_url(endpoint: &str, path: &str) -> String {
 // Config conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a [`MetricSignalNames`] CRD field to a [`MetricNames`] parser config.
+/// Convert CRD metrics configuration to a [`MetricNames`] parser config.
 ///
 /// Signal fields that are `None` in the CRD remain `None` in the parser config
-/// and are not extracted from the Prometheus text.
-pub(crate) fn metric_names_from_config(cfg: &MetricSignalNames) -> MetricNames {
+/// and are not extracted from the Prometheus text.  Pool-name selection and
+/// queue-capacity normalisation pass through when configured.
+pub(crate) fn metric_names_from_config(
+    cfg: &MetricSignalNames,
+    pool_name: Option<&str>,
+    queue_capacity: Option<u32>,
+) -> MetricNames {
     MetricNames {
         queue_depth: cfg.queue_depth.clone(),
         kv_cache_utilization: cfg.kv_cache_utilization.clone(),
@@ -95,6 +100,8 @@ pub(crate) fn metric_names_from_config(cfg: &MetricSignalNames) -> MetricNames {
         prefix_cache_hit_ratio: cfg.prefix_cache_hit_ratio.clone(),
         error_rate: cfg.error_rate.clone(),
         healthy: cfg.healthy.clone(),
+        pool_name: pool_name.map(str::to_owned),
+        queue_capacity: queue_capacity.map(f64::from),
     }
 }
 
@@ -153,6 +160,7 @@ pub(crate) fn parse_metrics_timeout(s: &str) -> Duration {
 /// `now` is passed in (rather than read from `Instant::now()`) so tests can
 /// control the clock without sleeping.
 #[expect(
+    clippy::cognitive_complexity,
     clippy::too_many_lines,
     reason = "sequential per-provider scrape loop with early-continue guards, cache read/write, and error logging"
 )]
@@ -190,14 +198,36 @@ pub(crate) async fn collect_provider_metrics(
         if endpoint.is_empty() {
             continue;
         }
-        let url = metrics_url(endpoint, &mc.path);
+        if let Some(ep) = mc.metrics_endpoint.as_deref()
+            && ep.trim().is_empty()
+        {
+            tracing::warn!(
+                provider = identity,
+                "metricsEndpoint is present but blank; skipping metrics collection"
+            );
+            continue;
+        }
+        if let Some(pn) = mc.pool_name.as_deref()
+            && pn.trim().is_empty()
+        {
+            tracing::warn!(
+                provider = identity,
+                "poolName is present but blank; skipping metrics collection"
+            );
+            continue;
+        }
+        let base = mc.metrics_endpoint.as_deref().unwrap_or(endpoint);
+        let url = metrics_url(base, &mc.path);
         let timeout = parse_metrics_timeout(&mc.timeout);
-        let names = metric_names_from_config(&mc.signal_names);
+        let names = metric_names_from_config(&mc.signal_names, mc.pool_name.as_deref(), mc.queue_capacity);
 
-        match scrape_metrics(&url, timeout).await {
-            Ok(text) => {
-                let bm = parse_prometheus_text(&text, &names).into_backend_metrics();
-                // Record the successful scrape in the cache.
+        let parse_result = match scrape_metrics(&url, timeout).await {
+            Ok(text) => parse_prometheus_text(&text, &names),
+            Err(e) => Err(e.to_string()),
+        };
+        match parse_result {
+            Ok(parsed) => {
+                let bm = parsed.into_backend_metrics();
                 cache_updates.push((
                     (network_name.to_owned(), identity.to_owned()),
                     TimestampedMetrics {
@@ -208,7 +238,6 @@ pub(crate) async fn collect_provider_metrics(
                 result.insert(identity.to_owned(), bm);
             },
             Err(e) => {
-                // Attempt to use a cached sample within the configured grace period.
                 let used_cache =
                     try_cached_metrics(identity, mc.stale_metrics_seconds, &cache_snapshot, now, &mut result);
                 if used_cache {
@@ -350,6 +379,9 @@ mod tests {
                 ..Default::default()
             },
             stale_metrics_seconds: None,
+            metrics_endpoint: None,
+            pool_name: None,
+            queue_capacity: None,
         }
     }
 
@@ -362,6 +394,9 @@ mod tests {
                 ..Default::default()
             },
             stale_metrics_seconds: Some(ttl),
+            metrics_endpoint: None,
+            pool_name: None,
+            queue_capacity: None,
         }
     }
 
@@ -453,7 +488,7 @@ mod tests {
             error_rate: Some("my_errors".to_owned()),
             healthy: Some("my_health".to_owned()),
         };
-        let names = metric_names_from_config(&cfg);
+        let names = metric_names_from_config(&cfg, None, None);
         assert_eq!(names.queue_depth.as_deref(), Some("my_queue"));
         assert_eq!(names.kv_cache_utilization.as_deref(), Some("my_kv"));
         assert_eq!(names.latency_p99_ms.as_deref(), Some("my_latency"));
@@ -464,13 +499,24 @@ mod tests {
 
     #[test]
     fn metric_names_from_config_maps_none_for_absent_signals() {
-        let names = metric_names_from_config(&MetricSignalNames::default());
+        let names = metric_names_from_config(&MetricSignalNames::default(), None, None);
         assert!(names.queue_depth.is_none());
         assert!(names.kv_cache_utilization.is_none());
         assert!(names.latency_p99_ms.is_none());
         assert!(names.prefix_cache_hit_ratio.is_none());
         assert!(names.error_rate.is_none());
         assert!(names.healthy.is_none());
+    }
+
+    #[test]
+    fn metric_names_from_config_passes_pool_name_and_queue_capacity() {
+        let cfg = MetricSignalNames {
+            queue_depth: Some("q".to_owned()),
+            ..Default::default()
+        };
+        let names = metric_names_from_config(&cfg, Some("my-pool"), Some(100));
+        assert_eq!(names.pool_name.as_deref(), Some("my-pool"));
+        assert_eq!(names.queue_capacity, Some(100.0));
     }
 
     // -----------------------------------------------------------------------

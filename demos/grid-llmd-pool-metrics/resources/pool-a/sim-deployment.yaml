@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sim-1
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-llmd-pool-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-d-sim
+      pool: "pool-a"
+      instance: sim-1
+  template:
+    metadata:
+      labels:
+        app: llm-d-sim
+        pool: "pool-a"
+        instance: sim-1
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sim
+          image: "llm-d-inference-sim:llmd-pool-metrics-demo"
+          imagePullPolicy: "Never"
+          args: ["--config", "/config/config.yaml"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          configMap:
+            name: sim-config
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sim-2
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-llmd-pool-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-d-sim
+      pool: "pool-a"
+      instance: sim-2
+  template:
+    metadata:
+      labels:
+        app: llm-d-sim
+        pool: "pool-a"
+        instance: sim-2
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sim
+          image: "llm-d-inference-sim:llmd-pool-metrics-demo"
+          imagePullPolicy: "Never"
+          args: ["--config", "/config/config.yaml"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          configMap:
+            name: sim-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sim-service
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-llmd-pool-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: llm-d-sim
+    pool: "pool-a"
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

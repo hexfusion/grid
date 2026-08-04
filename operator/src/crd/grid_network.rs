@@ -8,6 +8,36 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Routing policy
+// ---------------------------------------------------------------------------
+
+/// Candidate ordering policy for the routing overlay.
+///
+/// Controls whether geography (locality tier) or the scoring engine's
+/// weighted total score is the primary differentiator when ranking
+/// candidates after admission state and freshness.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutingPolicy {
+    /// Locality tier outranks score.
+    ///
+    /// Candidates on the same site always rank above remote candidates
+    /// regardless of runtime metrics.  This is the production default
+    /// and preserves the behaviour of grids created before this field
+    /// existed.
+    #[default]
+    GeographyFirst,
+
+    /// Score outranks locality tier.
+    ///
+    /// A remote candidate with a higher score can outrank
+    /// a local candidate.  Use this when runtime metrics (queue depth,
+    /// KV-cache pressure, latency) should drive routing decisions across
+    /// sites.
+    ScoreFirst,
+}
+
+// ---------------------------------------------------------------------------
 // Spec
 // ---------------------------------------------------------------------------
 
@@ -55,6 +85,24 @@ pub struct GridNetworkSpec {
 
     /// Availability zone.
     pub zone: Option<String>,
+
+    /// Candidate ordering policy for the routing overlay.
+    ///
+    /// **`geographyFirst`** (default): locality tier outranks the scoring
+    /// engine's weighted score.  A same-site candidate always ranks above
+    /// a remote candidate regardless of runtime metrics.
+    ///
+    /// **`scoreFirst`**: the scoring engine's weighted total score
+    /// outranks locality tier.  A remote candidate with better runtime
+    /// metrics (lower queue depth, lower KV-cache pressure) can outrank
+    /// a same-site candidate.
+    ///
+    /// Admission state (`newAndExisting` before `existingOnly`) always
+    /// outranks both geography and score in either mode.  In `scoreFirst`
+    /// mode, freshness also outranks both; in `geographyFirst` mode,
+    /// freshness is a tiebreaker below geography and score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_policy: Option<RoutingPolicy>,
 
     /// Maximum age in seconds before a stale (`fresh=false`) remote routing
     /// candidate is removed from the overlay.
@@ -996,6 +1044,96 @@ mod tests {
             mode_values.len(),
             2,
             "transport.mode enum must have exactly 2 values: {mode_values:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RoutingPolicy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_policy_defaults_to_none_when_absent() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "swim": {}
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            spec.routing_policy.is_none(),
+            "absent routingPolicy must default to None"
+        );
+    }
+
+    #[test]
+    fn routing_policy_geography_first_round_trips() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "routingPolicy": "geographyFirst"
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            spec.routing_policy,
+            Some(RoutingPolicy::GeographyFirst),
+            "geographyFirst must round-trip through serde"
+        );
+    }
+
+    #[test]
+    fn routing_policy_score_first_round_trips() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "routingPolicy": "scoreFirst"
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            spec.routing_policy,
+            Some(RoutingPolicy::ScoreFirst),
+            "scoreFirst must round-trip through serde"
+        );
+    }
+
+    #[test]
+    fn routing_policy_absent_not_serialized() {
+        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            serialized.get("routingPolicy").is_none(),
+            "absent routingPolicy must not appear in serialized output"
+        );
+    }
+
+    #[test]
+    fn routing_policy_appears_in_crd_schema() {
+        let crd = crd_json();
+        let schema = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/routingPolicy")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(schema.is_object(), "routingPolicy must appear in the CRD schema");
+        let enum_values = schema
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        let values: Vec<&str> = enum_values.iter().filter_map(serde_json::Value::as_str).collect();
+        assert!(
+            values.contains(&"geographyFirst"),
+            "CRD schema must include geographyFirst: {values:?}"
+        );
+        assert!(
+            values.contains(&"scoreFirst"),
+            "CRD schema must include scoreFirst: {values:?}"
+        );
+    }
+
+    #[test]
+    fn routing_policy_default_is_geography_first() {
+        assert_eq!(
+            RoutingPolicy::default(),
+            RoutingPolicy::GeographyFirst,
+            "default RoutingPolicy must be GeographyFirst"
         );
     }
 

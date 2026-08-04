@@ -21,6 +21,7 @@ env:
   CARGO_TERM_COLOR: always
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
+  OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
 
 jobs:
   # ----------------------------------------------------------------------------
@@ -120,3 +121,52 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           docker push "${MOCK_PROVIDERS_IMAGE_NAME}:sha-${SHORT_SHA}"
+
+  # ----------------------------------------------------------------------------
+  # Build the overlay-sync sidecar container image
+  # ----------------------------------------------------------------------------
+
+  overlay-sync-image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-1.96.0-overlay-sync-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.96.0-overlay-sync-
+          save-always: true
+
+      - name: Build container image
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker build -f overlay-sync/Containerfile \
+            -t "${OVERLAY_SYNC_IMAGE_NAME}:sha-${SHORT_SHA}" \
+            .
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push SHA image
+        if: github.event_name != 'pull_request'
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker push "${OVERLAY_SYNC_IMAGE_NAME}:sha-${SHORT_SHA}"

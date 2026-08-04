@@ -24,6 +24,9 @@ spec:
       {{- end }}
     spec:
       automountServiceAccountToken: false
+      {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
+      serviceAccountName: {{ include "praxis-gateway.fullname" . }}-overlay-sync
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -45,7 +48,98 @@ spec:
         {{- end }}
         seccompProfile:
           type: RuntimeDefault
+      {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
+      initContainers:
+        - name: overlay-sync-init
+          image: {{ printf "%s:%s" .Values.overlay.sidecar.image.repository .Values.overlay.sidecar.image.tag }}
+          imagePullPolicy: {{ .Values.overlay.sidecar.image.pullPolicy | quote }}
+          args:
+            - "--namespace"
+            - {{ .Release.Namespace | quote }}
+            - "--config-map"
+            - {{ .Values.overlay.existingConfigMap | quote }}
+            - "--data-key"
+            - {{ .Values.overlay.sidecar.dataKey | quote }}
+            - "--output"
+            - {{ printf "%s/%s" .Values.overlay.mountPath .Values.overlay.sidecar.dataKey | quote }}
+            - "--expected-network"
+            - {{ .Values.overlay.sidecar.expectedNetwork | quote }}
+            - "--expected-gateway"
+            - {{ include "praxis-gateway.fullname" . | quote }}
+            - "--expected-local-site"
+            - {{ .Values.overlay.sidecar.expectedLocalSite | quote }}
+            - "--once"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          {{- with .Values.overlay.sidecar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: overlay
+              mountPath: {{ .Values.overlay.mountPath | quote }}
+              readOnly: false
+            - name: sa-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      {{- end }}
       containers:
+        {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
+        - name: overlay-sync
+          image: {{ printf "%s:%s" .Values.overlay.sidecar.image.repository .Values.overlay.sidecar.image.tag }}
+          imagePullPolicy: {{ .Values.overlay.sidecar.image.pullPolicy | quote }}
+          args:
+            - "--namespace"
+            - {{ .Release.Namespace | quote }}
+            - "--config-map"
+            - {{ .Values.overlay.existingConfigMap | quote }}
+            - "--data-key"
+            - {{ .Values.overlay.sidecar.dataKey | quote }}
+            - "--output"
+            - {{ printf "%s/%s" .Values.overlay.mountPath .Values.overlay.sidecar.dataKey | quote }}
+            - "--expected-network"
+            - {{ .Values.overlay.sidecar.expectedNetwork | quote }}
+            - "--expected-gateway"
+            - {{ include "praxis-gateway.fullname" . | quote }}
+            - "--expected-local-site"
+            - {{ .Values.overlay.sidecar.expectedLocalSite | quote }}
+            - "--health-addr"
+            - "0.0.0.0:9091"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9091
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 9091
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          {{- with .Values.overlay.sidecar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: overlay
+              mountPath: {{ .Values.overlay.mountPath | quote }}
+              readOnly: false
+            - name: sa-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+        {{- end }}
         - name: praxis
           image: {{ include "praxis-gateway.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
@@ -103,6 +197,27 @@ spec:
               - key: {{ .Values.config.key | quote }}
                 path: "praxis.yaml"
         {{- if .Values.overlay.enabled }}
+        {{- if .Values.overlay.sidecar.enabled }}
+        - name: overlay
+          emptyDir:
+            sizeLimit: "10Mi"
+        - name: sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        {{- else }}
         - name: overlay
           configMap:
             name: {{ .Values.overlay.existingConfigMap | quote }}
@@ -110,6 +225,7 @@ spec:
             items:
               {{- toYaml . | nindent 14 }}
             {{- end }}
+        {{- end }}
         {{- end }}
         {{- if .Values.tls.enabled }}
         - name: tls

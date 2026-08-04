@@ -707,6 +707,54 @@ Local development with `xtask env` maps overlay site
 identities to generated `gateway-{site}` load-balancer
 entries; see `xtask/src/env/operator_overlay.rs`.
 
+### Routing overlay delivery
+
+For gateways that must react promptly to provider health, capacity, or score
+changes, enable the overlay-sync delivery path in the `praxis-gateway` chart.
+
+```text
+operator reconcile
+  -> overlay ConfigMap applied
+  -> overlay-sync Kubernetes API watch
+  -> envelope validated
+  -> atomic write to shared emptyDir
+  -> Praxis file watcher hot-reloads
+```
+
+A direct ConfigMap volume is eventually refreshed by the kubelet. That is
+adequate for static or slowly changing configuration, but its refresh delay is
+not appropriate as the delivery mechanism for short-lived routing changes.
+The sidecar watches the API directly, so a published revision does not wait for
+the kubelet's projected-volume polling cycle.
+
+The sidecar adds correctness controls as well as lower latency:
+
+- an init container blocks Praxis startup until the first valid overlay exists;
+- schema version, destination scope, content digest, and maximum size are
+  checked before publication;
+- a temporary file plus `fsync` and rename prevents partial reads;
+- invalid updates, source deletion, and temporary API loss retain the
+  last-known-good file;
+- readiness, degraded state, accepted/rejected counters, write counters, and
+  timestamps make the delivery boundary observable; and
+- a dedicated ServiceAccount token is mounted only into the init and sidecar
+  containers. Praxis has no Kubernetes API access.
+
+The sidecar does not change the metrics scrape interval or force the Grid
+operator to reconcile. End-to-end convergence is still:
+
+```text
+metrics become visible
+  + operator scrape/reconcile
+  + ConfigMap apply
+  + sidecar API-watch delivery
+  + Praxis file-watch reload
+```
+
+Use `overlay.sidecar.enabled=false` for the direct ConfigMap projection
+fallback. Do not use that mode when a demo or production SLO assumes prompt
+metrics-driven route changes.
+
 ## 9. Workloads Consume Providers
 
 Workloads send requests to the Praxis Gateway.

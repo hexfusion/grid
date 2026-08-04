@@ -95,6 +95,8 @@ mod tests {
                     stable_id: None,
                     admission_state: None,
                     selection_tier: None,
+                    score: None,
+                    score_breakdown: None,
                     rank: None,
                 })
                 .collect(),
