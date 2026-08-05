@@ -73,23 +73,6 @@ and pass through a Praxis edge before Grid selects a provider.
 that can use healthy edge gateways and eligible providers across sites without
 exposing private provider gateways or backends.
 
-```mermaid
-flowchart LR
-    Client[External inference client]
-    GTM[Global traffic management]
-    EastEdge[East Praxis edge]
-    WestEdge[West Praxis edge]
-    Grid[Grid provider selection]
-    Providers[Eligible provider gateways]
-
-    Client --> GTM
-    GTM --> EastEdge
-    GTM --> WestEdge
-    EastEdge --> Grid
-    WestEdge --> Grid
-    Grid --> Providers
-```
-
 The local GTM emulator represents the global-ingress layer. It chooses a
 healthy edge and provides edge-session affinity. The selected edge then uses
 its Grid overlay to make a separate provider decision. The verifier exercises

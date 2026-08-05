@@ -30,6 +30,7 @@ use std::{sync::Arc, time::Duration};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 
 // ---------------------------------------------------------------------------
 // Bounded input limits
@@ -214,7 +215,7 @@ pub fn build_tls_client_config(
     }
 
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(ca_pem))
+    let ca_certs = CertificateDer::pem_slice_iter(ca_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA PEM parse failed: {e}")))?;
     if ca_certs.is_empty() {
@@ -250,7 +251,7 @@ pub fn build_tls_client_config(
                     key_pem.len()
                 )));
             }
-            let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem))
+            let certs = CertificateDer::pem_slice_iter(cert_pem)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client cert PEM parse failed: {e}")))?;
             if certs.is_empty() {
@@ -264,9 +265,8 @@ pub fn build_tls_client_config(
                     certs.len()
                 )));
             }
-            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem))
-                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client key PEM parse failed: {e}")))?
-                .ok_or_else(|| MetricsScrapeError::TlsMaterial("client key PEM contains no private key".to_owned()))?;
+            let key = PrivateKeyDer::from_pem_slice(key_pem)
+                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client key PEM parse failed: {e}")))?;
             builder
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client identity construction failed: {e}")))?
@@ -574,16 +574,14 @@ mod tests {
         client_ca_pem: Option<&str>,
         response: Vec<u8>,
     ) -> String {
-        let server_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(server_cert_pem.as_bytes()))
+        let server_certs = CertificateDer::pem_slice_iter(server_cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let server_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(server_key_pem.as_bytes()))
-            .unwrap()
-            .unwrap();
+        let server_key = PrivateKeyDer::from_pem_slice(server_key_pem.as_bytes()).unwrap();
 
         let server_config = if let Some(ca) = client_ca_pem {
             let mut root_store = rustls::RootCertStore::empty();
-            let ca_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_bytes()))
+            let ca_certs = CertificateDer::pem_slice_iter(ca.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             for cert in &ca_certs {

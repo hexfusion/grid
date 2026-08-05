@@ -338,10 +338,10 @@ regeneration triggers.
 
 ## Scoring and Selection
 
-Grid scores provider candidates before writing the overlay.  The current scoring
-signals are:
+Grid scores each provider candidate using six weighted signals before writing
+the overlay. The current default weights are:
 
-| Signal | Weight | Typical source |
+| Signal | Default weight | Typical source |
 |---|---:|---|
 | Locality | 3.0 | Backend kind, site, region |
 | Queue depth | 3.0 | Metrics scrape or CRDT state |

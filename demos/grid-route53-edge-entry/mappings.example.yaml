@@ -1,0 +1,35 @@
+# Runtime mappings for Route 53 record materialization (Phase B).
+#
+# Fill in during the runtime workflow:
+#   1. Apply OpenShift Routes and record each admitted Route's
+#      .status.ingress[0].routerCanonicalHostname.
+#   2. Render and create health checks against those resolvable ingress names.
+#   3. Record each returned HealthCheck.Id.
+#
+# Copy this file to a private working directory and fill in real values.
+# Do not commit real hostnames, health-check IDs, or cluster-specific data.
+#
+# Usage:
+#   cp mappings.example.yaml /secure/path/mappings.yaml
+#   # fill in real values
+#   ./scripts/materialize-records.sh \
+#     /secure/path/inventory.yaml \
+#     /secure/path/mappings.yaml \
+#     --output-dir /secure/path/records
+
+sites:
+  east1:
+    routerCanonicalHostname: "router-default.apps.east1.example.com"
+    healthCheckId: "00000000-0000-0000-0000-000000000001"
+
+  east2:
+    routerCanonicalHostname: "router-default.apps.east2.example.com"
+    healthCheckId: "00000000-0000-0000-0000-000000000002"
+
+  west1:
+    routerCanonicalHostname: "router-default.apps.west1.example.com"
+    healthCheckId: "00000000-0000-0000-0000-000000000003"
+
+  west2:
+    routerCanonicalHostname: "router-default.apps.west2.example.com"
+    healthCheckId: "00000000-0000-0000-0000-000000000004"

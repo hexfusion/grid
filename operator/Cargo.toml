@@ -24,7 +24,6 @@ kube = { workspace = true }
 prometheus = { workspace = true }
 schemars = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

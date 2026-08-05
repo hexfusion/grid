@@ -10,6 +10,11 @@ by the current Grid/Praxis integration. Deployment-specific development
 topologies and proof commands are documented with their environment rather
 than embedded in this contract.
 
+The [Route 53 Edge Entry Demo](../../demos/grid-route53-edge-entry/README.md)
+provides a generic managed-DNS validation contract with an OpenShift reference
+implementation. It keeps public edge selection separate from Grid provider
+selection and documents the health and regional-policy limits of DNS steering.
+
 The architecture has two independent routing stages:
 
 ```text

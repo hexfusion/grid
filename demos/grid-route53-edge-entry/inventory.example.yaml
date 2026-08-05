@@ -1,0 +1,75 @@
+# Route 53 edge entry demo inventory.
+#
+# Copy to a private working directory and fill in real values.
+# Do not commit real hostnames, kubeconfig paths, AWS IDs, or credentials.
+#
+# Usage:
+#   cp inventory.example.yaml /secure/path/inventory.yaml
+#   # edit with real values
+#   ./scripts/preflight.sh /secure/path/inventory.yaml
+
+# AWS Route 53 hosted zone for the domain.
+# Records are created directly in this zone. Do not create a child zone.
+hostedZoneId: PLACEHOLDER-HOSTED-ZONE-ID
+hostedZoneDomain: grid.example.com
+
+# Global entry point hostname. Route 53 selects a healthy regional edge
+# using weighted or latency routing policy across all sites.
+globalHostname: inference.grid.example.com
+
+# Regional entry point hostname. Route 53 returns only edges assigned
+# to the sites listed in regionalSites.
+#
+# DNS edge membership alone does not enforce regional provider restrictions.
+# Grid/Praxis request-time policy must also exclude out-of-region providers
+# when this hostname is intended to enforce a residency boundary.
+regionalHostname: inference-east.grid.example.com
+regionalSites:
+  - east1
+  - east2
+
+# Kubernetes namespace where the consumer gateway runs.
+namespace: grid-system
+
+# Consumer gateway Service name and port.
+serviceName: consumer-gateway
+servicePort: "8080"
+
+# OpenShift Route TLS termination mode.
+# "edge" terminates TLS at the router and forwards plaintext to the Service.
+tlsTermination: edge
+
+# Route 53 record TTL in seconds. Low values allow faster DNS failover
+# but are advisory — recursive resolvers may cache longer. Route 53
+# accepts values as low as 0, but many resolvers treat anything below
+# 5 seconds as 5 seconds. Start with 60 and lower after measuring
+# convergence.
+recordTTL: 60
+
+# Route 53 set identifier prefix. Must be unique across all records
+# at the same Name+Type in the hosted zone.
+setIdentifierPrefix: grid-edge
+
+sites:
+  east1:
+    # kubectl context or KUBECONFIG path for this cluster.
+    context: east1-context
+    # Direct origin hostname for health checks and troubleshooting.
+    originHostname: east1.origin.grid.example.com
+    # AWS region for latency-based routing records.
+    awsRegion: us-east-1
+
+  east2:
+    context: east2-context
+    originHostname: east2.origin.grid.example.com
+    awsRegion: us-east-2
+
+  west1:
+    context: west1-context
+    originHostname: west1.origin.grid.example.com
+    awsRegion: us-west-1
+
+  west2:
+    context: west2-context
+    originHostname: west2.origin.grid.example.com
+    awsRegion: us-west-2

@@ -1,0 +1,12 @@
+{
+  "Type": "TCP",
+  "Port": 443,
+  "FullyQualifiedDomainName": "router-default.apps.east1.example.com",
+  "RequestInterval": 30,
+  "FailureThreshold": 3,
+  "Regions": [
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1"
+  ]
+}

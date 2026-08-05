@@ -398,8 +398,7 @@ pub struct InferenceProviderStatus {
     /// Stable reason values:
     /// - `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`, `CredentialSecretMissing`,
     ///   `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
-    /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`,
-    ///   `MetricsTlsIdentityMismatch`
+    /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

@@ -1,0 +1,69 @@
+{
+  "Comment": "Grid edge entry weighted records — one per origin at the global hostname",
+  "Changes": [
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "inference.grid.example.com",
+        "Type": "CNAME",
+        "SetIdentifier": "grid-edge-east1",
+        "Weight": 25,
+        "TTL": 60,
+        "ResourceRecords": [
+          {
+            "Value": "router-default.apps.east1.example.com"
+          }
+        ],
+        "HealthCheckId": "PLACEHOLDER-HEALTH-CHECK-ID-EAST1"
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "inference.grid.example.com",
+        "Type": "CNAME",
+        "SetIdentifier": "grid-edge-east2",
+        "Weight": 25,
+        "TTL": 60,
+        "ResourceRecords": [
+          {
+            "Value": "router-default.apps.east2.example.com"
+          }
+        ],
+        "HealthCheckId": "PLACEHOLDER-HEALTH-CHECK-ID-EAST2"
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "inference.grid.example.com",
+        "Type": "CNAME",
+        "SetIdentifier": "grid-edge-west1",
+        "Weight": 25,
+        "TTL": 60,
+        "ResourceRecords": [
+          {
+            "Value": "router-default.apps.west1.example.com"
+          }
+        ],
+        "HealthCheckId": "PLACEHOLDER-HEALTH-CHECK-ID-WEST1"
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "inference.grid.example.com",
+        "Type": "CNAME",
+        "SetIdentifier": "grid-edge-west2",
+        "Weight": 25,
+        "TTL": 60,
+        "ResourceRecords": [
+          {
+            "Value": "router-default.apps.west2.example.com"
+          }
+        ],
+        "HealthCheckId": "PLACEHOLDER-HEALTH-CHECK-ID-WEST2"
+      }
+    }
+  ]
+}

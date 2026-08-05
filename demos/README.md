@@ -36,6 +36,16 @@ pool-level llm-d EPP telemetry, scores both candidates, publishes a routing
 overlay, and moves live Praxis requests from the preferred local pool to the
 healthier remote pool and back again without restarting the gateways.
 
+## Route 53 Edge Entry
+
+The [Route 53 Edge Entry Demo](grid-route53-edge-entry/README.md) uses
+Amazon Route 53 as the complete public DNS layer for regional edge
+selection. Route 53 owns global and regional DNS records, applies
+weighted or latency routing among public Praxis edge gateways, performs
+synthetic health checks, and withdraws unhealthy edges from DNS. After
+a request reaches an edge, Grid and Praxis select an eligible private
+inference provider.
+
 ## MaaS IPP lab
 
 The [MaaS IPP lab](maas-ipp/README.md) is a single-cluster Forge environment

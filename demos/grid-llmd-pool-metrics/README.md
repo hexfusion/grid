@@ -103,7 +103,7 @@ queue_depth = waiting_requests / queue_capacity
 
 The Grid operator scores each backend with a six-signal weighted sum:
 
-| Signal | Weight | Source |
+| Signal | Default weight | Source |
 |--------|--------|--------|
 | `locality` | 3.0 | Config: Local=1.0, SameRegion=0.7, CrossRegion=0.4, Cloud=0.2, API=0.1 |
 | `queue_depth` | 3.0 | EPP: `1.0 - normalized_queue_depth` |
