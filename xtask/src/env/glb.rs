@@ -182,22 +182,20 @@ const CLIENT_BEARER_TOKEN: &str = "test-token";
 /// same demo CA and use organization `ai-grid`, which is independently checked
 /// by `peer_identity_trust` in the provider pipeline.
 pub(crate) fn prepare_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    stage_provider_boundary()?;
-    install_provider_boundary()
-}
-
-/// Generate and stage all local GLB identities and rendered provider configs.
-///
-/// This phase does not require Kubernetes. It runs before the provider
-/// workload stack so no pod is created with unresolved trust placeholders.
-pub(crate) fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None)
+    let demo_root = super::demo_root(Path::new("tests/e2e/topologies/grid-glb-demo/forge.yaml"));
+    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None, &demo_root)
+        .and_then(|()| install_provider_boundary())
 }
 
 /// Generate identities for an ingress mode and optional external provider.
+///
+/// `demo_root` is the canonical directory containing the active demo assets
+/// (configs, resources, policies, fixtures). All demo-relative file reads
+/// resolve from this root.
 pub(crate) fn stage_provider_boundary_with_mode_and_external(
     ingress_mode: IngressMode,
     external: Option<&ExternalProviderDescriptor>,
+    demo_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let identities = vec![
         "east-edge".to_owned(),
@@ -217,7 +215,7 @@ pub(crate) fn stage_provider_boundary_with_mode_and_external(
     }
     let east_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
     let west_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
-    stage_provider_configs_with_external(&east_edge_digest, &west_edge_digest, external)?;
+    stage_provider_configs_with_external(&east_edge_digest, &west_edge_digest, external, demo_root)?;
     Ok(())
 }
 
@@ -327,11 +325,10 @@ fn stage_provider_configs_with_external(
     east_edge_digest: &str,
     west_edge_digest: &str,
     external: Option<&ExternalProviderDescriptor>,
+    demo_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for provider in PROVIDER_CLUSTERS {
-        let source = Path::new("demos/grid-glb-demo/configs")
-            .join(provider)
-            .join("praxis.yaml");
+        let source = demo_root.join("configs").join(provider).join("praxis.yaml");
         let template = fs::read_to_string(&source)?;
         if !template.contains(EDGE_US_EAST_CERT_DIGEST_TOKEN)
             || !template.contains(EDGE_US_WEST_CERT_DIGEST_TOKEN)
@@ -1480,7 +1477,9 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
     record_step("backend private service", results, check_backend_private_service);
 
     proof_banner("checking backend network policy");
-    record_step("backend network policy", results, check_backend_network_policy);
+    record_step("backend network policy", results, || {
+        check_backend_network_policy(ingress_mode)
+    });
 
     proof_banner("checking provider mTLS trust matrix");
     record_step("provider mTLS trust matrix", results, || {
@@ -1802,7 +1801,7 @@ fn check_backend_private_service() -> Result<String, Box<dyn std::error::Error>>
 /// provider-gateway access label must connect, while an otherwise identical
 /// unlabeled pod must be denied. This detects actual enforcement rather than
 /// inferring support from the CNI name or the presence of a manifest.
-fn check_backend_network_policy() -> Result<String, Box<dyn std::error::Error>> {
+fn check_backend_network_policy(mode: IngressMode) -> Result<String, Box<dyn std::error::Error>> {
     let mut evidence = Vec::new();
     for provider in PROVIDER_CLUSTERS {
         let context = kubectl_context(provider);
@@ -1818,7 +1817,7 @@ fn check_backend_network_policy() -> Result<String, Box<dyn std::error::Error>> 
             &[("primary", "mock-inference.grid-system.svc.cluster.local:8080")]
         };
         for (instance, target) in backends {
-            check_one_backend_network_boundary(provider, &context, instance, target)?;
+            check_one_backend_network_boundary(provider, &context, instance, target, mode)?;
             evidence.push(format!(
                 "{provider}/{instance}: allowed=connected, unlabeled=denied, no_auth=HTTP_401, client_auth=HTTP_403"
             ));
@@ -1837,6 +1836,7 @@ fn check_one_backend_network_boundary(
     context: &str,
     instance: &str,
     target: &str,
+    mode: IngressMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let allowed_name = format!("grid-netpol-allowed-{instance}");
     let denied_name = format!("grid-netpol-denied-{instance}");
@@ -1848,6 +1848,7 @@ fn check_one_backend_network_boundary(
         &allowed_name,
         Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
         &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
+        mode,
     )?;
     if allowed.phase != "Succeeded" || !allowed.logs.contains("tcp-probe=connected") {
         return Err(format!(
@@ -1863,6 +1864,7 @@ fn check_one_backend_network_boundary(
         &denied_name,
         None,
         &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
+        mode,
     )?;
     if denied.phase != "Failed"
         || !(denied.logs.contains("tcp-probe=timeout") || denied.logs.contains("tcp-probe=connect-failed"))
@@ -1881,6 +1883,7 @@ fn check_one_backend_network_boundary(
         &no_auth_name,
         Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
         &["--http-probe", target],
+        mode,
     )?;
     require_http_probe_status(provider, "missing credential", &no_auth, 401)?;
 
@@ -1895,6 +1898,7 @@ fn check_one_backend_network_boundary(
             "--http-probe-authorization",
             "Bearer test-token",
         ],
+        mode,
     )?;
     require_http_probe_status(provider, "client-supplied credential", &client_auth, 403)
 }
@@ -1940,13 +1944,14 @@ fn run_probe_pod(
     name: &str,
     labels: Option<&str>,
     probe_args: &[&str],
+    mode: IngressMode,
 ) -> Result<NetworkPolicyProbe, Box<dyn std::error::Error>> {
     let _guard = ProbePodGuard {
         context: context.to_owned(),
         name: name.to_owned(),
     };
     let mut command = Command::new("kubectl");
-    let probe_image = crate::env::image_overrides::glb_mock_provider_image();
+    let probe_image = crate::env::image_overrides::demo_mock_provider_image(mode);
     command.args([
         "--context",
         context,
@@ -1957,7 +1962,7 @@ fn run_probe_pod(
         &format!("--image={probe_image}"),
         &format!(
             "--image-pull-policy={}",
-            crate::env::image_overrides::image_pull_policy()
+            crate::env::image_overrides::demo_image_pull_policy(mode)
         ),
         "--restart=Never",
     ]);
@@ -4778,7 +4783,7 @@ clusters:
     fn provider_configs_wire_secret_backed_credential_injection() {
         for provider in PROVIDER_CLUSTERS {
             let path = workspace_root()
-                .join("demos/grid-glb-demo/configs")
+                .join("tests/e2e/topologies/grid-glb-demo/configs")
                 .join(provider)
                 .join("praxis.yaml");
             let config = fs::read_to_string(&path).unwrap_or_else(|_| std::process::abort());
@@ -4808,7 +4813,7 @@ clusters:
 
     #[test]
     fn provider_gateway_helm_values_mount_credential_secrets() {
-        let forge = fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))
+        let forge = fs::read_to_string(workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
         assert!(
             forge.contains("name: \"mock-inference-credential\""),
@@ -4832,7 +4837,7 @@ clusters:
     #[test]
     fn provider_drain_uses_declared_metrics_and_health_inputs() {
         let root = workspace_root();
-        let resources = root.join("demos/grid-glb-demo/resources");
+        let resources = root.join("tests/e2e/topologies/grid-glb-demo/resources");
         let workloads =
             fs::read_to_string(resources.join("provider-workloads.yaml")).unwrap_or_else(|_| std::process::abort());
         assert!(workloads.contains("name: MOCK_QUEUE_DEPTH"));
@@ -4858,10 +4863,11 @@ clusters:
     #[test]
     fn backend_network_policy_separates_data_and_health_access() {
         let root = workspace_root();
-        let policy = fs::read_to_string(root.join("demos/grid-glb-demo/resources/backend-network-policy.yaml"))
+        let policy =
+            fs::read_to_string(root.join("tests/e2e/topologies/grid-glb-demo/resources/backend-network-policy.yaml"))
+                .unwrap_or_else(|_| std::process::abort());
+        let forge = fs::read_to_string(root.join("tests/e2e/topologies/grid-glb-demo/forge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
-        let forge =
-            fs::read_to_string(root.join("demos/grid-glb-demo/forge.yaml")).unwrap_or_else(|_| std::process::abort());
 
         assert!(policy.contains("grid.praxis-proxy.io/backend-access: provider-gateway"));
         assert!(policy.contains("app.kubernetes.io/name: grid-operator"));
@@ -4891,7 +4897,7 @@ clusters:
 
     #[test]
     fn provider_configs_render_candidate_ids_from_identity_contract() {
-        let configs = workspace_root().join("demos/grid-glb-demo/configs");
+        let configs = workspace_root().join("tests/e2e/topologies/grid-glb-demo/configs");
         for provider in PROVIDER_CLUSTERS {
             let template = fs::read_to_string(configs.join(format!("{provider}/praxis.yaml")))
                 .unwrap_or_else(|_| std::process::abort());
@@ -4909,7 +4915,7 @@ clusters:
 
     #[test]
     fn east_site_declares_two_independent_provider_candidates() {
-        let resources = workspace_root().join("demos/grid-glb-demo/resources");
+        let resources = workspace_root().join("tests/e2e/topologies/grid-glb-demo/resources");
         let secondary = fs::read_to_string(resources.join("inference-east-provider-secondary.yaml"))
             .unwrap_or_else(|_| std::process::abort());
         let workload = fs::read_to_string(resources.join("provider-workload-east-secondary.yaml"))
@@ -4982,7 +4988,7 @@ clusters:
 
     #[test]
     fn providers_bind_only_to_their_explicit_local_sites() {
-        let resources = workspace_root().join("demos/grid-glb-demo/resources");
+        let resources = workspace_root().join("tests/e2e/topologies/grid-glb-demo/resources");
         for provider in PROVIDER_CLUSTERS {
             let inference = fs::read_to_string(resources.join(format!("inference-{provider}.yaml")))
                 .unwrap_or_else(|_| std::process::abort());
@@ -5002,7 +5008,7 @@ clusters:
 
     #[test]
     fn operator_sites_set_explicit_swim_identity_without_partial_deployments() {
-        let forge = fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))
+        let forge = fs::read_to_string(workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
         for site in ["east-edge", "east-provider", "west-edge", "west-provider"] {
             assert!(
@@ -5296,7 +5302,7 @@ clusters:
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap_or_else(|| std::process::abort())
-                .join("demos/grid-glb-demo/resources/edge-gateway-deployment.yaml"),
+                .join("tests/e2e/topologies/grid-glb-demo/resources/edge-gateway-deployment.yaml"),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5828,7 +5834,7 @@ admin:
 
     #[test]
     fn static_provider_templates_contain_no_openai_tokens() {
-        let configs = workspace_root().join("demos/grid-glb-demo/configs");
+        let configs = workspace_root().join("tests/e2e/topologies/grid-glb-demo/configs");
         for provider in PROVIDER_CLUSTERS {
             let template = fs::read_to_string(configs.join(format!("{provider}/praxis.yaml")))
                 .unwrap_or_else(|_| std::process::abort());

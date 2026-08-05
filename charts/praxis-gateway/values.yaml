@@ -91,9 +91,9 @@ overlay:
     # -- Sidecar container image.
     image:
       # -- Image repository.
-      repository: grid-overlay-sync
-      # -- Image tag.
-      tag: latest
+      repository: ghcr.io/praxis-proxy/grid-overlay-sync
+      # -- Image tag. Defaults to the chart appVersion when empty.
+      tag: ""
       # -- Image pull policy.
       pullPolicy: IfNotPresent
     # -- ConfigMap data key containing the overlay envelope.

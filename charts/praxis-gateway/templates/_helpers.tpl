@@ -62,6 +62,14 @@ Defaults the tag to the chart appVersion when no digest or tag is set.
 {{- end }}
 
 {{/*
+Overlay-sync image reference.
+Defaults the tag to the chart appVersion when empty.
+*/}}
+{{- define "praxis-gateway.overlaySyncImage" -}}
+{{- printf "%s:%s" .Values.overlay.sidecar.image.repository (default .Chart.AppVersion .Values.overlay.sidecar.image.tag) }}
+{{- end }}
+
+{{/*
 Validate image digest format when provided.
 */}}
 {{- define "praxis-gateway.validateDigest" -}}

@@ -23,8 +23,8 @@ const PUBLIC_PORT: u16 = 8443;
 /// CA used to verify the stable local HTTPS name.
 const PUBLIC_CA: &str = ".forge/runtime/glb-tls/gtm/ca.crt";
 
-/// OpenAI-compatible request fixture.
-const REQUEST_FIXTURE: &str = "demos/grid-glb-demo/fixtures/requests/shared-model.json";
+/// Request fixture path relative to the demo root.
+const REQUEST_FIXTURE_SUFFIX: &str = "fixtures/requests/shared-model.json";
 
 /// Customer-side fixture credential accepted by the current edge profile.
 const CUSTOMER_TOKEN: &str = "test-token";
@@ -93,6 +93,11 @@ impl Drop for DeploymentRestore {
 )]
 pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let forge_bin = glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?;
+    let root = super::demo_root(forge_config);
+    let fixture = root.join(REQUEST_FIXTURE_SUFFIX);
+    if !fixture.exists() {
+        return Err(format!("request fixture not found: {}", fixture.display()).into());
+    }
     let mut results = Vec::new();
 
     record("forge config", &mut results, || {
@@ -101,14 +106,14 @@ pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Erro
     record("Praxis workloads", &mut results, check_praxis_workloads);
     record("edge overlays", &mut results, check_overlay_perspectives);
     record("stable HTTPS", &mut results, || {
-        let sample = request_path("gtm-stable-url")?;
+        let sample = request_path("gtm-stable-url", &fixture)?;
         Ok(format!(
             "https://{PUBLIC_NAME}:{PUBLIC_PORT} returned HTTP {} via {}",
             sample.status, sample.edge
         ))
     });
 
-    let sessions = find_sessions_for_both_edges();
+    let sessions = find_sessions_for_both_edges(&fixture);
     record("two edge identities", &mut results, || {
         let sessions = sessions.as_ref().map_err(ToString::to_string)?;
         Ok(format!(
@@ -119,11 +124,11 @@ pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Erro
     });
     record("session stickiness", &mut results, || {
         let sessions = sessions.as_ref().map_err(ToString::to_string)?;
-        check_stickiness(sessions)
+        check_stickiness(sessions, &fixture)
     });
     record("edge withdrawal and recovery", &mut results, || {
         let sessions = sessions.as_ref().map_err(ToString::to_string)?;
-        check_withdrawal_and_recovery(sessions)
+        check_withdrawal_and_recovery(sessions, &fixture)
     });
 
     eprintln!();
@@ -212,11 +217,11 @@ fn overlay_local_site(cluster: &str) -> Result<String, Box<dyn std::error::Error
 }
 
 /// Find two bounded session IDs that consistently hash to different edges.
-fn find_sessions_for_both_edges() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn find_sessions_for_both_edges(fixture: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let mut sessions = BTreeMap::new();
     for index in 0..64 {
         let session = format!("gtm-edge-discovery-{index}");
-        let sample = request_path(&session)?;
+        let sample = request_path(&session, fixture)?;
         sessions.entry(sample.edge).or_insert(session);
         if sessions.len() == 2 {
             return Ok(sessions);
@@ -226,10 +231,10 @@ fn find_sessions_for_both_edges() -> Result<BTreeMap<String, String>, Box<dyn st
 }
 
 /// Prove repeated requests with one session ID stay on the same Praxis edge.
-fn check_stickiness(sessions: &BTreeMap<String, String>) -> Result<String, Box<dyn std::error::Error>> {
+fn check_stickiness(sessions: &BTreeMap<String, String>, fixture: &Path) -> Result<String, Box<dyn std::error::Error>> {
     for (expected_edge, session) in sessions {
         for _attempt in 0..3 {
-            let sample = request_path(session)?;
+            let sample = request_path(session, fixture)?;
             if sample.edge != *expected_edge {
                 return Err(format!("session {session:?} moved from {expected_edge} to {}", sample.edge).into());
             }
@@ -239,7 +244,10 @@ fn check_stickiness(sessions: &BTreeMap<String, String>) -> Result<String, Box<d
 }
 
 /// Stop one edge, wait for Praxis health withdrawal, then restore and recover.
-fn check_withdrawal_and_recovery(sessions: &BTreeMap<String, String>) -> Result<String, Box<dyn std::error::Error>> {
+fn check_withdrawal_and_recovery(
+    sessions: &BTreeMap<String, String>,
+    fixture: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
     let stopped_edge = "east-edge";
     let session = sessions
         .get(stopped_edge)
@@ -252,13 +260,13 @@ fn check_withdrawal_and_recovery(sessions: &BTreeMap<String, String>) -> Result<
         armed: true,
     };
 
-    wait_for_edge(session, "west-edge", Duration::from_secs(30))?;
+    wait_for_edge(session, "west-edge", Duration::from_secs(30), fixture)?;
     eprintln!("[WITHDRAWAL 2/3] West-edge is serving the session; restoring east-edge.");
     scale_edge(stopped_edge, 1)?;
     wait_for_deployment(stopped_edge, "edge-gateway", Duration::from_secs(60))?;
     restore.disarm();
     eprintln!("[WITHDRAWAL 3/3] East-edge is ready; waiting for its original session path to recover.");
-    wait_for_edge(session, stopped_edge, Duration::from_secs(30))?;
+    wait_for_edge(session, stopped_edge, Duration::from_secs(30), fixture)?;
 
     Ok("east withdrawal routed to west; east recovered under the same URL and session key".to_owned())
 }
@@ -335,10 +343,15 @@ fn kubectl_jsonpath(cluster: &str, resource: &str, jsonpath: &str) -> Result<Str
 }
 
 /// Poll through transient 502/503 responses until the expected edge serves.
-fn wait_for_edge(session: &str, expected_edge: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_edge(
+    session: &str,
+    expected_edge: &str,
+    timeout: Duration,
+    fixture: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if request_path(session).is_ok_and(|sample| sample.edge == expected_edge) {
+        if request_path(session, fixture).is_ok_and(|sample| sample.edge == expected_edge) {
             return Ok(());
         }
         std::thread::park_timeout(Duration::from_millis(250));
@@ -361,8 +374,8 @@ pub(crate) fn resolve_gtm_ip() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 /// Send one request through the stable verified HTTPS endpoint.
-pub(crate) fn request_path(session: &str) -> Result<EdgeSample, Box<dyn std::error::Error>> {
-    request_path_with_affinity(session, session)
+pub(crate) fn request_path(session: &str, fixture: &Path) -> Result<EdgeSample, Box<dyn std::error::Error>> {
+    request_path_with_affinity(session, session, fixture)
 }
 
 /// Send one request with independent edge and provider affinity fixtures.
@@ -373,6 +386,7 @@ pub(crate) fn request_path(session: &str) -> Result<EdgeSample, Box<dyn std::err
 pub(crate) fn request_path_with_affinity(
     edge_session: &str,
     provider_session: &str,
+    fixture: &Path,
 ) -> Result<EdgeSample, Box<dyn std::error::Error>> {
     let gtm_ip = kubectl_jsonpath(
         "gtm-emulator",
@@ -404,7 +418,7 @@ pub(crate) fn request_path_with_affinity(
             "--header",
             &format!("{PROVIDER_SESSION_HEADER}: {provider_session}"),
             "--data-binary",
-            &format!("@{REQUEST_FIXTURE}"),
+            &format!("@{}", fixture.display()),
             &url,
         ])
         .output()?;
@@ -549,9 +563,10 @@ mod tests {
 
     #[test]
     fn gtm_is_praxis_edge_steering_only() {
-        let config =
-            std::fs::read_to_string(workspace_root().join("demos/grid-glb-demo/configs/gtm-emulator/praxis.yaml"))
-                .unwrap_or_else(|_| std::process::abort());
+        let config = std::fs::read_to_string(
+            workspace_root().join("tests/e2e/topologies/grid-glb-demo/configs/gtm-emulator/praxis.yaml"),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert!(config.contains("filter: router"));
         assert!(config.contains("filter: load_balancer"));
@@ -569,9 +584,10 @@ mod tests {
 
     #[test]
     fn gtm_registers_edge_health_at_praxis_top_level() {
-        let config =
-            std::fs::read_to_string(workspace_root().join("demos/grid-glb-demo/configs/gtm-emulator/praxis.yaml"))
-                .unwrap_or_else(|_| std::process::abort());
+        let config = std::fs::read_to_string(
+            workspace_root().join("tests/e2e/topologies/grid-glb-demo/configs/gtm-emulator/praxis.yaml"),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let document: serde_yaml::Value = serde_yaml::from_str(&config).unwrap_or_else(|_| std::process::abort());
         let clusters = document
             .get("clusters")
@@ -603,7 +619,7 @@ mod tests {
 
     #[test]
     fn all_praxis_workloads_are_kubernetes_deployments() {
-        let forge = std::fs::read_to_string(workspace_root().join("demos/grid-glb-demo/forge.yaml"))
+        let forge = std::fs::read_to_string(workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
         assert!(!forge.contains("\n  services:"));
         assert!(forge.contains("- name: gtm-emulator"));
@@ -615,7 +631,7 @@ mod tests {
 
     #[test]
     fn edge_perspectives_have_distinct_sources_and_keys() {
-        let root = workspace_root().join("demos/grid-glb-demo");
+        let root = workspace_root().join("tests/e2e/topologies/grid-glb-demo");
         let forge = std::fs::read_to_string(root.join("forge.yaml")).unwrap_or_else(|_| std::process::abort());
         let west_network = std::fs::read_to_string(root.join("resources/gridnetwork-west-edge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
@@ -630,7 +646,7 @@ mod tests {
 
     #[test]
     fn providers_pin_both_edge_certificate_digests() {
-        let root = workspace_root().join("demos/grid-glb-demo/configs");
+        let root = workspace_root().join("tests/e2e/topologies/grid-glb-demo/configs");
         for site in ["east-provider", "west-provider"] {
             let config = std::fs::read_to_string(root.join(format!("{site}/praxis.yaml")))
                 .unwrap_or_else(|_| std::process::abort());

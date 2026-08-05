@@ -102,6 +102,9 @@ static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Combined-site demo execution context.
 struct CombinedSiteContext {
+    /// Canonical demo root directory for resolving configs, resources, and
+    /// other demo-relative assets.
+    demo_root: PathBuf,
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
     /// Path to the forge binary.
@@ -4121,8 +4124,9 @@ fn materialize_provider_config(
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
     external_candidate_id: Option<&str>,
+    demo_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let template_path = Path::new("demos/grid-combined-site/configs/provider/praxis.yaml");
+    let template_path = demo_root.join("configs/provider/praxis.yaml");
     let template =
         fs::read_to_string(template_path).map_err(|e| format!("failed to read provider config template: {e}"))?;
 
@@ -4410,12 +4414,16 @@ fn prepare_setup(
         }
     }
 
+    let root = super::demo_root(forge_config);
+    eprintln!("Forge config: {}", forge_config.display());
+    eprintln!("Demo root:    {}", root.display());
     let resolved_config = materialize_config(forge_config, ext_descriptor.as_ref(), ext_site.as_deref())?;
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
 
     Ok(CombinedSiteContext {
+        demo_root: root,
         resolved_config,
         forge_bin,
         external_provider: ext_descriptor,
@@ -4625,6 +4633,7 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
         context.external_provider.as_ref(),
         context.external_provider_site.as_deref(),
         external_candidate_id.as_deref(),
+        &context.demo_root,
     )?;
     eprintln!("  [OK] Provider config materialized, trust installed");
 
@@ -4838,6 +4847,7 @@ fn run_full_scenarios(
     external_provider: Option<&ExternalProviderDescriptor>,
     forge_bin: &Path,
     resolved_config: &Path,
+    demo_root: &Path,
 ) -> BTreeMap<String, ProofResult> {
     let mut results = run_quick_scenarios(external_provider_site, external_provider);
 
@@ -4868,6 +4878,7 @@ fn run_full_scenarios(
         external_provider_site,
         forge_bin,
         resolved_config,
+        demo_root,
     );
 
     // Rollout convergence
@@ -5506,8 +5517,9 @@ fn rematerialize_site_provider_config(
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
     include_secondary: bool,
+    demo_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let template_path = Path::new("demos/grid-combined-site/configs/provider/praxis.yaml");
+    let template_path = demo_root.join("configs/provider/praxis.yaml");
     let template = fs::read_to_string(template_path)?;
     let overlay = read_cluster_overlay(site)?;
 
@@ -5880,12 +5892,17 @@ fn probe_secondary_model_with_retry(
 /// probe until the secondary model routes correctly.
 ///
 /// Returns `(ProofResult, stable_id)` on success.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "demo_root required for external asset resolution"
+)]
 fn lifecycle_add_provider(
     site: &str,
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
     forge_bin: &Path,
     resolved_config: &Path,
+    demo_root: &Path,
 ) -> Result<(ProofResult, String), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut facts = BTreeMap::new();
@@ -5895,7 +5912,7 @@ fn lifecycle_add_provider(
     let stable_id = wait_for_candidate_model_on_all_sites(SECONDARY_MODEL, Duration::from_secs(120))?;
     facts.insert("secondary_stable_id".to_owned(), serde_json::json!(stable_id));
 
-    rematerialize_site_provider_config(site, external_provider, external_site, true)?;
+    rematerialize_site_provider_config(site, external_provider, external_site, true, demo_root)?;
     apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
 
     let probe_facts = probe_secondary_model_with_retry(site, site, COMBINED_SITE_DATA_PLANE_WAIT)?;
@@ -5956,12 +5973,17 @@ fn lifecycle_assert_global_convergence(site: &str) -> AssertionResult {
 
 /// Remove the secondary provider, wait for overlay drain, restore the gateway
 /// config, and verify the primary model still routes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "demo_root required for external asset resolution"
+)]
 fn lifecycle_remove_provider(
     site: &str,
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
     forge_bin: &Path,
     resolved_config: &Path,
+    demo_root: &Path,
 ) -> AssertionResult {
     let start = Instant::now();
     let mut facts = BTreeMap::new();
@@ -5971,7 +5993,7 @@ fn lifecycle_remove_provider(
     wait_for_candidate_model_absent_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
     facts.insert("candidate_drained".to_owned(), serde_json::json!(true));
 
-    rematerialize_site_provider_config(site, external_provider, external_site, false)?;
+    rematerialize_site_provider_config(site, external_provider, external_site, false, demo_root)?;
     apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
 
     for cluster in CLUSTERS {
@@ -6066,6 +6088,7 @@ fn lifecycle_cleanup(
     external_site: Option<&str>,
     forge_bin: &Path,
     resolved_config: &Path,
+    demo_root: &Path,
 ) {
     eprintln!();
     eprintln!("  [CLEANUP] Ensuring secondary provider fully removed");
@@ -6074,7 +6097,7 @@ fn lifecycle_cleanup(
     let cleanup_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         remove_secondary_mock_provider(site)?;
         wait_for_candidate_model_absent_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
-        rematerialize_site_provider_config(site, external_provider, external_site, false)?;
+        rematerialize_site_provider_config(site, external_provider, external_site, false, demo_root)?;
         apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
 
         let ctx = format!("kind-grid-combined-{site}");
@@ -6134,6 +6157,7 @@ fn run_provider_lifecycle_sequence(
     external_site: Option<&str>,
     forge_bin: &Path,
     resolved_config: &Path,
+    demo_root: &Path,
 ) {
     let site = LIFECYCLE_SITE;
 
@@ -6159,7 +6183,15 @@ fn run_provider_lifecycle_sequence(
     eprintln!("[SCENARIO {}] Provider addition", scenario());
     let add_result = {
         let start = Instant::now();
-        lifecycle_add_provider(site, external_provider, external_site, forge_bin, resolved_config).map_err(|e| {
+        lifecycle_add_provider(
+            site,
+            external_provider,
+            external_site,
+            forge_bin,
+            resolved_config,
+            demo_root,
+        )
+        .map_err(|e| {
             results.insert(
                 "provider_addition".to_owned(),
                 proof_failure(
@@ -6194,6 +6226,7 @@ fn run_provider_lifecycle_sequence(
             external_site,
             forge_bin,
             resolved_config,
+            demo_root,
         );
         return;
     };
@@ -6219,7 +6252,14 @@ fn run_provider_lifecycle_sequence(
     eprintln!();
     eprintln!("[SCENARIO {}] Provider removal", scenario());
     let removal_ok = match run_assertion("provider_removal", || {
-        lifecycle_remove_provider(site, external_provider, external_site, forge_bin, resolved_config)
+        lifecycle_remove_provider(
+            site,
+            external_provider,
+            external_site,
+            forge_bin,
+            resolved_config,
+            demo_root,
+        )
     }) {
         Ok(proof) => {
             let ok = proof.success;
@@ -6252,6 +6292,7 @@ fn run_provider_lifecycle_sequence(
             external_site,
             forge_bin,
             resolved_config,
+            demo_root,
         );
         return;
     }
@@ -6266,7 +6307,14 @@ fn run_provider_lifecycle_sequence(
     eprintln!("[SCENARIO {}] Provider re-addition", scenario());
     let readd_stable_id = {
         let start = Instant::now();
-        match lifecycle_add_provider(site, external_provider, external_site, forge_bin, resolved_config) {
+        match lifecycle_add_provider(
+            site,
+            external_provider,
+            external_site,
+            forge_bin,
+            resolved_config,
+            demo_root,
+        ) {
             Ok((proof, id)) => {
                 results.insert("provider_readdition".to_owned(), proof);
                 Some(id)
@@ -6410,6 +6458,7 @@ fn run_provider_lifecycle_sequence(
         external_site,
         forge_bin,
         resolved_config,
+        demo_root,
     );
 }
 
@@ -6485,9 +6534,13 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                     let ext_ref = ext_descriptor.as_ref();
                     let scenario_results = match mode {
                         DemoMode::Quick => run_quick_scenarios(ext_site, ext_ref),
-                        DemoMode::Full => {
-                            run_full_scenarios(ext_site, ext_ref, &context.forge_bin, &context.resolved_config)
-                        },
+                        DemoMode::Full => run_full_scenarios(
+                            ext_site,
+                            ext_ref,
+                            &context.forge_bin,
+                            &context.resolved_config,
+                            &context.demo_root,
+                        ),
                     };
 
                     let failed_proofs: Vec<&str> = scenario_results
@@ -7137,7 +7190,7 @@ spec:
     }
 
     fn rendered_provider_config_for_tests() -> String {
-        let template = include_str!("../../../demos/grid-combined-site/configs/provider/praxis.yaml");
+        let template = include_str!("../../../tests/e2e/topologies/grid-combined-site/configs/provider/praxis.yaml");
         template
             .replace("SITE_PLACEHOLDER", "west")
             .replace("CANDIDATE_ID_PLACEHOLDER", "test-primary-id")

@@ -174,6 +174,22 @@ impl Drop for ProcGuard {
 const DEFAULT_CONFIG_PATH: &str = "tests/env/config.toml";
 
 // ---------------------------------------------------------------------------
+// Demo path resolution
+// ---------------------------------------------------------------------------
+
+/// Canonical demo root directory derived from a supplied Forge config.
+///
+/// The parent of the Forge config file is the demo root. All demo-relative
+/// assets — configs, resources, policies, fixtures — resolve from this
+/// directory so that both internal (`tests/e2e/topologies/…`) and external
+/// (`praxis-demos/demos/…`) asset trees are consumed faithfully.
+pub(crate) fn demo_root(forge_config: &Path) -> PathBuf {
+    forge_config
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -872,7 +888,7 @@ pub(crate) enum Action {
     /// routing, provider affinity and drain, hot reload, and pod stability.
     VerifyGridGlbRouting {
         /// Path to the Forge environment config file.
-        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
     },
 
@@ -892,7 +908,7 @@ pub(crate) enum Action {
     /// changing the client URL. The edge is restored before this command exits.
     VerifyGridGlbGtmEmulator {
         /// Path to the Forge environment config file.
-        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
     },
 
@@ -903,7 +919,7 @@ pub(crate) enum Action {
     /// Kubernetes edge withdrawal and recovery through the GTM emulator.
     DemonstrateGridGlb {
         /// Path to the Forge environment config file.
-        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
         /// Demo mode.
         #[command(flatten)]
@@ -913,7 +929,7 @@ pub(crate) enum Action {
     /// Create the complete local GLB environment from image overrides.
     SetupGridGlb {
         /// Path to the source Forge environment config file.
-        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
 
         /// Use workload-inference topology: four clusters, no GTM emulator.
@@ -924,7 +940,7 @@ pub(crate) enum Action {
     /// Create the environment, then run the narrated GLB scenario collection.
     RunGridGlbDemo {
         /// Path to the source Forge environment config file.
-        #[arg(long, default_value = "demos/grid-glb-demo/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
         /// Demo mode and lifecycle options.
         #[command(flatten)]
@@ -934,7 +950,7 @@ pub(crate) enum Action {
     /// Create the environment, then run the narrated combined-site scenario collection.
     RunGridCombinedSiteDemo {
         /// Path to the source Forge environment config file.
-        #[arg(long, default_value = "demos/grid-combined-site/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-combined-site/forge.yaml")]
         forge_config: PathBuf,
         /// Demo mode and lifecycle options.
         #[command(flatten)]
@@ -944,7 +960,7 @@ pub(crate) enum Action {
     /// Run the llm-d pool-metrics routing demo with two clusters.
     RunGridLlmdPoolMetricsDemo {
         /// Path to the source Forge environment config file.
-        #[arg(long, default_value = "demos/grid-llmd-pool-metrics/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml")]
         forge_config: PathBuf,
         /// Demo mode and lifecycle options.
         #[command(flatten)]
@@ -6944,5 +6960,71 @@ mod llmd_compat_routing_tests {
             resolve_consumer_site(&cfg).is_err(),
             "must error when no consumer cluster exists"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// demo_root resolution tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod demo_root_tests {
+    use std::fs;
+
+    use super::*;
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
+
+    #[test]
+    fn demo_root_is_parent_of_forge_config() {
+        let root = demo_root(Path::new("/some/demo/forge.yaml"));
+        assert_eq!(root, PathBuf::from("/some/demo"));
+    }
+
+    #[test]
+    fn demo_root_falls_back_to_empty_for_bare_filename() {
+        let root = demo_root(Path::new("forge.yaml"));
+        assert_eq!(root, PathBuf::from(""));
+    }
+
+    #[test]
+    fn internal_and_external_forge_configs_resolve_to_distinct_trees() {
+        let internal = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
+        assert!(internal.exists(), "required internal topology fixture is missing");
+
+        let tmp = std::env::temp_dir().join("demo-root-test-external");
+        drop(fs::remove_dir_all(&tmp));
+        fs::create_dir_all(tmp.join("fixtures/requests")).unwrap_or_else(|_| std::process::abort());
+        fs::write(tmp.join("forge.yaml"), "# external marker\n").unwrap_or_else(|_| std::process::abort());
+        fs::write(
+            tmp.join("fixtures/requests/shared-model.json"),
+            r#"{"marker": "external"}"#,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        let internal_root = demo_root(&internal);
+        let external_root = demo_root(&tmp.join("forge.yaml"));
+
+        assert_ne!(
+            internal_root, external_root,
+            "internal and external demo roots must differ"
+        );
+
+        let internal_fixture = internal_root.join("fixtures/requests/shared-model.json");
+        let external_fixture = external_root.join("fixtures/requests/shared-model.json");
+        assert!(internal_fixture.exists(), "internal fixture must exist");
+        assert!(external_fixture.exists(), "external fixture must exist");
+
+        let internal_content = fs::read_to_string(&internal_fixture).unwrap_or_else(|_| std::process::abort());
+        let external_content = fs::read_to_string(&external_fixture).unwrap_or_else(|_| std::process::abort());
+        assert_ne!(
+            internal_content, external_content,
+            "internal and external fixtures must have distinct content — \
+             runtime must not silently fall back to internal assets"
+        );
+
+        drop(fs::remove_dir_all(&tmp));
     }
 }

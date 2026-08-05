@@ -7,7 +7,7 @@ external HTTPS APIs.
 ## Prerequisites
 
 - A running Grid installation with `install.sh` (see the
-  [existing-clusters README](../examples/helm/existing-clusters/README.md))
+  [Existing-Cluster Helm Installation](installation/existing-clusters.md))
 - `kubectl`, `helm`, `jq`, `python3`, `yq` (v4.18.0+)
 - Cluster access via `KUBECONFIG` and `--context`
 - TLS Secrets (`consumer-tls`, `provider-tls`) already created
@@ -492,7 +492,7 @@ stays `Unavailable` and the overlay excludes it.
 
 For backends not managed by the `grid-mock-providers` chart, create a
 NetworkPolicy that permits these two sources. See
-[NetworkPolicy for Multiple Backends](../examples/helm/existing-clusters/README.md#networkpolicy-for-multiple-backends).
+[NetworkPolicy for Multiple Backends](installation/existing-clusters.md#networkpolicy-for-multiple-backends).
 
 ## Troubleshooting
 

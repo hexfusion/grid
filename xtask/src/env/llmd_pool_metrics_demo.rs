@@ -106,7 +106,7 @@ const DEFAULT_SIM_IMAGE: &str = "llm-d-inference-sim:llmd-pool-metrics-demo";
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:llmd-pool-metrics-demo";
 
 /// Default nginx image for the metrics TLS reverse proxy sidecar.
-const DEFAULT_NGINX_IMAGE: &str = "nginx:metrics-proxy-demo";
+const DEFAULT_NGINX_IMAGE: &str = "docker.io/library/nginx:1.27.4-alpine";
 
 /// Metrics TLS CA common name (separate from gateway CA).
 const METRICS_CA_CN: &str = "Grid Metrics Test CA";
@@ -278,10 +278,12 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id)?;
     fs::create_dir_all(&evidence_dir)?;
 
+    let demo_root = super::demo_root(forge_config);
     eprintln!("{OUTPUT_RULE}");
     eprintln!("Grid llm-d Pool-Metrics Routing Demo");
     eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
-    eprintln!("Config: {}", forge_config.display());
+    eprintln!("Forge config: {}", forge_config.display());
+    eprintln!("Demo root:    {}", demo_root.display());
     eprintln!("{OUTPUT_RULE}");
 
     let context = prepare_setup(forge_config)?;
@@ -440,7 +442,6 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
         ("epp", &images.epp, "EPP"),
         ("sim", &images.sim, "SIM"),
         ("overlay-sync", &images.overlay_sync, "OVERLAY_SYNC"),
-        ("nginx", &images.nginx, "NGINX"),
     ] {
         let status = Command::new("docker")
             .args(["image", "inspect", image])
@@ -1610,7 +1611,6 @@ fn load_images_into_clusters(_context: &DemoContext) -> Result<(), Box<dyn std::
         "praxis-ai:llmd-pool-metrics-demo",
         "llm-d-epp:llmd-pool-metrics-demo",
         "llm-d-inference-sim:llmd-pool-metrics-demo",
-        "nginx:metrics-proxy-demo",
     ];
     for cluster in CLUSTERS {
         let kind_name = format!("grid-llmd-pm-{cluster}");
@@ -1871,6 +1871,92 @@ fn is_provider_observable(cluster: &str, provider_suffix: &str) -> bool {
     candidates
         .iter()
         .any(|c| c.cluster.contains(provider_suffix) && c.score > 0.0)
+}
+
+/// Read a base64-encoded field from a Kubernetes Secret.
+fn read_secret_field_b64(context: &str, secret_name: &str, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let escaped_key = key.replace('.', r"\.");
+    let jsonpath = format!("{{.data.{escaped_key}}}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "secret",
+            secret_name,
+            "-o",
+            &format!("jsonpath={jsonpath}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Secret/{secret_name} key={key}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let data = String::from_utf8_lossy(&output.stdout).to_string();
+    if data.is_empty() {
+        return Err(format!("Secret/{secret_name} key={key} is empty").into());
+    }
+    Ok(data)
+}
+
+/// Probe the metrics TLS endpoint using credentials read from Kubernetes
+/// Secrets.
+///
+/// Decodes client cert, client key, and CA inside the metrics-tls-proxy
+/// container, then uses curl to connect to the TLS-protected metrics
+/// Service. Returns `true` on HTTP 200. Use this to distinguish TLS
+/// transport failures from operator ingestion failures.
+fn probe_mtls_endpoint(cluster: &str) -> bool {
+    let ctx = kind_context(cluster);
+
+    let Ok(cert_b64) = read_secret_field_b64(&ctx, METRICS_CLIENT_TLS_SECRET, "tls.crt") else {
+        return false;
+    };
+    let Ok(key_b64) = read_secret_field_b64(&ctx, METRICS_CLIENT_TLS_SECRET, "tls.key") else {
+        return false;
+    };
+    let Ok(ca_b64) = read_secret_field_b64(&ctx, METRICS_CA_SECRET, "ca.crt") else {
+        return false;
+    };
+
+    let metrics_url = format!("https://{METRICS_SERVER_DNS}:9443/metrics");
+    let cmd = format!(
+        "echo '{ca_b64}' | base64 -d > /tmp/p-ca.pem\n\
+         echo '{cert_b64}' | base64 -d > /tmp/p-cert.pem\n\
+         echo '{key_b64}' | base64 -d > /tmp/p-key.pem\n\
+         curl -sf --connect-timeout 5 \
+           --cacert /tmp/p-ca.pem \
+           --cert /tmp/p-cert.pem \
+           --key /tmp/p-key.pem \
+           {metrics_url} -o /dev/null\n\
+         rc=$?\n\
+         rm -f /tmp/p-ca.pem /tmp/p-cert.pem /tmp/p-key.pem\n\
+         exit $rc"
+    );
+
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deploy/llmd-epp",
+            "-c",
+            "metrics-tls-proxy",
+            "--",
+            "sh",
+            "-c",
+            &cmd,
+        ])
+        .output();
+
+    output.is_ok_and(|o| o.status.success())
 }
 
 /// Wait until a provider becomes observable in the overlay.
@@ -2252,7 +2338,18 @@ fn proof_tls_baseline() -> ProofResult {
             let score = overlay_score_for_cluster(&candidates, cluster);
             observations.push(format!("{cluster}: observable, score={score:.2} (mTLS working)"));
         } else {
-            observations.push(format!("{cluster}: NOT observable — mTLS scraping may have failed"));
+            let tls_ok = probe_mtls_endpoint(cluster);
+            if tls_ok {
+                observations.push(format!(
+                    "{cluster}: NOT observable — TLS transport OK but operator did not ingest metrics into overlay scores \
+                     (check operator image contains MetricsConfig implementation)"
+                ));
+            } else {
+                observations.push(format!(
+                    "{cluster}: NOT observable — TLS transport also failed \
+                     (check Secrets and TLS proxy configuration)"
+                ));
+            }
             return ProofResult {
                 success: false,
                 description: "Baseline mTLS: operator scrapes metrics through TLS".to_owned(),

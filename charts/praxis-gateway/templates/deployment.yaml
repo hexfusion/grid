@@ -51,7 +51,7 @@ spec:
       {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
       initContainers:
         - name: overlay-sync-init
-          image: {{ printf "%s:%s" .Values.overlay.sidecar.image.repository .Values.overlay.sidecar.image.tag }}
+          image: {{ include "praxis-gateway.overlaySyncImage" . }}
           imagePullPolicy: {{ .Values.overlay.sidecar.image.pullPolicy | quote }}
           args:
             - "--namespace"
@@ -91,7 +91,7 @@ spec:
       containers:
         {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
         - name: overlay-sync
-          image: {{ printf "%s:%s" .Values.overlay.sidecar.image.repository .Values.overlay.sidecar.image.tag }}
+          image: {{ include "praxis-gateway.overlaySyncImage" . }}
           imagePullPolicy: {{ .Values.overlay.sidecar.image.pullPolicy | quote }}
           args:
             - "--namespace"

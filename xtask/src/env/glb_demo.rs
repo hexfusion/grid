@@ -149,6 +149,9 @@ type ObservedPaths = BTreeMap<(String, String), AffinityFixture>;
 
 /// Resolved environment references needed after setup.
 pub(crate) struct SetupContext {
+    /// Canonical demo root directory from which configs, resources, policies,
+    /// and fixtures are resolved.
+    demo_root: PathBuf,
     /// Resolved forge config path.
     resolved_config: PathBuf,
     /// Forge binary path.
@@ -325,7 +328,11 @@ fn prepare_setup(
     external_provider: Option<ExternalProviderDescriptor>,
     external_key_file: Option<PathBuf>,
 ) -> Result<SetupContext, Box<dyn std::error::Error>> {
+    let root = super::demo_root(forge_config);
+    eprintln!("Forge config: {}", forge_config.display());
+    eprintln!("Demo root:    {}", root.display());
     Ok(SetupContext {
+        demo_root: root,
         resolved_config: materialize_config(forge_config, ingress_mode, external_provider.as_ref())?,
         forge_bin: glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?,
         ingress_mode,
@@ -358,7 +365,11 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
         "[SETUP {}/{total_phases}] Staging demo certificates and provider identities",
         next()
     );
-    glb::stage_provider_boundary_with_mode_and_external(context.ingress_mode, context.external_provider.as_ref())?;
+    glb::stage_provider_boundary_with_mode_and_external(
+        context.ingress_mode,
+        context.external_provider.as_ref(),
+        &context.demo_root,
+    )?;
 
     eprintln!();
     eprintln!(
@@ -640,6 +651,8 @@ fn demonstrate_global(
     external: Option<&ExternalProviderDescriptor>,
     narrator: &mut Narrator,
 ) -> DemoOutcome {
+    let root = super::demo_root(forge_config);
+    let fixture = root.join("fixtures/requests/shared-model.json");
     let mut capabilities = Vec::new();
     let mut external_provider = None;
 
@@ -657,7 +670,7 @@ fn demonstrate_global(
         return failed_outcome(capabilities, Vec::new(), "Active/active routing", concise_error(error));
     }
 
-    let paths = match discover_paths() {
+    let paths = match discover_paths(&fixture) {
         Ok(paths) => paths,
         Err(error) => {
             return failed_outcome(capabilities, Vec::new(), "Active/active routing", concise_error(error));
@@ -706,7 +719,7 @@ fn demonstrate_global(
             "Session affinity and provider drain",
             "As an inference client, I need repeated requests to remain on one edge and provider while existing sessions survive a metrics-driven drain and new sessions move safely.",
         );
-        if let Err(error) = prove_affinity(narrator, &paths) {
+        if let Err(error) = prove_affinity(narrator, &paths, &fixture) {
             return failed_outcome(
                 capabilities,
                 observed_paths,
@@ -748,7 +761,7 @@ fn demonstrate_global(
             "Grid restart recovery and request soak",
             "As a platform operator, I need Grid control-plane restarts to preserve converged routing and sustained inference traffic.",
         );
-        match prove_restart_recovery_and_soak(narrator, &paths) {
+        match prove_restart_recovery_and_soak(narrator, &paths, &fixture) {
             Ok(evidence) => capabilities.push(CapabilityResult {
                 capability: "Grid restart recovery and soak".to_owned(),
                 result: "pass",
@@ -1506,14 +1519,18 @@ fn restore_deployment(
 // ---------------------------------------------------------------------------
 
 /// Discover real edge/provider combinations through the stable HTTPS name.
-fn discover_paths() -> Result<ObservedPaths, Box<dyn std::error::Error>> {
+fn discover_paths(request_fixture: &Path) -> Result<ObservedPaths, Box<dyn std::error::Error>> {
     let mut paths = BTreeMap::new();
     for index in 0..MAX_PATH_SAMPLES {
         let fixture = AffinityFixture {
             edge_session: format!("narrated-edge-{index}"),
             provider_session: format!("narrated-provider-{index}"),
         };
-        let sample = gtm_emulator::request_path_with_affinity(&fixture.edge_session, &fixture.provider_session)?;
+        let sample = gtm_emulator::request_path_with_affinity(
+            &fixture.edge_session,
+            &fixture.provider_session,
+            request_fixture,
+        )?;
         if !paths.keys().any(|(edge, _)| edge == &sample.edge) {
             paths.insert((sample.edge, sample.provider), fixture);
         }
@@ -1543,13 +1560,21 @@ fn build_observed_paths(paths: &ObservedPaths) -> Vec<ObservedPathEntry> {
 }
 
 /// Repeat one observed path and require both affinity layers to remain stable.
-fn prove_affinity(narrator: &mut Narrator, paths: &ObservedPaths) -> Result<(), Box<dyn std::error::Error>> {
+fn prove_affinity(
+    narrator: &mut Narrator,
+    paths: &ObservedPaths,
+    request_fixture: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ((expected_edge, expected_provider), fixture) = paths
         .first_key_value()
         .ok_or("no observed path available for affinity")?;
 
     for _attempt in 0..AFFINITY_REPEATS {
-        let sample = gtm_emulator::request_path_with_affinity(&fixture.edge_session, &fixture.provider_session)?;
+        let sample = gtm_emulator::request_path_with_affinity(
+            &fixture.edge_session,
+            &fixture.provider_session,
+            request_fixture,
+        )?;
         if sample.edge != *expected_edge || sample.provider != *expected_provider {
             return Err(format!(
                 "affinity fixtures moved from {expected_edge}/{expected_provider} to {}/{}",
@@ -1575,14 +1600,15 @@ fn prove_affinity(narrator: &mut Narrator, paths: &ObservedPaths) -> Result<(), 
 fn prove_restart_recovery_and_soak(
     narrator: &mut Narrator,
     paths: &ObservedPaths,
+    request_fixture: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let fixtures = paths.values().collect::<Vec<_>>();
     if fixtures.is_empty() {
         return Err("no observed path available for restart and soak proof".into());
     }
 
-    prove_operator_restarts(narrator, &fixtures)?;
-    let (samples, edge_count, provider_count) = run_request_soak(narrator, &fixtures)?;
+    prove_operator_restarts(narrator, &fixtures, request_fixture)?;
+    let (samples, edge_count, provider_count) = run_request_soak(narrator, &fixtures, request_fixture)?;
     let evidence = format!(
         "4 Grid operators restarted; {samples} soak requests passed across {edge_count} edges and {provider_count} provider(s)"
     );
@@ -1594,6 +1620,7 @@ fn prove_restart_recovery_and_soak(
 fn prove_operator_restarts(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
+    request_fixture: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     narrator.narrate("");
     narrator.wrapped(
@@ -1612,7 +1639,11 @@ fn prove_operator_restarts(
         let fixture = fixtures
             .get(index % fixtures.len())
             .ok_or("no affinity fixture available after Grid restart")?;
-        let sample = gtm_emulator::request_path_with_affinity(&fixture.edge_session, &fixture.provider_session)?;
+        let sample = gtm_emulator::request_path_with_affinity(
+            &fixture.edge_session,
+            &fixture.provider_session,
+            request_fixture,
+        )?;
         narrator.narrate(&format!(
             "[PASS] Restarted {cluster} Grid operator; routing recovered via {} -> {} ({overlay_evidence}).",
             sample.edge, sample.provider
@@ -1625,6 +1656,7 @@ fn prove_operator_restarts(
 fn run_request_soak(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
+    request_fixture: &Path,
 ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
     narrate_soak_start(narrator);
     let deadline = Instant::now() + FULL_SOAK_DURATION;
@@ -1635,7 +1667,11 @@ fn run_request_soak(
         let fixture = fixtures
             .get(samples % fixtures.len())
             .ok_or("no affinity fixture available during request soak")?;
-        let sample = gtm_emulator::request_path_with_affinity(&fixture.edge_session, &fixture.provider_session)?;
+        let sample = gtm_emulator::request_path_with_affinity(
+            &fixture.edge_session,
+            &fixture.provider_session,
+            request_fixture,
+        )?;
         edges.insert(sample.edge);
         providers.insert(sample.provider);
         samples += 1;
@@ -2469,7 +2505,7 @@ mod setup_tests {
 
         #[test]
         fn materialized_config_uses_glb_image_contract() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
             let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global, None)?;
             assert!(rendered.contains(&image_overrides::demo_gateway_image(IngressMode::Global)));
             assert!(rendered.contains(&image_overrides::demo_operator_image(IngressMode::Global)));
@@ -2481,7 +2517,7 @@ mod setup_tests {
 
         #[test]
         fn grid_operator_stack_uses_helm_and_captures_swim_ip() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
             let forge: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(source)?)?;
             let steps = forge
                 .get("spec")
@@ -2513,7 +2549,7 @@ mod setup_tests {
         #[test]
         #[expect(clippy::too_many_lines, reason = "asserts Helm SWIM wiring for four identity stacks")]
         fn identity_stacks_use_helm_with_swim_config() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
             let forge: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(source)?)?;
             let stacks = forge
                 .get("spec")
@@ -2557,7 +2593,7 @@ mod setup_tests {
 
         #[test]
         fn demo_workloads_use_restricted_container_defaults() -> Result<(), Box<dyn std::error::Error>> {
-            let resources = workspace_root().join("demos/grid-glb-demo/resources");
+            let resources = workspace_root().join("tests/e2e/topologies/grid-glb-demo/resources");
             for manifest in ["provider-workloads.yaml", "provider-workload-east-secondary.yaml"] {
                 let deployment = fs::read_to_string(resources.join(manifest))?;
                 for required in [
@@ -2586,7 +2622,7 @@ mod setup_tests {
 
         #[test]
         fn workload_config_has_four_clusters() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
             let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload, None)?;
             let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
             let clusters = config
@@ -2608,7 +2644,7 @@ mod setup_tests {
 
         #[test]
         fn global_config_has_five_clusters() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
             let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global, None)?;
             let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
             let clusters = config
@@ -2622,7 +2658,7 @@ mod setup_tests {
 
         #[test]
         fn workload_config_strips_gtm_stacks() -> Result<(), Box<dyn std::error::Error>> {
-            let source = workspace_root().join("demos/grid-glb-demo/forge.yaml");
+            let source = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
             let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Workload, None)?;
             let config: serde_yaml::Value = serde_yaml::from_str(&rendered)?;
             let stacks = config

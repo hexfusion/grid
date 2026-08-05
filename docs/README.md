@@ -30,9 +30,14 @@
 
 ## Demos
 
-- [Demonstrations](../demos/README.md) — deployable environments with automated
-  runtime proof covering global ingress, workload inference, and combined-site
-  topologies.
+- [Grid QuickStarts](https://github.com/praxis-proxy/demos) — deployable
+  demonstrations with automated runtime proofs of routing, failover, security
+  boundaries, and provider lifecycle.
+
+## Installation
+
+- [Existing-Cluster Helm Installation](installation/existing-clusters.md) —
+  install Grid and Praxis on running Kubernetes clusters with Helm.
 
 ## Development
 

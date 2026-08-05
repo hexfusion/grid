@@ -26,6 +26,7 @@ env:
   NIGHTLY_RUSTFMT: nightly-2026-03-28
   AI_ROLLUP_IMAGE: >-
     ghcr.io/praxis-proxy/grid-ai-rollup@sha256:95132eb39c0f568b5361a250002979c5063db427ff0fb63b59a93146fcb7ad31
+  AI_ROLLUP_IMAGE_NAME: ghcr.io/praxis-proxy/grid-ai-rollup
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
   OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
@@ -116,7 +117,7 @@ jobs:
       - name: Validate GLB demo configuration
         run: >-
           cargo run -p forge --
-          --config demos/grid-glb-demo/forge.yaml
+          --config tests/e2e/topologies/grid-glb-demo/forge.yaml
           config validate
 
   # ----------------------------------------------------------------------------
@@ -207,6 +208,12 @@ jobs:
           cache-to: type=gha,mode=max,scope=release-overlay-sync
           provenance: mode=max
           sbom: true
+
+      - name: Publish release tag for verified Praxis AI rollup
+        run: >-
+          docker buildx imagetools create
+          --tag "${AI_ROLLUP_IMAGE_NAME}:${{ needs.validate.outputs.tag }}"
+          "${AI_ROLLUP_IMAGE}"
 
   # ----------------------------------------------------------------------------
   # Package and publish Helm chart to GHCR OCI registry

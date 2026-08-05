@@ -95,11 +95,6 @@ pub(crate) fn operator_image() -> String {
     env::var(OPERATOR_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned())
 }
 
-/// Get the GLB demo mock-provider image, respecting the shared override.
-pub(crate) fn glb_mock_provider_image() -> String {
-    env::var(MOCK_PROVIDER_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_GLB_MOCK_PROVIDER_IMAGE.to_owned())
-}
-
 /// Get the demo gateway image for the given ingress mode.
 pub(crate) fn demo_gateway_image(mode: IngressMode) -> String {
     let default = match mode {
@@ -210,6 +205,13 @@ mod tests {
                 "workload and global gateway defaults must differ"
             );
         }
+        if env::var(MOCK_PROVIDER_IMAGE_ENV).is_err() {
+            assert_ne!(
+                demo_mock_provider_image(IngressMode::Global),
+                demo_mock_provider_image(IngressMode::Workload),
+                "workload mock-provider image must differ from global default"
+            );
+        }
         if env::var(IMAGE_PULL_POLICY_ENV).is_err() {
             assert_eq!(demo_image_pull_policy(IngressMode::Global), "Never");
             assert_eq!(demo_image_pull_policy(IngressMode::Workload), "IfNotPresent");
@@ -249,6 +251,17 @@ mod tests {
             assert!(!should_skip, "Should not skip loading when policy is Never");
         } else {
             assert!(should_skip, "Should skip loading when policy is not Never");
+        }
+    }
+
+    #[test]
+    fn workload_mode_mock_provider_differs_from_glb() {
+        if env::var(MOCK_PROVIDER_IMAGE_ENV).is_err() {
+            assert_ne!(
+                demo_mock_provider_image(IngressMode::Global),
+                demo_mock_provider_image(IngressMode::Workload),
+                "workload mock-provider image must differ from global (glb) default"
+            );
         }
     }
 }

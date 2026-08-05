@@ -1112,7 +1112,7 @@ The `xtask env` commands provide a local development and
 integration-validation path using Kind clusters. They are not the production
 reconciliation model. The Kubernetes-native global-ingress scenario is
 documented in
-[`demos/grid-glb-demo/README.md`](../../demos/grid-glb-demo/README.md).
+the [Praxis demos repository](https://github.com/praxis-proxy/demos).
 
 This path is intended for:
 

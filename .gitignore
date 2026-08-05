@@ -34,10 +34,7 @@ tests/env/certs/
 
 # Forge runtime state and generated files
 .forge/
-demos/grid-glb-demo/.forge.resolved.yaml
+tests/e2e/topologies/**/.forge.resolved.yaml
 
 # Helm chart packaging artifacts
 *.tgz
-
-# Demo-local tool caches (e.g. fetched istioctl)
-demos/**/.cache/
