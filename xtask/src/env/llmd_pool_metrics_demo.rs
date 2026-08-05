@@ -25,7 +25,7 @@ use std::{
 
 use serde::Serialize;
 
-use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator};
+use super::{DemoMode, GlbDemoOptions, certs, glb, image_overrides, kubectl, operator};
 
 /// Directory where generated TLS certificates are stored.
 const CERTS_DIR: &str = "tests/env/certs";
@@ -434,8 +434,16 @@ fn resolve_images() -> Result<ResolvedImages, Box<dyn std::error::Error>> {
     })
 }
 
-/// Verify all required images exist locally before creating clusters.
+/// Verify local-mode images before creating clusters.
+///
+/// Registry mode references pullable images directly from the Forge config, so
+/// each Kind node resolves them without host-side tagging or loading.
 fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Error>> {
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  registry image mode: images will be pulled by each cluster");
+        return Ok(());
+    }
+
     for (role, image, env_suffix) in [
         ("gateway", &images.gateway, "GATEWAY"),
         ("operator", &images.operator, "OPERATOR"),
@@ -658,9 +666,12 @@ fn proof_provenance() -> ProofResult {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster) {
-                let has_kv = metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
-                let has_queue = metrics_text.contains("llm_d_router_epp_average_queue_size");
-                let has_ready = metrics_text.contains("llm_d_router_epp_ready_endpoints");
+                let has_kv = metrics_text.contains("inference_pool_average_kv_cache_utilization")
+                    || metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
+                let has_queue = metrics_text.contains("inference_pool_average_queue_size")
+                    || metrics_text.contains("llm_d_router_epp_average_queue_size");
+                let has_ready = metrics_text.contains("inference_pool_ready_pods")
+                    || metrics_text.contains("llm_d_router_epp_ready_endpoints");
                 if has_kv && has_queue && has_ready {
                     observations.push(format!("{cluster}: all 3 EPP pool metrics present"));
                     metrics_ok = true;
@@ -969,8 +980,12 @@ fn scrape_epp_metrics(cluster: &str) -> EppMetrics {
     let text = kubectl_exec_epp_metrics(cluster).unwrap_or_default();
 
     EppMetrics {
-        queue_size: extract_prom_value(&text, "llm_d_router_epp_average_queue_size").unwrap_or(0.0),
-        kv_cache: extract_prom_value(&text, "llm_d_router_epp_average_kv_cache_utilization").unwrap_or(0.0),
+        queue_size: extract_prom_value(&text, "inference_pool_average_queue_size")
+            .or_else(|| extract_prom_value(&text, "llm_d_router_epp_average_queue_size"))
+            .unwrap_or(0.0),
+        kv_cache: extract_prom_value(&text, "inference_pool_average_kv_cache_utilization")
+            .or_else(|| extract_prom_value(&text, "llm_d_router_epp_average_kv_cache_utilization"))
+            .unwrap_or(0.0),
     }
 }
 
@@ -1600,11 +1615,16 @@ fn wait_for_overlay_convergence() -> Result<(), Box<dyn std::error::Error>> {
 // Image loading
 // ---------------------------------------------------------------------------
 
-/// Load pre-built images into Kind clusters.
+/// Load pre-built images into Kind clusters in local-image mode.
 ///
 /// Uses the forge-expected tags (created by [`tag_images_for_forge`]) since
 /// the forge manifests and Helm values reference those names.
 fn load_images_into_clusters(_context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  [OK] Registry image mode: skipped local Kind image loading");
+        return Ok(());
+    }
+
     let forge_tags: &[&str] = &[
         "grid-operator:llmd-pool-metrics-demo",
         "grid-overlay-sync:llmd-pool-metrics-demo",
@@ -3003,18 +3023,18 @@ mod tests {
 
     #[test]
     fn extract_prom_value_parses_labeled_metric() {
-        let text = r#"# HELP llm_d_router_epp_average_kv_cache_utilization Average kv cache
-# TYPE llm_d_router_epp_average_kv_cache_utilization gauge
-llm_d_router_epp_average_kv_cache_utilization{name="pool-a"} 0.35
+        let text = r#"# HELP inference_pool_average_kv_cache_utilization Average kv cache
+# TYPE inference_pool_average_kv_cache_utilization gauge
+inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 "#;
-        let val = extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization");
+        let val = extract_prom_value(text, "inference_pool_average_kv_cache_utilization");
         assert_eq!(val, Some(0.35), "expected Some(0.35)");
     }
 
     #[test]
     fn extract_prom_value_returns_none_for_missing_metric() {
         let text = "some_other_metric 1.0\n";
-        let val = extract_prom_value(text, "llm_d_router_epp_average_queue_size");
+        let val = extract_prom_value(text, "inference_pool_average_queue_size");
         assert_eq!(val, None, "expected None for missing metric");
     }
 
