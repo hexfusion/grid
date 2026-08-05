@@ -5,10 +5,10 @@ replicaCount: 1
 image:
   # -- Image repository.
   repository: ghcr.io/praxis-proxy/grid-ai-rollup
-  # -- Image tag. Defaults to the chart appVersion when empty.
+  # -- Image tag. Used when digest is empty; defaults to the chart appVersion.
   tag: ""
   # -- Immutable image digest (sha256:<64 hex>). When set, tag is ignored.
-  digest: ""
+  digest: "sha256:95132eb39c0f568b5361a250002979c5063db427ff0fb63b59a93146fcb7ad31"
   # -- Image pull policy.
   pullPolicy: "IfNotPresent"
 
