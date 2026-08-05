@@ -58,8 +58,11 @@ const OUTPUT_RULE: &str = "=====================================================
 /// Evidence JSON schema version.
 const EVIDENCE_SCHEMA_VERSION: &str = "1";
 
-/// Number of setup phases.
-const SETUP_PHASES: usize = 11;
+/// Number of setup phases in mTLS mode.
+const SETUP_PHASES_MTLS: usize = 11;
+
+/// Number of setup phases in direct-HTTP mode (no metrics TLS secrets phase).
+const SETUP_PHASES_DIRECT: usize = 10;
 
 /// Primary model name served by inference simulators.
 const SIM_MODEL: &str = "llmd-sim-model";
@@ -127,6 +130,25 @@ const METRICS_CLIENT_TLS_SECRET: &str = "metrics-client-tls";
 // Context
 // ---------------------------------------------------------------------------
 
+/// Metrics transport mode selected by the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricsTransport {
+    /// Scrape EPP directly over HTTP on port 9090.
+    DirectHttp,
+    /// nginx mTLS reverse proxy on port 9443 forwarding to EPP 9090.
+    MtlsProxy,
+}
+
+impl MetricsTransport {
+    /// Human-readable label used in CLI output and evidence JSON.
+    fn label(self) -> &'static str {
+        match self {
+            Self::DirectHttp => "direct-http",
+            Self::MtlsProxy => "mtls-proxy",
+        }
+    }
+}
+
 /// Demo execution context holding resolved paths.
 struct DemoContext {
     /// Path to the resolved Forge config.
@@ -135,6 +157,8 @@ struct DemoContext {
     forge_bin: PathBuf,
     /// Resolved container images.
     images: ResolvedImages,
+    /// Selected metrics transport mode.
+    metrics_transport: MetricsTransport,
 }
 
 /// Resolved container image references.
@@ -149,8 +173,8 @@ struct ResolvedImages {
     sim: String,
     /// Grid overlay-sync sidecar image.
     overlay_sync: String,
-    /// nginx image for metrics TLS reverse proxy sidecar.
-    nginx: String,
+    /// nginx image for metrics TLS reverse proxy sidecar (mTLS mode only).
+    nginx: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +188,8 @@ struct Evidence {
     schema_version: String,
     /// Demo mode.
     mode: String,
+    /// Metrics transport: "direct-http" or "mtls-proxy".
+    metrics_transport: String,
     /// UTC timestamp when the run started.
     started_at: String,
     /// Wall-clock duration in seconds.
@@ -269,8 +295,17 @@ struct InferenceResponse {
 /// # Errors
 ///
 /// Returns an error when setup, proof scenarios, or teardown fail.
-pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run(
+    forge_config: &Path,
+    options: &GlbDemoOptions,
+    metrics_mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
+    let metrics_transport = if metrics_mtls {
+        MetricsTransport::MtlsProxy
+    } else {
+        MetricsTransport::DirectHttp
+    };
     let run_id = format_utc_timestamp();
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
@@ -282,11 +317,12 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     eprintln!("{OUTPUT_RULE}");
     eprintln!("Grid llm-d Pool-Metrics Routing Demo");
     eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
+    eprintln!("Metrics transport: {}", metrics_transport.label());
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", demo_root.display());
     eprintln!("{OUTPUT_RULE}");
 
-    let context = prepare_setup(forge_config)?;
+    let context = prepare_setup(forge_config, metrics_transport)?;
     let mut teardown_success = false;
     let mut run_error: Option<String> = None;
 
@@ -344,6 +380,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence = Evidence {
         schema_version: EVIDENCE_SCHEMA_VERSION.to_owned(),
         mode: format!("{mode:?}").to_lowercase(),
+        metrics_transport: metrics_transport.label().to_owned(),
         started_at,
         wall_secs,
         success,
@@ -390,31 +427,36 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
 // ---------------------------------------------------------------------------
 
 /// Resolve inputs before creating clusters.
-fn prepare_setup(forge_config: &Path) -> Result<DemoContext, Box<dyn std::error::Error>> {
-    let resolved_config = materialize_config(forge_config)?;
+fn prepare_setup(
+    forge_config: &Path,
+    metrics_transport: MetricsTransport,
+) -> Result<DemoContext, Box<dyn std::error::Error>> {
+    let images = resolve_images(metrics_transport)?;
+    verify_images(&images)?;
+
+    let resolved_config = materialize_config(forge_config, metrics_transport, images.nginx.as_deref())?;
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
-
-    let images = resolve_images()?;
-    verify_images(&images)?;
 
     Ok(DemoContext {
         resolved_config,
         forge_bin,
         images,
+        metrics_transport,
     })
 }
 
 /// Resolve image references from environment variables with defaults.
-fn resolve_images() -> Result<ResolvedImages, Box<dyn std::error::Error>> {
+fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages, Box<dyn std::error::Error>> {
     let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned());
     let epp = std::env::var("GRID_XTASK_EPP_IMAGE").unwrap_or_else(|_| DEFAULT_EPP_IMAGE.to_owned());
     let sim = std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| DEFAULT_SIM_IMAGE.to_owned());
     let overlay_sync =
         std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned());
-    let nginx = std::env::var("GRID_XTASK_NGINX_IMAGE").unwrap_or_else(|_| DEFAULT_NGINX_IMAGE.to_owned());
+    let nginx = (metrics_transport == MetricsTransport::MtlsProxy)
+        .then(|| std::env::var("GRID_XTASK_NGINX_IMAGE").unwrap_or_else(|_| DEFAULT_NGINX_IMAGE.to_owned()));
 
     eprintln!("  Images:");
     eprintln!("    gateway:      {gateway}");
@@ -422,7 +464,9 @@ fn resolve_images() -> Result<ResolvedImages, Box<dyn std::error::Error>> {
     eprintln!("    epp:          {epp}");
     eprintln!("    sim:          {sim}");
     eprintln!("    overlay-sync: {overlay_sync}");
-    eprintln!("    nginx:        {nginx}");
+    if let Some(n) = &nginx {
+        eprintln!("    nginx:        {n}");
+    }
 
     Ok(ResolvedImages {
         gateway,
@@ -444,13 +488,17 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
         return Ok(());
     }
 
-    for (role, image, env_suffix) in [
+    let mut checks: Vec<(&str, &str, &str)> = vec![
         ("gateway", &images.gateway, "GATEWAY"),
         ("operator", &images.operator, "OPERATOR"),
         ("epp", &images.epp, "EPP"),
         ("sim", &images.sim, "SIM"),
         ("overlay-sync", &images.overlay_sync, "OVERLAY_SYNC"),
-    ] {
+    ];
+    if let Some(nginx) = &images.nginx {
+        checks.push(("nginx", nginx, "NGINX"));
+    }
+    for (role, image, env_suffix) in checks {
         let status = Command::new("docker")
             .args(["image", "inspect", image])
             .stdout(std::process::Stdio::null())
@@ -496,7 +544,8 @@ fn tag_images_for_forge(images: &ResolvedImages) -> Result<(), Box<dyn std::erro
 
 /// Deploy the two-cluster environment.
 fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
-    let total = SETUP_PHASES;
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+    let total = if mtls { SETUP_PHASES_MTLS } else { SETUP_PHASES_DIRECT };
     let mut phase = 0_usize;
     let mut next = || {
         phase += 1;
@@ -521,8 +570,23 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 
     // Phase 2: Generate TLS certificates
     eprintln!();
-    eprintln!("[SETUP {}/{}] Generating TLS certificates", next(), total);
-    stage_certificates()?;
+    if mtls {
+        eprintln!(
+            "[SETUP {}/{}] Generating TLS certificates (gateway + metrics)",
+            next(),
+            total
+        );
+        stage_certificates()?;
+    } else {
+        eprintln!(
+            "[SETUP {}/{}] Generating TLS certificates (gateway only)",
+            next(),
+            total
+        );
+        let clusters: Vec<String> = CLUSTERS.iter().map(|s| (*s).to_owned()).collect();
+        certs::generate_all(&clusters)?;
+        eprintln!("  [OK] TLS certificates generated for pool-a, pool-b");
+    }
 
     // Phase 3: Create Kind clusters
     eprintln!();
@@ -555,21 +619,23 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("[SETUP {}/{}] Seeding SWIM cross-cluster membership", next(), total);
     seed_swim_membership()?;
 
-    // Phase 7: Install metrics TLS secrets (before EPP deployment needs them)
-    eprintln!();
-    eprintln!(
-        "[SETUP {}/{}] Installing metrics TLS secrets for EPP sidecar",
-        next(),
-        total
-    );
-    let metrics_certs_dir = Path::new(CERTS_DIR);
-    for cluster in CLUSTERS {
-        let ctx = kind_context(cluster);
-        install_metrics_tls_secrets(&ctx, metrics_certs_dir)?;
-        eprintln!("  [OK] {cluster}: metrics TLS secrets installed");
+    // Phase 7 (mTLS only): Install metrics TLS secrets
+    if mtls {
+        eprintln!();
+        eprintln!(
+            "[SETUP {}/{}] Installing metrics TLS secrets for EPP sidecar",
+            next(),
+            total
+        );
+        let metrics_certs_dir = Path::new(CERTS_DIR);
+        for cluster in CLUSTERS {
+            let ctx = kind_context(cluster);
+            install_metrics_tls_secrets(&ctx, metrics_certs_dir)?;
+            eprintln!("  [OK] {cluster}: metrics TLS secrets installed");
+        }
     }
 
-    // Phase 8: Deploy llm-d simulators and EPP
+    // Phase 7/8: Deploy llm-d simulators and EPP
     eprintln!();
     eprintln!("[SETUP {}/{}] Deploying llm-d simulators and EPP", next(), total);
     for cluster in CLUSTERS {
@@ -578,16 +644,12 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         eprintln!("  [OK] {cluster}: sim-1, sim-2, and EPP running");
     }
 
-    // Phase 9: Install provider trust and credentials
+    // Phase 8/9: Install provider trust and credentials
     eprintln!();
     eprintln!("[SETUP {}/{}] Installing provider trust and credentials", next(), total);
     install_provider_trust()?;
 
-    // Phase 9: Deploy Grid site resources and gateways
-    //
-    // Consumer gateway configs reference provider-gateway IPs from *both*
-    // clusters (via forge captures), so all provider gateways must be up
-    // before any consumer gateway is deployed.
+    // Phase 9/10: Deploy Grid site resources and gateways
     eprintln!();
     eprintln!(
         "[SETUP {}/{}] Deploying Grid site resources and gateways",
@@ -615,7 +677,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         eprintln!("  [OK] {cluster}: consumer-gateway deployed");
     }
 
-    // Phase 10: Wait for overlay convergence
+    // Phase 10/11: Wait for overlay convergence
     eprintln!();
     eprintln!("[SETUP {}/{}] Waiting for overlay convergence", next(), total);
     authorize_discovered_sites()?;
@@ -633,9 +695,10 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 /// Run the demo proof scenarios.
 fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
     // Proof 1: Provenance — image digests and config verification
-    results.insert("provenance".to_owned(), proof_provenance());
+    results.insert("provenance".to_owned(), proof_provenance(mtls));
 
     // Proof 2: Baseline — early state scorecard with production scores
     results.insert("baseline".to_owned(), proof_baseline(context));
@@ -648,15 +711,17 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
         results.insert("recovery".to_owned(), proof_recovery(context));
     }
 
-    // TLS proof stages — always run (these are the core mTLS acceptance criteria)
-    let tls_results = run_tls_proof_stages();
-    results.extend(tls_results);
+    // TLS proof stages — only in mTLS mode
+    if mtls {
+        let tls_results = run_tls_proof_stages();
+        results.extend(tls_results);
+    }
 
     results
 }
 
 /// Proof 1: Image digests and sim-config verification.
-fn proof_provenance() -> ProofResult {
+fn proof_provenance(mtls: bool) -> ProofResult {
     let mut observations = Vec::new();
     let mut success = true;
 
@@ -665,7 +730,7 @@ fn proof_provenance() -> ProofResult {
         let mut metrics_ok = false;
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster) {
+            if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster, mtls) {
                 let has_kv = metrics_text.contains("inference_pool_average_kv_cache_utilization")
                     || metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
                 let has_queue = metrics_text.contains("inference_pool_average_queue_size")
@@ -706,7 +771,7 @@ fn proof_provenance() -> ProofResult {
 
 /// Proof 2: Wait for pool-a ramp reset, confirm pool-a preferred, send
 /// attributed request through pool-a.
-fn proof_baseline(_context: &DemoContext) -> ProofResult {
+fn proof_baseline(context: &DemoContext) -> ProofResult {
     let mut observations = Vec::new();
 
     eprintln!("  Waiting for pool-a to become preferred (ramp reset)...");
@@ -726,7 +791,7 @@ fn proof_baseline(_context: &DemoContext) -> ProofResult {
             last_reconcile_trigger = Instant::now();
         }
 
-        let epp_a = scrape_epp_metrics("pool-a");
+        let epp_a = scrape_epp_metrics("pool-a", context.metrics_transport == MetricsTransport::MtlsProxy);
         let candidates = read_overlay_candidates("pool-a");
         let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
 
@@ -787,7 +852,7 @@ fn proof_baseline(_context: &DemoContext) -> ProofResult {
 
 /// Proof 3: Require pool-a rank 0 at entry, wait until pressure causes
 /// A→B flip, verify attributed request goes to pool-b.
-fn proof_pressure_and_flip(_context: &DemoContext) -> ProofResult {
+fn proof_pressure_and_flip(context: &DemoContext) -> ProofResult {
     let mut observations = Vec::new();
 
     let candidates = read_overlay_candidates("pool-a");
@@ -817,7 +882,7 @@ fn proof_pressure_and_flip(_context: &DemoContext) -> ProofResult {
             last_reconcile_trigger = Instant::now();
         }
 
-        let epp_a = scrape_epp_metrics("pool-a");
+        let epp_a = scrape_epp_metrics("pool-a", context.metrics_transport == MetricsTransport::MtlsProxy);
         let candidates = read_overlay_candidates("pool-a");
         let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
         let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
@@ -889,7 +954,7 @@ fn proof_pressure_and_flip(_context: &DemoContext) -> ProofResult {
 
 /// Proof 4: Wait for rampreset recovery, verify pool-a regains rank 0,
 /// send attributed request through pool-a.
-fn proof_recovery(_context: &DemoContext) -> ProofResult {
+fn proof_recovery(context: &DemoContext) -> ProofResult {
     let mut observations = Vec::new();
 
     eprintln!("  Waiting for pool-a ramp reset and recovery...");
@@ -909,7 +974,7 @@ fn proof_recovery(_context: &DemoContext) -> ProofResult {
             last_reconcile_trigger = Instant::now();
         }
 
-        let epp_a = scrape_epp_metrics("pool-a");
+        let epp_a = scrape_epp_metrics("pool-a", context.metrics_transport == MetricsTransport::MtlsProxy);
         let candidates = read_overlay_candidates("pool-a");
         let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
 
@@ -972,12 +1037,12 @@ struct EppMetrics {
     kv_cache: f64,
 }
 
-/// Scrape EPP metrics by exec-ing into the nginx sidecar.
+/// Scrape EPP metrics.
 ///
-/// The metrics Service requires mTLS, so demo probes access the EPP's
-/// plain HTTP port (9090) via localhost inside the pod.
-fn scrape_epp_metrics(cluster: &str) -> EppMetrics {
-    let text = kubectl_exec_epp_metrics(cluster).unwrap_or_default();
+/// In mTLS mode, execs into the nginx sidecar to access localhost:9090.
+/// In direct-HTTP mode, uses the Kubernetes API proxy to reach the Service.
+fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
+    let text = kubectl_exec_epp_metrics(cluster, mtls).unwrap_or_default();
 
     EppMetrics {
         queue_size: extract_prom_value(&text, "inference_pool_average_queue_size")
@@ -1167,34 +1232,58 @@ fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceRe
     })
 }
 
-/// Exec into the nginx sidecar to fetch EPP metrics via localhost.
-fn kubectl_exec_epp_metrics(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Fetch EPP metrics.
+///
+/// In mTLS mode, execs into the nginx sidecar to access localhost:9090.
+/// In direct-HTTP mode, uses the Kubernetes API server proxy to reach
+/// the metrics Service without requiring extra images or containers.
+fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn std::error::Error>> {
     let ctx = kind_context(cluster);
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            &ctx,
-            "-n",
-            GRID_SYSTEM_NS,
-            "exec",
-            "deploy/llmd-epp",
-            "-c",
-            "metrics-tls-proxy",
-            "--",
-            "wget",
-            "-qO-",
-            "--timeout=5",
-            "http://127.0.0.1:9090/metrics",
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "kubectl exec metrics failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
+    if mtls {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &ctx,
+                "-n",
+                GRID_SYSTEM_NS,
+                "exec",
+                "deploy/llmd-epp",
+                "-c",
+                "metrics-tls-proxy",
+                "--",
+                "wget",
+                "-qO-",
+                "--timeout=5",
+                "http://127.0.0.1:9090/metrics",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "kubectl exec metrics failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &ctx,
+                "get",
+                "--raw",
+                "/api/v1/namespaces/grid-system/services/llmd-epp-metrics:9090/proxy/metrics",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "kubectl api proxy metrics failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Run an arbitrary command via `kubectl run` in a temporary pod.
@@ -1619,22 +1708,25 @@ fn wait_for_overlay_convergence() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Uses the forge-expected tags (created by [`tag_images_for_forge`]) since
 /// the forge manifests and Helm values reference those names.
-fn load_images_into_clusters(_context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
+fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
     if image_overrides::should_skip_kind_image_loading() {
         eprintln!("  [OK] Registry image mode: skipped local Kind image loading");
         return Ok(());
     }
 
-    let forge_tags: &[&str] = &[
+    let mut tags: Vec<&str> = vec![
         "grid-operator:llmd-pool-metrics-demo",
         "grid-overlay-sync:llmd-pool-metrics-demo",
         "praxis-ai:llmd-pool-metrics-demo",
         "llm-d-epp:llmd-pool-metrics-demo",
         "llm-d-inference-sim:llmd-pool-metrics-demo",
     ];
+    if let Some(nginx) = &context.images.nginx {
+        tags.push(nginx);
+    }
     for cluster in CLUSTERS {
         let kind_name = format!("grid-llmd-pm-{cluster}");
-        for image_tag in forge_tags {
+        for image_tag in &tags {
             let status = Command::new("kind")
                 .args(["load", "docker-image", image_tag, "--name", &kind_name])
                 .status()?;
@@ -1650,14 +1742,17 @@ fn load_images_into_clusters(_context: &DemoContext) -> Result<(), Box<dyn std::
 /// Collect image tags and digests for evidence.
 fn collect_image_evidence(resolved: &ResolvedImages) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let mut images = BTreeMap::new();
-    for (role, tag) in [
+    let mut entries: Vec<(&str, &str)> = vec![
         ("operator", &resolved.operator),
         ("gateway", &resolved.gateway),
         ("epp", &resolved.epp),
         ("sim", &resolved.sim),
         ("overlay-sync", &resolved.overlay_sync),
-        ("nginx", &resolved.nginx),
-    ] {
+    ];
+    if let Some(nginx) = &resolved.nginx {
+        entries.push(("nginx", nginx));
+    }
+    for (role, tag) in entries {
         let digest = Command::new("docker")
             .args(["inspect", "--format", "{{.Id}}", tag])
             .output()
@@ -1701,13 +1796,24 @@ fn run_forge_stack(
     Ok(())
 }
 
-/// Materialize the forge config with computed candidate IDs.
+/// Materialize the forge config with computed candidate IDs and
+/// optional mTLS transformations.
 ///
 /// Injects `candidateId` properties into each cluster definition so
 /// that the provider gateway's `provider_route` filter `candidate_id`
 /// matches the `stable_id` the operator writes to the routing overlay.
 /// Both are derived from `fnv1a_hex8("{kind}/{model}/{site}/{cluster}")`.
-fn materialize_config(forge_config: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+///
+/// In mTLS mode, additionally:
+/// - Swaps EPP deployment paths to the `-mtls` variants (with nginx sidecar)
+/// - Adds the metrics TLS proxy ConfigMap manifest step
+/// - Changes the metricsEndpoint to HTTPS :9443
+/// - Adds the TLS Secret references to the InferenceProvider metricsConfig
+fn materialize_config(
+    forge_config: &Path,
+    metrics_transport: MetricsTransport,
+    nginx_image: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
     let resolved = dir.join(".forge.resolved.yaml");
     let content = fs::read_to_string(forge_config)?;
@@ -1718,11 +1824,85 @@ fn materialize_config(forge_config: &Path) -> Result<PathBuf, Box<dyn std::error
         let candidate_id = fnv1a_hex8(&format!("inference_model/{SIM_MODEL}/{cluster}/{provider_name}"));
         let anchor = format!("poolName: {cluster}");
         let replacement = format!("{anchor}\n        candidateId: \"{candidate_id}\"");
-        result = result.replacen(&anchor, &replacement, 1);
+        result = checked_replace(&result, &anchor, &replacement, 1, &format!("poolName:{cluster}"))?;
+    }
+
+    if metrics_transport == MetricsTransport::MtlsProxy {
+        let nginx_img = nginx_image.unwrap_or(DEFAULT_NGINX_IMAGE);
+
+        // Create resolved mTLS deployment manifests with injected nginx image
+        for pool in CLUSTERS {
+            let src = dir.join(format!("resources/{pool}/epp-deployment-mtls.yaml"));
+            let resolved_name = format!(".forge.resolved.{pool}-epp-deployment-mtls.yaml");
+            let dst = dir.join(&resolved_name);
+            let manifest = fs::read_to_string(&src)?;
+            let patched = checked_replace(
+                &manifest,
+                DEFAULT_NGINX_IMAGE,
+                nginx_img,
+                1,
+                &format!("{pool} nginx image"),
+            )?;
+            fs::write(&dst, patched)?;
+
+            // Point forge config to resolved manifest (instead of the template)
+            result = checked_replace(
+                &result,
+                &format!("resources/{pool}/epp-deployment.yaml"),
+                &resolved_name,
+                1,
+                &format!("{pool} deployment path"),
+            )?;
+        }
+
+        // Add metrics-tls-proxy-config manifest step after epp-rbac
+        let rbac_step = "          path: resources/common/epp-rbac.yaml";
+        let rbac_with_proxy = format!(
+            "{rbac_step}\n        - type: manifest\n          path: resources/common/metrics-tls-proxy-config.yaml"
+        );
+        result = checked_replace(&result, rbac_step, &rbac_with_proxy, 2, "epp-rbac anchor")?;
+
+        // Change metricsEndpoint from HTTP :9090 to HTTPS :9443
+        result = checked_replace(
+            &result,
+            "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090",
+            "https://llmd-epp-metrics.grid-system.svc.cluster.local:9443",
+            2,
+            "metrics endpoint",
+        )?;
+
+        // Add TLS secret references to metricsConfig
+        let signal_anchor = "                    healthy: inference_pool_ready_pods";
+        let tls_block = format!(
+            "{signal_anchor}\n\
+             \x20                 tls:\n\
+             \x20                   caSecretRef:\n\
+             \x20                     name: metrics-ca\n\
+             \x20                     namespace: grid-system\n\
+             \x20                   clientCertificateSecretRef:\n\
+             \x20                     name: metrics-client-tls\n\
+             \x20                     namespace: grid-system"
+        );
+        result = checked_replace(&result, signal_anchor, &tls_block, 2, "metrics signal anchor")?;
     }
 
     fs::write(&resolved, result)?;
     Ok(resolved)
+}
+
+/// Replace `needle` in `content`, failing if the match count differs from `expected`.
+fn checked_replace(
+    content: &str,
+    needle: &str,
+    replacement: &str,
+    expected: usize,
+    label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let found = content.matches(needle).count();
+    if found != expected {
+        return Err(format!("materialize_config: {label}: expected {expected} match(es), found {found}").into());
+    }
+    Ok(content.replacen(needle, replacement, expected))
 }
 
 /// FNV-1a 32-bit hash, formatted as 8-char lowercase hex.
@@ -3043,6 +3223,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let evidence = Evidence {
             schema_version: "1".to_owned(),
             mode: "quick".to_owned(),
+            metrics_transport: "direct-http".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 42.0,
             success: true,
@@ -3070,5 +3251,248 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         assert!(!is_leap(2023));
         assert!(is_leap(2000));
         assert!(!is_leap(1900));
+    }
+
+    #[test]
+    fn metrics_transport_labels() {
+        assert_eq!(MetricsTransport::DirectHttp.label(), "direct-http");
+        assert_eq!(MetricsTransport::MtlsProxy.label(), "mtls-proxy");
+    }
+
+    #[test]
+    fn setup_phase_count_differs_by_transport() {
+        const _: () = assert!(SETUP_PHASES_MTLS > SETUP_PHASES_DIRECT);
+        const _: () = assert!(SETUP_PHASES_MTLS - SETUP_PHASES_DIRECT == 1);
+    }
+
+    #[test]
+    fn evidence_records_direct_http_transport() {
+        let evidence = Evidence {
+            schema_version: "1".to_owned(),
+            mode: "quick".to_owned(),
+            metrics_transport: MetricsTransport::DirectHttp.label().to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            wall_secs: 10.0,
+            success: true,
+            error: None,
+            setup: SetupEvidence {
+                clusters: vec!["pool-a".to_owned()],
+                images: BTreeMap::new(),
+            },
+            proofs: BTreeMap::new(),
+            lifecycle: LifecycleRecord {
+                teardown_requested: false,
+                teardown_performed: false,
+                teardown_result: None,
+                kept_on_failure: false,
+            },
+        };
+        let json = serde_json::to_string_pretty(&evidence).unwrap();
+        assert!(json.contains("\"metrics_transport\": \"direct-http\""));
+    }
+
+    #[test]
+    fn evidence_records_mtls_proxy_transport() {
+        let evidence = Evidence {
+            schema_version: "1".to_owned(),
+            mode: "quick".to_owned(),
+            metrics_transport: MetricsTransport::MtlsProxy.label().to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            wall_secs: 10.0,
+            success: true,
+            error: None,
+            setup: SetupEvidence {
+                clusters: vec!["pool-a".to_owned()],
+                images: BTreeMap::new(),
+            },
+            proofs: BTreeMap::new(),
+            lifecycle: LifecycleRecord {
+                teardown_requested: false,
+                teardown_performed: false,
+                teardown_result: None,
+                kept_on_failure: false,
+            },
+        };
+        let json = serde_json::to_string_pretty(&evidence).unwrap();
+        assert!(json.contains("\"metrics_transport\": \"mtls-proxy\""));
+    }
+
+    /// Build a minimal forge.yaml fragment that matches the indentation
+    /// anchors used by `materialize_config`.
+    fn test_forge_config() -> String {
+        // Indentation matches the real forge.yaml exactly so that
+        // string replacements in materialize_config fire correctly.
+        "\
+      properties:
+        poolName: pool-a
+
+      properties:
+        poolName: pool-b
+
+    llmd-pool-a:
+      steps:
+        - type: manifest
+          path: resources/common/epp-rbac.yaml
+        - type: manifest
+          path: resources/pool-a/epp-deployment.yaml
+
+    llmd-pool-b:
+      steps:
+        - type: manifest
+          path: resources/common/epp-rbac.yaml
+        - type: manifest
+          path: resources/pool-b/epp-deployment.yaml
+
+                  metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
+                  signalNames:
+                    healthy: inference_pool_ready_pods
+
+                  metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
+                  signalNames:
+                    healthy: inference_pool_ready_pods
+"
+        .to_owned()
+    }
+
+    /// Stub mTLS deployment manifest containing the default nginx image.
+    fn test_mtls_manifest(pool: &str) -> String {
+        format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: llmd-epp-{pool}\n\
+             spec:\n  containers:\n    - name: epp\n      image: epp:latest\n\
+             \x20   - name: metrics-tls-proxy\n      image: \"{DEFAULT_NGINX_IMAGE}\"\n"
+        )
+    }
+
+    /// Create mTLS manifest stubs under the test directory.
+    fn write_test_mtls_manifests(dir: &Path) {
+        for pool in CLUSTERS {
+            let pool_dir = dir.join(format!("resources/{pool}"));
+            fs::create_dir_all(&pool_dir).unwrap();
+            fs::write(pool_dir.join("epp-deployment-mtls.yaml"), test_mtls_manifest(pool)).unwrap();
+        }
+    }
+
+    #[test]
+    fn materialize_direct_http_has_no_tls_config() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-direct");
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, test_forge_config()).unwrap();
+        let resolved = materialize_config(&forge_path, MetricsTransport::DirectHttp, None).unwrap();
+        let content = fs::read_to_string(&resolved).unwrap();
+
+        assert!(
+            !content.contains("epp-deployment-mtls.yaml"),
+            "direct-HTTP must not reference mTLS deployment"
+        );
+        assert!(
+            !content.contains("metrics-tls-proxy-config.yaml"),
+            "direct-HTTP must not include metrics TLS proxy config"
+        );
+        assert!(
+            content.contains("http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"),
+            "direct-HTTP must use HTTP endpoint"
+        );
+        assert!(
+            !content.contains("https://llmd-epp-metrics"),
+            "direct-HTTP must not use HTTPS endpoint"
+        );
+        assert!(
+            !content.contains("caSecretRef"),
+            "direct-HTTP must not include TLS secret references"
+        );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_mtls_has_tls_config() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-mtls");
+        drop(fs::create_dir_all(&dir));
+        write_test_mtls_manifests(&dir);
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, test_forge_config()).unwrap();
+        let resolved = materialize_config(&forge_path, MetricsTransport::MtlsProxy, None).unwrap();
+        let content = fs::read_to_string(&resolved).unwrap();
+
+        assert!(
+            content.contains("epp-deployment-mtls.yaml"),
+            "mTLS must reference mTLS deployment variant"
+        );
+        assert!(
+            content.contains("metrics-tls-proxy-config.yaml"),
+            "mTLS must include metrics TLS proxy config"
+        );
+        assert!(
+            content.contains("https://llmd-epp-metrics.grid-system.svc.cluster.local:9443"),
+            "mTLS must use HTTPS endpoint"
+        );
+        assert!(
+            !content.contains("http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"),
+            "mTLS must not use HTTP endpoint"
+        );
+        assert!(content.contains("caSecretRef"), "mTLS must include CA secret reference");
+        assert!(
+            content.contains("clientCertificateSecretRef"),
+            "mTLS must include client cert secret reference"
+        );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_mtls_injects_custom_nginx_image() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-mtls-nginx");
+        drop(fs::create_dir_all(&dir));
+        write_test_mtls_manifests(&dir);
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, test_forge_config()).unwrap();
+
+        let custom_image = "registry.example.com/nginx:custom";
+        materialize_config(&forge_path, MetricsTransport::MtlsProxy, Some(custom_image)).unwrap();
+
+        for pool in CLUSTERS {
+            let resolved_manifest =
+                fs::read_to_string(dir.join(format!(".forge.resolved.{pool}-epp-deployment-mtls.yaml"))).unwrap();
+            assert!(
+                resolved_manifest.contains(custom_image),
+                "{pool}: resolved manifest must contain the custom nginx image"
+            );
+            assert!(
+                !resolved_manifest.contains(DEFAULT_NGINX_IMAGE),
+                "{pool}: resolved manifest must not contain the default nginx image"
+            );
+        }
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_fails_on_missing_anchor() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-bad-anchor");
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, "empty config with no anchors").unwrap();
+        let result = materialize_config(&forge_path, MetricsTransport::DirectHttp, None);
+        assert!(result.is_err(), "must fail when anchors are missing");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expected 1 match(es), found 0"),
+            "error must report the mismatch: {err}"
+        );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn nginx_image_absent_in_direct_http() {
+        if std::env::var("GRID_XTASK_NGINX_IMAGE").is_ok() {
+            return;
+        }
+        let images = resolve_images(MetricsTransport::DirectHttp).unwrap();
+        assert!(images.nginx.is_none(), "direct-HTTP must not resolve nginx image");
+    }
+
+    #[test]
+    fn nginx_image_present_in_mtls() {
+        let images = resolve_images(MetricsTransport::MtlsProxy).unwrap();
+        assert!(images.nginx.is_some(), "mTLS must resolve nginx image");
+        assert_eq!(images.nginx.unwrap(), DEFAULT_NGINX_IMAGE);
     }
 }

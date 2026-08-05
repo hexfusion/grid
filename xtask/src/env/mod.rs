@@ -965,6 +965,9 @@ pub(crate) enum Action {
         /// Demo mode and lifecycle options.
         #[command(flatten)]
         options: GlbDemoOptions,
+        /// Protect EPP metrics with an nginx mTLS proxy instead of scraping directly over HTTP.
+        #[arg(long)]
+        metrics_mtls: bool,
     },
 }
 
@@ -1045,9 +1048,11 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         },
         Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
         Action::RunGridCombinedSiteDemo { forge_config, options } => combined_site_demo::run(forge_config, options),
-        Action::RunGridLlmdPoolMetricsDemo { forge_config, options } => {
-            llmd_pool_metrics_demo::run(forge_config, options)
-        },
+        Action::RunGridLlmdPoolMetricsDemo {
+            forge_config,
+            options,
+            metrics_mtls,
+        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls),
     }
 }
 
