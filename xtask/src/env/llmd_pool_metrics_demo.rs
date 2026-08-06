@@ -19,7 +19,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -99,11 +99,11 @@ const DEFAULT_GATEWAY_IMAGE: &str = "praxis-ai:glb-demo";
 /// Default operator image tag.
 const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:llmd-pool-metrics-demo";
 
-/// Default EPP image tag.
-const DEFAULT_EPP_IMAGE: &str = "llm-d-epp:llmd-pool-metrics-demo";
+/// Default EPP image reference required by this demo.
+const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0";
 
-/// Default inference-sim image tag.
-const DEFAULT_SIM_IMAGE: &str = "llm-d-inference-sim:llmd-pool-metrics-demo";
+/// Default inference-sim image reference required by this demo.
+const DEFAULT_SIM_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-sim:v0.10.2";
 
 /// Default overlay-sync sidecar image tag.
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:llmd-pool-metrics-demo";
@@ -501,8 +501,8 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
     for (role, image, env_suffix) in checks {
         let status = Command::new("docker")
             .args(["image", "inspect", image])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
         if !status.success() {
             return Err(format!(
@@ -1727,14 +1727,52 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
     for cluster in CLUSTERS {
         let kind_name = format!("grid-llmd-pm-{cluster}");
         for image_tag in &tags {
-            let status = Command::new("kind")
-                .args(["load", "docker-image", image_tag, "--name", &kind_name])
-                .status()?;
-            if !status.success() {
-                return Err(format!("Failed to load {image_tag} into {kind_name}").into());
-            }
+            load_docker_image_into_kind(image_tag, &kind_name)?;
         }
         eprintln!("  [OK] {cluster}: all images loaded");
+    }
+    Ok(())
+}
+
+/// Stream a Docker image directly into Kind's containerd image store.
+///
+/// `kind load docker-image` imports with `ctr --all-platforms`. Docker's
+/// containerd image store can retain an OCI index while only having the host
+/// platform's child content available locally, causing that import to fail on
+/// multi-platform images. Importing the Docker save stream without
+/// `--all-platforms` selects the host platform and preserves the local-image
+/// workflow without weakening registry-backed deployments.
+fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let control_plane = format!("{kind_name}-control-plane");
+    let mut save = Command::new("docker")
+        .args(["save", image])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let save_stdout = save.stdout.take().ok_or("docker save did not provide stdout")?;
+
+    let import_status = Command::new("docker")
+        .args([
+            "exec",
+            "--privileged",
+            "-i",
+            &control_plane,
+            "ctr",
+            "--namespace=k8s.io",
+            "images",
+            "import",
+            "--digests",
+            "--snapshotter=overlayfs",
+            "-",
+        ])
+        .stdin(save_stdout)
+        .status()?;
+    let save_status = save.wait()?;
+
+    if !save_status.success() {
+        return Err(format!("docker save failed for {image}").into());
+    }
+    if !import_status.success() {
+        return Err(format!("failed to import {image} into {control_plane}").into());
     }
     Ok(())
 }
