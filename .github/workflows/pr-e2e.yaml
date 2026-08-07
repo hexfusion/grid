@@ -23,6 +23,15 @@ on:
         options:
           - full
           - quick
+      demo:
+        description: Demo topology to execute
+        required: false
+        default: glb
+        type: choice
+        options:
+          - glb
+          - llm-d-pool-metrics
+          - all
 
 concurrency:
   group: grid-pr-e2e-${{ inputs.pr_number }}
@@ -141,7 +150,8 @@ jobs:
   # GLB E2E demo — five Kind clusters, SWIM mesh, mTLS, global routing
   # ============================================================================
 
-  glb-e2e:
+  demo-e2e:
+    name: PR E2E (${{ inputs.demo || 'glb' }})
     needs: resolve-pr
     runs-on: ubuntu-24.04
     permissions:
@@ -153,6 +163,7 @@ jobs:
       HEAD_SHA: ${{ needs.resolve-pr.outputs.head_sha }}
       BASE_SHA: ${{ needs.resolve-pr.outputs.base_sha }}
       MODE: ${{ inputs.mode || 'full' }}
+      DEMO: ${{ inputs.demo || 'glb' }}
     steps:
       # ----------------------------------------------------------------------
       # Checkout
@@ -525,7 +536,8 @@ jobs:
       # ----------------------------------------------------------------------
 
       - name: Run GLB demo
-        id: demo
+        id: glb
+        if: ${{ inputs.demo == 'glb' || inputs.demo == 'all' || inputs.demo == '' }}
         env:
           GRID_REPO: ${{ github.workspace }}/grid
           GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
@@ -546,8 +558,61 @@ jobs:
           echo "Gateway image:  ${GRID_XTASK_GATEWAY_IMAGE}@${GATEWAY_IMAGE_DIGEST}"
           cd "${GITHUB_WORKSPACE}/praxis-demos/demos/grid-glb-demo"
           ./run.sh "--${MODE}" --teardown --keep-on-failure \
-            --evidence-dir "${GITHUB_WORKSPACE}/evidence" \
-            2>&1 | tee "${GITHUB_WORKSPACE}/run.log"
+            --evidence-dir "${GITHUB_WORKSPACE}/evidence/glb" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/run-glb.log"
+          echo "result=success" >> "${GITHUB_OUTPUT}"
+
+      - name: Clean up GLB resources before llm-d demo
+        if: ${{ always() && inputs.demo == 'all' }}
+        run: |
+          set -euo pipefail
+          for cluster in $(kind get clusters 2>/dev/null); do
+            case "${cluster}" in
+              grid-glb-*)
+                echo "Deleting completed/failed GLB cluster before next demo: ${cluster}"
+                kind delete cluster --name "${cluster}" || true
+                ;;
+              *)
+                ;;
+            esac
+          done
+          for net in $(docker network ls --filter name=kind --format '{{.Name}}' 2>/dev/null); do
+            case "${net}" in
+              kind-grid-glb-*|grid-glb-*)
+                docker network rm "${net}" 2>/dev/null || true
+                ;;
+              *)
+                ;;
+            esac
+          done
+          rm -rf /tmp/kind-grid-glb-* 2>/dev/null || true
+
+      - name: Run llm-d pool metrics demo
+        id: llmd
+        if: ${{ always() && (inputs.demo == 'llm-d-pool-metrics' || inputs.demo == 'all') }}
+        env:
+          GRID_REPO: ${{ github.workspace }}/grid
+          GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
+          GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
+          GRID_XTASK_EPP_IMAGE: ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0
+          GRID_XTASK_SIM_IMAGE: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+          GRID_XTASK_OVERLAY_SYNC_IMAGE: ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.2
+          GRID_XTASK_IMAGE_PULL_POLICY: IfNotPresent
+        run: |
+          set -euo pipefail
+          GRID_ACTUAL=$(git -C "${GRID_REPO}" rev-parse HEAD)
+          if [[ "${GRID_ACTUAL}" != "${MERGE_SHA}" ]]; then
+            echo "::error::Grid checkout changed before llm-d demo: expected ${MERGE_SHA}, got ${GRID_ACTUAL}"
+            exit 1
+          fi
+          echo "::notice::llm-d demo will build xtask/forge from PR merge ${GRID_ACTUAL}"
+          echo "EPP image:      ${GRID_XTASK_EPP_IMAGE}"
+          echo "Simulator:      ${GRID_XTASK_SIM_IMAGE}"
+          echo "Overlay sync:   ${GRID_XTASK_OVERLAY_SYNC_IMAGE}"
+          cd "${GITHUB_WORKSPACE}/praxis-demos/demos/grid-llmd-pool-metrics"
+          ./run.sh "--${MODE}" --teardown --keep-on-failure \
+            --evidence-dir "${GITHUB_WORKSPACE}/evidence/llm-d-pool-metrics" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/run-llm-d-pool-metrics.log"
           echo "result=success" >> "${GITHUB_OUTPUT}"
 
       # ----------------------------------------------------------------------
@@ -636,23 +701,26 @@ jobs:
           docker ps -a > "${DIAG}/docker-containers.txt" 2>&1 || true
           echo "::endgroup::"
 
-          # Forge-generated configuration (strip private keys)
-          DEMO_DIR="${GITHUB_WORKSPACE}/praxis-demos/demos/grid-glb-demo"
-          if [[ -d "${DEMO_DIR}/.forge" ]]; then
-            cp -r "${DEMO_DIR}/.forge" "${DIAG}/forge-output" 2>/dev/null || true
-            find "${DIAG}/forge-output" \
+          # Forge-generated configuration and evidence from either selected
+          # demo. Keep each demo's output separate when running all demos.
+          for demo_dir_name in grid-glb-demo grid-llmd-pool-metrics; do
+            DEMO_DIR="${GITHUB_WORKSPACE}/praxis-demos/demos/${demo_dir_name}"
+            [[ -d "${DEMO_DIR}/.forge" ]] || continue
+            SAFE_NAME="${demo_dir_name#grid-}"
+            FORGE_OUT="${DIAG}/forge-output-${SAFE_NAME}"
+            cp -r "${DEMO_DIR}/.forge" "${FORGE_OUT}" 2>/dev/null || true
+            find "${FORGE_OUT}" \
               \( -name "*.key" -o -name "*.pem" -o -name "*.crt" \
                  -o -name "*.cer" -o -name "*.p12" -o -name "*.pfx" \
                  -o -name "*.jks" -o -name "*secret*" \
                  -o -name "*credential*" -o -name "*token*" \) \
               -type f -exec rm -f {} + 2>/dev/null || true
-          fi
 
-          # Forge evidence (results.json, scorecards, narration)
-          if [[ -d "${DEMO_DIR}/.forge/evidence" ]]; then
-            cp -r "${DEMO_DIR}/.forge/evidence" \
-              "${GITHUB_WORKSPACE}/evidence/forge-default" 2>/dev/null || true
-          fi
+            if [[ -d "${DEMO_DIR}/.forge/evidence" ]]; then
+              cp -r "${DEMO_DIR}/.forge/evidence" \
+                "${GITHUB_WORKSPACE}/evidence/forge-${SAFE_NAME}" 2>/dev/null || true
+            fi
+          done
 
           echo "Diagnostics collection complete"
 
@@ -687,11 +755,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: grid-pr-${{ env.PR_NUMBER }}-${{ steps.tags.outputs.short_sha || 'unknown' }}-glb-${{ env.MODE }}
+          name: grid-pr-${{ env.PR_NUMBER }}-${{ steps.tags.outputs.short_sha || 'unknown' }}-${{ env.DEMO }}-${{ env.MODE }}
           path: |
             ${{ github.workspace }}/evidence/
             ${{ github.workspace }}/diagnostics/
-            ${{ github.workspace }}/run.log
+            ${{ github.workspace }}/run-glb.log
+            ${{ github.workspace }}/run-llm-d-pool-metrics.log
             ${{ github.workspace }}/image-manifest.txt
             ${{ github.workspace }}/pr-metadata.json
             ${{ github.workspace }}/versions.txt
@@ -712,7 +781,7 @@ jobs:
 
           for cluster in $(kind get clusters 2>/dev/null); do
             case "${cluster}" in
-              grid-glb-*)
+              grid-glb-*|grid-llmd-pm-*)
                 echo "Deleting cluster: ${cluster}"
                 if ! kind delete cluster --name "${cluster}"; then
                   echo "::warning::Failed to delete Kind cluster '${cluster}'"
@@ -727,13 +796,14 @@ jobs:
 
           for net in $(docker network ls --filter name=kind --format '{{.Name}}' 2>/dev/null); do
             case "${net}" in
-              kind-grid-glb-*|grid-glb-*)
+              kind-grid-glb-*|grid-glb-*|kind-grid-llmd-pm-*|grid-llmd-pm-*)
                 docker network rm "${net}" 2>/dev/null || true
                 ;;
             esac
           done
 
           rm -rf /tmp/kind-grid-glb-* 2>/dev/null || true
+          rm -rf /tmp/kind-grid-llmd-pm-* 2>/dev/null || true
 
           echo "result=${CLEANUP_RESULT}" >> "${GITHUB_OUTPUT}"
           echo "Cleanup: ${CLEANUP_RESULT}"
@@ -749,7 +819,9 @@ jobs:
           SHORT_SHA: ${{ steps.tags.outputs.short_sha || 'unknown' }}
           DEMOS_SHA: ${{ steps.demos.outputs.sha || 'unknown' }}
           DEMOS_REF: main
-          DEMO_RESULT: ${{ steps.demo.outputs.result || 'failure' }}
+          DEMO: ${{ env.DEMO }}
+          GLB_RESULT: ${{ steps.glb.outputs.result || 'skipped' }}
+          LLMD_RESULT: ${{ steps.llmd.outputs.result || 'skipped' }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest || 'unknown' }}
           PR_TITLE: ${{ needs.resolve-pr.outputs.title }}
@@ -758,7 +830,7 @@ jobs:
           PR_DRAFT: ${{ needs.resolve-pr.outputs.draft }}
         run: |
           cat >> "${GITHUB_STEP_SUMMARY}" <<SUMMARY
-          ## PR E2E: GLB Demo
+          ## PR E2E: Selected Demo(s)
 
           | Field | Value |
           |-------|-------|
@@ -773,8 +845,10 @@ jobs:
           | **Grid source verification** | PR merge verified; not base/main |
           | **Demos ref** | \`${DEMOS_REF}\` |
           | **Demos SHA** | \`${DEMOS_SHA}\` |
+          | **Demo selection** | \`${DEMO}\` |
           | **Mode** | \`${MODE}\` |
-          | **GLB result** | ${DEMO_RESULT} |
+          | **GLB result** | ${GLB_RESULT} |
+          | **llm-d pool metrics result** | ${LLMD_RESULT} |
           | **Cleanup** | ${CLEANUP_RESULT} |
 
           ### Images
@@ -787,5 +861,5 @@ jobs:
 
           ### Artifact
 
-          \`grid-pr-${PR_NUMBER}-${SHORT_SHA}-glb-${MODE}\`
+          \`grid-pr-${PR_NUMBER}-${SHORT_SHA}-${DEMO}-${MODE}\`
           SUMMARY
