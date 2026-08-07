@@ -1,8 +1,8 @@
 //! llm-d pool-metrics routing demo orchestration.
 //!
 //! Deploys two Kind clusters, each running an llm-d EPP backed by two
-//! `inference-sim` replicas. Grid scrapes EPP pool-level metrics and
-//! adjusts routing when load pressure changes one pool's state.
+//! vllm-vcr inference backends. Grid scrapes EPP pool-level metrics and
+//! adjusts routing when controlled HTTP load changes one pool's state.
 #![expect(
     clippy::string_slice,
     clippy::too_many_lines,
@@ -46,7 +46,7 @@ const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 /// Provider gateway TLS secret name.
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
-/// Provider credential secret name (simulators accept any bearer token).
+/// Provider credential secret name (VCR backends accept any bearer token).
 const SIM_INFERENCE_CREDENTIAL: &str = "sim-inference-credential";
 
 /// Overlay ConfigMap name created by the Grid operator for consumer gateways.
@@ -64,8 +64,8 @@ const SETUP_PHASES_MTLS: usize = 11;
 /// Number of setup phases in direct-HTTP mode (no metrics TLS secrets phase).
 const SETUP_PHASES_DIRECT: usize = 10;
 
-/// Primary model name served by inference simulators.
-const SIM_MODEL: &str = "llmd-sim-model";
+/// Primary model name served by vllm-vcr inference backends.
+const VCR_MODEL: &str = "Qwen/Qwen3-0.6B";
 
 /// Data-plane convergence timeout for overlay propagation.
 const DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
@@ -73,8 +73,8 @@ const DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
 /// Retry interval for convergence probes.
 const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Configured queue capacity (matches sim-config max-waiting-queue-length).
-const QUEUE_CAPACITY: f64 = 16.0;
+/// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
+const QUEUE_CAPACITY: f64 = 4.0;
 
 /// Scoring weight for queue_depth signal (must match ScoringWeights default).
 const QUEUE_DEPTH_WEIGHT: f64 = 3.0;
@@ -83,7 +83,20 @@ const QUEUE_DEPTH_WEIGHT: f64 = 3.0;
 const KV_CACHE_WEIGHT: f64 = 2.0;
 
 /// Minimum score gap required before capturing the pressure scorecard.
-const MIN_PRESSURE_SCORE_GAP: f64 = 1.0;
+///
+/// With real VCR backends, pressure creates modest score differences
+/// (queue=2 → gap ≈ 0.03) unlike deterministic fake-metrics ramps.
+const MIN_PRESSURE_SCORE_GAP: f64 = 0.01;
+
+/// Pressure generator Deployment name.
+const PRESSURE_GENERATOR_DEPLOYMENT: &str = "pressure-generator";
+
+/// Number of pressure generator replicas during the pressure phase.
+///
+/// With 4 workers per pod, 6 replicas = 24 concurrent requests. This
+/// reliably pushes pool-a queue past 3.5/4, triggering the rank flip
+/// even when pool-b's SWIM-propagated overlay scores are stale.
+const PRESSURE_REPLICAS: u32 = 6;
 
 /// GridNetwork resource name.
 const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
@@ -102,8 +115,8 @@ const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:llmd-pool-metrics-demo";
 /// Default EPP image reference required by this demo.
 const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0";
 
-/// Default inference-sim image reference required by this demo.
-const DEFAULT_SIM_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-sim:v0.10.2";
+/// Default vllm-vcr image reference required by this demo.
+const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 
 /// Default overlay-sync sidecar image tag.
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:llmd-pool-metrics-demo";
@@ -169,8 +182,8 @@ struct ResolvedImages {
     operator: String,
     /// llm-d EPP image.
     epp: String,
-    /// llm-d inference-sim image.
-    sim: String,
+    /// vllm-vcr inference backend image.
+    vcr: String,
     /// Grid overlay-sync sidecar image.
     overlay_sync: String,
     /// nginx image for metrics TLS reverse proxy sidecar (mTLS mode only).
@@ -284,6 +297,20 @@ struct InferenceResponse {
     provider_gateway: String,
     /// Demo attribution from `x-ai-demo-provider-gateway`.
     demo_attribution: String,
+}
+
+/// Aggregated request counts from pressure generator pods.
+struct PressureStats {
+    /// Total requests sent.
+    total: u64,
+    /// Successful (HTTP 200) requests.
+    ok: u64,
+    /// Failed requests.
+    fail: u64,
+    /// Requests attributed to pool-a.
+    a_reqs: u64,
+    /// Requests attributed to pool-b.
+    b_reqs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +479,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
     let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned());
     let epp = std::env::var("GRID_XTASK_EPP_IMAGE").unwrap_or_else(|_| DEFAULT_EPP_IMAGE.to_owned());
-    let sim = std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| DEFAULT_SIM_IMAGE.to_owned());
+    let vcr = std::env::var("GRID_XTASK_VCR_IMAGE").unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned());
     let overlay_sync =
         std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned());
     let nginx = (metrics_transport == MetricsTransport::MtlsProxy)
@@ -462,7 +489,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
     eprintln!("    gateway:      {gateway}");
     eprintln!("    operator:     {operator}");
     eprintln!("    epp:          {epp}");
-    eprintln!("    sim:          {sim}");
+    eprintln!("    vcr:          {vcr}");
     eprintln!("    overlay-sync: {overlay_sync}");
     if let Some(n) = &nginx {
         eprintln!("    nginx:        {n}");
@@ -472,7 +499,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
         gateway,
         operator,
         epp,
-        sim,
+        vcr,
         overlay_sync,
         nginx,
     })
@@ -492,7 +519,7 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
         ("gateway", &images.gateway, "GATEWAY"),
         ("operator", &images.operator, "OPERATOR"),
         ("epp", &images.epp, "EPP"),
-        ("sim", &images.sim, "SIM"),
+        ("vcr", &images.vcr, "VCR"),
         ("overlay-sync", &images.overlay_sync, "OVERLAY_SYNC"),
     ];
     if let Some(nginx) = &images.nginx {
@@ -527,7 +554,7 @@ fn tag_images_for_forge(images: &ResolvedImages) -> Result<(), Box<dyn std::erro
         (&images.gateway, "praxis-ai:llmd-pool-metrics-demo"),
         (&images.operator, "grid-operator:llmd-pool-metrics-demo"),
         (&images.epp, "llm-d-epp:llmd-pool-metrics-demo"),
-        (&images.sim, "llm-d-inference-sim:llmd-pool-metrics-demo"),
+        (&images.vcr, "vllm-vcr:llmd-pool-metrics-demo"),
         (&images.overlay_sync, "grid-overlay-sync:llmd-pool-metrics-demo"),
     ];
     for (source, target) in forge_expected {
@@ -637,11 +664,11 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 
     // Phase 7/8: Deploy llm-d simulators and EPP
     eprintln!();
-    eprintln!("[SETUP {}/{}] Deploying llm-d simulators and EPP", next(), total);
+    eprintln!("[SETUP {}/{}] Deploying vllm-vcr backends and EPP", next(), total);
     for cluster in CLUSTERS {
         let llmd_stack = format!("llmd-{cluster}");
         run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, &llmd_stack)?;
-        eprintln!("  [OK] {cluster}: sim-1, sim-2, and EPP running");
+        eprintln!("  [OK] {cluster}: vcr-1, vcr-2, and EPP running");
     }
 
     // Phase 8/9: Install provider trust and credentials
@@ -704,11 +731,16 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     results.insert("baseline".to_owned(), proof_baseline(context));
 
     if mode == DemoMode::Full {
-        // Proof 3: Pressure and flip — poll until score crossover
-        results.insert("pressure_and_flip".to_owned(), proof_pressure_and_flip(context));
+        let table_start = Instant::now();
 
-        // Proof 4: Recovery — poll until ramp resets
-        results.insert("recovery".to_owned(), proof_recovery(context));
+        // Proof 3: Pressure via consumer gateway — live table with attribution
+        results.insert(
+            "pressure_and_flip".to_owned(),
+            proof_pressure_and_flip(context, table_start),
+        );
+
+        // Proof 4: Recovery — measured queue drain with live table
+        results.insert("recovery".to_owned(), proof_recovery(context, table_start));
     }
 
     // TLS proof stages — only in mTLS mode
@@ -750,31 +782,35 @@ fn proof_provenance(mtls: bool) -> ProofResult {
             success = false;
         }
 
-        // Verify sim-config ConfigMap
-        match kubectl::get_configmap_yaml(&ctx, GRID_SYSTEM_NS, "sim-config") {
-            Ok(yaml) => {
-                let has_fake = yaml.contains("fake-metrics");
-                observations.push(format!("{cluster}: sim-config has fake-metrics={has_fake}"));
+        // Verify VCR deployment MODEL env var
+        match kubectl_get_deployment_env(&ctx, "sim-1", "MODEL") {
+            Ok(val) if val == VCR_MODEL => {
+                observations.push(format!("{cluster}: VCR MODEL={val}"));
+            },
+            Ok(val) => {
+                observations.push(format!("{cluster}: VCR MODEL={val} (expected {VCR_MODEL})"));
+                success = false;
             },
             Err(e) => {
-                observations.push(format!("{cluster}: sim-config missing: {e}"));
+                observations.push(format!("{cluster}: cannot read VCR env: {e}"));
             },
         }
     }
 
     ProofResult {
         success,
-        description: "Provenance: EPP metrics live, sim-config verified".to_owned(),
+        description: "Provenance: EPP metrics live, VCR model verified".to_owned(),
         observations,
     }
 }
 
-/// Proof 2: Wait for pool-a ramp reset, confirm pool-a preferred, send
-/// attributed request through pool-a.
+/// Proof 2: Confirm pool-a preferred at idle, send attributed request
+/// through pool-a.
 fn proof_baseline(context: &DemoContext) -> ProofResult {
     let mut observations = Vec::new();
 
-    eprintln!("  Waiting for pool-a to become preferred (ramp reset)...");
+    eprintln!();
+    eprintln!("  [BASELINE] Waiting for pool-a to become preferred at idle");
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
     let mut last_request = Instant::now() - Duration::from_secs(10);
@@ -797,13 +833,24 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
 
         if rank_a == 0 && epp_a.queue_size < 3.0 && last_request.elapsed() >= Duration::from_secs(5) {
             last_request = Instant::now();
+            eprintln!(
+                "  [BASELINE] Pool A is preferred (rank=0, queue={:.1}); sending verification traffic",
+                epp_a.queue_size
+            );
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, SIM_MODEL) {
+            match send_inference_request(&probe_ctx, VCR_MODEL) {
                 Ok(resp) => {
                     if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
                         let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
                         let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
-                        print_scorecard("BASELINE", &[&row_a, &row_b], "CLUSTER A", &candidates);
+                        eprintln!("  [BASELINE] Request attributed to pool-a -- baseline confirmed");
+                        print_scorecard_with_cause(
+                            "BASELINE",
+                            &[&row_a, &row_b],
+                            "CLUSTER A",
+                            &candidates,
+                            "Both pools idle. Pool A outscores Pool B on locality (local=3.0 vs remote=1.5).",
+                        );
                         observations.push(format!(
                             "pool-a: queue={:.2} kv={:.2} score={:.2} rank=0",
                             row_a.queue, row_a.kv_cache, row_a.score
@@ -818,23 +865,22 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
                         ));
                         return ProofResult {
                             success: true,
-                            description: "Baseline: pool-a preferred after ramp reset, pool-a attribution confirmed"
-                                .to_owned(),
+                            description: "Baseline: pool-a preferred at idle, pool-a attribution confirmed".to_owned(),
                             observations,
                         };
                     }
                     eprintln!(
-                        "  data plane converging (overlay=pool-a rank 0, routing={})",
+                        "  [BASELINE] Data plane converging (overlay=pool-a rank 0, but routing to {})",
                         resp.provider_gateway
                     );
                 },
                 Err(e) => {
-                    eprintln!("  inference probe retrying: {e}");
+                    eprintln!("  [BASELINE] Inference probe retrying: {e}");
                 },
             }
         } else if rank_a != 0 {
             eprintln!(
-                "  pool-a: queue={:.1} rank={} (waiting for ramp reset)",
+                "  [BASELINE] pool-a: queue={:.1} rank={} (waiting for idle convergence)",
                 epp_a.queue_size, rank_a
             );
         }
@@ -845,16 +891,16 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
     observations.push("pool-a did not reach rank 0 with confirmed routing within timeout".to_owned());
     ProofResult {
         success: false,
-        description: "Baseline: pool-a preferred after ramp reset, pool-a attribution confirmed".to_owned(),
+        description: "Baseline: pool-a preferred at idle, pool-a attribution confirmed".to_owned(),
         observations,
     }
 }
 
-/// Proof 3: Require pool-a rank 0 at entry, wait until pressure causes
-/// A→B flip, verify attributed request goes to pool-b.
-fn proof_pressure_and_flip(context: &DemoContext) -> ProofResult {
+/// Proof 3: Scale up pressure through the consumer gateway, wait for
+/// A→B flip with live metrics table and attribution tracking.
+fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> ProofResult {
     let mut observations = Vec::new();
-
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
     let candidates = read_overlay_candidates("pool-a");
     let initial_rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
     if initial_rank_a != 0 {
@@ -869,10 +915,35 @@ fn proof_pressure_and_flip(context: &DemoContext) -> ProofResult {
     }
     observations.push("precondition: pool-a rank=0 at entry".to_owned());
 
-    eprintln!("  Polling for pool-a pressure and A\u{2192}B routing flip...");
+    eprintln!();
+    eprintln!("  [PRESSURE] Starting pressure generator through the consumer gateway");
+    eprintln!("    replicas:    {PRESSURE_REPLICAS}");
+    eprintln!("    workers:     4 per replica (total {})", PRESSURE_REPLICAS * 4);
+    eprintln!("    gateway:     consumer-gateway.grid-system:8080");
+    eprintln!("    model:       {VCR_MODEL}");
+    eprintln!("    max_tokens:  64");
+    if let Err(e) = scale_pressure_generator("pool-a", PRESSURE_REPLICAS) {
+        observations.push(format!("pressure generator scale-up failed: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Pressure & flip: pressure generator failed to start".to_owned(),
+            observations,
+        };
+    }
+    observations.push(format!(
+        "pressure generator scaled to {PRESSURE_REPLICAS} replicas (gateway-routed)"
+    ));
+
+    eprintln!();
+    eprintln!("  Live Metrics Table");
+    eprintln!("    Queue/KV/Score/Rank: derived from the Grid overlay (production scoring engine)");
+    eprintln!("    A_REQ/B_REQ:        cumulative gateway attribution counts from pressure pods");
+    eprintln!("    LAST_ROUTE:         most recent confirmed request destination");
+    print_live_table_header();
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
-    let mut last_request = Instant::now() - Duration::from_secs(10);
+    let mut last_route = String::from("-");
+    let mut pressure_announced = false;
 
     while Instant::now() < deadline {
         if last_reconcile_trigger.elapsed() > Duration::from_secs(5) {
@@ -882,85 +953,139 @@ fn proof_pressure_and_flip(context: &DemoContext) -> ProofResult {
             last_reconcile_trigger = Instant::now();
         }
 
-        let epp_a = scrape_epp_metrics("pool-a", context.metrics_transport == MetricsTransport::MtlsProxy);
+        let epp_a = scrape_epp_metrics("pool-a", mtls);
         let candidates = read_overlay_candidates("pool-a");
         let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
         let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
+        let stats = read_pressure_stats("pool-a");
         let score_gap = row_b.score - row_a.score;
 
-        if row_b.rank == 0
-            && row_a.rank > 0
-            && score_gap >= MIN_PRESSURE_SCORE_GAP
-            && last_request.elapsed() >= Duration::from_secs(5)
-        {
-            last_request = Instant::now();
-            let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, SIM_MODEL) {
-                Ok(resp) => {
-                    if resp.provider_gateway.contains("pool-b") && resp.demo_attribution.contains("pool-b") {
-                        print_scorecard(
-                            "CLUSTER A CAPACITY PRESSURE",
-                            &[&row_a, &row_b],
-                            "CLUSTER B",
-                            &candidates,
-                        );
-                        observations.push(format!(
-                            "flip: pool-b rank=0 score={:.2}, pool-a rank={} score={:.2} (gap={:.2})",
-                            row_b.score, row_a.rank, row_a.score, score_gap
-                        ));
-                        observations.push(format!(
-                            "pool-a: queue={:.1}/{:.0} kv={:.2}",
-                            row_a.queue, row_a.capacity, row_a.kv_cache
-                        ));
-                        observations.push(format!(
-                            "attribution: gateway={} provider={}",
-                            resp.provider_gateway, resp.demo_attribution
-                        ));
-                        observations.push("Grid rerouted: preference changed A\u{2192}B by score".to_owned());
-                        return ProofResult {
-                            success: true,
-                            description:
-                                "Controlled simulated telemetry drove A\u{2192}B routing change via production scoring"
-                                    .to_owned(),
-                            observations,
-                        };
-                    }
-                    eprintln!(
-                        "  data plane converging (overlay=pool-b rank 0, routing={})",
-                        resp.provider_gateway
-                    );
-                },
-                Err(e) => {
-                    eprintln!("  inference probe retrying: {e}");
-                },
-            }
-        } else if epp_a.queue_size > 2.0 {
+        let phase = if row_b.rank == 0 && row_a.rank > 0 {
+            "FAILOVER"
+        } else if epp_a.queue_size > 1.0 {
+            "PRESSURE"
+        } else {
+            "BASELINE"
+        };
+
+        if !pressure_announced && epp_a.queue_size > 1.0 {
+            pressure_announced = true;
             eprintln!(
-                "  pool-a: queue={:.1} kv={:.2} score={:.2} rank={}  pool-b: score={:.2} rank={} gap={:.2}",
-                epp_a.queue_size, epp_a.kv_cache, row_a.score, row_a.rank, row_b.score, row_b.rank, score_gap
+                "  [PRESSURE] Pool A queue/KV pressure is increasing (queue={:.1})",
+                epp_a.queue_size
             );
         }
 
-        std::thread::sleep(DATA_PLANE_INTERVAL);
+        print_live_table_row(&LiveTableRow {
+            elapsed: table_start.elapsed(),
+            phase,
+            rows: (&row_a, &row_b),
+            stats: &stats,
+            last_route: &last_route,
+        });
+
+        if row_b.rank == 0 && row_a.rank > 0 && score_gap >= MIN_PRESSURE_SCORE_GAP {
+            eprintln!(
+                "  [SCORING] Pool A score={:.2} rank={}; Pool B score={:.2} rank={} (gap={:.2})",
+                row_a.score, row_a.rank, row_b.score, row_b.rank, score_gap
+            );
+            eprintln!("  [FAILOVER] Pool B is now preferred; sending verification request");
+            let probe_ctx = kind_context("pool-a");
+            if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
+                last_route = if resp.provider_gateway.contains("pool-b") {
+                    "pool-b".to_owned()
+                } else {
+                    "pool-a".to_owned()
+                };
+                if resp.provider_gateway.contains("pool-b") && resp.demo_attribution.contains("pool-b") {
+                    eprintln!("  [TRAFFIC SHIFT] Request attributed to pool-b");
+                    eprintln!(
+                        "    load stats: total={} ok={} fail={} | a={} b={}",
+                        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
+                    );
+                    print_scorecard_with_cause(
+                        "FAILOVER",
+                        &[&row_a, &row_b],
+                        "CLUSTER B",
+                        &candidates,
+                        "Pool A pressure lowered its queue/KV scores, so Pool B became rank 0.",
+                    );
+                    observations.push(format!(
+                        "flip: pool-b rank=0 score={:.2}, pool-a rank={} score={:.2} (gap={:.2})",
+                        row_b.score, row_a.rank, row_a.score, score_gap
+                    ));
+                    observations.push(format!(
+                        "pool-a: queue={:.1}/{:.0} kv={:.2}",
+                        row_a.queue, row_a.capacity, row_a.kv_cache
+                    ));
+                    observations.push(format!(
+                        "attribution: gateway={} provider={}",
+                        resp.provider_gateway, resp.demo_attribution
+                    ));
+                    observations.push(format!(
+                        "load stats: total={} ok={} fail={} a={} b={}",
+                        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
+                    ));
+                    observations
+                        .push("Grid rerouted: gateway-routed load caused A\u{2192}B preference change".to_owned());
+                    return ProofResult {
+                        success: true,
+                        description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift"
+                            .to_owned(),
+                        observations,
+                    };
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_secs(2));
     }
 
+    let stats = read_pressure_stats("pool-a");
+    observations.push(format!(
+        "final load stats: total={} ok={} fail={} a={} b={}",
+        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
+    ));
     observations.push("A\u{2192}B flip did not converge in data plane within timeout".to_owned());
     ProofResult {
         success: false,
-        description: "Controlled simulated telemetry drove A\u{2192}B routing change via production scoring".to_owned(),
+        description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift".to_owned(),
         observations,
     }
 }
 
-/// Proof 4: Wait for rampreset recovery, verify pool-a regains rank 0,
-/// send attributed request through pool-a.
-fn proof_recovery(context: &DemoContext) -> ProofResult {
+/// Proof 4: Stop pressure, wait for measured queue drain and rank
+/// recovery, verify pool-a attribution returns via the live table.
+fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
     let mut observations = Vec::new();
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
-    eprintln!("  Waiting for pool-a ramp reset and recovery...");
+    let final_stats = read_pressure_stats("pool-a");
+    eprintln!();
+    eprintln!("  [RECOVERY] Stopping pressure generator");
+    eprintln!(
+        "    final load: total={} ok={} fail={} | pool-a={} pool-b={}",
+        final_stats.total, final_stats.ok, final_stats.fail, final_stats.a_reqs, final_stats.b_reqs
+    );
+    if let Err(e) = scale_pressure_generator("pool-a", 0) {
+        observations.push(format!("pressure generator scale-down failed: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Recovery: pressure generator failed to stop".to_owned(),
+            observations,
+        };
+    }
+    observations.push("pressure generator scaled to 0 replicas".to_owned());
+    observations.push(format!(
+        "final load stats: total={} ok={} fail={} a={} b={}",
+        final_stats.total, final_stats.ok, final_stats.fail, final_stats.a_reqs, final_stats.b_reqs
+    ));
+
+    eprintln!("  [RECOVERY] Pressure stopped; waiting for Pool A to drain and regain rank 0");
+
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
-    let mut last_request = Instant::now() - Duration::from_secs(10);
+    let mut last_route = String::from("-");
 
     for cluster in CLUSTERS {
         trigger_gridnetwork_reconcile(cluster);
@@ -974,43 +1099,55 @@ fn proof_recovery(context: &DemoContext) -> ProofResult {
             last_reconcile_trigger = Instant::now();
         }
 
-        let epp_a = scrape_epp_metrics("pool-a", context.metrics_transport == MetricsTransport::MtlsProxy);
+        let epp_a = scrape_epp_metrics("pool-a", mtls);
         let candidates = read_overlay_candidates("pool-a");
-        let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
+        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
+        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
 
-        if rank_a == 0 && epp_a.queue_size < 3.0 && last_request.elapsed() >= Duration::from_secs(5) {
-            last_request = Instant::now();
+        print_live_table_row(&LiveTableRow {
+            elapsed: table_start.elapsed(),
+            phase: "RECOVERY",
+            rows: (&row_a, &row_b),
+            stats: &final_stats,
+            last_route: &last_route,
+        });
+
+        if row_a.rank == 0 && epp_a.queue_size < 3.0 {
+            eprintln!(
+                "  [RECOVERY] Pool A queue drained (queue={:.1}); sending verification request",
+                epp_a.queue_size
+            );
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, SIM_MODEL) {
-                Ok(resp) => {
-                    if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
-                        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
-                        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
-                        print_scorecard("RECOVERED", &[&row_a, &row_b], "CLUSTER A", &candidates);
-                        observations.push(format!(
-                            "recovery: pool-a queue={:.2} kv={:.2} score={:.2} rank=0",
-                            row_a.queue, row_a.kv_cache, row_a.score
-                        ));
-                        observations.push(format!(
-                            "attribution: gateway={} provider={}",
-                            resp.provider_gateway, resp.demo_attribution
-                        ));
-                        observations.push("pool-a recovered to rank 0, pool-a attribution confirmed".to_owned());
-                        return ProofResult {
-                            success: true,
-                            description: "Recovery: ramp reset restores pool-a to preferred, attribution confirmed"
-                                .to_owned(),
-                            observations,
-                        };
-                    }
-                    eprintln!(
-                        "  data plane converging (overlay=pool-a rank 0, routing={})",
-                        resp.provider_gateway
+            if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
+                last_route = if resp.provider_gateway.contains("pool-a") {
+                    "pool-a".to_owned()
+                } else {
+                    "pool-b".to_owned()
+                };
+                if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
+                    eprintln!("  [RECOVERED] Pool A is preferred again; request attributed to pool-a");
+                    print_scorecard_with_cause(
+                        "RECOVERED",
+                        &[&row_a, &row_b],
+                        "CLUSTER A",
+                        &candidates,
+                        "Pressure stopped; Pool A drained and regained rank 0.",
                     );
-                },
-                Err(e) => {
-                    eprintln!("  inference probe retrying: {e}");
-                },
+                    observations.push(format!(
+                        "recovery: pool-a queue={:.2} kv={:.2} score={:.2} rank=0",
+                        row_a.queue, row_a.kv_cache, row_a.score
+                    ));
+                    observations.push(format!(
+                        "attribution: gateway={} provider={}",
+                        resp.provider_gateway, resp.demo_attribution
+                    ));
+                    observations.push("pool-a recovered to rank 0, pool-a attribution confirmed".to_owned());
+                    return ProofResult {
+                        success: true,
+                        description: "Recovery: measured queue drain restores pool-a, attribution confirmed".to_owned(),
+                        observations,
+                    };
+                }
             }
         }
 
@@ -1020,9 +1157,135 @@ fn proof_recovery(context: &DemoContext) -> ProofResult {
     observations.push("pool-a did not recover with confirmed routing within timeout".to_owned());
     ProofResult {
         success: false,
-        description: "Recovery: ramp reset restores pool-a to preferred, attribution confirmed".to_owned(),
+        description: "Recovery: measured queue drain restores pool-a, attribution confirmed".to_owned(),
         observations,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pressure generator
+// ---------------------------------------------------------------------------
+
+/// Scale the pressure-generator Deployment on a cluster.
+fn scale_pressure_generator(cluster: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "scale",
+            &format!("deployment/{PRESSURE_GENERATOR_DEPLOYMENT}"),
+            &format!("--replicas={replicas}"),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("failed to scale {PRESSURE_GENERATOR_DEPLOYMENT} to {replicas}").into());
+    }
+    if replicas > 0 {
+        let wait = Command::new("kubectl")
+            .args([
+                "--context",
+                &ctx,
+                "-n",
+                GRID_SYSTEM_NS,
+                "rollout",
+                "status",
+                &format!("deployment/{PRESSURE_GENERATOR_DEPLOYMENT}"),
+                "--timeout=60s",
+            ])
+            .status()?;
+        if !wait.success() {
+            return Err("pressure generator pods did not become ready".into());
+        }
+    }
+    eprintln!("  [OK] {cluster}: pressure-generator scaled to {replicas}");
+    Ok(())
+}
+
+/// Read aggregated pressure stats from all pressure generator pods.
+///
+/// Each pod prints `STATS total ok fail a b` lines to stdout every 2s.
+/// This reads the last line from each pod and sums the counts.
+fn read_pressure_stats(cluster: &str) -> PressureStats {
+    let ctx = kind_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "logs",
+            "-l",
+            &format!("app={PRESSURE_GENERATOR_DEPLOYMENT}"),
+            "--tail=1",
+        ])
+        .output();
+    let mut stats = PressureStats {
+        total: 0,
+        ok: 0,
+        fail: 0,
+        a_reqs: 0,
+        b_reqs: 0,
+    };
+    let Ok(out) = output else {
+        return stats;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("STATS ") {
+            let mut parts = rest.split_whitespace();
+            let t = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let o = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let f = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let a = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let b = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            stats.total += t;
+            stats.ok += o;
+            stats.fail += f;
+            stats.a_reqs += a;
+            stats.b_reqs += b;
+        }
+    }
+    stats
+}
+
+// ---------------------------------------------------------------------------
+// VCR config helpers
+// ---------------------------------------------------------------------------
+
+/// Read a specific environment variable from a Deployment's first container.
+fn kubectl_get_deployment_env(
+    context: &str,
+    deployment: &str,
+    env_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let jsonpath = format!("{{.spec.template.spec.containers[0].env[?(@.name==\"{env_name}\")].value}}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            &format!("deployment/{deployment}"),
+            "-o",
+            &format!("jsonpath={jsonpath}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "deployment/{deployment} env {env_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let val = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if val.is_empty() {
+        return Err(format!("deployment/{deployment} env {env_name} is empty").into());
+    }
+    Ok(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,8 +1296,6 @@ fn proof_recovery(context: &DemoContext) -> ProofResult {
 struct EppMetrics {
     /// Average queue size (raw, unnormalized).
     queue_size: f64,
-    /// Average KV cache utilization (0.0 - 1.0).
-    kv_cache: f64,
 }
 
 /// Scrape EPP metrics.
@@ -1047,9 +1308,6 @@ fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
     EppMetrics {
         queue_size: extract_prom_value(&text, "inference_pool_average_queue_size")
             .or_else(|| extract_prom_value(&text, "llm_d_router_epp_average_queue_size"))
-            .unwrap_or(0.0),
-        kv_cache: extract_prom_value(&text, "inference_pool_average_kv_cache_utilization")
-            .or_else(|| extract_prom_value(&text, "llm_d_router_epp_average_kv_cache_utilization"))
             .unwrap_or(0.0),
     }
 }
@@ -1153,8 +1411,14 @@ fn build_scorecard_row(label: &str, candidates: &[OverlayCandidate], cluster_suf
     }
 }
 
-/// Print a narrated CLI scorecard.
-fn print_scorecard(state: &str, rows: &[&ScorecardRow], preferred: &str, candidates: &[OverlayCandidate]) {
+/// Print a narrated CLI scorecard with scoring breakdown and a causal explanation.
+fn print_scorecard_with_cause(
+    state: &str,
+    rows: &[&ScorecardRow],
+    preferred: &str,
+    candidates: &[OverlayCandidate],
+    cause: &str,
+) {
     eprintln!();
     eprintln!("  LLM-D POOL ROUTING DECISION");
     eprintln!("  State: {state}");
@@ -1170,25 +1434,89 @@ fn print_scorecard(state: &str, rows: &[&ScorecardRow], preferred: &str, candida
         );
     }
 
-    // Print score breakdowns from production scoring engine
+    eprintln!();
+    eprintln!(
+        "  {:>14} {:>8} {:>5} {:>5} {:>6} {:>7} {:>5}  {:>5}",
+        "Signal", "Locality", "Queue", "KV", "Prefix", "Latency", "Cost", "Total"
+    );
     for oc in candidates {
         if let Some(bd) = &oc.breakdown {
+            let label = if oc.cluster.contains("pool-a") {
+                "Cluster A"
+            } else {
+                "Cluster B"
+            };
             eprintln!(
-                "  Score breakdown ({cluster}): locality={loc:.2} queue={q:.2} kv={kv:.2} prefix={p:.2} latency={lat:.2} cost={c:.2}",
-                cluster = oc.cluster,
-                loc = bd.locality,
-                q = bd.queue_depth,
-                kv = bd.kv_cache,
-                p = bd.prefix_cache,
-                lat = bd.latency,
-                c = bd.cost,
+                "  {:>14} {:>8.2} {:>5.2} {:>5.2} {:>6.2} {:>7.2} {:>5.2}  {:>5.2}",
+                label, bd.locality, bd.queue_depth, bd.kv_cache, bd.prefix_cache, bd.latency, bd.cost, bd.total,
             );
         }
     }
 
     eprintln!();
     eprintln!("  Grid preference: {preferred}");
+    if !cause.is_empty() {
+        eprintln!("  Reason: {cause}");
+    }
     eprintln!();
+}
+
+/// Print the live metrics table header.
+fn print_live_table_header() {
+    eprintln!();
+    eprintln!(
+        "  {:<6} {:<11} {:>7} {:>5} {:>7} {:>6}  {:>7} {:>5} {:>7} {:>6}  {:>5} {:>5} {:>10}",
+        "TIME",
+        "PHASE",
+        "A_QUEUE",
+        "A_KV",
+        "A_SCORE",
+        "A_RANK",
+        "B_QUEUE",
+        "B_KV",
+        "B_SCORE",
+        "B_RANK",
+        "A_REQ",
+        "B_REQ",
+        "LAST_ROUTE"
+    );
+}
+
+/// Snapshot of live table data for one row.
+struct LiveTableRow<'a> {
+    /// Elapsed time since the table started.
+    elapsed: Duration,
+    /// Current phase label.
+    phase: &'a str,
+    /// Scorecard rows for pool-a and pool-b.
+    rows: (&'a ScorecardRow, &'a ScorecardRow),
+    /// Pressure generator attribution stats.
+    stats: &'a PressureStats,
+    /// Last probe request attribution.
+    last_route: &'a str,
+}
+
+/// Print one row of the live metrics table.
+fn print_live_table_row(row: &LiveTableRow<'_>) {
+    let secs = row.elapsed.as_secs();
+    let time_str = format!("{:02}:{:02}", secs / 60, secs % 60);
+    let (a, b) = row.rows;
+    eprintln!(
+        "  {:<6} {:<11} {:>7.1} {:>.2} {:>7.2} {:>6}  {:>7.1} {:>.2} {:>7.2} {:>6}  {:>5} {:>5} {:>10}",
+        time_str,
+        row.phase,
+        a.queue,
+        a.kv_cache,
+        a.score,
+        a.rank,
+        b.queue,
+        b.kv_cache,
+        b.score,
+        b.rank,
+        row.stats.a_reqs,
+        row.stats.b_reqs,
+        row.last_route,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,7 +2047,7 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
         "grid-overlay-sync:llmd-pool-metrics-demo",
         "praxis-ai:llmd-pool-metrics-demo",
         "llm-d-epp:llmd-pool-metrics-demo",
-        "llm-d-inference-sim:llmd-pool-metrics-demo",
+        "vllm-vcr:llmd-pool-metrics-demo",
     ];
     if let Some(nginx) = &context.images.nginx {
         tags.push(nginx);
@@ -1784,7 +2112,7 @@ fn collect_image_evidence(resolved: &ResolvedImages) -> Result<BTreeMap<String, 
         ("operator", &resolved.operator),
         ("gateway", &resolved.gateway),
         ("epp", &resolved.epp),
-        ("sim", &resolved.sim),
+        ("vcr", &resolved.vcr),
         ("overlay-sync", &resolved.overlay_sync),
     ];
     if let Some(nginx) = &resolved.nginx {
@@ -1859,7 +2187,7 @@ fn materialize_config(
     let mut result = content.clone();
     for cluster in CLUSTERS {
         let provider_name = format!("llmd-{cluster}-provider");
-        let candidate_id = fnv1a_hex8(&format!("inference_model/{SIM_MODEL}/{cluster}/{provider_name}"));
+        let candidate_id = fnv1a_hex8(&format!("inference_model/{VCR_MODEL}/{cluster}/{provider_name}"));
         let anchor = format!("poolName: {cluster}");
         let replacement = format!("{anchor}\n        candidateId: \"{candidate_id}\"");
         result = checked_replace(&result, &anchor, &replacement, 1, &format!("poolName:{cluster}"))?;
@@ -3174,7 +3502,7 @@ fn proof_tls_routing() -> ProofResult {
 
     // Send an inference request and verify attribution
     let probe_ctx = kind_context("pool-a");
-    match send_inference_request(&probe_ctx, SIM_MODEL) {
+    match send_inference_request(&probe_ctx, VCR_MODEL) {
         Ok(resp) => {
             observations.push(format!(
                 "routing attribution: gateway={} provider={}",
