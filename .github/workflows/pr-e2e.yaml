@@ -1,0 +1,791 @@
+name: PR E2E
+
+# ------------------------------------------------------------------------------
+# Maintainer-triggered E2E validation of a Grid pull request.
+#
+# Runs the GLB demo against the PR's merge commit to verify multi-cluster
+# routing, SWIM discovery, mTLS, overlay hot-reload, and provider selection
+# work end-to-end before merge.
+# ------------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Grid pull-request number to test
+        required: true
+        type: string
+      mode:
+        description: Demo execution mode
+        required: false
+        default: full
+        type: choice
+        options:
+          - full
+          - quick
+
+concurrency:
+  group: grid-pr-e2e-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.96.0"
+  KIND_VERSION: v0.32.0
+  KUBECTL_VERSION: v1.32.3
+  # The gateway image MUST be pinned by digest for reproducible evidence.
+  # To obtain the digest for a new tag:
+  #   docker pull ghcr.io/praxis-proxy/grid-ai-rollup:<tag>
+  #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/praxis-proxy/grid-ai-rollup:<tag>
+  GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.1
+  GATEWAY_IMAGE_DIGEST: sha256:95132eb39c0f568b5361a250002979c5063db427ff0fb63b59a93146fcb7ad31
+
+jobs:
+  # ============================================================================
+  # Resolve and validate the pull request
+  # ============================================================================
+
+  resolve-pr:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      title: ${{ steps.pr.outputs.title }}
+      url: ${{ steps.pr.outputs.url }}
+      author: ${{ steps.pr.outputs.author }}
+      draft: ${{ steps.pr.outputs.draft }}
+      head_repo: ${{ steps.pr.outputs.head_repo }}
+      head_branch: ${{ steps.pr.outputs.head_branch }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      base_sha: ${{ steps.pr.outputs.base_sha }}
+    steps:
+      - name: Validate PR number
+        env:
+          PR_NUM: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${PR_NUM}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pr_number must be a positive decimal integer, got: '${PR_NUM}'"
+            exit 1
+          fi
+
+      - name: Query PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          PR_JSON=""
+          PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUM}" 2>&1) || {
+            echo "::error::Failed to fetch PR #${PR_NUM} — does the PR exist?"
+            echo "::error::API response: ${PR_JSON}"
+            exit 1
+          }
+
+          STATE=$(echo "${PR_JSON}" | jq -r '.state')
+          if [[ "${STATE}" != "open" ]]; then
+            echo "::error::PR #${PR_NUM} is '${STATE}', expected 'open'"
+            exit 1
+          fi
+
+          BASE_BRANCH=$(echo "${PR_JSON}" | jq -r '.base.ref')
+          if [[ "${BASE_BRANCH}" != "main" ]]; then
+            echo "::error::PR #${PR_NUM} targets '${BASE_BRANCH}', expected 'main'"
+            exit 1
+          fi
+
+          TITLE=$(echo "${PR_JSON}" | jq -r '.title' | head -c 200 | tr -d '\n\r')
+          {
+            echo "pr_number=${PR_NUM}"
+            echo "title=${TITLE}"
+            echo "url=$(echo "${PR_JSON}" | jq -r '.html_url')"
+            echo "author=$(echo "${PR_JSON}" | jq -r '.user.login')"
+            echo "draft=$(echo "${PR_JSON}" | jq -r '.draft')"
+            echo "head_repo=$(echo "${PR_JSON}" | jq -r '.head.repo.full_name')"
+            echo "head_branch=$(echo "${PR_JSON}" | jq -r '.head.ref')"
+            echo "head_sha=$(echo "${PR_JSON}" | jq -r '.head.sha')"
+            echo "base_sha=$(echo "${PR_JSON}" | jq -r '.base.sha')"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "${PR_JSON}" | jq '{
+            number: .number,
+            title: .title,
+            html_url: .html_url,
+            state: .state,
+            draft: .draft,
+            author: .user.login,
+            head_repo: .head.repo.full_name,
+            head_branch: .head.ref,
+            head_sha: .head.sha,
+            base_branch: .base.ref,
+            base_sha: .base.sha
+          }' > pr-metadata.json
+
+          echo "::group::PR metadata"
+          cat pr-metadata.json
+          echo "::endgroup::"
+
+      - name: Upload PR metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-metadata
+          path: pr-metadata.json
+          retention-days: 14
+
+  # ============================================================================
+  # GLB E2E demo — five Kind clusters, SWIM mesh, mTLS, global routing
+  # ============================================================================
+
+  glb-e2e:
+    needs: resolve-pr
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 120
+    env:
+      PR_NUMBER: ${{ needs.resolve-pr.outputs.pr_number }}
+      HEAD_SHA: ${{ needs.resolve-pr.outputs.head_sha }}
+      BASE_SHA: ${{ needs.resolve-pr.outputs.base_sha }}
+      MODE: ${{ inputs.mode || 'full' }}
+    steps:
+      # ----------------------------------------------------------------------
+      # Checkout
+      # ----------------------------------------------------------------------
+
+      - name: Checkout Grid at merge SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.resolve-pr.outputs.base_sha }}
+          path: grid
+          # Full history is required so Git can find the common ancestor
+          # between the exact base commit and the PR head before merging.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create verified local PR merge
+        id: merge
+        env:
+          PR_NUM: ${{ needs.resolve-pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_WORKSPACE}/grid"
+
+          # Do not use refs/pull/N/merge here. GitHub can retain a stale
+          # synthetic merge ref after main advances. Fetch the exact current
+          # PR head and create the merge locally from the API's base SHA.
+          git -C "${REPO}" fetch --no-tags origin \
+            "refs/pull/${PR_NUM}/head:refs/remotes/origin/pr-${PR_NUM}-head"
+          FETCHED_HEAD=$(git -C "${REPO}" rev-parse "refs/remotes/origin/pr-${PR_NUM}-head")
+          if [[ "${FETCHED_HEAD}" != "${HEAD_SHA}" ]]; then
+            echo "::error::PR head changed during checkout"
+            echo "::error::Expected ${HEAD_SHA}, fetched ${FETCHED_HEAD}"
+            exit 1
+          fi
+
+          git -C "${REPO}" config user.name "github-actions[bot]"
+          git -C "${REPO}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git -C "${REPO}" merge --no-ff --no-commit "refs/remotes/origin/pr-${PR_NUM}-head"; then
+            git -C "${REPO}" merge --abort || true
+            echo "::error::PR head cannot be merged cleanly with the current base"
+            exit 1
+          fi
+          git -C "${REPO}" commit -m "Merge PR #${PR_NUM} for E2E validation"
+
+          MERGE_SHA=$(git -C "${REPO}" rev-parse HEAD)
+          PARENT_COUNT=$(git -C "${REPO}" rev-list --parents -n 1 HEAD | awk '{print NF - 1}')
+          ACTUAL_BASE=$(git -C "${REPO}" rev-parse HEAD^1)
+          ACTUAL_HEAD=$(git -C "${REPO}" rev-parse HEAD^2)
+          if [[ "${PARENT_COUNT}" -ne 2 || "${ACTUAL_BASE}" != "${BASE_SHA}" || "${ACTUAL_HEAD}" != "${HEAD_SHA}" ]]; then
+            echo "::error::Local merge parents do not match the resolved PR base/head"
+            echo "::error::Expected parents: ${BASE_SHA} ${HEAD_SHA}"
+            echo "::error::Actual parents:   ${ACTUAL_BASE} ${ACTUAL_HEAD}"
+            exit 1
+          fi
+
+          echo "merge_sha=${MERGE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "MERGE_SHA=${MERGE_SHA}" >> "${GITHUB_ENV}"
+          echo "Created local synthetic merge ${MERGE_SHA} from ${BASE_SHA} + ${HEAD_SHA}"
+
+      - name: Verify PR merge checkout
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_WORKSPACE}/grid"
+          ACTUAL=$(git -C "${REPO}" rev-parse HEAD)
+          PARENT_COUNT=$(git -C "${REPO}" rev-list --parents -n 1 HEAD | awk '{print NF - 1}')
+          ACTUAL_BASE=$(git -C "${REPO}" rev-parse HEAD^1)
+          ACTUAL_HEAD=$(git -C "${REPO}" rev-parse HEAD^2)
+
+          echo "::group::Verified Grid source checkout"
+          echo "Repository:       ${{ github.repository }}"
+          echo "Requested PR:     #${PR_NUMBER}"
+          echo "PR head branch:   ${{ needs.resolve-pr.outputs.head_repo }}:${{ needs.resolve-pr.outputs.head_branch }}"
+          echo "Expected PR head: ${HEAD_SHA}"
+          echo "Expected base:    ${BASE_SHA}"
+          echo "Expected local merge: ${MERGE_SHA}"
+          echo "Checked-out HEAD: ${ACTUAL}"
+          echo "Merge parent 1:   ${ACTUAL_BASE} (base)"
+          echo "Merge parent 2:   ${ACTUAL_HEAD} (PR head)"
+          git -C "${REPO}" status --short --branch
+          git -C "${REPO}" log -1 --format='Commit: %H%nParents: %P%nSubject: %s'
+          echo "::endgroup::"
+
+          if [[ "${ACTUAL}" != "${MERGE_SHA}" ]]; then
+            echo "::error::Merge SHA changed after local merge creation"
+            echo "::error::Expected ${MERGE_SHA}, got ${ACTUAL}"
+            echo "::error::The checkout was modified unexpectedly"
+            exit 1
+          fi
+          if [[ "${PARENT_COUNT}" -ne 2 ]]; then
+            echo "::error::Expected a two-parent PR merge commit, found ${PARENT_COUNT} parent(s)"
+            exit 1
+          fi
+          if [[ "${ACTUAL_BASE}" != "${BASE_SHA}" || "${ACTUAL_HEAD}" != "${HEAD_SHA}" ]]; then
+            echo "::error::Checked-out merge does not combine the expected base and PR head"
+            echo "::error::Expected parents: ${BASE_SHA} ${HEAD_SHA}"
+            echo "::error::Actual parents:   ${ACTUAL_BASE} ${ACTUAL_HEAD}"
+            exit 1
+          fi
+          if [[ "${ACTUAL}" == "${BASE_SHA}" || "${ACTUAL}" == "${HEAD_SHA}" ]]; then
+            echo "::error::Checked-out commit is not the synthetic PR merge commit"
+            exit 1
+          fi
+          echo "::notice::PASS: testing PR #${PR_NUMBER} local merge ${MERGE_SHA}, containing PR head ${HEAD_SHA}; this is not main/base ${BASE_SHA}"
+
+      - name: Checkout demos
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: praxis-proxy/demos
+          ref: main
+          path: praxis-demos
+          persist-credentials: false
+
+      - name: Record demos SHA
+        id: demos
+        run: |
+          DEMOS_SHA=$(git -C "${GITHUB_WORKSPACE}/praxis-demos" rev-parse HEAD)
+          echo "sha=${DEMOS_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Demos repo SHA: ${DEMOS_SHA}"
+
+      - name: Validate immutable gateway input
+        run: |
+          set -euo pipefail
+          if ! [[ "${GATEWAY_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::gateway_image_digest must be a sha256 digest (sha256 followed by 64 lowercase hex characters)"
+            exit 1
+          fi
+          echo "Gateway input: ${GATEWAY_IMAGE_REF}@${GATEWAY_IMAGE_DIGEST}"
+
+      # ----------------------------------------------------------------------
+      # Toolchain
+      # ----------------------------------------------------------------------
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-rust-${{ env.RUST_VERSION }}-pr-e2e-${{ hashFiles('grid/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.RUST_VERSION }}-pr-e2e-
+          save-always: true
+
+      - name: Install Kind
+        run: |
+          curl -fsSL -o /tmp/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind" | sha256sum -c
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          rm /tmp/kind
+          kind version
+
+      - name: Install kubectl
+        run: |
+          curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -fsSL -o /tmp/kubectl.sha256 \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          rm /tmp/kubectl /tmp/kubectl.sha256
+          kubectl version --client
+
+      - name: Verify system tools
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          openssl version
+          curl --version | head -1
+          jq --version
+
+      - name: Record tool versions
+        run: |
+          {
+            echo "rust=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "docker=$(docker version --format '{{.Server.Version}}')"
+            echo "kind=$(kind version)"
+            echo "kubectl=$(kubectl version --client -o json | jq -r '.clientVersion.gitVersion')"
+            echo "openssl=$(openssl version)"
+            echo "curl=$(curl --version | head -1)"
+            echo "jq=$(jq --version)"
+            echo "os=$(uname -sr)"
+            echo "runner=${{ runner.os }}-${{ runner.arch }}"
+          } | tee "${GITHUB_WORKSPACE}/versions.txt"
+
+      # ----------------------------------------------------------------------
+      # Free disk space for five Kind clusters
+      # ----------------------------------------------------------------------
+
+      - name: Free disk space
+        run: |
+          echo "=== Before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/local/graalvm /usr/local/share/chromium \
+            /usr/local/.ghcup 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "=== After cleanup ==="
+          df -h /
+
+      # ----------------------------------------------------------------------
+      # Build images from the submitted PR merge commit
+      # ----------------------------------------------------------------------
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          SHORT_SHA="${MERGE_SHA:0:7}"
+          TAG="pr-${PR_NUMBER}-${SHORT_SHA}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Image tag: ${TAG}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build Grid Operator image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: grid
+          file: grid/deploy/operator/Containerfile
+          push: false
+          load: true
+          tags: grid-operator:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ steps.merge.outputs.merge_sha }}
+          cache-from: type=gha,scope=pr-e2e-operator
+          cache-to: type=gha,mode=max,scope=pr-e2e-operator
+
+      - name: Build Grid mock-providers image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: grid
+          file: grid/mock-providers/Containerfile
+          push: false
+          load: true
+          tags: grid-mock-providers:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ steps.merge.outputs.merge_sha }}
+          cache-from: type=gha,scope=pr-e2e-mock-providers
+          cache-to: type=gha,mode=max,scope=pr-e2e-mock-providers
+
+      - name: Pull pinned gateway image
+        id: gateway
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Prefer anonymous pull; fall back to authenticated if the image is private.
+          PINNED_GATEWAY="${GATEWAY_IMAGE_REF}@${GATEWAY_IMAGE_DIGEST}"
+          if ! docker pull "${PINNED_GATEWAY}" 2>/dev/null; then
+            echo "Anonymous pull failed — attempting authenticated pull"
+            echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker pull "${PINNED_GATEWAY}"
+            docker logout ghcr.io
+          fi
+          docker tag "${PINNED_GATEWAY}" "${GATEWAY_IMAGE_REF}"
+
+          # Capture the resolved digest for reproducibility.
+          RESOLVED_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${GATEWAY_IMAGE_REF}" \
+            | grep -oP 'sha256:[0-9a-f]+')
+          echo "digest=${RESOLVED_DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved gateway digest: ${RESOLVED_DIGEST}"
+
+          # Verify the pulled image matches the pinned digest.
+          if [[ "${RESOLVED_DIGEST}" != "${GATEWAY_IMAGE_DIGEST}" ]]; then
+            echo "::error::Gateway image digest mismatch"
+            echo "::error::Expected: ${GATEWAY_IMAGE_DIGEST}"
+            echo "::error::Actual:   ${RESOLVED_DIGEST}"
+            exit 1
+          fi
+          echo "Digest verification: PASS"
+
+      # ----------------------------------------------------------------------
+      # Image verification
+      # ----------------------------------------------------------------------
+
+      - name: Verify locally built PR images
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+        run: |
+          set -euo pipefail
+          FAILED=0
+
+          for img in "grid-operator:${TAG}" "grid-mock-providers:${TAG}"; do
+            if ! docker image inspect "${img}" > /dev/null 2>&1; then
+              echo "::error::Required locally-built image missing: ${img}"
+              FAILED=1
+              continue
+            fi
+            IMAGE_REVISION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "${img}")
+            echo "${img}: revision label ${IMAGE_REVISION}"
+            if [[ "${IMAGE_REVISION}" != "${MERGE_SHA}" ]]; then
+              echo "::error::${img} was not built from verified PR merge ${MERGE_SHA}"
+              FAILED=1
+            fi
+          done
+
+          if ! docker image inspect "${GATEWAY_IMAGE_REF}" > /dev/null 2>&1; then
+            echo "::error::Pinned gateway image missing: ${GATEWAY_IMAGE_REF}"
+            FAILED=1
+          fi
+
+          for img_var in GRID_XTASK_OPERATOR_IMAGE GRID_XTASK_MOCK_PROVIDER_IMAGE; do
+            img_val="grid-operator:${TAG}"
+            if [[ "${img_var}" == "GRID_XTASK_MOCK_PROVIDER_IMAGE" ]]; then
+              img_val="grid-mock-providers:${TAG}"
+            fi
+            if [[ "${img_val}" =~ ^ghcr\.io/ ]] || [[ "${img_val}" =~ :v[0-9] ]] || [[ "${img_val}" =~ :latest$ ]]; then
+              echo "::error::${img_var}=${img_val} appears to be a released image, not a locally-built PR image"
+              FAILED=1
+            fi
+          done
+
+          if [[ "${FAILED}" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "All required images verified"
+
+      - name: Write image manifest
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "=== Image Manifest ==="
+            echo ""
+            echo "grid-operator:${TAG}"
+            docker inspect --format='  ID: {{.Id}}' "grid-operator:${TAG}"
+            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-operator:${TAG}"
+            echo ""
+            echo "grid-mock-providers:${TAG}"
+            docker inspect --format='  ID: {{.Id}}' "grid-mock-providers:${TAG}"
+            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-mock-providers:${TAG}"
+            echo ""
+            echo "${GATEWAY_IMAGE_REF}  (pinned gateway — not built by Grid)"
+            docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
+            echo "  Digest: ${RESOLVED_DIGEST}"
+            echo ""
+            echo "=== Override Environment ==="
+            echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
+            echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
+            echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
+            echo "GRID_XTASK_IMAGE_PULL_POLICY=Never"
+          } | tee "${GITHUB_WORKSPACE}/image-manifest.txt"
+
+      # ----------------------------------------------------------------------
+      # Prepare workspace
+      # ----------------------------------------------------------------------
+
+      - name: Download PR metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pr-metadata
+          path: ${{ github.workspace }}
+
+      - name: Create evidence and diagnostics directories
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/evidence" "${GITHUB_WORKSPACE}/diagnostics"
+
+      # ----------------------------------------------------------------------
+      # Run GLB E2E demo
+      # ----------------------------------------------------------------------
+
+      - name: Run GLB demo
+        id: demo
+        env:
+          GRID_REPO: ${{ github.workspace }}/grid
+          GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
+          GRID_XTASK_MOCK_PROVIDER_IMAGE: grid-mock-providers:${{ steps.tags.outputs.tag }}
+          GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
+          GRID_XTASK_IMAGE_PULL_POLICY: Never
+        run: |
+          set -euo pipefail
+          GRID_ACTUAL=$(git -C "${GRID_REPO}" rev-parse HEAD)
+          if [[ "${GRID_ACTUAL}" != "${MERGE_SHA}" ]]; then
+            echo "::error::Grid checkout changed before demo: expected ${MERGE_SHA}, got ${GRID_ACTUAL}"
+            exit 1
+          fi
+          echo "::notice::Demo will build xtask/forge from PR merge ${GRID_ACTUAL}, not main/base ${BASE_SHA}"
+          echo "Grid source:    ${GRID_REPO}"
+          echo "Operator image: ${GRID_XTASK_OPERATOR_IMAGE} (revision ${MERGE_SHA})"
+          echo "Mock image:     ${GRID_XTASK_MOCK_PROVIDER_IMAGE} (revision ${MERGE_SHA})"
+          echo "Gateway image:  ${GRID_XTASK_GATEWAY_IMAGE}@${GATEWAY_IMAGE_DIGEST}"
+          cd "${GITHUB_WORKSPACE}/praxis-demos/demos/grid-glb-demo"
+          ./run.sh "--${MODE}" --teardown --keep-on-failure \
+            --evidence-dir "${GITHUB_WORKSPACE}/evidence" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/run.log"
+          echo "result=success" >> "${GITHUB_OUTPUT}"
+
+      # ----------------------------------------------------------------------
+      # Diagnostics (always, even on failure)
+      # ----------------------------------------------------------------------
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          DIAG="${GITHUB_WORKSPACE}/diagnostics"
+          mkdir -p "${DIAG}" "${GITHUB_WORKSPACE}/evidence"
+
+          echo "::group::Kind clusters"
+          kind get clusters > "${DIAG}/kind-clusters.txt" 2>&1 || echo "(none)" > "${DIAG}/kind-clusters.txt"
+          cat "${DIAG}/kind-clusters.txt"
+          echo "::endgroup::"
+
+          for cluster in $(kind get clusters 2>/dev/null); do
+            CTX="kind-${cluster}"
+            CDIR="${DIAG}/${cluster}"
+            mkdir -p "${CDIR}/logs"
+
+            echo "::group::Diagnostics: ${cluster}"
+
+            kubectl --context "${CTX}" get nodes -o wide \
+              > "${CDIR}/nodes.txt" 2>&1 || true
+
+            kubectl --context "${CTX}" get pods -A -o wide \
+              > "${CDIR}/pods.txt" 2>&1 || true
+
+            kubectl --context "${CTX}" get deployments -A -o wide \
+              > "${CDIR}/deployments.txt" 2>&1 || true
+
+            kubectl --context "${CTX}" get statefulsets -A -o wide \
+              > "${CDIR}/statefulsets.txt" 2>&1 || true
+
+            kubectl --context "${CTX}" get daemonsets -A -o wide \
+              > "${CDIR}/daemonsets.txt" 2>&1 || true
+
+            kubectl --context "${CTX}" get services -A -o wide \
+              > "${CDIR}/services.txt" 2>&1 || true
+
+            kubectl --context "${CTX}" get events -A --sort-by='.lastTimestamp' \
+              > "${CDIR}/events.txt" 2>&1 || true
+
+            kubectl --context "${CTX}" get configmaps -A \
+              > "${CDIR}/configmaps.txt" 2>&1 || true
+
+            # Grid CRDs
+            for crd in gridnetworks gridsites inferenceproviders; do
+              kubectl --context "${CTX}" get "${crd}" -A -o yaml \
+                > "${CDIR}/${crd}.yaml" 2>&1 || true
+            done
+
+            # Pod logs from all namespaces (GLB gateway, provider, operator,
+            # metallb, and system pods are spread across several namespaces).
+            for ns in $(kubectl --context "${CTX}" get namespaces \
+              -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              mkdir -p "${CDIR}/logs/${ns}"
+              for pod in $(kubectl --context "${CTX}" get pods -n "${ns}" \
+                -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl --context "${CTX}" logs -n "${ns}" "${pod}" \
+                  --all-containers --tail=2000 \
+                  > "${CDIR}/logs/${ns}/${pod}.log" 2>&1 || true
+              done
+            done
+
+            # Cluster info dump (sanitized)
+            kubectl --context "${CTX}" cluster-info dump \
+              --output-directory="${CDIR}/cluster-info" 2>&1 || true
+            if [[ -d "${CDIR}/cluster-info" ]]; then
+              find "${CDIR}/cluster-info" \
+                \( -name "*.key" -o -name "*.pem" -o -name "*.crt" \
+                   -o -name "*.cer" -o -name "*.p12" -o -name "*.pfx" \
+                   -o -name "*.jks" -o -name "*secret*" \
+                   -o -name "*credential*" -o -name "*token*" \) \
+                -type f -exec rm -f {} + 2>/dev/null || true
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo "::group::Docker state"
+          docker images > "${DIAG}/docker-images.txt" 2>&1 || true
+          docker ps -a > "${DIAG}/docker-containers.txt" 2>&1 || true
+          echo "::endgroup::"
+
+          # Forge-generated configuration (strip private keys)
+          DEMO_DIR="${GITHUB_WORKSPACE}/praxis-demos/demos/grid-glb-demo"
+          if [[ -d "${DEMO_DIR}/.forge" ]]; then
+            cp -r "${DEMO_DIR}/.forge" "${DIAG}/forge-output" 2>/dev/null || true
+            find "${DIAG}/forge-output" \
+              \( -name "*.key" -o -name "*.pem" -o -name "*.crt" \
+                 -o -name "*.cer" -o -name "*.p12" -o -name "*.pfx" \
+                 -o -name "*.jks" -o -name "*secret*" \
+                 -o -name "*credential*" -o -name "*token*" \) \
+              -type f -exec rm -f {} + 2>/dev/null || true
+          fi
+
+          # Forge evidence (results.json, scorecards, narration)
+          if [[ -d "${DEMO_DIR}/.forge/evidence" ]]; then
+            cp -r "${DEMO_DIR}/.forge/evidence" \
+              "${GITHUB_WORKSPACE}/evidence/forge-default" 2>/dev/null || true
+          fi
+
+          echo "Diagnostics collection complete"
+
+      - name: Remove sensitive diagnostic content
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # File-name filtering above does not catch PEM or credential material
+          # embedded in logs, YAML, JSON, or ConfigMap output. Remove any file
+          # containing recognizable private keys, certificates, or bearer tokens
+          # before the artifact upload. Do not print matching content.
+          for root in "${GITHUB_WORKSPACE}/diagnostics" "${GITHUB_WORKSPACE}/evidence"; do
+            [[ -d "${root}" ]] || continue
+            while IFS= read -r -d '' file; do
+              if grep -aEq -- \
+                '-----BEGIN ([A-Z0-9 ]+ )?(PRIVATE KEY|CERTIFICATE)-----|Authorization:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}|(client[_-]?secret|private[_-]?key|access[_-]?token)[[:space:]]*:[[:space:]]*[^[:space:]}]{16,}' \
+                "${file}"; then
+                echo "::warning::Removing sensitive diagnostic file: ${file#"${GITHUB_WORKSPACE}"/}"
+                rm -f -- "${file}"
+              fi
+            done < <(find "${root}" -type f -print0)
+          done
+
+          echo "Sensitive diagnostic content scan complete"
+
+      # ----------------------------------------------------------------------
+      # Artifact upload
+      # ----------------------------------------------------------------------
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: grid-pr-${{ env.PR_NUMBER }}-${{ steps.tags.outputs.short_sha || 'unknown' }}-glb-${{ env.MODE }}
+          path: |
+            ${{ github.workspace }}/evidence/
+            ${{ github.workspace }}/diagnostics/
+            ${{ github.workspace }}/run.log
+            ${{ github.workspace }}/image-manifest.txt
+            ${{ github.workspace }}/pr-metadata.json
+            ${{ github.workspace }}/versions.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      # ----------------------------------------------------------------------
+      # Cleanup
+      # ----------------------------------------------------------------------
+
+      - name: Delete Kind clusters
+        id: cleanup
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          CLEANUP_RESULT="success"
+
+          for cluster in $(kind get clusters 2>/dev/null); do
+            case "${cluster}" in
+              grid-glb-*)
+                echo "Deleting cluster: ${cluster}"
+                if ! kind delete cluster --name "${cluster}"; then
+                  echo "::warning::Failed to delete Kind cluster '${cluster}'"
+                  CLEANUP_RESULT="partial"
+                fi
+                ;;
+              *)
+                echo "Skipping non-GLB cluster: ${cluster}"
+                ;;
+            esac
+          done
+
+          for net in $(docker network ls --filter name=kind --format '{{.Name}}' 2>/dev/null); do
+            case "${net}" in
+              kind-grid-glb-*|grid-glb-*)
+                docker network rm "${net}" 2>/dev/null || true
+                ;;
+            esac
+          done
+
+          rm -rf /tmp/kind-grid-glb-* 2>/dev/null || true
+
+          echo "result=${CLEANUP_RESULT}" >> "${GITHUB_OUTPUT}"
+          echo "Cleanup: ${CLEANUP_RESULT}"
+
+      # ----------------------------------------------------------------------
+      # Job summary
+      # ----------------------------------------------------------------------
+
+      - name: Write job summary
+        if: always()
+        env:
+          TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
+          SHORT_SHA: ${{ steps.tags.outputs.short_sha || 'unknown' }}
+          DEMOS_SHA: ${{ steps.demos.outputs.sha || 'unknown' }}
+          DEMOS_REF: main
+          DEMO_RESULT: ${{ steps.demo.outputs.result || 'failure' }}
+          CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
+          RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest || 'unknown' }}
+          PR_TITLE: ${{ needs.resolve-pr.outputs.title }}
+          PR_URL: ${{ needs.resolve-pr.outputs.url }}
+          PR_AUTHOR: ${{ needs.resolve-pr.outputs.author }}
+          PR_DRAFT: ${{ needs.resolve-pr.outputs.draft }}
+        run: |
+          cat >> "${GITHUB_STEP_SUMMARY}" <<SUMMARY
+          ## PR E2E: GLB Demo
+
+          | Field | Value |
+          |-------|-------|
+          | **PR** | #${PR_NUMBER} |
+          | **Title** | ${PR_TITLE} |
+          | **URL** | ${PR_URL} |
+          | **Author** | ${PR_AUTHOR} |
+          | **Draft** | ${PR_DRAFT} |
+          | **Head SHA** | \`${HEAD_SHA}\` |
+          | **Base SHA** | \`${BASE_SHA}\` |
+          | **Merge SHA** | \`${MERGE_SHA}\` |
+          | **Grid source verification** | PR merge verified; not base/main |
+          | **Demos ref** | \`${DEMOS_REF}\` |
+          | **Demos SHA** | \`${DEMOS_SHA}\` |
+          | **Mode** | \`${MODE}\` |
+          | **GLB result** | ${DEMO_RESULT} |
+          | **Cleanup** | ${CLEANUP_RESULT} |
+
+          ### Images
+
+          | Image | Reference |
+          |-------|-----------|
+          | Grid Operator | \`grid-operator:${TAG}\` |
+          | Mock Providers | \`grid-mock-providers:${TAG}\` |
+          | Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |
+
+          ### Artifact
+
+          \`grid-pr-${PR_NUMBER}-${SHORT_SHA}-glb-${MODE}\`
+          SUMMARY
