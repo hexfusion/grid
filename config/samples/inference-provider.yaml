@@ -43,11 +43,21 @@ spec:
     siteSelector:
       matchLabels: {}
 
-  # Health check
-  healthCheck:
-    path: /v1/complete
-    interval: "60s"
-    timeout: "10s"
+  # Health check — enable only when the provider exposes a suitable
+  # unauthenticated health endpoint. Non-2xx responses mark the provider
+  # Degraded.
+  # healthCheck:
+  #   endpoint: https://provider-health.example.com
+  #   path: /healthz
+  #   interval: "60s"
+  #   timeout: "10s"
+  #   tls:
+  #     caSecretRef:
+  #       name: backend-ca
+  #       namespace: grid-system
+  #     clientCertificateSecretRef:
+  #       name: client-cert
+  #       namespace: grid-system
 
   # No metrics scraping for external API
   metricsConfig: null
