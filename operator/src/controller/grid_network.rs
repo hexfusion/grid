@@ -275,8 +275,17 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let remote_crdt_providers =
         routing_overlay::apply_stale_gc_filter(&remote_crdt_providers, membership.as_ref(), &stale_policy);
 
-    let (consumer_config_statuses, overlay_statuses) =
-        reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
+    let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
+
+    let (consumer_config_statuses, overlay_statuses) = reconcile_routing_overlay_inner(
+        &network,
+        client,
+        &providers,
+        &remote_crdt_providers,
+        &raw_metrics,
+        &scoring_weights,
+    )
+    .await?;
 
     let grid_id = resolve_grid_id(&network);
     let phase = if swim_runtime_running {
@@ -674,12 +683,17 @@ async fn apply_site_secret(
     clippy::cognitive_complexity,
     reason = "sequential overlay render loop with per-gateway eligibility filter, consumer config, and status; splitting obscures the pipeline"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
+)]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     client: &Client,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+    scoring_weights: &scoring::ScoringWeights,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -731,6 +745,7 @@ async fn reconcile_routing_overlay_inner(
             local_site,
             metrics_arg,
             timestamp.as_deref(),
+            scoring_weights,
         ) {
             Ok(overlay) => overlay,
             Err(error) => {

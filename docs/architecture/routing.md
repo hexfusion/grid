@@ -247,9 +247,10 @@ The operator orders candidates before writing the overlay. Ordering proceeds
 in two phases:
 
 1. **Scoring.** Each provider is scored by `scoring::score_backends` using
-   provider configuration, optional live metrics, and optional
-   CRDT-propagated provider metrics. Providers with no live metrics use
-   neutral metric scores.
+   the weights selected by `GridNetwork.spec.scoringPolicy.strategy`,
+   optional live metrics, and optional CRDT-propagated provider metrics.
+   Providers with no live metrics use neutral metric scores.
+   See [Scoring](scoring.md) for the available strategies.
 
 2. **Enrichment and ordering.** Each candidate is enriched with admission
    state, locality tier, stable ID, score, score breakdown, and rank.
@@ -827,7 +828,7 @@ another deployment-owned reload mechanism. See
 | `operator/src/resources/routing_overlay.rs` | Provider-to-candidate mapping, scoring input construction, and overlay JSON rendering. |
 | `operator/src/resources/overlay_envelope.rs` | Envelope construction, RFC 8785 canonicalization, semantic digest, scope, and provenance. |
 | `operator/src/resources/provider_metrics.rs` | Prometheus scrape and metric-name mapping for `metricsConfig`. |
-| `scoring/src/scoring.rs` | Six-signal backend scoring implementation. |
+| `scoring/src/scoring.rs` | Backend scoring engine (strategy-selected signals). |
 | `swim/src/state_broadcast.rs` | CRDT state broadcast handler used by SWIM custom broadcasts. |
 | `xtask/src/env/consumer.rs` | Local validation consumer gateway configuration. |
 | `xtask/src/env/gateway.rs` | Local validation provider gateway configuration. |

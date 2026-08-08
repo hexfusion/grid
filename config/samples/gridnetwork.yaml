@@ -8,6 +8,10 @@ spec:
   region: us-west-2
   zone: us-west-2a
 
+  # Provider scoring (defaults to noMetrics when absent).
+  # scoringPolicy:
+  #   strategy: noMetrics  # "noMetrics" | "queueDepth" | "kvCachePressure"
+
   # SWIM protocol settings (defaults)
   swim:
     probeInterval: "5s"

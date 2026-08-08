@@ -86,20 +86,27 @@ cargo xtask env status   # health of all components
 
 ### scoring
 
-Six-signal scoring engine:
+The scoring crate retains six normalized signal fields for overlay contract
+and score-breakdown compatibility. The supported `GridNetwork` API does not
+combine them with arbitrary user weights. It selects one provider-level
+strategy:
 
-| Signal | Weight | Source |
-|--------|--------|--------|
-| locality | 3.0 | config (region-aware) |
-| queue_depth | 3.0 | Prometheus / CRDT |
-| kv_cache | 2.0 | Prometheus / CRDT |
-| prefix_cache | 2.0 | Prometheus / CRDT |
-| latency | 2.0 | local measurement |
-| cost | 1.0 | config |
+| Strategy | Active signal | Meaning |
+|----------|---------------|---------|
+| `noMetrics` | none | Generic default for external APIs and providers without comparable metrics |
+| `queueDepth` | `queue_depth` | Prefer the pool with the shortest normalized queue |
+| `kvCachePressure` | `kv_cache` | Prefer the pool with the most available KV-cache capacity |
 
-Locality: Local=1.0, same-region Remote=0.7,
-cross-region Remote=0.4, CloudManaged=0.2,
-ApiProvider=0.1.
+Configure the choice through `spec.scoringPolicy.strategy`. When
+`scoringPolicy` is present, `strategy` is required; omitting the entire policy
+selects `noMetrics`. Do not add a Grid
+`prefixAware` strategy: prefix affinity depends on the current request and
+per-endpoint cache contents, so it belongs in llm-d EPP after Grid selects the
+provider pool.
+
+The operator adapts the chosen strategy to one-hot internal weights. All
+unselected score-breakdown contributions must remain zero. `routingPolicy`
+still controls whether geography or the selected score orders candidates.
 
 ### certs
 

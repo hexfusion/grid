@@ -338,24 +338,20 @@ regeneration triggers.
 
 ## Scoring and Selection
 
-Grid scores each provider candidate using six weighted signals before writing
-the overlay. The current default weights are:
+Grid applies one provider-level scoring strategy before writing the overlay.
+`noMetrics` is the generic default for external APIs and providers without
+comparable telemetry; it gives all admitted candidates the same dynamic score.
+llm-d pools can opt into `queueDepth` to prefer the shortest normalized queue
+or `kvCachePressure` to prefer the most available KV-cache capacity.
+Unavailable providers are excluded, while stale or degraded candidates can
+remain as lower-preference fallbacks.
 
-| Signal | Default weight | Typical source |
-|---|---:|---|
-| Locality | 3.0 | Backend kind, site, region |
-| Queue depth | 3.0 | Metrics scrape or CRDT state |
-| KV-cache utilization | 2.0 | Metrics scrape or CRDT state |
-| Prefix-cache hit ratio | 2.0 | Metrics scrape or CRDT state |
-| Latency | 2.0 | Metrics or local observation |
-| Cost | 1.0 | Provider config |
+Grid does not perform request-specific prefix scoring. That requires the
+current request and per-endpoint cache state, so it remains inside llm-d EPP
+after Grid has selected the provider pool.
 
-Higher-scored candidates sort earlier.  `Unavailable` providers are excluded.
-Stale or degraded candidates can remain in the overlay as lower-preference
-fallbacks.
-
-At request time, Praxis AI `intelligent_route` consumes the loaded overlay.  It does
-not recompute Grid's full scoring formula.  Its job is to match the requested
+At request time, Praxis AI `intelligent_route` consumes the loaded overlay. It
+does not recompute Grid's score. Its job is to match the requested
 model or MCP tool against the already-loaded candidate set and choose the best
 candidate under its request-time rules.
 

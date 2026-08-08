@@ -244,6 +244,8 @@ spec:
               region: pool-a
               zone: pool-a-1
               routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: queueDepth
               swim:
                 probeInterval: "5s"
                 suspicionTimeout: "15s"
@@ -321,6 +323,8 @@ spec:
               region: pool-b
               zone: pool-b-1
               routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: queueDepth
               swim:
                 probeInterval: "5s"
                 suspicionTimeout: "15s"

@@ -1,67 +1,124 @@
-# Scoring and Routing Preference
+# Provider Scoring
 
-Grid scores providers when the operator renders a Praxis routing overlay. The
-result is an ordered candidate list stored in a content-addressed overlay
-`ConfigMap`. Praxis uses that order at request time; it does not scrape provider
-metrics or recompute Grid's six-signal score for every request.
+Grid scores provider pools when the operator renders a Praxis routing overlay.
+Praxis reads that overlay from memory at request time; it does not call Grid,
+Kubernetes, the operator, or an EPP metrics endpoint on the request path.
 
-## Decision Path
+## Responsibility Boundary
 
-```text
-InferenceProvider CRDs
-  + local Prometheus-compatible metrics
-  + remote provider metrics propagated through Grid
-        |
-        v
-normalize and validate signals
-        |
-        v
-scoring::score_backends
-        |
-        v
-admission + routingPolicy ordering
-        |
-        v
-versioned RoutingOverlay candidates
-        |
-        v
-Praxis intelligent_route
-```
-
-The scoring engine is implemented in `scoring/src/scoring.rs`. The operator
-connects metrics, admission, locality, and overlay ordering in
-`operator/src/resources/routing_overlay.rs`.
-
-## Signals
-
-Higher total scores are better. Each candidate carries its total `score` and a
-`score_breakdown` containing the weighted contribution from every signal.
-
-| Signal | Default weight | Better value |
-|---|---:|---|
-| Locality | 3.0 | A provider nearer to the consuming site. |
-| Queue depth | 3.0 | Less of the provider's queue capacity in use. |
-| KV-cache utilization | 2.0 | Less cache-capacity pressure. This is utilization, not prompt-prefix affinity. |
-| Prefix-cache hit ratio | 2.0 | More expected prefix reuse. |
-| P99 latency | 2.0 | Lower tail latency. |
-| Cost | 1.0 | Lower configured cost. |
-
-The breakdown fields are weighted contributions, not raw metrics. For example,
-with the default queue weight:
+Grid and llm-d make different decisions:
 
 ```text
-queue contribution = 3.0 * (1.0 - normalized queue depth)
+Grid operator (before the request)
+  EPP pool metrics -> select and score a provider pool -> routing overlay
+
+Praxis edge (during the request)
+  local overlay -> select an eligible provider gateway
+
+llm-d EPP (inside the selected provider)
+  request + endpoint state -> select an inference pod
 ```
 
-The breakdown makes an operator decision explainable without requiring the
-demo, gateway, or observability stack to reimplement the scoring formula.
+Grid uses provider-level telemetry that can be collected asynchronously. llm-d
+EPP can additionally use request-specific information, such as how much of the
+current prompt prefix is cached on each pod.
+
+Grid therefore does not offer a `prefixAware` scoring strategy. A pool-average
+KV-cache utilization metric measures capacity pressure; it does not prove that
+the current request's prefix is cached. Prefix affinity belongs in EPP.
+
+## Configuration
+
+`GridNetwork.spec.scoringPolicy.strategy` selects one provider-level strategy.
+This follows llm-d's independent-scorer model without exposing a plugin system
+or an arbitrary matrix of weights in the Grid API.
+
+When `scoringPolicy` is present, `strategy` is required. Omit the entire
+`scoringPolicy` object to use the `noMetrics` default. This also makes manifests
+using the removed `profile`/`weights` shape fail admission instead of silently
+falling back to another strategy.
+
+### No metrics (default)
+
+```yaml
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: production
+spec:
+  scoringPolicy:
+    strategy: noMetrics
+```
+
+Omitting `scoringPolicy` has the same effect. Every admitted candidate receives
+zero dynamic score. "No metrics" does not mean "no policy": health, admission,
+freshness, model compatibility, geography, selection tiers, session affinity,
+and Praxis picker policy continue to apply.
+
+Use this strategy for heterogeneous grids, external APIs such as OpenAI,
+Anthropic, or Bedrock, and providers that do not expose comparable pool
+telemetry. Equivalent providers can participate in the same Praxis selection
+group without an unavailable metric creating an artificial preference.
+
+### Queue depth
+
+```yaml
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: production
+spec:
+  routingPolicy: scoreFirst
+  scoringPolicy:
+    strategy: queueDepth
+```
+
+The operator prefers the provider with the shortest normalized queue:
+
+```text
+score = 1 - normalized_queue_depth
+```
+
+This corresponds to the intent of llm-d's `queue-scorer`. Grid normalizes an
+EPP pool-average queue count using `metricsConfig.queueCapacity` and clamps the
+result to `0.0..1.0`.
+
+### KV-cache pressure
+
+```yaml
+spec:
+  routingPolicy: scoreFirst
+  scoringPolicy:
+    strategy: kvCachePressure
+```
+
+The operator prefers the provider with the most available KV-cache capacity:
+
+```text
+score = 1 - kv_cache_utilization
+```
+
+This corresponds to llm-d's `kv-cache-utilization-scorer`. Lower utilization
+scores higher. This strategy is about available capacity, not cache affinity.
+
+## Why Strategies Are Not Combined
+
+Queue depth and KV-cache pressure describe different operating objectives. A
+weighted sum can hide which condition caused a provider to win and can produce
+surprising crossover points. Grid keeps the normal configuration explicit: use
+`noMetrics`, or choose the single signal that represents the deployment's
+provider-selection goal.
+
+llm-d supports weighted scorer composition because it performs fine-grained,
+per-request endpoint scheduling. Grid deliberately exposes less complexity at
+the cross-site provider layer. New strategies should be added only when Grid
+has a real provider-level signal with defined freshness and normalization.
 
 ## Metrics Configuration
 
 `InferenceProvider.spec.metricsConfig` enables Prometheus text-format scraping.
-By default, Grid appends `path` to the provider's inference endpoint. Set
-`metricsEndpoint` when metrics are exposed by a separate service, such as an
-llm-d EPP:
+Use `metricsEndpoint` when metrics are exposed by an llm-d EPP service rather
+than the inference endpoint:
 
 ```yaml
 spec:
@@ -79,138 +136,85 @@ spec:
       healthy: llm_d_router_epp_ready_endpoints
 ```
 
-The fields have distinct purposes:
-
 | Field | Purpose |
 |---|---|
-| `metricsEndpoint` | Optional base URL for a dedicated metrics service. When absent, Grid uses `spec.endpoint`. |
+| `metricsEndpoint` | Optional base URL for a dedicated metrics service. |
 | `path` | Metrics path, default `/metrics`. |
 | `timeout` | Per-scrape timeout. |
-| `poolName` | Selects samples whose `name` label identifies the intended pool. A configured pool that matches no routing signal is a failed scrape. |
-| `queueCapacity` | Converts a raw queue count to a normalized ratio: `waiting / capacity`, clamped to `0.0..1.0`. Minimum value is `1`. |
-| `signalNames` | Maps Grid signals to exporter-specific Prometheus metric names. |
-| `staleMetricsSeconds` | Optional grace period for reusing the last successful local scrape. |
+| `poolName` | Selects samples for the intended EPP pool. |
+| `queueCapacity` | Normalizes an absolute queue count to `0.0..1.0`. |
+| `signalNames` | Maps Grid signals to exporter metric names. |
+| `staleMetricsSeconds` | Grace period for reusing the last successful local scrape. |
 
-This contract lets Grid consume pool-level llm-d EPP metrics while keeping pod
-selection inside llm-d. One `InferenceProvider` represents a schedulable pool;
-Grid does not rank each vLLM pod in that pool.
+One `InferenceProvider` represents a schedulable pool. Grid does not rank the
+individual vLLM pods in that pool.
 
-### Normalization
-
-Grid expects ratios in `0.0..1.0` for queue depth, KV-cache utilization, prefix
-hit ratio, and error rate. A destination exporter or recording rule should
-normally perform normalization because it knows the pool's capacity. The
-`queueCapacity` adapter is available for EPPs that expose an absolute waiting
-request count.
-
-P99 latency is supplied as milliseconds and normalized by the scoring engine
-against its current maximum-latency constant. Grid does not calculate a P99
-gauge from histogram buckets during a scrape.
+## Missing and Stale Metrics
 
 NaN and infinite samples are discarded. Ratio values received through remote
-state are clamped before scoring.
+state are clamped before scoring. A local scrape failure may reuse the last
+successful sample while it remains within `staleMetricsSeconds`.
 
-## Admission Before Ranking
+A provider with no live metrics currently falls back to neutral signal values
+(0.5 for ratio signals, `healthy = true`). This compatibility behavior means a
+provider with missing telemetry can score competitively with a provider under
+real pressure. Production deployments using `queueDepth` or `kvCachePressure`
+should ensure every competing provider exposes fresh, comparable telemetry for
+the selected signal. `noMetrics` does not require a metrics endpoint.
 
-Admission is a harder boundary than score:
+## Admission and Ordering
 
-| Observed condition | Admission state | Effect |
+Admission remains a harder boundary than score:
+
+| State | New requests | Existing sessions |
 |---|---|---|
-| Healthy and below saturation thresholds | `new_and_existing` | Eligible for new and established sessions. |
-| Queue above `0.85` or KV-cache utilization above `0.90` | `existing_only` | Preserve established sessions; do not admit new ones. |
-| Explicitly unhealthy | `none` | Excluded from the overlay. |
-| No metrics | `new_and_existing` | Current compatibility behavior; see limitations below. |
+| `new_and_existing` | Allowed | Allowed |
+| `existing_only` | Rejected | Allowed |
+| `none` | Rejected | Rejected |
 
-Candidate sorting always places `new_and_existing` ahead of `existing_only`
-and removes `none` candidates.
+`routingPolicy` then determines how the selected score interacts with
+geography:
 
-## Routing Policies
+- `geographyFirst` keeps a same-site provider ahead of a remote provider.
+- `scoreFirst` allows the provider with the better selected signal to outrank
+  a local provider.
 
-`GridNetwork.spec.routingPolicy` controls whether locality or the weighted score
-is the primary ranking input. The field is optional.
-
-### `geographyFirst`
-
-This is the default and preserves existing behavior:
-
-1. admission state;
-2. locality tier;
-3. score, descending;
-4. freshness;
-5. deterministic `(site, name, cluster)` tie-break.
-
-A same-site candidate remains ahead of a remote candidate regardless of metric
-score, unless admission removes or restricts it.
-
-### `scoreFirst`
-
-This policy enables metrics-driven cross-site preference:
-
-1. admission state;
-2. freshness;
-3. score, descending;
-4. locality tier;
-5. deterministic `(site, name, cluster)` tie-break.
-
-A healthy remote pool can outrank a local pool when its total score is higher.
-Use this mode only when the participating providers expose comparable,
-normalized signals and the deployment accepts cross-site routing.
+Use `scoreFirst` when queue or KV pressure is intended to drive cross-site
+selection:
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
-kind: GridNetwork
-metadata:
-  name: production
 spec:
   routingPolicy: scoreFirst
+  scoringPolicy:
+    strategy: queueDepth
 ```
 
-The operator writes the final zero-based `rank`, total `score`, and
-`score_breakdown` into each candidate. Praxis follows that ordering and applies
-request-time model matching and session affinity.
+The routing overlay still contains the total score and score breakdown. A
+metric strategy has only its selected contribution; `noMetrics` has all-zero
+contributions. This keeps the decision easy to explain.
 
-## Freshness and Missing Values
+## Scoring Is Not Request Distribution
 
-Signals without values currently receive a neutral score of `0.5`. A local
-scrape failure may reuse the last successful sample while it remains within
-`staleMetricsSeconds`; after that grace period, it returns to neutral scoring.
-The local cache is process memory and is cleared when the operator restarts.
+Grid scoring determines provider preference and overlay ordering. It does not
+perform a request-time control-plane lookup and does not itself guarantee a
+traffic ratio. Praxis performs local selection, session affinity, retry, and
+failover from its current overlay snapshot.
 
-Remote provider values are propagated through Grid state. SWIM freshness says
-whether the advertising site is participating; it is not yet a timestamp for
-the individual metrics sample.
+If multiple providers should actively receive new traffic, the overlay must
+place them in the same eligible selection group or publish an explicit traffic
+distribution contract that Praxis understands. Recalculating a rank every few
+seconds is not a substitute for request-time load balancing.
 
-These compatibility behaviors matter more under `scoreFirst`: neutral values
-can make a provider with missing telemetry competitive with a provider that is
-reporting real pressure. Production policy should not interpret missing data as
-proof of spare capacity.
+## Current Limits
 
-## Current Safety Limits
-
-The following are explicit current limitations:
-
-- Candidate ordering has no score-switch margin, observation count, dwell
-  timer, or recovery hold-down. A small score change can change rank.
+- No request-specific prefix affinity at the Grid layer.
+- No independent remote metric sample timestamp yet.
+- No score-switch margin, dwell timer, or recovery hold-down.
 - Admission thresholds are point-in-time comparisons without hysteresis.
-- Remote metric snapshots do not carry independent sample timestamps.
-- Missing or expired metrics return to neutral scoring rather than failing
-  closed.
-- KV-cache utilization measures capacity pressure. It does not tell Grid that
-  a particular request prefix is cached in a pool.
-- Signals that an exporter does not expose remain neutral; Grid does not invent
-  favorable values.
+- Queue normalization depends on a correct `queueCapacity`.
+- A network-wide metric strategy is appropriate only when competing providers
+  expose comparable telemetry; use `noMetrics` for heterogeneous providers.
+- Strategy changes alter the overlay on the next successful reconciliation.
 
-Until the deterministic routing-safety policy adds freshness, hysteresis, and
-recovery controls, enable `scoreFirst` deliberately and monitor score changes,
-scrape failures, overlay revisions, and actual provider attribution.
-
-## Request-Time Boundary
-
-Praxis does not recompute the full score. `intelligent_route` reads the
-validated, pre-sorted overlay, matches candidates to request attributes such as
-model name, and selects an eligible candidate. Per-request inputs such as an
-explicit residency constraint or session binding must remain hard policy inputs
-rather than being approximated by DNS or a weighted provider score.
-
-See [Routing and Overlays](routing.md) for admission, locality, stale candidate
-retention, and overlay revision details.
+See [Routing and Overlays](routing.md) for admission, selection, stale-candidate
+retention, and overlay revision behavior.

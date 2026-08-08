@@ -18,6 +18,12 @@ spec:
   {{- with .Values.gridNetwork.routingPolicy }}
   routingPolicy: {{ . | quote }}
   {{- end }}
+  {{- with .Values.gridNetwork.scoringPolicy }}
+  {{- if .strategy }}
+  scoringPolicy:
+    strategy: {{ .strategy | quote }}
+  {{- end }}
+  {{- end }}
   {{- with .Values.gridNetwork.swim }}
   swim:
     {{- toYaml . | nindent 4 }}

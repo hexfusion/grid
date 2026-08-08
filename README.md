@@ -71,17 +71,12 @@ writes for each gateway. Contains scored candidates,
 cluster definitions with mTLS config, and credential
 references. Praxis hot-reloads this without restarts.
 
-**Scoring** - Grid scores each candidate using six
-weighted signals before writing the overlay:
-
-| Signal | Weight | What it measures |
-|--------|-------:|------------------|
-| Locality | 3.0 | How close the backend is |
-| Queue depth | 3.0 | How busy the backend is |
-| KV-cache utilization | 2.0 | Memory pressure |
-| Prefix-cache hit ratio | 2.0 | Cache efficiency |
-| Latency | 2.0 | Response time |
-| Cost | 1.0 | Price per token |
+**Scoring** - Grid applies one provider-level strategy before
+writing the overlay. `noMetrics` is the generic default for
+external APIs and providers without comparable telemetry.
+llm-d pools can opt into `queueDepth` or `kvCachePressure`.
+Request-specific prefix affinity remains inside llm-d EPP,
+which selects a pod after Grid selects a provider pool.
 
 ## Request Flow
 
@@ -139,7 +134,7 @@ clusters with Helm.
 | Crate | Purpose |
 |-------|---------|
 | `operator` | K8s controllers, CRDs, operator binary |
-| `scoring` | Six-signal scoring engine and grid state |
+| `scoring` | Strategy-selected scoring engine and grid state |
 | `certs` | Certificate generation and mTLS provider trait |
 | `swim` | foca SWIM wrapper and encryption |
 | `crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
