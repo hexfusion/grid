@@ -24,8 +24,8 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   NIGHTLY_RUSTFMT: nightly-2026-03-28
-  AI_ROLLUP_IMAGE: >-
-    ghcr.io/praxis-proxy/grid-ai-rollup@sha256:95132eb39c0f568b5361a250002979c5063db427ff0fb63b59a93146fcb7ad31
+  AI_ROLLUP_IMAGE_NAME: ghcr.io/praxis-proxy/grid-ai-rollup
+  AI_ROLLUP_SOURCE_SHA: c68149502d991d51daaff8d6bf96c18704aeb38d
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
   OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
@@ -133,6 +133,7 @@ jobs:
       operator_digest: ${{ steps.operator.outputs.digest }}
       mock_providers_digest: ${{ steps.mock_providers.outputs.digest }}
       overlay_sync_digest: ${{ steps.overlay_sync.outputs.digest }}
+      ai_rollup_digest: ${{ steps.ai_rollup.outputs.digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -148,8 +149,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Verify Praxis AI rollup
-        run: docker buildx imagetools inspect "${AI_ROLLUP_IMAGE}"
+      - name: Verify official Grid AI rollup
+        id: ai_rollup
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          RELEASE_REF="${AI_ROLLUP_IMAGE_NAME}:${TAG}"
+          SOURCE_REF="${AI_ROLLUP_IMAGE_NAME}:sha-${AI_ROLLUP_SOURCE_SHA}"
+          RELEASE_DIGEST=$(docker buildx imagetools inspect "${RELEASE_REF}" \
+            --format '{{.Manifest.Digest}}')
+          SOURCE_DIGEST=$(docker buildx imagetools inspect "${SOURCE_REF}" \
+            --format '{{.Manifest.Digest}}')
+          if [[ ! "${RELEASE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ || \
+                ! "${SOURCE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve official AI rollup digests"
+            exit 1
+          fi
+          if [[ "${RELEASE_DIGEST}" != "${SOURCE_DIGEST}" ]]; then
+            echo "::error::Official AI rollup tags resolve to different digests"
+            echo "::error::${RELEASE_REF}: ${RELEASE_DIGEST}"
+            echo "::error::${SOURCE_REF}:  ${SOURCE_DIGEST}"
+            exit 1
+          fi
+          echo "digest=${RELEASE_DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Verified ${RELEASE_REF}@${RELEASE_DIGEST}"
+          echo "Verified ${SOURCE_REF}@${SOURCE_DIGEST}"
 
       - name: Build and push operator
         id: operator
@@ -310,6 +335,7 @@ jobs:
           OPERATOR_DIGEST: ${{ needs.container.outputs.operator_digest }}
           MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
           OVERLAY_SYNC_DIGEST: ${{ needs.container.outputs.overlay_sync_digest }}
+          AI_ROLLUP_DIGEST: ${{ needs.container.outputs.ai_rollup_digest }}
           CHART_DIGEST: ${{ needs.chart.outputs.chart_digest }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
           VERSION: ${{ needs.validate.outputs.version }}
@@ -318,7 +344,7 @@ jobs:
           ## Container Images
 
           \`\`\`text
-          ${AI_ROLLUP_IMAGE}
+          ${AI_ROLLUP_IMAGE_NAME}:${VERSION}@${AI_ROLLUP_DIGEST}
           ${OPERATOR_IMAGE_NAME}@${OPERATOR_DIGEST}
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
           ${OVERLAY_SYNC_IMAGE_NAME}@${OVERLAY_SYNC_DIGEST}
@@ -345,8 +371,8 @@ jobs:
 
           The Grid images were built from \`${SOURCE_SHA}\`. The Praxis AI
           rollup was built from
-          \`praxis-proxy/ai@7341b2d593f9aaafee6b8c3e1be75a2c6ea4108e\` and
-          \`praxis-proxy/praxis@e6001bad6fc42fde26cecca4682f04ddedc57abf\`.
+          \`praxis-proxy/ai@${AI_ROLLUP_SOURCE_SHA}\` and
+          \`praxis-proxy/praxis@0d3347c634ab4e09d882c02bf01767a1667c82db\`.
           Every reference above is immutable.
           EOF
 

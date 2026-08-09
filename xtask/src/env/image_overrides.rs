@@ -53,13 +53,13 @@ const DEFAULT_GLB_MOCK_PROVIDER_IMAGE: &str = "grid-mock-providers:glb-demo";
 const DEFAULT_GLB_OPERATOR_IMAGE: &str = "grid-operator:glb-demo";
 
 /// Default gateway image for workload-inference demos.
-const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.1";
+const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3";
 
 /// Default mock-provider image for workload-inference demos.
-const DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE: &str = "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.1";
+const DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE: &str = "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.3";
 
 /// Default operator image for workload-inference demos (v0.1.1+: health endpoints).
-const DEFAULT_WORKLOAD_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.1";
+const DEFAULT_WORKLOAD_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.3";
 
 /// Default image pull policy for workload-inference demos (registry-backed).
 const DEFAULT_WORKLOAD_IMAGE_PULL_POLICY: &str = "IfNotPresent";
@@ -183,15 +183,15 @@ mod tests {
         assert_eq!(DEFAULT_IMAGE_PULL_POLICY, "Never");
         assert_eq!(
             DEFAULT_WORKLOAD_GATEWAY_IMAGE,
-            "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.1"
+            "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
         );
         assert_eq!(
             DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE,
-            "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.1"
+            "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.3"
         );
         assert_eq!(
             DEFAULT_WORKLOAD_OPERATOR_IMAGE,
-            "ghcr.io/praxis-proxy/grid-operator:v0.1.1"
+            "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         );
         assert_eq!(DEFAULT_WORKLOAD_IMAGE_PULL_POLICY, "IfNotPresent");
     }

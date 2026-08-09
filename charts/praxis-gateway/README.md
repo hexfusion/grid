@@ -18,7 +18,7 @@ release ownership exist. Do not treat this as a permanent Grid responsibility.
 - Kubernetes >= 1.26
 - Helm >= 3.12
 - A Praxis configuration ConfigMap already created in the target namespace
-- A compatible Praxis AI image (default: Grid v0.1.2 rollup)
+- A compatible Grid AI gateway image (default: Grid v0.1.3 rollup)
 
 ## Install
 
@@ -34,9 +34,9 @@ helm install edge-gateway charts/praxis-gateway \
   --set config.existingConfigMap=edge-gateway-config
 ```
 
-The default image is the Grid v0.1.2 Praxis AI rollup. Override
+The default image is the Grid v0.1.3 AI gateway rollup. Override
 `image.repository`, `image.tag`, or `image.digest` to install another compatible
-Praxis image. Prefer a digest when reproducing a validated deployment.
+gateway image. Prefer a digest when reproducing a validated deployment.
 
 The chart uses [Semantic Versioning](https://semver.org/). Its `version`
 identifies the chart package, while `appVersion` identifies the default Praxis
@@ -48,7 +48,7 @@ AI image; these values may advance independently.
 |-----|------|---------|-------------|
 | `replicaCount` | int | `1` | Gateway replicas. |
 | `image.repository` | string | `ghcr.io/praxis-proxy/grid-ai-rollup` | Image repository. |
-| `image.tag` | string | `""` | Image tag. Defaults to chart `appVersion` (`v0.1.2`). |
+| `image.tag` | string | `""` | Image tag. Defaults to chart `appVersion` (`v0.1.3`). |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
