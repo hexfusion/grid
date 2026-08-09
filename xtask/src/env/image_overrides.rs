@@ -18,7 +18,8 @@ const GATEWAY_IMAGE_ENV: &str = "GRID_XTASK_GATEWAY_IMAGE";
 /// Environment variable to override the mock EPP image.
 const MOCK_EPP_IMAGE_ENV: &str = "GRID_XTASK_MOCK_EPP_IMAGE";
 
-/// Environment variable to override the mock provider image.
+/// Environment variable to override the mock provider image used by legacy
+/// generic environments.
 const MOCK_PROVIDER_IMAGE_ENV: &str = "GRID_XTASK_MOCK_PROVIDER_IMAGE";
 
 /// Environment variable to override the VCR image.
@@ -40,7 +41,7 @@ const DEFAULT_GATEWAY_IMAGE: &str = "localhost/praxis-ai:llmd-ext-proc";
 /// Default mock EPP image (matches images.rs).
 const DEFAULT_MOCK_EPP_IMAGE: &str = "localhost/praxis-ai-mock-epp:latest";
 
-/// Default mock provider image (matches kind.rs).
+/// Default mock provider image used by legacy generic environments.
 const DEFAULT_MOCK_PROVIDER_IMAGE: &str = "grid-mock-providers:latest";
 
 /// Default operator image (matches operator.rs).
@@ -48,9 +49,6 @@ const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:latest";
 
 /// Default gateway image used by the GLB demo.
 const DEFAULT_GLB_GATEWAY_IMAGE: &str = "praxis-ai:glb-demo";
-
-/// Default mock-provider image used by the GLB demo.
-const DEFAULT_GLB_MOCK_PROVIDER_IMAGE: &str = "grid-mock-providers:glb-demo";
 
 /// Default VCR image used by forge-based demos.
 const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
@@ -61,10 +59,7 @@ const DEFAULT_GLB_OPERATOR_IMAGE: &str = "grid-operator:glb-demo";
 /// Default gateway image for workload-inference demos.
 const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3";
 
-/// Default mock-provider image for workload-inference demos.
-const DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE: &str = "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.3";
-
-/// Default operator image for workload-inference demos (v0.1.1+: health endpoints).
+/// Default operator image for workload-inference demos.
 const DEFAULT_WORKLOAD_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.3";
 
 /// Default image pull policy for workload-inference demos (registry-backed).
@@ -91,7 +86,7 @@ pub(crate) fn mock_epp_image() -> String {
     env::var(MOCK_EPP_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_MOCK_EPP_IMAGE.to_owned())
 }
 
-/// Get the mock provider image name, respecting environment overrides.
+/// Get the mock provider image name for legacy generic environments.
 pub(crate) fn mock_provider_image() -> String {
     env::var(MOCK_PROVIDER_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_MOCK_PROVIDER_IMAGE.to_owned())
 }
@@ -113,15 +108,6 @@ pub(crate) fn demo_gateway_image(mode: IngressMode) -> String {
         IngressMode::Workload => DEFAULT_WORKLOAD_GATEWAY_IMAGE,
     };
     env::var(GATEWAY_IMAGE_ENV).unwrap_or_else(|_| default.to_owned())
-}
-
-/// Get the demo mock-provider image for the given ingress mode.
-pub(crate) fn demo_mock_provider_image(mode: IngressMode) -> String {
-    let default = match mode {
-        IngressMode::Global => DEFAULT_GLB_MOCK_PROVIDER_IMAGE,
-        IngressMode::Workload => DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE,
-    };
-    env::var(MOCK_PROVIDER_IMAGE_ENV).unwrap_or_else(|_| default.to_owned())
 }
 
 /// Get the demo operator image for the given ingress mode.
@@ -174,9 +160,6 @@ mod tests {
         if env::var(MOCK_EPP_IMAGE_ENV).is_err() {
             assert_eq!(mock_epp_image(), DEFAULT_MOCK_EPP_IMAGE);
         }
-        if env::var(MOCK_PROVIDER_IMAGE_ENV).is_err() {
-            assert_eq!(mock_provider_image(), DEFAULT_MOCK_PROVIDER_IMAGE);
-        }
         if env::var(OPERATOR_IMAGE_ENV).is_err() {
             assert_eq!(operator_image(), DEFAULT_OPERATOR_IMAGE);
         }
@@ -186,19 +169,13 @@ mod tests {
     fn constants_are_correct() {
         assert_eq!(DEFAULT_GATEWAY_IMAGE, "localhost/praxis-ai:llmd-ext-proc");
         assert_eq!(DEFAULT_MOCK_EPP_IMAGE, "localhost/praxis-ai-mock-epp:latest");
-        assert_eq!(DEFAULT_MOCK_PROVIDER_IMAGE, "grid-mock-providers:latest");
         assert_eq!(DEFAULT_OPERATOR_IMAGE, "grid-operator:latest");
         assert_eq!(DEFAULT_GLB_GATEWAY_IMAGE, "praxis-ai:glb-demo");
-        assert_eq!(DEFAULT_GLB_MOCK_PROVIDER_IMAGE, "grid-mock-providers:glb-demo");
         assert_eq!(DEFAULT_GLB_OPERATOR_IMAGE, "grid-operator:glb-demo");
         assert_eq!(DEFAULT_IMAGE_PULL_POLICY, "Never");
         assert_eq!(
             DEFAULT_WORKLOAD_GATEWAY_IMAGE,
             "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
-        );
-        assert_eq!(
-            DEFAULT_WORKLOAD_MOCK_PROVIDER_IMAGE,
-            "ghcr.io/praxis-proxy/grid-mock-providers:v0.1.3"
         );
         assert_eq!(
             DEFAULT_WORKLOAD_OPERATOR_IMAGE,
@@ -214,13 +191,6 @@ mod tests {
                 demo_gateway_image(IngressMode::Global),
                 demo_gateway_image(IngressMode::Workload),
                 "workload and global gateway defaults must differ"
-            );
-        }
-        if env::var(MOCK_PROVIDER_IMAGE_ENV).is_err() {
-            assert_ne!(
-                demo_mock_provider_image(IngressMode::Global),
-                demo_mock_provider_image(IngressMode::Workload),
-                "workload mock-provider image must differ from global default"
             );
         }
         if env::var(IMAGE_PULL_POLICY_ENV).is_err() {
@@ -262,17 +232,6 @@ mod tests {
             assert!(!should_skip, "Should not skip loading when policy is Never");
         } else {
             assert!(should_skip, "Should skip loading when policy is not Never");
-        }
-    }
-
-    #[test]
-    fn workload_mode_mock_provider_differs_from_glb() {
-        if env::var(MOCK_PROVIDER_IMAGE_ENV).is_err() {
-            assert_ne!(
-                demo_mock_provider_image(IngressMode::Global),
-                demo_mock_provider_image(IngressMode::Workload),
-                "workload mock-provider image must differ from global (glb) default"
-            );
         }
     }
 }

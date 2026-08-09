@@ -47,7 +47,7 @@ const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
 /// Provider credential secret name (VCR backends accept any bearer token).
-const SIM_INFERENCE_CREDENTIAL: &str = "sim-inference-credential";
+const VCR_INFERENCE_CREDENTIAL: &str = "vcr-inference-credential";
 
 /// Overlay ConfigMap name created by the Grid operator for consumer gateways.
 const OVERLAY_CONFIGMAP: &str = "grid-overlay-grid-llmd-pool-metrics-consumer-gateway";
@@ -85,7 +85,7 @@ const KV_CACHE_WEIGHT: f64 = 1.0;
 /// Minimum score gap required before capturing the pressure scorecard.
 ///
 /// With real VCR backends, pressure creates modest score differences
-/// (queue=2 → gap ≈ 0.03) unlike deterministic fake-metrics ramps.
+/// (queue=2 → gap ≈ 0.03) from live VCR/EPP pressure.
 const MIN_PRESSURE_SCORE_GAP: f64 = 0.01;
 
 /// Pressure generator Deployment name.
@@ -662,7 +662,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
-    // Phase 7/8: Deploy llm-d simulators and EPP
+    // Phase 7/8: Deploy VCR backends and EPP
     eprintln!();
     eprintln!("[SETUP {}/{}] Deploying vllm-vcr backends and EPP", next(), total);
     for cluster in CLUSTERS {
@@ -752,7 +752,7 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     results
 }
 
-/// Proof 1: Image digests and sim-config verification.
+/// Proof 1: Image digests and VCR configuration verification.
 fn proof_provenance(mtls: bool) -> ProofResult {
     let mut observations = Vec::new();
     let mut success = true;
@@ -783,7 +783,7 @@ fn proof_provenance(mtls: bool) -> ProofResult {
         }
 
         // Verify VCR deployment MODEL env var
-        match kubectl_get_deployment_env(&ctx, "sim-1", "MODEL") {
+        match kubectl_get_deployment_env(&ctx, "vcr-1", "MODEL") {
             Ok(val) if val == VCR_MODEL => {
                 observations.push(format!("{cluster}: VCR MODEL={val}"));
             },
@@ -1384,7 +1384,7 @@ fn overlay_score_for_cluster(candidates: &[OverlayCandidate], cluster_suffix: &s
 /// Raw queue size and KV-cache utilization are back-computed from the
 /// score breakdown so that every value in the row comes from the same
 /// operator scoring revision.  Mixing live EPP metrics with overlay
-/// scores produces contradictions when the simulator ramp advances
+/// scores produces contradictions when the pressure ramp advances
 /// between the operator scrape and the demo capture.
 fn build_scorecard_row(label: &str, candidates: &[OverlayCandidate], cluster_suffix: &str) -> ScorecardRow {
     let rank = overlay_rank_for_cluster(candidates, cluster_suffix);
@@ -1818,7 +1818,7 @@ fn install_provider_trust() -> Result<(), Box<dyn std::error::Error>> {
         apply_tls_secret(&ctx, cluster, CONSUMER_TLS_SECRET, certs_dir)?;
         apply_tls_secret(&ctx, cluster, PROVIDER_TLS_SECRET, certs_dir)?;
 
-        apply_credential_secret(&ctx, SIM_INFERENCE_CREDENTIAL, "sim-demo-token")?;
+        apply_credential_secret(&ctx, VCR_INFERENCE_CREDENTIAL, "vcr-demo-token")?;
 
         eprintln!("  [OK] {cluster}: TLS secrets and credentials installed");
     }

@@ -469,10 +469,6 @@ fn print_runtime_images(ingress_mode: IngressMode) {
         "  operator:      {}",
         image_overrides::demo_operator_image(ingress_mode)
     );
-    eprintln!(
-        "  mock provider: {}",
-        image_overrides::demo_mock_provider_image(ingress_mode)
-    );
     eprintln!("  vcr:           {}", image_overrides::vcr_image());
     eprintln!(
         "  pull policy:   {}",
@@ -2171,10 +2167,7 @@ fn validate_image_contract_for_mode(ingress_mode: IngressMode) -> Result<(), Box
             "GRID_XTASK_OPERATOR_IMAGE",
             image_overrides::demo_operator_image(ingress_mode),
         ),
-        (
-            "GRID_XTASK_MOCK_PROVIDER_IMAGE",
-            image_overrides::demo_mock_provider_image(ingress_mode),
-        ),
+        ("GRID_XTASK_VCR_IMAGE", image_overrides::vcr_image()),
     ] {
         if image.is_empty() || image.chars().any(char::is_whitespace) {
             return Err(format!("{name} must be a non-empty image reference without whitespace").into());
@@ -2216,10 +2209,6 @@ fn set_cluster_image_properties_for_mode(
         for (key, value) in [
             ("gatewayImage", gateway_image.clone()),
             ("operatorImage", operator_image.clone()),
-            (
-                "mockProviderImage",
-                image_overrides::demo_mock_provider_image(ingress_mode),
-            ),
             ("vcrImage", image_overrides::vcr_image()),
             ("imagePullPolicy", image_overrides::demo_image_pull_policy(ingress_mode)),
             ("gatewayImageRepo", gw_repo.clone()),
@@ -2244,9 +2233,8 @@ fn load_local_images_if_required(
     }
     let operator = image_overrides::demo_operator_image(ingress_mode);
     let gateway = image_overrides::demo_gateway_image(ingress_mode);
-    let mock = image_overrides::demo_mock_provider_image(ingress_mode);
     let vcr = image_overrides::vcr_image();
-    for image in [&operator, &gateway, &mock, &vcr] {
+    for image in [&operator, &gateway, &vcr] {
         require_local_image(image)?;
     }
     let gateway_clusters = match ingress_mode {
@@ -2260,7 +2248,6 @@ fn load_local_images_if_required(
         run_forge(forge, config, &["cluster", "load-image", cluster, &gateway])?;
     }
     for cluster in PROVIDER_CLUSTERS {
-        run_forge(forge, config, &["cluster", "load-image", cluster, &mock])?;
         run_forge(forge, config, &["cluster", "load-image", cluster, &vcr])?;
     }
     Ok(())
@@ -2513,7 +2500,7 @@ mod setup_tests {
             let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global, None)?;
             assert!(rendered.contains(&image_overrides::demo_gateway_image(IngressMode::Global)));
             assert!(rendered.contains(&image_overrides::demo_operator_image(IngressMode::Global)));
-            assert!(rendered.contains(&image_overrides::demo_mock_provider_image(IngressMode::Global)));
+            assert!(rendered.contains(&image_overrides::vcr_image()));
             assert!(rendered.contains(&image_overrides::demo_image_pull_policy(IngressMode::Global)));
             assert!(!rendered.contains("grid-overlay-sync"));
             Ok(())

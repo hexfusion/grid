@@ -3313,7 +3313,8 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
     if resp.status != 200 {
         return Err(format!("inference request returned HTTP {}", resp.status).into());
     }
-    let provider = extract_provider(&resp).map_err(|_e| "inference response missing X-AI-Demo-Provider-Gateway header")?;
+    let provider =
+        extract_provider(&resp).map_err(|_e| "inference response missing X-AI-Demo-Provider-Gateway header")?;
     let provider_gateway = resp
         .headers
         .get(PROVIDER_GATEWAY_RESPONSE_HEADER)
@@ -5070,7 +5071,8 @@ clusters:
 
     #[test]
     fn parse_header_dump_basic() {
-        let dump = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-ai-demo-provider-gateway: west-provider\r\n\r\n";
+        let dump =
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-ai-demo-provider-gateway: west-provider\r\n\r\n";
         let map = parse_header_dump(dump);
         assert_eq!(
             map.get("x-ai-demo-provider-gateway").map(String::as_str),
