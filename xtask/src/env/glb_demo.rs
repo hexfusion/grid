@@ -473,6 +473,7 @@ fn print_runtime_images(ingress_mode: IngressMode) {
         "  mock provider: {}",
         image_overrides::demo_mock_provider_image(ingress_mode)
     );
+    eprintln!("  vcr:           {}", image_overrides::vcr_image());
     eprintln!(
         "  pull policy:   {}",
         image_overrides::demo_image_pull_policy(ingress_mode)
@@ -1092,13 +1093,13 @@ fn print_boundaries(narrator: &mut Narrator, mode: DemoMode) {
         narrator.wrapped(
             "[PROVEN] ",
             "         ",
-            "Edge and provider session affinity, metrics-driven provider drain, health-driven edge withdrawal and recovery, operator restart recovery, sustained request soak, hot reload, provider mTLS, and peer authorization.",
+            "Edge and provider session affinity, health-driven provider withdrawal, health-driven edge withdrawal and recovery, operator restart recovery, sustained request soak, hot reload, provider mTLS, and peer authorization.",
         );
     } else {
         narrator.wrapped(
             "[PROVEN] ",
             "         ",
-            "Metrics-driven same-site provider drain, hot reload, provider mTLS, and peer authorization.",
+            "Health-driven provider withdrawal, hot reload, provider mTLS, and peer authorization.",
         );
     }
     narrator.wrapped(
@@ -1185,7 +1186,7 @@ fn print_workload_boundaries(narrator: &mut Narrator, mode: DemoMode) {
 
 /// Request fixture body for in-cluster workload requests.
 const WORKLOAD_REQUEST_BODY: &str =
-    r#"{"model":"sim-model-v1","messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#;
+    r#"{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#;
 
 /// Discover routing paths by sending in-cluster requests from each consumer.
 fn discover_workload_paths() -> Result<Vec<ObservedPathEntry>, Box<dyn std::error::Error>> {
@@ -2072,7 +2073,7 @@ fn render_config(
     Ok(serde_yaml::to_string(&config)?)
 }
 
-/// Clone inference-sim stack as inference-sim-openai with required `OpenAI` credential mount.
+/// Clone vcr-backend stack as vcr-backend-openai with required `OpenAI` credential mount.
 ///
 /// Creates east-only stack to prevent west-provider requiring credentials that only exist in east-provider.
 #[expect(
@@ -2085,21 +2086,21 @@ fn add_openai_credential_mount(spec: &mut serde_yaml::Mapping) -> Result<(), Box
         .and_then(|v| v.as_mapping_mut())
         .ok_or("spec.stacks not found or not a mapping")?;
 
-    if stacks.contains_key("inference-sim-openai") {
-        return Err("inference-sim-openai stack already exists".into());
+    if stacks.contains_key("vcr-backend-openai") {
+        return Err("vcr-backend-openai stack already exists".into());
     }
 
-    let inference_sim = stacks
-        .get("inference-sim")
+    let vcr_backend = stacks
+        .get("vcr-backend")
         .and_then(|v| v.as_mapping())
-        .ok_or("inference-sim stack not found")?;
+        .ok_or("vcr-backend stack not found")?;
 
-    let mut inference_sim_openai = inference_sim.clone();
+    let mut vcr_backend_openai = vcr_backend.clone();
 
-    let steps = inference_sim_openai
+    let steps = vcr_backend_openai
         .get_mut("steps")
         .and_then(|v| v.as_sequence_mut())
-        .ok_or("inference-sim-openai.steps not found or not a sequence")?;
+        .ok_or("vcr-backend-openai.steps not found or not a sequence")?;
 
     let mut found_helm_step = false;
     for step in steps {
@@ -2144,16 +2145,16 @@ fn add_openai_credential_mount(spec: &mut serde_yaml::Mapping) -> Result<(), Box
     }
 
     if !found_helm_step {
-        return Err("provider-gateway Helm step not found in inference-sim stack".into());
+        return Err("provider-gateway Helm step not found in vcr-backend stack".into());
     }
 
-    if let Some(desc) = inference_sim_openai.get_mut("description") {
+    if let Some(desc) = vcr_backend_openai.get_mut("description") {
         *desc = "Private inference backend with OpenAI external provider support".into();
     }
 
     stacks.insert(
-        "inference-sim-openai".into(),
-        serde_yaml::Value::Mapping(inference_sim_openai),
+        "vcr-backend-openai".into(),
+        serde_yaml::Value::Mapping(vcr_backend_openai),
     );
 
     Ok(())
@@ -2219,6 +2220,7 @@ fn set_cluster_image_properties_for_mode(
                 "mockProviderImage",
                 image_overrides::demo_mock_provider_image(ingress_mode),
             ),
+            ("vcrImage", image_overrides::vcr_image()),
             ("imagePullPolicy", image_overrides::demo_image_pull_policy(ingress_mode)),
             ("gatewayImageRepo", gw_repo.clone()),
             ("gatewayImageTag", gw_tag.clone()),
@@ -2243,7 +2245,8 @@ fn load_local_images_if_required(
     let operator = image_overrides::demo_operator_image(ingress_mode);
     let gateway = image_overrides::demo_gateway_image(ingress_mode);
     let mock = image_overrides::demo_mock_provider_image(ingress_mode);
-    for image in [&operator, &gateway, &mock] {
+    let vcr = image_overrides::vcr_image();
+    for image in [&operator, &gateway, &mock, &vcr] {
         require_local_image(image)?;
     }
     let gateway_clusters = match ingress_mode {
@@ -2258,6 +2261,7 @@ fn load_local_images_if_required(
     }
     for cluster in PROVIDER_CLUSTERS {
         run_forge(forge, config, &["cluster", "load-image", cluster, &mock])?;
+        run_forge(forge, config, &["cluster", "load-image", cluster, &vcr])?;
     }
     Ok(())
 }
@@ -2293,13 +2297,13 @@ fn apply_foundation_stacks_with_mode(
 /// Apply provider sites and private provider paths before edge rendering.
 /// Select the appropriate stack name for a provider based on region and external provider status.
 ///
-/// Returns `inference-sim-openai` only for east-provider with external providers enabled.
+/// Returns `vcr-backend-openai` only for east-provider with external providers enabled.
 /// This separation prevents west-provider from requiring credentials that only exist in east-provider.
 fn select_stack_for_provider(region: &str, has_external_provider: bool) -> &'static str {
     if region == "east" && has_external_provider {
-        "inference-sim-openai"
+        "vcr-backend-openai"
     } else {
-        "inference-sim"
+        "vcr-backend"
     }
 }
 
@@ -2601,7 +2605,7 @@ mod setup_tests {
                     "runAsNonRoot: true",
                     "type: RuntimeDefault",
                     "allowPrivilegeEscalation: false",
-                    "readOnlyRootFilesystem: true",
+                    "readOnlyRootFilesystem: false",
                     "- ALL",
                 ] {
                     assert!(deployment.contains(required), "{manifest} must contain {required:?}");
@@ -2893,7 +2897,7 @@ mod setup_tests {
             let mut quick = Narrator::new();
             print_boundaries(&mut quick, DemoMode::Quick);
             let quick_text = quick.lines.join("\n");
-            assert!(quick_text.contains("same-site provider drain"));
+            assert!(quick_text.contains("Health-driven provider withdrawal"));
             assert!(!quick_text.contains("edge withdrawal"));
             assert!(!quick_text.contains("restart recovery"));
             assert!(!quick_text.contains("request soak"));

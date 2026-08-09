@@ -33,7 +33,7 @@ filter_chains:
         emit_demo_attribution: true
         routes:
           - candidate_id: "{{ cluster.properties.candidateId }}"
-            model: llmd-sim-model
+            model: Qwen/Qwen3-0.6B
             paths:
               - /v1/chat/completions
               - /v1/responses

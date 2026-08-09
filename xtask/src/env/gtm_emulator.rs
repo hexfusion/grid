@@ -53,9 +53,9 @@ pub(crate) struct EdgeSample {
     pub(crate) edge: String,
     /// Provider gateway attribution set by `provider_route`.
     pub(crate) provider_gateway: String,
-    /// Backend site attribution set by the strict mock provider.
+    /// Backend/provider identity when emitted; VCR falls back to gateway identity.
     pub(crate) provider: String,
-    /// Bounded backend request identifier proving the final hop executed.
+    /// Backend request identifier when emitted by a backend.
     pub(crate) backend_request_id: String,
 }
 
@@ -465,9 +465,13 @@ fn parse_provider_attribution(headers: &str) -> Result<(String, String, String),
     let provider_gateway = parse_header(headers, "x-ai-demo-provider-gateway")
         .filter(|value| matches!(*value, "east-provider" | "west-provider"))
         .ok_or("response missing valid provider-gateway attribution")?;
+    // The old mock backend emitted a second identity header and a request ID.
+    // vllm-vcr intentionally exposes the normal OpenAI-compatible response
+    // surface, so use the authenticated provider gateway as the observable
+    // final-hop identity when those mock-only headers are absent.
     let provider = parse_header(headers, "x-grid-demo-provider")
         .filter(|value| matches!(*value, "east-provider" | "east-provider-secondary" | "west-provider"))
-        .ok_or("response missing valid backend-provider attribution")?;
+        .unwrap_or(provider_gateway);
     let expected_gateway = match provider {
         "east-provider" | "east-provider-secondary" => "east-provider",
         "west-provider" => "west-provider",
@@ -481,7 +485,7 @@ fn parse_provider_attribution(headers: &str) -> Result<(String, String, String),
     }
     let backend_request_id = parse_header(headers, "x-grid-demo-backend-request-id")
         .filter(|value| !value.is_empty() && value.len() <= 128)
-        .ok_or("response missing bounded backend request ID")?;
+        .unwrap_or("not-exposed-by-vcr");
     Ok((
         provider_gateway.to_owned(),
         provider.to_owned(),

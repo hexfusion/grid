@@ -8,7 +8,7 @@ spec:
     - number: 8000
   selector:
     matchLabels:
-      app: llm-d-sim
+      app: vllm-vcr
       pool: "pool-a"
   endpointPickerRef:
     name: llmd-epp

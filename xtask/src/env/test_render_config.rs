@@ -10,11 +10,11 @@ spec:
     provider: docker
   clusters:
     - name: test-cluster
-      stacks: [inference-sim]
+      stacks: [vcr-backend]
       properties:
         region: test
   stacks:
-    inference-sim:
+    vcr-backend:
       description: Private inference backend
       steps:
         - type: helm
@@ -36,9 +36,9 @@ fn test_normal_mode_no_openai() {
 
     let stacks = config.get("spec").unwrap().get("stacks").unwrap().as_mapping().unwrap();
 
-    assert!(stacks.get("inference-sim-openai").is_none());
+    assert!(stacks.get("vcr-backend-openai").is_none());
 
-    let inference_sim = stacks.get("inference-sim").unwrap();
+    let inference_sim = stacks.get("vcr-backend").unwrap();
     let steps = inference_sim.get("steps").unwrap().as_sequence().unwrap();
 
     for step in steps {
@@ -76,7 +76,7 @@ fn test_openai_mode_creates_required_credential() {
 
     let stacks = config.get("spec").unwrap().get("stacks").unwrap().as_mapping().unwrap();
 
-    let openai_stack = stacks.get("inference-sim-openai").unwrap();
+    let openai_stack = stacks.get("vcr-backend-openai").unwrap();
     let steps = openai_stack.get("steps").unwrap().as_sequence().unwrap();
 
     let mut found_openai_credential = false;
@@ -125,7 +125,7 @@ fn test_normal_stack_unchanged_in_openai_mode() {
 
     let stacks = config.get("spec").unwrap().get("stacks").unwrap().as_mapping().unwrap();
 
-    let inference_sim = stacks.get("inference-sim").unwrap();
+    let inference_sim = stacks.get("vcr-backend").unwrap();
     let steps = inference_sim.get("steps").unwrap().as_sequence().unwrap();
 
     for step in steps {
@@ -151,11 +151,11 @@ apiVersion: forge.praxis.dev/v1alpha1
 spec:
   clusters:
     - name: test-cluster
-      stacks: [inference-sim]
+      stacks: [vcr-backend]
       properties:
         region: test
   stacks:
-    inference-sim:
+    vcr-backend:
       description: Test
 ";
 
@@ -170,7 +170,7 @@ spec:
         Err(e) => e.to_string(),
         Ok(_) => unreachable!("Expected error but got success"),
     };
-    assert_eq!(error_msg, "inference-sim-openai.steps not found or not a sequence");
+    assert_eq!(error_msg, "vcr-backend-openai.steps not found or not a sequence");
 }
 
 #[test]
@@ -180,7 +180,7 @@ apiVersion: forge.praxis.dev/v1alpha1
 spec:
   clusters:
     - name: test-cluster
-      stacks: [inference-sim]
+      stacks: [vcr-backend]
   runtime:
     provider: docker
 ";
@@ -197,10 +197,10 @@ spec:
 
 #[test]
 fn test_stack_selection() {
-    assert_eq!(super::select_stack_for_provider("east", true), "inference-sim-openai");
-    assert_eq!(super::select_stack_for_provider("east", false), "inference-sim");
-    assert_eq!(super::select_stack_for_provider("west", true), "inference-sim");
-    assert_eq!(super::select_stack_for_provider("west", false), "inference-sim");
+    assert_eq!(super::select_stack_for_provider("east", true), "vcr-backend-openai");
+    assert_eq!(super::select_stack_for_provider("east", false), "vcr-backend");
+    assert_eq!(super::select_stack_for_provider("west", true), "vcr-backend");
+    assert_eq!(super::select_stack_for_provider("west", false), "vcr-backend");
 }
 
 #[test]
@@ -216,18 +216,18 @@ spec:
     provider: docker
   clusters:
     - name: test-cluster
-      stacks: [inference-sim]
+      stacks: [vcr-backend]
       properties:
         region: test
   stacks:
-    inference-sim:
+    vcr-backend:
       description: Private inference backend
       steps:
         - type: helm
           release: provider-gateway
           values:
             credentials: []
-    inference-sim-openai:
+    vcr-backend-openai:
       description: Existing stack
 ";
 
@@ -242,5 +242,5 @@ spec:
         Err(e) => e.to_string(),
         Ok(_) => unreachable!("Expected error but got success"),
     };
-    assert_eq!(error_msg, "inference-sim-openai stack already exists");
+    assert_eq!(error_msg, "vcr-backend-openai stack already exists");
 }

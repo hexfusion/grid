@@ -21,6 +21,9 @@ const MOCK_EPP_IMAGE_ENV: &str = "GRID_XTASK_MOCK_EPP_IMAGE";
 /// Environment variable to override the mock provider image.
 const MOCK_PROVIDER_IMAGE_ENV: &str = "GRID_XTASK_MOCK_PROVIDER_IMAGE";
 
+/// Environment variable to override the VCR image.
+const VCR_IMAGE_ENV: &str = "GRID_XTASK_VCR_IMAGE";
+
 /// Environment variable to override the operator image.
 const OPERATOR_IMAGE_ENV: &str = "GRID_XTASK_OPERATOR_IMAGE";
 
@@ -48,6 +51,9 @@ const DEFAULT_GLB_GATEWAY_IMAGE: &str = "praxis-ai:glb-demo";
 
 /// Default mock-provider image used by the GLB demo.
 const DEFAULT_GLB_MOCK_PROVIDER_IMAGE: &str = "grid-mock-providers:glb-demo";
+
+/// Default VCR image used by forge-based demos.
+const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 
 /// Default operator image used by the GLB demo.
 const DEFAULT_GLB_OPERATOR_IMAGE: &str = "grid-operator:glb-demo";
@@ -93,6 +99,11 @@ pub(crate) fn mock_provider_image() -> String {
 /// Get the operator image name, respecting environment overrides.
 pub(crate) fn operator_image() -> String {
     env::var(OPERATOR_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned())
+}
+
+/// Get the VCR image name, respecting environment overrides.
+pub(crate) fn vcr_image() -> String {
+    env::var(VCR_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned())
 }
 
 /// Get the demo gateway image for the given ingress mode.
