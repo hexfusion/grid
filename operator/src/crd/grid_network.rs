@@ -227,6 +227,17 @@ pub struct GridNetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring_policy: Option<ScoringPolicyConfig>,
 
+    /// Maximum time between metric refreshes and score/ranking recalculation.
+    ///
+    /// This controls the `GridNetwork` reconcile cadence for provider metrics;
+    /// it does not change request-path routing or the overlay watch latency.
+    /// Use a duration of at least one second, such as `"10s"` or `"1500ms"`.
+    /// The default cadence is 300 seconds. TLS-protected provider metrics cap
+    /// the cadence at 60 seconds for bounded certificate-rotation detection.
+    #[schemars(regex(pattern = "^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_refresh_interval: Option<String>,
+
     /// Maximum age in seconds before a stale (`fresh=false`) remote routing
     /// candidate is removed from the overlay.
     ///
@@ -1497,6 +1508,19 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(required, &[serde_json::Value::String("strategy".to_owned())]);
+    }
+
+    #[test]
+    fn metrics_refresh_interval_schema_requires_positive_duration_of_at_least_one_second() {
+        let crd = crd_json();
+        let schema = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsRefreshInterval")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(schema.get("type").and_then(serde_json::Value::as_str), Some("string"));
+        assert_eq!(
+            schema.get("pattern").and_then(serde_json::Value::as_str),
+            Some("^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$")
+        );
     }
 
     // -----------------------------------------------------------------------
