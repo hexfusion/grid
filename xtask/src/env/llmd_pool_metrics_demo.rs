@@ -25,7 +25,7 @@ use std::{
 
 use serde::Serialize;
 
-use super::{DemoMode, GlbDemoOptions, certs, glb, image_overrides, kubectl, operator};
+use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator};
 
 /// Directory where generated TLS certificates are stored.
 const CERTS_DIR: &str = "tests/env/certs";
@@ -106,11 +106,11 @@ const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
 /// The pool-metrics demo shares the same Grid-enabled Praxis AI binary as the
 /// combined-site demo. Both require the `peer_identity_trust`,
 /// `provider_route`, `credential_inject`, and `intelligent_route` filters
-/// which are built into the GLB demo image.
-const DEFAULT_GATEWAY_IMAGE: &str = "praxis-ai:glb-demo";
+/// which are built into the published Grid AI rollup.
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3";
 
 /// Default operator image tag.
-const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:llmd-pool-metrics-demo";
+const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.3";
 
 /// Default EPP image reference required by this demo.
 const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0";
@@ -119,7 +119,7 @@ const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0"
 const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 
 /// Default overlay-sync sidecar image tag.
-const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:llmd-pool-metrics-demo";
+const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.3";
 
 /// Default nginx image for the metrics TLS reverse proxy sidecar.
 const DEFAULT_NGINX_IMAGE: &str = "docker.io/library/nginx:1.27.4-alpine";
@@ -505,12 +505,17 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
     })
 }
 
+/// Whether the demo should pull its published images in each Kind cluster.
+fn uses_registry_images() -> bool {
+    std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned()) != "Never"
+}
+
 /// Verify local-mode images before creating clusters.
 ///
 /// Registry mode references pullable images directly from the Forge config, so
 /// each Kind node resolves them without host-side tagging or loading.
 fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Error>> {
-    if image_overrides::should_skip_kind_image_loading() {
+    if uses_registry_images() {
         eprintln!("  registry image mode: images will be pulled by each cluster");
         return Ok(());
     }
@@ -547,7 +552,7 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
 ///
 /// The forge config uses fixed image references (e.g.
 /// `praxis-ai:llmd-pool-metrics-demo`). When the resolved source image
-/// differs (e.g. `praxis-ai:glb-demo`), this function creates the
+/// differs (for example, an explicitly configured local development image), this function creates the
 /// expected tag so Kind image loading and pod pulls succeed.
 fn tag_images_for_forge(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Error>> {
     let forge_expected: &[(&str, &str)] = &[
@@ -2037,7 +2042,7 @@ fn wait_for_overlay_convergence() -> Result<(), Box<dyn std::error::Error>> {
 /// Uses the forge-expected tags (created by [`tag_images_for_forge`]) since
 /// the forge manifests and Helm values reference those names.
 fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
-    if image_overrides::should_skip_kind_image_loading() {
+    if uses_registry_images() {
         eprintln!("  [OK] Registry image mode: skipped local Kind image loading");
         return Ok(());
     }
