@@ -1140,26 +1140,107 @@ fn render_overlay_for_gateway(
     })
 }
 
-/// True when `existing`'s revision annotation already matches `revision_hex`,
-/// meaning a re-apply of the overlay `ConfigMap` would be a no-op write.
+/// True when the existing overlay has the expected semantic content and scope.
 ///
-/// Pure/synchronous so it is fully unit-testable without a live Kubernetes
-/// API. Server-side apply still writes managedFields metadata (bumping
-/// resourceVersion and firing a watch event) even when applied content is
-/// byte-for-byte unchanged; combined with the apply being re-triggered by the
-/// very watch event it emits, applying unconditionally becomes an infinite
-/// reconcile hot-loop (see grid#42).
-fn configmap_up_to_date(existing: &ConfigMap, revision_hex: &str) -> bool {
-    existing
-        .metadata
-        .annotations
+/// Provenance and timestamps are intentionally ignored: they explain when and
+/// where an overlay was rendered, but do not change request routing. The
+/// semantic digest and parsed payload still protect against a corrupted or
+/// partially modified `ConfigMap` retaining an old revision annotation.
+fn overlay_configmap_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    configmap_revision_matches(existing, desired, revision)
+        && overlay_envelope_payload_matches(existing, desired, revision)
+        && legacy_overlay_payload_matches(existing, desired, revision)
+}
+
+/// Check all content-addressed annotations before parsing the stored payload.
+fn configmap_revision_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_annotations), Some(desired_annotations)) = (
+        existing.metadata.annotations.as_ref(),
+        desired.metadata.annotations.as_ref(),
+    ) else {
+        return false;
+    };
+    let annotation_matches = |key: &str| {
+        existing_annotations
+            .get(key)
+            .zip(desired_annotations.get(key))
+            .is_some_and(|(existing, desired)| existing == desired)
+    };
+
+    annotation_matches(overlay_envelope::ANNOTATION_SCHEMA_VERSION)
+        && annotation_matches(overlay_envelope::ANNOTATION_REVISION)
+        && annotation_matches(overlay_envelope::ANNOTATION_CONTENT_DIGEST)
+        && desired_annotations
+            .get(overlay_envelope::ANNOTATION_REVISION)
+            .is_some_and(|value| value == revision)
+        && desired_annotations
+            .get(overlay_envelope::ANNOTATION_CONTENT_DIGEST)
+            .is_some_and(|value| value == revision)
+}
+
+/// Parse the content-addressed envelope stored in a routing `ConfigMap`.
+fn overlay_envelope_from_configmap(configmap: &ConfigMap) -> Option<overlay_envelope::OverlayEnvelope> {
+    configmap
+        .data
         .as_ref()
-        .and_then(|a| a.get(overlay_envelope::ANNOTATION_REVISION))
-        .is_some_and(|rev| rev == revision_hex)
+        .and_then(|data| data.get(overlay_envelope::ENVELOPE_KEY))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+/// Parse the compatibility routing payload stored in a routing `ConfigMap`.
+fn routing_overlay_from_configmap(configmap: &ConfigMap) -> Option<routing_overlay::RoutingOverlay> {
+    configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get("routing-config.json"))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+/// Validate the semantic envelope and its gateway scope.
+fn overlay_envelope_payload_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_envelope), Some(desired_envelope)) = (
+        overlay_envelope_from_configmap(existing),
+        overlay_envelope_from_configmap(desired),
+    ) else {
+        return false;
+    };
+
+    existing_envelope.schema_version == desired_envelope.schema_version
+        && existing_envelope.revision.kind == desired_envelope.revision.kind
+        && existing_envelope.revision.algorithm == desired_envelope.revision.algorithm
+        && existing_envelope.content_digest.algorithm == desired_envelope.content_digest.algorithm
+        && existing_envelope.revision.value == revision
+        && existing_envelope.content_digest.value == revision
+        && existing_envelope.scope.network == desired_envelope.scope.network
+        && existing_envelope.scope.gateway == desired_envelope.scope.gateway
+        && existing_envelope.scope.namespace == desired_envelope.scope.namespace
+        && existing_envelope.scope.local_site == desired_envelope.scope.local_site
+        && overlay_envelope::compute_semantic_digest(&existing_envelope.overlay)
+            .ok()
+            .as_deref()
+            == Some(revision)
+}
+
+/// Validate the compatibility routing payload and its semantic digest.
+fn legacy_overlay_payload_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_overlay), Some(desired_overlay)) = (
+        routing_overlay_from_configmap(existing),
+        routing_overlay_from_configmap(desired),
+    ) else {
+        return false;
+    };
+
+    existing_overlay.network == desired_overlay.network
+        && existing_overlay.local_site == desired_overlay.local_site
+        && overlay_envelope::compute_semantic_digest(&existing_overlay)
+            .ok()
+            .as_deref()
+            == Some(revision)
 }
 
 /// Server-side apply a pre-rendered overlay `ConfigMap` for a single gateway,
-/// skipping the apply when [`configmap_up_to_date`] says it would be a no-op.
+/// skipping the apply when [`overlay_configmap_matches`] says it would be a
+/// no-op.
 ///
 /// Returns the Kubernetes `resourceVersion` of the (applied or pre-existing)
 /// `ConfigMap`.
@@ -1190,7 +1271,7 @@ async fn distribute_overlay_configmap(
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
 
     if let Ok(existing) = api.get(&render.config_map_name).await
-        && configmap_up_to_date(&existing, &render.revision_hex)
+        && overlay_configmap_matches(&existing, &cm, &render.revision_hex)
     {
         tracing::debug!(
             cm_name = %render.config_map_name,
@@ -3667,49 +3748,153 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // configmap_up_to_date — grid#42 acceptance criterion for the overlay
-    // ConfigMap: re-applying an unchanged revision must be recognized as a
-    // no-op so `distribute_overlay_configmap` can skip the write.
+    // overlay_configmap_matches — grid#42 no-op write guard
     // -----------------------------------------------------------------------
 
-    fn configmap_with_revision(revision: Option<&str>) -> ConfigMap {
-        let annotations = revision.map(|rev| {
-            std::collections::BTreeMap::from([(overlay_envelope::ANNOTATION_REVISION.to_owned(), rev.to_owned())])
-        });
-        ConfigMap {
-            metadata: kube::api::ObjectMeta {
-                annotations,
-                ..Default::default()
-            },
-            ..Default::default()
+    fn overlay_configmaps_for_test() -> (ConfigMap, ConfigMap, String) {
+        let overlay: routing_overlay::RoutingOverlay = serde_json::from_value(serde_json::json!({
+            "network": "net",
+            "local_site": "site",
+            "candidates": []
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let built = overlay_envelope::build_overlay_envelope(&overlay, "gateway", "grid-system", "uid", 1, "now")
+            .unwrap_or_else(|_| std::process::abort());
+        let desired =
+            routing_overlay::build_overlay_configmap(&overlay, Some(&built.envelope), "net", "gateway", "grid-system")
+                .unwrap_or_else(|_| std::process::abort());
+        (desired.clone(), desired, built.revision_hex)
+    }
+
+    fn mutate_envelope(configmap: &mut ConfigMap, mutate: impl FnOnce(&mut overlay_envelope::OverlayEnvelope)) {
+        let payload = configmap
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+            .unwrap_or_else(|| std::process::abort());
+        let mut envelope = serde_json::from_str(payload).unwrap_or_else(|_| std::process::abort());
+        mutate(&mut envelope);
+        *payload = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    fn identical_overlay_configmap_is_safe_to_skip() {
+        let (existing, desired, revision) = overlay_configmaps_for_test();
+        assert!(overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn provenance_only_overlay_changes_are_safe_to_skip() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        let envelope_payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+            .unwrap_or_else(|| std::process::abort());
+        let mut envelope: overlay_envelope::OverlayEnvelope =
+            serde_json::from_str(envelope_payload).unwrap_or_else(|_| std::process::abort());
+        envelope.provenance.rendered_at = "later-render-time".to_owned();
+        envelope.overlay.generated_at = Some("later-overlay-time".to_owned());
+        *envelope_payload = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| std::process::abort());
+
+        let legacy_payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("routing-config.json"))
+            .unwrap_or_else(|| std::process::abort());
+        *legacy_payload = serde_json::to_string_pretty(&envelope.overlay).unwrap_or_else(|_| std::process::abort());
+
+        assert!(overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn corrupted_overlay_configmap_is_repaired_even_with_matching_annotation() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        if let Some(payload) = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+        {
+            *payload = "not-json".to_owned();
+        }
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn missing_overlay_payload_is_repaired_even_with_matching_annotation() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        existing.data = None;
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn annotation_payload_disagreement_is_repaired() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        if let Some(value) = existing
+            .metadata
+            .annotations
+            .as_mut()
+            .and_then(|annotations| annotations.get_mut(overlay_envelope::ANNOTATION_REVISION))
+        {
+            *value = "stale-revision".to_owned();
+        }
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn contract_annotation_disagreement_is_repaired() {
+        let (_, desired, revision) = overlay_configmaps_for_test();
+        for key in [
+            overlay_envelope::ANNOTATION_SCHEMA_VERSION,
+            overlay_envelope::ANNOTATION_REVISION,
+            overlay_envelope::ANNOTATION_CONTENT_DIGEST,
+        ] {
+            let mut existing = desired.clone();
+            existing
+                .metadata
+                .annotations
+                .as_mut()
+                .unwrap_or_else(|| std::process::abort())
+                .insert(key.to_owned(), "corrupted".to_owned());
+            assert!(!overlay_configmap_matches(&existing, &desired, &revision));
         }
     }
 
     #[test]
-    fn configmap_up_to_date_true_when_revision_annotation_matches() {
-        let cm = configmap_with_revision(Some("abc123"));
-        assert!(
-            configmap_up_to_date(&cm, "abc123"),
-            "identical revision must be recognized as up to date (grid#42)"
-        );
+    fn envelope_revision_contract_disagreement_is_repaired() {
+        let (_, desired, revision) = overlay_configmaps_for_test();
+        for field in ["schema", "kind", "revision_algorithm", "digest_algorithm"] {
+            let mut existing = desired.clone();
+            mutate_envelope(&mut existing, |envelope| match field {
+                "schema" => envelope.schema_version = "corrupted".to_owned(),
+                "kind" => envelope.revision.kind = "corrupted".to_owned(),
+                "revision_algorithm" => envelope.revision.algorithm = "corrupted".to_owned(),
+                "digest_algorithm" => envelope.content_digest.algorithm = "corrupted".to_owned(),
+                _ => std::process::abort(),
+            });
+            assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+        }
     }
 
     #[test]
-    fn configmap_up_to_date_false_when_revision_annotation_differs() {
-        let cm = configmap_with_revision(Some("abc123"));
-        assert!(
-            !configmap_up_to_date(&cm, "def456"),
-            "a changed revision must not be treated as up to date"
-        );
+    fn corrupted_legacy_payload_is_repaired_even_when_envelope_is_valid() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        let payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("routing-config.json"))
+            .unwrap_or_else(|| std::process::abort());
+        *payload = "not-json".to_owned();
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
     }
 
     #[test]
-    fn configmap_up_to_date_false_when_no_revision_annotation_present() {
-        let cm = configmap_with_revision(None);
-        assert!(
-            !configmap_up_to_date(&cm, "abc123"),
-            "a ConfigMap with no revision annotation at all must never be treated as up to date"
-        );
+    fn semantic_payload_disagreement_is_repaired() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        mutate_envelope(&mut existing, |envelope| {
+            envelope.overlay.local_site = "other-site".to_owned();
+        });
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
     }
 
     // -----------------------------------------------------------------------
