@@ -76,12 +76,6 @@ const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
 
-/// Scoring weight for queue_depth signal (one-hot strategy: weight = 1.0).
-const QUEUE_DEPTH_WEIGHT: f64 = 1.0;
-
-/// Scoring weight for kv_cache signal (one-hot strategy: weight = 1.0).
-const KV_CACHE_WEIGHT: f64 = 1.0;
-
 /// Minimum score gap required before capturing the pressure scorecard.
 ///
 /// With real VCR backends, pressure creates modest score differences
@@ -922,8 +916,10 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
             match send_inference_request(&probe_ctx, VCR_MODEL) {
                 Ok(resp) => {
                     if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
-                        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
-                        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
+                        let epp_b =
+                            scrape_epp_metrics("pool-b", context.metrics_transport == MetricsTransport::MtlsProxy);
+                        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
+                        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
                         eprintln!("  [BASELINE] Request attributed to pool-a -- baseline confirmed");
                         print_scorecard_with_cause(
                             "BASELINE",
@@ -1035,9 +1031,10 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         }
 
         let epp_a = scrape_epp_metrics("pool-a", mtls);
+        let epp_b = scrape_epp_metrics("pool-b", mtls);
         let candidates = read_overlay_candidates("pool-a");
-        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
-        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
+        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
+        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
         let stats = read_pressure_stats("pool-a");
         let score_gap = row_b.score - row_a.score;
 
@@ -1181,9 +1178,10 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
         }
 
         let epp_a = scrape_epp_metrics("pool-a", mtls);
+        let epp_b = scrape_epp_metrics("pool-b", mtls);
         let candidates = read_overlay_candidates("pool-a");
-        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
-        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
+        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
+        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
 
         print_live_table_row(&LiveTableRow {
             elapsed: table_start.elapsed(),
@@ -1431,13 +1429,15 @@ fn pressure_phase_active(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
 /// `QueueDepth` uses its own calibrated [`RECOVERY_QUEUE_THRESHOLD`] (looser
 /// than [`QUEUE_PRESSURE_THRESHOLD`] by design -- recovery only needs "clearly
 /// drained," not a full return below the phase-detection threshold).
-/// `KvCachePressure` has no independently-calibrated recovery threshold yet,
-/// so it reuses the inverse of [`pressure_phase_active`] rather than
-/// inventing an untested second KV constant.
+/// `KvCachePressure` requires the shared queue-drain threshold as well as the
+/// inverse of [`pressure_phase_active`]. This prevents a locality tie-break
+/// from being reported as recovery while request queues remain saturated.
 fn recovery_condition_met(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
     match flavor {
         ScoringFlavor::QueueDepth => epp.queue_size < RECOVERY_QUEUE_THRESHOLD,
-        ScoringFlavor::KvCachePressure => !pressure_phase_active(flavor, epp),
+        ScoringFlavor::KvCachePressure => {
+            epp.queue_size < RECOVERY_QUEUE_THRESHOLD && !pressure_phase_active(flavor, epp)
+        },
     }
 }
 
@@ -1508,33 +1508,26 @@ fn overlay_score_for_cluster(candidates: &[OverlayCandidate], cluster_suffix: &s
         .map_or(0.0, |c| c.score)
 }
 
-/// Build a scorecard row entirely from the overlay.
+/// Build a scorecard row from the overlay decision and live EPP metrics.
 ///
-/// Raw queue size and KV-cache utilization are back-computed from the
-/// score breakdown so that every value in the row comes from the same
-/// operator scoring revision.  Mixing live EPP metrics with overlay
-/// scores produces contradictions when the pressure ramp advances
-/// between the operator scrape and the demo capture.
-fn build_scorecard_row(label: &str, candidates: &[OverlayCandidate], cluster_suffix: &str) -> ScorecardRow {
+/// The overlay owns score and rank. EPP owns the raw queue and KV-cache
+/// measurements. Reconstructing raw metrics from score-breakdown weights is
+/// invalid when a signal is inactive, because its zero contribution does not
+/// mean the underlying metric is zero.
+fn build_scorecard_row(
+    label: &str,
+    candidates: &[OverlayCandidate],
+    cluster_suffix: &str,
+    metrics: &EppMetrics,
+) -> ScorecardRow {
     let rank = overlay_rank_for_cluster(candidates, cluster_suffix);
     let score = overlay_score_for_cluster(candidates, cluster_suffix);
-    let bd = candidates
-        .iter()
-        .find(|c| c.cluster.contains(cluster_suffix))
-        .and_then(|c| c.breakdown.as_ref());
-    let (queue, kv_cache) = if let Some(b) = bd {
-        let q = QUEUE_CAPACITY * (1.0 - b.queue_depth / QUEUE_DEPTH_WEIGHT);
-        let kv = 1.0 - b.kv_cache / KV_CACHE_WEIGHT;
-        (q.max(0.0), kv.max(0.0))
-    } else {
-        (0.0, 0.0)
-    };
     ScorecardRow {
         cluster: label.to_owned(),
-        queue,
+        queue: metrics.queue_size,
         capacity: QUEUE_CAPACITY,
-        pressure: queue / QUEUE_CAPACITY,
-        kv_cache,
+        pressure: metrics.queue_size / QUEUE_CAPACITY,
+        kv_cache: metrics.kv_cache,
         score,
         rank,
     }
@@ -2387,13 +2380,29 @@ fn materialize_config(
     if scoring_flavor == ScoringFlavor::KvCachePressure {
         let default_strategy = format!("strategy: {}", ScoringFlavor::QueueDepth.strategy_yaml());
         let selected_strategy = format!("strategy: {}", scoring_flavor.strategy_yaml());
-        result = checked_replace(
-            &result,
-            &default_strategy,
-            &selected_strategy,
-            2,
-            "scoringPolicy.strategy",
-        )?;
+        let default_matches = result.matches(&default_strategy).count();
+        let selected_matches = result.matches(&selected_strategy).count();
+        match (default_matches, selected_matches) {
+            (2, 0) => {
+                result = checked_replace(
+                    &result,
+                    &default_strategy,
+                    &selected_strategy,
+                    2,
+                    "scoringPolicy.strategy",
+                )?;
+            },
+            (0, 2) => {
+                // The wrapper may select a Forge config that already uses the
+                // requested strategy. Keep materialization idempotent.
+            },
+            _ => {
+                return Err(format!(
+                    "materialize_config: scoringPolicy.strategy: expected either 2 queueDepth matches or 2 kvCachePressure matches, found {default_matches} and {selected_matches}"
+                )
+                .into());
+            },
+        }
     }
 
     fs::write(&resolved, result)?;
@@ -3872,16 +3881,21 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
-    fn recovery_condition_met_kv_cache_flavor_uses_pressure_active_inverse() {
-        // No independently-calibrated recovery threshold exists for
-        // kv_cache yet, so recovery is defined as "pressure phase is no
-        // longer active" -- reusing the one KV threshold that IS
-        // calibrated, rather than inventing an untested second one.
+    fn recovery_condition_met_kv_cache_flavor_requires_queue_drain_and_low_pressure() {
         let recovered = EppMetrics {
-            queue_size: 99.0, // must be ignored for this flavor
+            queue_size: 2.9, // must be below the shared recovery threshold
             kv_cache: 0.0,
         };
         assert!(recovery_condition_met(ScoringFlavor::KvCachePressure, &recovered));
+
+        let queue_still_saturated = EppMetrics {
+            queue_size: 4.0,
+            kv_cache: 0.0,
+        };
+        assert!(!recovery_condition_met(
+            ScoringFlavor::KvCachePressure,
+            &queue_still_saturated
+        ));
 
         let still_pressured = EppMetrics {
             queue_size: 0.0,
@@ -4174,6 +4188,32 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             !content.contains("strategy: queueDepth"),
             "no queueDepth strategy should remain after the swap"
         );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_kv_cache_flavor_accepts_preselected_strategy() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-kv-cache-preselected");
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge-kv-cache.yaml");
+        let config = test_forge_config().replace("strategy: queueDepth", "strategy: kvCachePressure");
+        fs::write(&forge_path, config).unwrap();
+
+        let resolved = materialize_config(
+            &forge_path,
+            MetricsTransport::DirectHttp,
+            ScoringFlavor::KvCachePressure,
+            None,
+        )
+        .unwrap();
+        let content = fs::read_to_string(&resolved).unwrap();
+
+        assert_eq!(
+            content.matches("strategy: kvCachePressure").count(),
+            2,
+            "a preselected kv-cache config must remain unchanged"
+        );
+        assert!(!content.contains("strategy: queueDepth"));
         drop(fs::remove_dir_all(&dir));
     }
 
