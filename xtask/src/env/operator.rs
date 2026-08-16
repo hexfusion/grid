@@ -914,7 +914,15 @@ pub(crate) fn apply_test_fixtures_for_cluster(
     routing_cluster: &str,
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
+    // localSiteName must match the healthy/degraded/metrics fixtures'
+    // routingClusterRef so their overlay candidates resolve to
+    // LocalityTier::SameSite (grid#60): without it, GatewayRef.localSiteName
+    // falls back to the network name, which matches no candidate's site, so
+    // every candidate ties at LocalityTier::Unknown and GeographyFirst
+    // ordering falls through to score (tied under the noMetrics default
+    // strategy) and then to the alphabetical (site, name, cluster) tiebreak —
+    // silently masking locality-order assertions instead of exercising them.
+    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, routing_cluster);
     let healthy = provider_fixture_json(
         TEST_PROVIDER_HEALTHY,
         TEST_NETWORK,
@@ -931,14 +939,19 @@ pub(crate) fn apply_test_fixtures_for_cluster(
 }
 
 /// Build a `GridNetwork` JSON fixture.
-fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str) -> String {
+///
+/// `local_site_name` becomes `gatewayRefs[0].localSiteName` — the site the
+/// rendered overlay treats as "local" for `GeographyFirst` locality-tier
+/// ordering. Pass the `routingClusterRef` used by the fixtures that should
+/// resolve to `LocalityTier::SameSite`.
+fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str, local_site_name: &str) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": name },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{ "name": gw_name, "namespace": gw_ns }]
+            "gatewayRefs": [{ "name": gw_name, "namespace": gw_ns, "localSiteName": local_site_name }]
         }
     }))
     .unwrap_or_else(|e| {
@@ -5506,6 +5519,17 @@ fn multi_provider_fixture_json(
     })
 }
 
+/// Build the multi-provider validation `GridNetwork` fixture JSON.
+///
+/// No single site is "local" across multiple provider sites — this
+/// intentionally passes `TEST_NETWORK` (not a real site name) as
+/// `local_site`, preserving the prior behavior (`localSiteName` falls back to
+/// the network name, which matches no candidate) since this validation
+/// checks candidate presence per site, not locality ordering.
+fn multi_provider_network_fixture_json() -> String {
+    network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK)
+}
+
 /// Apply a `GridNetwork` + one `InferenceProvider` per provider site.
 ///
 /// Used in multi-provider mode instead of `apply_test_fixtures`.  Each
@@ -5520,7 +5544,7 @@ pub(crate) fn apply_multi_provider_fixtures(
     providers: &[(&str, &[String])],
     provider_endpoint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
+    let network = multi_provider_network_fixture_json();
     kubectl::apply_manifest(context, &network)?;
     for &(site_name, models) in providers {
         let fixture_name = multi_provider_fixture_name(site_name);
@@ -7538,6 +7562,81 @@ pub(crate) fn delete_api_credential_secret(context: &str, namespace: &str) -> Re
 )]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // network_fixture_json — E2E harness contract (grid#60)
+    //
+    // These pin the fixture-builder's wiring, not the business rule itself:
+    // "local ranks before remote/API-provider under GeographyFirst" is
+    // already asserted at the unit tier against the real renderer in
+    // operator::resources::routing_overlay (score_ordered_local_ranks_before_api_provider,
+    // no_metrics_geography_first_still_prefers_local). What broke was that
+    // this E2E fixture never gave the operator a `localSiteName` to compare
+    // candidates against, so the live reconcile path silently stopped
+    // exercising that business rule at all. This test guards the fixture's
+    // contract so a future regression here is caught by `cargo test -p xtask`
+    // in milliseconds, not only by a multi-minute live-cluster E2E run.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn network_fixture_json_sets_local_site_name_from_argument() {
+        let json = network_fixture_json(
+            TEST_NETWORK,
+            TEST_GATEWAY_NAME,
+            TEST_GATEWAY_NS,
+            TEST_HEALTHY_ROUTING_CLUSTER,
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("fixture must be valid JSON");
+        let gw_ref = &value["spec"]["gatewayRefs"][0];
+
+        assert_eq!(
+            gw_ref["localSiteName"].as_str(),
+            Some(TEST_HEALTHY_ROUTING_CLUSTER),
+            "grid#60: without localSiteName, the operator's local_site falls back to the network name, \
+             which matches no candidate's site, silently disabling GeographyFirst locality-tier ordering"
+        );
+        assert_eq!(gw_ref["name"].as_str(), Some(TEST_GATEWAY_NAME));
+        assert_eq!(gw_ref["namespace"].as_str(), Some(TEST_GATEWAY_NS));
+    }
+
+    #[test]
+    fn apply_test_fixtures_for_cluster_wires_routing_cluster_as_local_site_name() {
+        let routing_cluster = "site-nonstandard";
+        let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, routing_cluster);
+        let healthy = provider_fixture_json(
+            TEST_PROVIDER_HEALTHY,
+            TEST_NETWORK,
+            "http://x",
+            Some(routing_cluster),
+            "model-x",
+        );
+
+        let network_json: serde_json::Value =
+            serde_json::from_str(&network).expect("network fixture must be valid JSON");
+        let provider_json: serde_json::Value =
+            serde_json::from_str(&healthy).expect("provider fixture must be valid JSON");
+
+        assert_eq!(
+            network_json["spec"]["gatewayRefs"][0]["localSiteName"].as_str(),
+            provider_json["spec"]["routingClusterRef"].as_str(),
+            "GridNetwork.gatewayRefs[0].localSiteName must match the healthy provider's \
+             routingClusterRef so its candidate resolves to LocalityTier::SameSite"
+        );
+    }
+
+    #[test]
+    fn apply_multi_provider_fixtures_network_uses_test_network_as_local_site_name() {
+        let json = multi_provider_network_fixture_json();
+        let value: serde_json::Value = serde_json::from_str(&json).expect("fixture must be valid JSON");
+
+        assert_eq!(
+            value["spec"]["gatewayRefs"][0]["localSiteName"].as_str(),
+            Some(TEST_NETWORK),
+            "multi-provider validation has no single local site; localSiteName must stay TEST_NETWORK \
+             (matching no candidate) so candidate-presence checks aren't skewed by locality ordering — if this \
+             ever changed to pass a real site name, locality ordering would silently re-engage with no signal"
+        );
+    }
 
     #[test]
     fn operator_image_patch_uses_selected_image_contract() {
