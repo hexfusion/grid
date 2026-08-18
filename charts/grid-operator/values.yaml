@@ -101,7 +101,7 @@ gateway:
   serviceName: ""
   # -- Gateway port for operator-to-gateway discovery. Maps to
   # GRID_GATEWAY_PORT.
-  port: ""
+  port: null
 
 # -- Probe timing configuration.
 health:

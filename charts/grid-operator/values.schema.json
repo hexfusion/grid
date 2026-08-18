@@ -213,7 +213,9 @@
           "description": "Gateway Kubernetes Service name for discovery."
         },
         "port": {
-          "type": "string",
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 65535,
           "description": "Gateway port for discovery."
         }
       }

@@ -24,4 +24,4 @@ swim:
 gateway:
   # The Praxis consumer gateway Service name in the same namespace.
   serviceName: consumer-gateway
-  port: "8080"
+  port: 8080

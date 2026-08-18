@@ -116,7 +116,13 @@ try_template "$CHART_DIR" "SA annotations" \
 try_template "$CHART_DIR" "hostile podLabels" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile'
 try_template "$CHART_DIR" "gateway discovery" \
-  --set-string gateway.serviceName=edge-gateway --set-string gateway.port=8080
+  --set-string gateway.serviceName=edge-gateway --set gateway.port=8080
+try_reject "$CHART_DIR" "gateway.port as a string" \
+  --set-string gateway.port=8080
+try_reject "$CHART_DIR" "gateway.port out of range" \
+  --set gateway.port=99999
+try_reject "$CHART_DIR" "gateway.port non-numeric" \
+  --set-string gateway.port=bananas
 
 # ── Verify selector protection ──────────────────────────────────────
 echo ""
