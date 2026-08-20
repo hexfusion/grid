@@ -189,7 +189,7 @@ pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
-    use k8s_openapi::api::core::v1::{LoadBalancerIngress, LoadBalancerStatus, Service, ServiceStatus};
+    use k8s_openapi::api::core::v1::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus};
 
     use super::*;
 
