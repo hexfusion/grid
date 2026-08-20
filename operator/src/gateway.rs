@@ -146,7 +146,7 @@ async fn discover_from_service(client: &Client, config: &Config) -> Result<Optio
     let api: Api<Service> = Api::namespaced(client.clone(), &config.namespace);
     if let Some(svc) = api.get_opt(&config.service_name).await? {
         let addr = extract_lb_address(&svc, config.port);
-        log_discovery_result(&config.service_name, &config.namespace, &addr);
+        log_discovery_result(&config.service_name, &config.namespace, addr.as_ref());
         Ok(addr)
     } else {
         tracing::info!(
@@ -159,7 +159,7 @@ async fn discover_from_service(client: &Client, config: &Config) -> Result<Optio
 }
 
 /// Log the outcome of Service-based discovery.
-fn log_discovery_result(service: &str, namespace: &str, addr: &Option<String>) {
+fn log_discovery_result(service: &str, namespace: &str, addr: Option<&String>) {
     if let Some(a) = addr {
         tracing::info!(
             service = %service,

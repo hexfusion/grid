@@ -353,7 +353,7 @@ impl GridStateSnapshot {
     /// Used by the SWIM runtime's dead-member eviction sweep to clean up
     /// state from a site that has been dead longer than the eviction TTL.
     pub fn remove_origin_providers(&mut self, origin_site: &str) {
-        self.providers.retain(|_, p| p.site_id != origin_site);
+        self.providers.retain(|_key, prov| prov.site_id != origin_site);
     }
 
     /// Return a provider by network/site/provider identity.
@@ -483,18 +483,18 @@ mod tests {
 
     #[test]
     fn merge_order_does_not_change_result() {
-        let mut a = GridStateSnapshot::new("site-p".to_owned());
-        a.add_capability(Capability::Model("model-p".to_owned()));
-        a.upsert_provider(provider("site-p", "provider", 1, 0.8));
+        let mut snap_a = GridStateSnapshot::new("site-p".to_owned());
+        snap_a.add_capability(Capability::Model("model-p".to_owned()));
+        snap_a.upsert_provider(provider("site-p", "provider", 1, 0.8));
 
-        let mut b = GridStateSnapshot::new("site-q".to_owned());
-        b.add_capability(Capability::Model("model-q".to_owned()));
-        b.upsert_provider(provider("site-p", "provider", 2, 0.2));
+        let mut snap_b = GridStateSnapshot::new("site-q".to_owned());
+        snap_b.add_capability(Capability::Model("model-q".to_owned()));
+        snap_b.upsert_provider(provider("site-p", "provider", 2, 0.2));
 
-        let mut ab = a.clone();
-        ab.merge(&b);
-        let mut ba = b;
-        ba.merge(&a);
+        let mut ab = snap_a.clone();
+        ab.merge(&snap_b);
+        let mut ba = snap_b;
+        ba.merge(&snap_a);
 
         assert_eq!(
             ab.capabilities.len(),
@@ -519,20 +519,20 @@ mod tests {
 
     #[test]
     fn merge_is_associative_for_provider_records() {
-        let mut a = GridStateSnapshot::new("site-p".to_owned());
-        a.upsert_provider(provider("site-p", "provider", 1, 0.8));
-        let mut b = GridStateSnapshot::new("site-q".to_owned());
-        b.upsert_provider(provider("site-p", "provider", 2, 0.4));
-        let mut c = GridStateSnapshot::new("site-r".to_owned());
-        c.upsert_provider(provider("site-p", "provider", 3, 0.1));
+        let mut snap_a = GridStateSnapshot::new("site-p".to_owned());
+        snap_a.upsert_provider(provider("site-p", "provider", 1, 0.8));
+        let mut snap_b = GridStateSnapshot::new("site-q".to_owned());
+        snap_b.upsert_provider(provider("site-p", "provider", 2, 0.4));
+        let mut snap_c = GridStateSnapshot::new("site-r".to_owned());
+        snap_c.upsert_provider(provider("site-p", "provider", 3, 0.1));
 
-        let mut ab_then_c = a.clone();
-        ab_then_c.merge(&b);
-        ab_then_c.merge(&c);
+        let mut ab_then_c = snap_a.clone();
+        ab_then_c.merge(&snap_b);
+        ab_then_c.merge(&snap_c);
 
-        let mut bc = b;
-        bc.merge(&c);
-        let mut a_then_bc = a;
+        let mut bc = snap_b;
+        bc.merge(&snap_c);
+        let mut a_then_bc = snap_a;
         a_then_bc.merge(&bc);
 
         let left = ab_then_c
@@ -699,14 +699,15 @@ mod tests {
 
     #[test]
     fn merge_adds_tenant_present_only_in_other() {
-        let mut a = GridStateSnapshot::new("site-a".to_owned());
-        let mut b = GridStateSnapshot::new("site-b".to_owned());
-        b.increment_tenant_spend("tenant-x", 500);
+        let mut snap_a = GridStateSnapshot::new("site-a".to_owned());
+        let mut snap_b = GridStateSnapshot::new("site-b".to_owned());
+        snap_b.increment_tenant_spend("tenant-x", 500);
 
-        a.merge(&b);
+        snap_a.merge(&snap_b);
 
         assert_eq!(
-            a.tenant_spend
+            snap_a
+                .tenant_spend
                 .get("tenant-x")
                 .unwrap_or_else(|| std::process::abort())
                 .total(),
@@ -717,15 +718,16 @@ mod tests {
 
     #[test]
     fn merge_tenant_spend_takes_per_site_max() {
-        let mut a = GridStateSnapshot::new("site-a".to_owned());
-        a.increment_tenant_spend("tenant-x", 100);
-        let mut b = GridStateSnapshot::new("site-b".to_owned());
-        b.increment_tenant_spend("tenant-x", 200);
+        let mut snap_a = GridStateSnapshot::new("site-a".to_owned());
+        snap_a.increment_tenant_spend("tenant-x", 100);
+        let mut snap_b = GridStateSnapshot::new("site-b".to_owned());
+        snap_b.increment_tenant_spend("tenant-x", 200);
 
-        a.merge(&b);
+        snap_a.merge(&snap_b);
 
         assert_eq!(
-            a.tenant_spend
+            snap_a
+                .tenant_spend
                 .get("tenant-x")
                 .unwrap_or_else(|| std::process::abort())
                 .total(),
@@ -736,14 +738,15 @@ mod tests {
 
     #[test]
     fn merge_tenant_spend_is_idempotent() {
-        let mut a = GridStateSnapshot::new("site-a".to_owned());
-        a.increment_tenant_spend("tenant-x", 100);
-        let duplicate = a.clone();
+        let mut snap_a = GridStateSnapshot::new("site-a".to_owned());
+        snap_a.increment_tenant_spend("tenant-x", 100);
+        let duplicate = snap_a.clone();
 
-        a.merge(&duplicate);
+        snap_a.merge(&duplicate);
 
         assert_eq!(
-            a.tenant_spend
+            snap_a
+                .tenant_spend
                 .get("tenant-x")
                 .unwrap_or_else(|| std::process::abort())
                 .total(),
@@ -754,15 +757,15 @@ mod tests {
 
     #[test]
     fn merge_tenant_spend_is_commutative() {
-        let mut a = GridStateSnapshot::new("site-a".to_owned());
-        a.increment_tenant_spend("tenant-x", 100);
-        let mut b = GridStateSnapshot::new("site-b".to_owned());
-        b.increment_tenant_spend("tenant-x", 200);
+        let mut snap_a = GridStateSnapshot::new("site-a".to_owned());
+        snap_a.increment_tenant_spend("tenant-x", 100);
+        let mut snap_b = GridStateSnapshot::new("site-b".to_owned());
+        snap_b.increment_tenant_spend("tenant-x", 200);
 
-        let mut ab = a.clone();
-        ab.merge(&b);
-        let mut ba = b;
-        ba.merge(&a);
+        let mut ab = snap_a.clone();
+        ab.merge(&snap_b);
+        let mut ba = snap_b;
+        ba.merge(&snap_a);
 
         assert_eq!(
             ab.tenant_spend
@@ -779,20 +782,20 @@ mod tests {
 
     #[test]
     fn merge_tenant_spend_is_associative() {
-        let mut a = GridStateSnapshot::new("site-a".to_owned());
-        a.increment_tenant_spend("tenant-x", 100);
-        let mut b = GridStateSnapshot::new("site-b".to_owned());
-        b.increment_tenant_spend("tenant-x", 200);
-        let mut c = GridStateSnapshot::new("site-c".to_owned());
-        c.increment_tenant_spend("tenant-x", 300);
+        let mut snap_a = GridStateSnapshot::new("site-a".to_owned());
+        snap_a.increment_tenant_spend("tenant-x", 100);
+        let mut snap_b = GridStateSnapshot::new("site-b".to_owned());
+        snap_b.increment_tenant_spend("tenant-x", 200);
+        let mut snap_c = GridStateSnapshot::new("site-c".to_owned());
+        snap_c.increment_tenant_spend("tenant-x", 300);
 
-        let mut ab_then_c = a.clone();
-        ab_then_c.merge(&b);
-        ab_then_c.merge(&c);
+        let mut ab_then_c = snap_a.clone();
+        ab_then_c.merge(&snap_b);
+        ab_then_c.merge(&snap_c);
 
-        let mut bc = b;
-        bc.merge(&c);
-        let mut a_then_bc = a;
+        let mut bc = snap_b;
+        bc.merge(&snap_c);
+        let mut a_then_bc = snap_a;
         a_then_bc.merge(&bc);
 
         assert_eq!(
@@ -1003,11 +1006,11 @@ mod tests {
         // cannot grow tenant_spend without bound. Already-tracked tenants may
         // still accumulate; only brand-new tenant_ids are refused at capacity.
         let mut snap = GridStateSnapshot::new("site-local".to_owned());
-        for i in 0..MAX_TRACKED_TENANTS {
+        for idx in 0..MAX_TRACKED_TENANTS {
             let mut incoming = BTreeMap::new();
             let mut counter = GCounter::new("site-a".to_owned());
             counter.increment(1);
-            incoming.insert(format!("tenant-{i}"), counter);
+            incoming.insert(format!("tenant-{idx}"), counter);
             snap.merge_tenant_spend_from_origin("site-a", &incoming);
         }
         assert_eq!(
@@ -1036,11 +1039,11 @@ mod tests {
     #[test]
     fn merge_tenant_spend_from_origin_still_updates_already_tracked_tenant_at_capacity() {
         let mut snap = GridStateSnapshot::new("site-local".to_owned());
-        for i in 0..MAX_TRACKED_TENANTS {
+        for idx in 0..MAX_TRACKED_TENANTS {
             let mut incoming = BTreeMap::new();
             let mut counter = GCounter::new("site-a".to_owned());
             counter.increment(1);
-            incoming.insert(format!("tenant-{i}"), counter);
+            incoming.insert(format!("tenant-{idx}"), counter);
             snap.merge_tenant_spend_from_origin("site-a", &incoming);
         }
 

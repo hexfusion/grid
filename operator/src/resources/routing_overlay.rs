@@ -44,7 +44,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crdt;
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 
@@ -1935,6 +1934,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact zero comparison for absent cost")]
     fn provider_to_backend_config_absent_cost_is_zero() {
         let p = test_provider_with_backend_kind("prov-i", "net", "local");
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
@@ -3838,6 +3838,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact equality for deterministic scoring")]
     fn no_metrics_map_preserves_static_ordering() {
         // Passing None for metrics must produce the same result as the current
         // static-only path (locality and cost only).
@@ -5039,6 +5040,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact boundary comparison for clamped signals")]
     fn crdt_metrics_ratio_signals_clamped_above_one() {
         // Out-of-range ratio values from a remote site with different schema must not
         // corrupt scoring; they must be clamped to [0.0, 1.0].
@@ -5063,6 +5065,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact boundary comparison for clamped signals")]
     fn crdt_metrics_ratio_signals_clamped_below_zero() {
         // Negative ratio values must be clamped to 0.0.
         let m = crdt::ProviderMetricsSnapshot {
@@ -5084,6 +5087,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact equality for deterministic neutral defaults")]
     fn crdt_metrics_non_finite_values_default_before_scoring() {
         // f64::clamp does not sanitize NaN, so CRDT values must be filtered before
         // clamping. Treat non-finite values like absent fields.
@@ -5801,9 +5805,9 @@ mod tests {
         );
 
         let labels = test_site_labels(&[("env", "prod")]);
-        let result = evaluate_access_policy(&policy, Some(&labels));
+        let result_with_labels = evaluate_access_policy(&policy, Some(&labels));
         assert_eq!(
-            result,
+            result_with_labels,
             AccessPolicyResult::Allow,
             "empty access policy must allow any consumer"
         );
@@ -5955,7 +5959,7 @@ mod tests {
         assert!(site_names.contains("site-staging"), "must include staging site");
 
         // Consumer from staging site should get the same candidates (all sites)
-        let overlay = render_routing_overlay(
+        let overlay_staging = render_routing_overlay(
             &network,
             &[site_prod, site_staging],
             &[provider],
@@ -5967,7 +5971,7 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            overlay.candidates.len(),
+            overlay_staging.candidates.len(),
             2,
             "unrestricted provider must serve all sites regardless of consumer"
         );
@@ -6006,7 +6010,7 @@ mod tests {
         );
 
         // Consumer from staging site should get no candidates due to access policy
-        let overlay = render_routing_overlay(
+        let overlay_staging = render_routing_overlay(
             &network,
             &[site_prod, site_staging],
             &[provider],
@@ -6018,7 +6022,7 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            overlay.candidates.len(),
+            overlay_staging.candidates.len(),
             0,
             "non-matching consumer must get no candidates from restricted provider"
         );
@@ -6057,7 +6061,7 @@ mod tests {
         );
 
         // Consumer with wrong env should get no candidates
-        let overlay = render_routing_overlay(
+        let overlay_wrong_env = render_routing_overlay(
             &network,
             &[site_prod.clone(), site_wrong_env.clone()],
             std::slice::from_ref(&provider),
@@ -6069,13 +6073,13 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            overlay.candidates.len(),
+            overlay_wrong_env.candidates.len(),
             0,
             "consumer with wrong env must get no candidates"
         );
 
         // Consumer with wrong team should get no candidates
-        let overlay = render_routing_overlay(
+        let overlay_wrong_team = render_routing_overlay(
             &network,
             &[site_prod, site_wrong_env, site_wrong_team],
             &[provider],
@@ -6087,7 +6091,7 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            overlay.candidates.len(),
+            overlay_wrong_team.candidates.len(),
             0,
             "consumer with wrong team must get no candidates"
         );
@@ -6179,7 +6183,7 @@ mod tests {
         );
 
         // Staging consumer should get unrestricted + platform-only (but not prod-only)
-        let overlay = render_routing_overlay(
+        let overlay_staging = render_routing_overlay(
             &network,
             &[site_staging],
             &[provider_unrestricted, provider_prod_only, provider_platform_only],
@@ -6192,18 +6196,21 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         // Staging site only, 2 allowed providers (unrestricted + platform-only) = 2 candidates
         assert_eq!(
-            overlay.candidates.len(),
+            overlay_staging.candidates.len(),
             2,
             "staging consumer should get filtered candidates"
         );
-        let clusters: BTreeSet<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        let filtered_clusters: BTreeSet<&str> = overlay_staging.candidates.iter().map(|c| c.cluster.as_str()).collect();
         assert!(
-            clusters.contains("unrestricted-prov"),
+            filtered_clusters.contains("unrestricted-prov"),
             "must include unrestricted provider"
         );
-        assert!(!clusters.contains("prod-only-prov"), "must exclude prod-only provider");
         assert!(
-            clusters.contains("platform-only-prov"),
+            !filtered_clusters.contains("prod-only-prov"),
+            "must exclude prod-only provider"
+        );
+        assert!(
+            filtered_clusters.contains("platform-only-prov"),
             "must include platform-only provider"
         );
     }
@@ -6266,7 +6273,7 @@ mod tests {
         );
 
         // Non-matching consumer should get no candidates
-        let overlay = render_routing_overlay(
+        let overlay_denied = render_routing_overlay(
             &network,
             &[site_prod, site_staging],
             std::slice::from_ref(&provider),
@@ -6278,7 +6285,7 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            overlay.candidates.len(),
+            overlay_denied.candidates.len(),
             0,
             "non-matching consumer must get no candidates from local restricted provider"
         );
@@ -6407,7 +6414,7 @@ mod tests {
         );
 
         // Non-matching consumer should get no candidates
-        let overlay = render_routing_overlay(
+        let overlay_denied = render_routing_overlay(
             &network,
             &[site_prod, site_staging],
             &[],
@@ -6419,7 +6426,7 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            overlay.candidates.len(),
+            overlay_denied.candidates.len(),
             0,
             "non-matching consumer must get no candidates from remote restricted provider"
         );

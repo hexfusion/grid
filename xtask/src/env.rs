@@ -987,6 +987,10 @@ mod llmd_pool_metrics_demo_cli_tests {
 
     /// Parses `env run-grid-llmd-pool-metrics-demo` with the given extra args
     /// and returns its `kv_cache` flag value.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "catch-all panic for unexpected Action variants"
+    )]
     fn parsed_kv_cache_flag(extra_args: &[&str]) -> bool {
         let mut args = vec!["xtask", "env", "run-grid-llmd-pool-metrics-demo"];
         args.extend_from_slice(extra_args);
@@ -1807,10 +1811,10 @@ fn is_multi_provider_config(cfg: &EnvConfig) -> bool {
 ///
 /// Uses the first provider site in the config when `site` is `None`.
 /// Resolve the config site name for operator validation.
-fn resolve_operator_site_name<'a>(
-    cfg: &'a EnvConfig,
-    site: Option<&'a str>,
-) -> Result<&'a str, Box<dyn std::error::Error>> {
+fn resolve_operator_site_name<'cfg>(
+    cfg: &'cfg EnvConfig,
+    site: Option<&'cfg str>,
+) -> Result<&'cfg str, Box<dyn std::error::Error>> {
     if let Some(site) = site {
         Ok(site)
     } else {
@@ -3981,7 +3985,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
             if !status.success() {
                 return Err(format!("mock-epp restart failed in {site}").into());
             }
-            let status = Command::new("kubectl")
+            let delete_status = Command::new("kubectl")
                 .args([
                     "--context",
                     ctx,
@@ -3994,7 +3998,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
                     "60s",
                 ])
                 .status()?;
-            if !status.success() {
+            if !delete_status.success() {
                 return Err(format!("mock-epp rollout timed out in {site}").into());
             }
             eprintln!("  [OK] {site} mock-epp ready with shared model route");

@@ -270,6 +270,10 @@ impl StateBroadcast {
 
 /// Key used to replace stale queued broadcasts in foca.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "kind is internal; callers use origin_site + revision"
+)]
 pub struct StateBroadcastKey {
     /// Site that originated the broadcast.
     pub origin_site: String,
@@ -585,8 +589,8 @@ impl StateBroadcastHandler {
                 .insert(broadcast.origin_site.clone(), broadcast.revision);
             retained.gateway_addrs.insert(broadcast.origin_site.clone(), gw.clone());
             drop(retained);
-            self.gateway_addrs_tx.send_modify(|m| {
-                m.insert(broadcast.origin_site.clone(), gw.clone());
+            self.gateway_addrs_tx.send_modify(|map| {
+                map.insert(broadcast.origin_site.clone(), gw.clone());
             });
         }
     }
@@ -610,8 +614,8 @@ impl StateBroadcastHandler {
                 .insert(broadcast.origin_site.clone(), broadcast.revision);
             retained.cert_pems.insert(broadcast.origin_site.clone(), pem.clone());
             drop(retained);
-            self.cert_pems_tx.send_modify(|m| {
-                m.insert(broadcast.origin_site.clone(), pem.clone());
+            self.cert_pems_tx.send_modify(|map| {
+                map.insert(broadcast.origin_site.clone(), pem.clone());
             });
         }
     }

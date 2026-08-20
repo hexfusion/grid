@@ -191,7 +191,7 @@ pub(crate) fn site_phase_next(
             "Left".to_owned(),
             "site has left the grid".to_owned(),
         ),
-        _ => {
+        GridSitePhase::Connecting | GridSitePhase::Active | GridSitePhase::Unreachable => {
             let outcome = outcome.unwrap_or(&GatewayProbeOutcome::AddressMissing);
             let t = probe_transition(current, outcome);
             (t.phase, t.reason.to_owned(), t.message)

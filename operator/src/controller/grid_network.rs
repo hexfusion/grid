@@ -53,6 +53,10 @@ use crate::{
 /// [`MembershipSnapshot`] to feed into `determine_phase` and
 /// `update_status`.  When `swim` is `None`, the controller falls back
 /// to its existing static phase logic.
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "client and swim are public API; metrics_cache and last_seeds are crate-internal"
+)]
 pub struct OperatorCtx {
     /// Kubernetes API client.
     pub client: Client,
@@ -257,7 +261,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         // Broadcast the local site's public certificate PEM so remote peers can
         // populate GridSite.status.publicCertPem.  Only the public cert is read —
         // the private key (tls.key) is never accessed by this code path.
-        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, &network.spec.tls.site_secret_ref).await {
+        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await
+        {
             let cert_broadcast = swim::StateBroadcast::new(
                 swim.site_name().to_owned(),
                 cert_broadcast_revision(),
@@ -994,7 +999,7 @@ async fn reconcile_routing_overlay_inner(
 }
 
 /// Find the last successfully distributed overlay status for a gateway.
-fn find_prior_overlay<'a>(network: &'a GridNetwork, gw_ref: &GatewayRef) -> Option<&'a OverlayRevisionStatus> {
+fn find_prior_overlay<'net>(network: &'net GridNetwork, gw_ref: &GatewayRef) -> Option<&'net OverlayRevisionStatus> {
     network.status.as_ref().and_then(|status| {
         status
             .overlay_status
@@ -1244,7 +1249,7 @@ fn configmap_revision_matches(existing: &ConfigMap, desired: &ConfigMap, revisio
         existing_annotations
             .get(key)
             .zip(desired_annotations.get(key))
-            .is_some_and(|(existing, desired)| existing == desired)
+            .is_some_and(|(cm_existing, cm_desired)| cm_existing == cm_desired)
     };
 
     annotation_matches(overlay_envelope::ANNOTATION_SCHEMA_VERSION)
@@ -1812,7 +1817,12 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::PlaintextWithSni { .. }) => "PlaintextWithSni",
         OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
         OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
-        _ => "ConsumerConfigError",
+        OperatorError::Certificate(_)
+        | OperatorError::Json(_)
+        | OperatorError::NotFound(_)
+        | OperatorError::OverlayRender(_)
+        | OperatorError::SwimKeyConfig(_)
+        | OperatorError::InvalidResource(_) => "ConsumerConfigError",
     };
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
@@ -1860,11 +1870,11 @@ fn network_site_name(network: &GridNetwork) -> String {
 /// `Active`, or a `GridSite` in a different network are excluded.  This is the
 /// fail-closed contract: a SWIM-discovered site must not become routable solely
 /// because it gossiped.
-pub(crate) fn filter_eligible_remote_crdt_providers<'a>(
+pub(crate) fn filter_eligible_remote_crdt_providers<'ctx>(
     network_name: &str,
     sites: &[GridSite],
-    remote_providers: &'a [crdt::ProviderState],
-) -> Vec<&'a crdt::ProviderState> {
+    remote_providers: &'ctx [crdt::ProviderState],
+) -> Vec<&'ctx crdt::ProviderState> {
     remote_providers
         .iter()
         .filter(|p| is_crdt_provider_routing_eligible(network_name, sites, p))
@@ -2060,13 +2070,13 @@ enum CertPemWrite {
 ///
 /// Never itself touches the Kubernetes API — see [`CertPemWrite`].
 fn decide_cert_pem_write(
-    existing_status: &Option<GridSiteStatus>,
+    existing_status: Option<&GridSiteStatus>,
     cert_pem: &str,
     check: &CertPemStatus,
 ) -> CertPemWrite {
     match check {
         CertPemStatus::ValidStructure => {
-            if existing_status.as_ref().and_then(|s| s.public_cert_pem.as_deref()) == Some(cert_pem) {
+            if existing_status.and_then(|s| s.public_cert_pem.as_deref()) == Some(cert_pem) {
                 CertPemWrite::NoOp
             } else {
                 CertPemWrite::StoreValid
@@ -2083,7 +2093,7 @@ fn decide_cert_pem_write(
 /// Shared decision logic for the three invalid-cert-PEM outcomes: skip when
 /// `existing_status` already records this exact `message`, otherwise reject.
 fn decide_reject_invalid(
-    existing_status: &Option<GridSiteStatus>,
+    existing_status: Option<&GridSiteStatus>,
     message: &'static str,
     security_violation: bool,
 ) -> CertPemWrite {
@@ -2100,8 +2110,8 @@ fn decide_reject_invalid(
 /// True when `existing` already records the given invalid-cert `message` with
 /// no stored `publicCertPem`, meaning a re-patch with the same content would
 /// be a redundant write.
-fn already_recorded_invalid(existing: &Option<GridSiteStatus>, message: &str) -> bool {
-    existing.as_ref().is_some_and(|s| {
+fn already_recorded_invalid(existing: Option<&GridSiteStatus>, message: &str) -> bool {
+    existing.is_some_and(|s| {
         s.public_cert_pem.is_none() && s.reason == REASON_TRUST_MATERIAL_INVALID && s.message == message
     })
 }
@@ -2124,7 +2134,7 @@ fn already_recorded_invalid(existing: &Option<GridSiteStatus>, message: &str) ->
 async fn reconcile_site_cert_pem(
     api: &Api<GridSite>,
     site_name: &str,
-    existing_status: &Option<GridSiteStatus>,
+    existing_status: Option<&GridSiteStatus>,
     cert_pem: &str,
 ) -> Result<(), OperatorError> {
     match decide_cert_pem_write(existing_status, cert_pem, &trust_bundle::check_cert_pem(cert_pem)) {
@@ -2294,7 +2304,7 @@ async fn reconcile_discovered_sites(
         // above `existing_status`) becomes an infinite reconcile hot-loop even
         // when the remote site's cert hasn't changed (grid#42).
         if let Some(cert_pem) = &site.site_cert_pem {
-            reconcile_site_cert_pem(&api, &site.name, &existing_status, cert_pem).await?;
+            reconcile_site_cert_pem(&api, &site.name, existing_status.as_ref(), cert_pem).await?;
         }
 
         tracing::info!(
@@ -3664,7 +3674,7 @@ mod tests {
     fn already_recorded_invalid_true_when_reason_message_and_absence_all_match() {
         let existing = Some(invalid_cert_status("private key detected"));
         assert!(
-            already_recorded_invalid(&existing, "private key detected"),
+            already_recorded_invalid(existing.as_ref(), "private key detected"),
             "identical reason/message/absent-cert must be recognized as already recorded"
         );
     }
@@ -3672,7 +3682,7 @@ mod tests {
     #[test]
     fn already_recorded_invalid_false_when_status_is_none() {
         assert!(
-            !already_recorded_invalid(&None, "private key detected"),
+            !already_recorded_invalid(None, "private key detected"),
             "a GridSite with no status yet has nothing recorded"
         );
     }
@@ -3681,7 +3691,7 @@ mod tests {
     fn already_recorded_invalid_false_when_message_differs() {
         let existing = Some(invalid_cert_status("private key detected"));
         assert!(
-            !already_recorded_invalid(&existing, "cert exceeds size bound"),
+            !already_recorded_invalid(existing.as_ref(), "cert exceeds size bound"),
             "a different rejection reason must not be treated as already recorded"
         );
     }
@@ -3695,7 +3705,7 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            !already_recorded_invalid(&existing, "private key detected"),
+            !already_recorded_invalid(existing.as_ref(), "private key detected"),
             "a status recorded for an unrelated reason must not suppress the write"
         );
     }
@@ -3709,7 +3719,7 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            !already_recorded_invalid(&existing, "private key detected"),
+            !already_recorded_invalid(existing.as_ref(), "private key detected"),
             "a leftover publicCertPem means the invalid status was never actually applied yet"
         );
     }
@@ -3734,7 +3744,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            decide_cert_pem_write(&stored, "cert-a", &CertPemStatus::ValidStructure),
+            decide_cert_pem_write(stored.as_ref(), "cert-a", &CertPemStatus::ValidStructure),
             CertPemWrite::NoOp,
             "an unchanged valid cert must never be re-patched (grid#42)"
         );
@@ -3747,7 +3757,7 @@ mod tests {
         ] {
             let recorded = Some(invalid_cert_status(message));
             assert_eq!(
-                decide_cert_pem_write(&recorded, "irrelevant-pem", &check),
+                decide_cert_pem_write(recorded.as_ref(), "irrelevant-pem", &check),
                 CertPemWrite::NoOp,
                 "an unchanged rejection ({check:?}) must never be re-patched (grid#42)"
             );
@@ -3757,7 +3767,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_stores_valid_cert_on_first_sight() {
         assert_eq!(
-            decide_cert_pem_write(&None, "cert-a", &CertPemStatus::ValidStructure),
+            decide_cert_pem_write(None, "cert-a", &CertPemStatus::ValidStructure),
             CertPemWrite::StoreValid,
             "a GridSite with no prior status must store the first valid cert seen"
         );
@@ -3770,7 +3780,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            decide_cert_pem_write(&stale, "cert-new", &CertPemStatus::ValidStructure),
+            decide_cert_pem_write(stale.as_ref(), "cert-new", &CertPemStatus::ValidStructure),
             CertPemWrite::StoreValid,
             "a rotated cert (different from what's stored) must still be written"
         );
@@ -3779,7 +3789,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_rejects_private_key_as_security_violation() {
         assert_eq!(
-            decide_cert_pem_write(&None, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            decide_cert_pem_write(None, "leaked-key", &CertPemStatus::ContainsPrivateKey),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
                 security_violation: true
@@ -3791,7 +3801,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_rejects_malformed_cert_as_non_security() {
         assert_eq!(
-            decide_cert_pem_write(&None, "garbage", &CertPemStatus::NotACertificate),
+            decide_cert_pem_write(None, "garbage", &CertPemStatus::NotACertificate),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_NOT_A_CERTIFICATE,
                 security_violation: false
@@ -3803,7 +3813,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_rejects_oversized_cert_as_non_security() {
         assert_eq!(
-            decide_cert_pem_write(&None, "huge", &CertPemStatus::TooLarge),
+            decide_cert_pem_write(None, "huge", &CertPemStatus::TooLarge),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_TOO_LARGE,
                 security_violation: false
@@ -3818,7 +3828,11 @@ mod tests {
         // mistaken for "already handled".
         let recorded_other_reason = Some(invalid_cert_status(CERT_PEM_MSG_TOO_LARGE));
         assert_eq!(
-            decide_cert_pem_write(&recorded_other_reason, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            decide_cert_pem_write(
+                recorded_other_reason.as_ref(),
+                "leaked-key",
+                &CertPemStatus::ContainsPrivateKey
+            ),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
                 security_violation: true
@@ -5022,7 +5036,10 @@ mod tests {
         let providers = vec![make_inference_provider("p1", "net")];
         let mut network = base_network();
         network.spec.metrics_refresh_interval = Some("5m".to_owned());
-        assert!(requeue_interval_for_network(&network, &providers).is_err());
+        assert!(
+            requeue_interval_for_network(&network, &providers).is_err(),
+            "unsupported duration unit '5m' must be rejected"
+        );
     }
 
     #[test]
@@ -5063,15 +5080,43 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "exhaustive rejection table")]
     fn metrics_refresh_duration_parser_rejects_unsupported_values() {
-        assert!(parse_metrics_refresh_interval("").is_err());
-        assert!(parse_metrics_refresh_interval("10").is_err());
-        assert!(parse_metrics_refresh_interval("0s").is_err());
-        assert!(parse_metrics_refresh_interval("500ms").is_err());
-        assert!(parse_metrics_refresh_interval("-1s").is_err());
-        assert!(parse_metrics_refresh_interval("1m").is_err());
-        assert!(parse_metrics_refresh_interval("01s").is_err());
-        assert!(parse_metrics_refresh_interval(" 10s").is_err());
-        assert!(parse_metrics_refresh_interval("18446744073709551615s").is_err());
+        assert!(
+            parse_metrics_refresh_interval("").is_err(),
+            "empty string must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("10").is_err(),
+            "bare number without unit must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("0s").is_err(),
+            "zero-second interval must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("500ms").is_err(),
+            "sub-second interval must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("-1s").is_err(),
+            "negative interval must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("1m").is_err(),
+            "minute unit must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("01s").is_err(),
+            "leading-zero numeric must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval(" 10s").is_err(),
+            "leading whitespace must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("18446744073709551615s").is_err(),
+            "overflow value must be rejected"
+        );
     }
 }

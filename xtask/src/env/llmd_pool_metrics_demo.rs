@@ -1032,9 +1032,9 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
 
         let epp_a = scrape_epp_metrics("pool-a", mtls);
         let epp_b = scrape_epp_metrics("pool-b", mtls);
-        let candidates = read_overlay_candidates("pool-a");
-        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
-        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
+        let updated_candidates = read_overlay_candidates("pool-a");
+        let row_a = build_scorecard_row("Cluster A", &updated_candidates, "pool-a", &epp_a);
+        let row_b = build_scorecard_row("Cluster B", &updated_candidates, "pool-b", &epp_b);
         let stats = read_pressure_stats("pool-a");
         let score_gap = row_b.score - row_a.score;
 
@@ -1085,7 +1085,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                         "FAILOVER",
                         &[&row_a, &row_b],
                         "CLUSTER B",
-                        &candidates,
+                        &updated_candidates,
                         "Pool A pressure lowered its queue/KV scores, so Pool B became rank 0.",
                     );
                     observations.push(format!(
@@ -1605,17 +1605,17 @@ fn print_live_table_header() {
 }
 
 /// Snapshot of live table data for one row.
-struct LiveTableRow<'a> {
+struct LiveTableRow<'row> {
     /// Elapsed time since the table started.
     elapsed: Duration,
     /// Current phase label.
-    phase: &'a str,
+    phase: &'row str,
     /// Scorecard rows for pool-a and pool-b.
-    rows: (&'a ScorecardRow, &'a ScorecardRow),
+    rows: (&'row ScorecardRow, &'row ScorecardRow),
     /// Pressure generator attribution stats.
-    stats: &'a PressureStats,
+    stats: &'row PressureStats,
     /// Last probe request attribution.
-    last_route: &'a str,
+    last_route: &'row str,
 }
 
 /// Print one row of the live metrics table.
@@ -3542,14 +3542,14 @@ fn proof_tls_stale_cache() -> ProofResult {
         if is_provider_observable(cluster, cluster) {
             inside_ttl_observable = true;
             let elapsed = pre_break.elapsed().as_secs();
-            let candidates = read_overlay_candidates(cluster);
-            let score = overlay_score_for_cluster(&candidates, cluster);
-            let msg = format!(
+            let refreshed_candidates = read_overlay_candidates(cluster);
+            let score = overlay_score_for_cluster(&refreshed_candidates, cluster);
+            let overlay_msg = format!(
                 "inside-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} still observable, \
                  score={score:.2} (cached metrics served)"
             );
-            eprintln!("    {msg}");
-            observations.push(msg);
+            eprintln!("    {overlay_msg}");
+            observations.push(overlay_msg);
             break;
         }
     }
@@ -3582,12 +3582,12 @@ fn proof_tls_stale_cache() -> ProofResult {
         !is_provider_observable(cluster, cluster) || wait_for_unobservable(cluster, cluster, Duration::from_secs(30));
     let elapsed = pre_break.elapsed().as_secs();
     if post_ttl_unobservable {
-        let msg = format!(
+        let retry_msg = format!(
             "post-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} unobservable \
              (cached metrics expired, UNOBSERVABLE_METRICS applied)"
         );
-        eprintln!("    {msg}");
-        observations.push(msg);
+        eprintln!("    {retry_msg}");
+        observations.push(retry_msg);
     } else {
         observations.push(format!(
             "post-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} still observable \
@@ -3613,11 +3613,11 @@ fn proof_tls_stale_cache() -> ProofResult {
     }
     let recovered = wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
     if recovered {
-        let candidates = read_overlay_candidates(cluster);
-        let score = overlay_score_for_cluster(&candidates, cluster);
-        let msg = format!("recovery: {cluster} observable after client cert restored, score={score:.2}");
-        eprintln!("    {msg}");
-        observations.push(msg);
+        let recovery_candidates = read_overlay_candidates(cluster);
+        let score = overlay_score_for_cluster(&recovery_candidates, cluster);
+        let recovery_msg = format!("recovery: {cluster} observable after client cert restored, score={score:.2}");
+        eprintln!("    {recovery_msg}");
+        observations.push(recovery_msg);
     } else {
         observations.push(format!("{cluster}: provider did not recover after stale-cache test"));
         return ProofResult {
@@ -3837,6 +3837,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_prefers_primary_metric_names() {
         let text = "inference_pool_average_queue_size{name=\"pool-a\"} 4.5\n\
                      inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n";
@@ -3846,6 +3847,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_falls_back_to_llm_d_router_metric_names() {
         // Some EPP builds only expose the llm_d_router_* series (no
         // inference_pool_* series at all) -- both queue_size and kv_cache
@@ -3859,6 +3861,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_defaults_to_zero_when_absent() {
         let epp = parse_epp_metrics("");
         assert_eq!(epp.queue_size, 0.0);

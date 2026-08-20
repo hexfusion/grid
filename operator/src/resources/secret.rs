@@ -45,7 +45,7 @@ pub fn ca_secret_data(ca: &certs::CaCert) -> BTreeMap<String, ByteString> {
 /// Returns [`kube::Error`] on Kubernetes API failures.
 pub async fn read_site_cert_pem(
     client: &kube::Client,
-    secret_ref: &Option<crate::crd::grid_network::SecretRef>,
+    secret_ref: Option<&crate::crd::grid_network::SecretRef>,
 ) -> Result<Option<String>, kube::Error> {
     let Some(r) = secret_ref else {
         return Ok(None);

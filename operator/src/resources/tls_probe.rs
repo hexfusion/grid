@@ -274,6 +274,7 @@ fn classify_tls_error(err: &std::io::Error) -> GatewayProbeOutcome {
 }
 
 /// Map a rustls error to a `GatewayProbeOutcome`.
+#[expect(clippy::wildcard_enum_match_arm, reason = "external type with many variants")]
 fn classify_rustls_error(err: &rustls::Error) -> GatewayProbeOutcome {
     use rustls::{CertificateError, Error};
 
@@ -477,8 +478,11 @@ mod tests {
 
     #[test]
     fn first_cert_der_from_invalid_pem() {
-        assert!(first_cert_der_from_pem("not a cert").is_err());
-        assert!(first_cert_der_from_pem("").is_err());
+        assert!(
+            first_cert_der_from_pem("not a cert").is_err(),
+            "non-PEM text must be rejected"
+        );
+        assert!(first_cert_der_from_pem("").is_err(), "empty input must be rejected");
     }
 
     #[test]

@@ -3842,12 +3842,16 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
 // ---------------------------------------------------------------------------
 
 /// Guard that kills a spawned TLS probe server process on drop.
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "child and _temp_dir are implementation details"
+)]
 pub(crate) struct TlsFixtureGuard {
     /// Address the TLS probe server is listening on (e.g. `"127.0.0.1:9443"`).
     #[expect(dead_code, reason = "read by the rotation verifier")]
     pub addr: String,
     /// Spawned TLS probe server process.
-    child: Option<Child>,
+    pub(crate) child: Option<Child>,
     /// Temporary directory holding PEM files (kept alive for the server).
     _temp_dir: tempfile::TempDir,
 }
@@ -6680,7 +6684,7 @@ pub(crate) fn list_gridsites_for_network(
 /// `network`.
 ///
 /// This is a pure function, suitable for unit testing without kubectl.
-pub(crate) fn gridsites_in_network<'a>(sites: &'a [serde_json::Value], network: &str) -> Vec<&'a str> {
+pub(crate) fn gridsites_in_network<'sites>(sites: &'sites [serde_json::Value], network: &str) -> Vec<&'sites str> {
     sites
         .iter()
         .filter_map(|s| {
@@ -8650,7 +8654,7 @@ mod tests {
                 assert_eq!(namespace, "default");
                 assert_eq!(key, "token");
             },
-            _ => panic!("expected BearerToken plan"),
+            ApiCredentialPlan::Manual | ApiCredentialPlan::Absent => panic!("expected BearerToken plan"),
         }
     }
 

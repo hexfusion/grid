@@ -833,6 +833,10 @@ pub struct SwimConfig {
 /// TLS configuration for grid certificate management.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_field_names,
+    reason = "fields named after Kubernetes Secret references"
+)]
 pub struct TlsConfig {
     /// Secret storing the grid CA certificate and key.
     pub ca_secret_ref: Option<SecretRef>,
@@ -1119,9 +1123,6 @@ impl Default for SwimConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use crdt::GCounter;
     use kube::CustomResourceExt as _;
 
     use super::*;
@@ -1130,7 +1131,7 @@ mod tests {
         serde_json::to_value(GridNetwork::crd()).unwrap_or_else(|_| std::process::abort())
     }
 
-    fn crd_spec<'a>(crd: &'a serde_json::Value, field: &str) -> &'a str {
+    fn crd_spec<'val>(crd: &'val serde_json::Value, field: &str) -> &'val str {
         crd.get("spec")
             .and_then(|spec| spec.get(field))
             .and_then(serde_json::Value::as_str)

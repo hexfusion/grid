@@ -537,7 +537,9 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
         metrics_scraper::MetricsScrapeError::TlsMaterial(_) | metrics_scraper::MetricsScrapeError::HttpWithTls(_) => {
             "MetricsTlsMaterialInvalid"
         },
-        _ => "MetricsScrapeError",
+        metrics_scraper::MetricsScrapeError::InvalidUrl(_)
+        | metrics_scraper::MetricsScrapeError::NonOkStatus { .. }
+        | metrics_scraper::MetricsScrapeError::Encoding(_) => "MetricsScrapeError",
     }
 }
 

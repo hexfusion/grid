@@ -35,6 +35,11 @@
 //! [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
 
 #![deny(unsafe_code)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::min_ident_chars,
+    reason = "operator uses short closure params and index arithmetic pervasively"
+)]
 
 use std::{
     collections::BTreeMap,
@@ -226,11 +231,11 @@ async fn reserve_revision_lease(client: &Client, site_name: &str) -> Result<Revi
                         );
                         return Ok(lease);
                     },
-                    Err(kube::Error::Api(error)) if error.code == 409 => {},
-                    Err(error) => return Err(format!("replace {cm_name}: {error}")),
+                    Err(kube::Error::Api(conflict)) if conflict.code == 409 => {},
+                    Err(replace_err) => return Err(format!("replace {cm_name}: {replace_err}")),
                 }
             },
-            Err(kube::Error::Api(error)) if error.code == 404 => {
+            Err(kube::Error::Api(not_found)) if not_found.code == 404 => {
                 let lease = initial_revision_lease()?;
                 let cm = ConfigMap {
                     metadata: ObjectMeta {
@@ -252,11 +257,11 @@ async fn reserve_revision_lease(client: &Client, site_name: &str) -> Result<Revi
                         );
                         return Ok(lease);
                     },
-                    Err(kube::Error::Api(error)) if error.code == 409 => {},
-                    Err(error) => return Err(format!("create {cm_name}: {error}")),
+                    Err(kube::Error::Api(conflict)) if conflict.code == 409 => {},
+                    Err(create_err) => return Err(format!("create {cm_name}: {create_err}")),
                 }
             },
-            Err(error) => return Err(format!("read {cm_name}: {error}")),
+            Err(read_err) => return Err(format!("read {cm_name}: {read_err}")),
         }
     }
     Err(format!(
@@ -584,9 +589,15 @@ mod tests {
 
     #[test]
     fn exhausted_revision_or_generation_fails_closed() {
-        assert!(next_revision_lease(u64::MAX, 1).is_err());
-        assert!(next_revision_lease(1, u64::MAX).is_err());
-        assert!(lease_from_seeds(u64::MAX, 1).is_err());
+        assert!(
+            next_revision_lease(u64::MAX, 1).is_err(),
+            "u64::MAX revision must overflow"
+        );
+        assert!(
+            next_revision_lease(1, u64::MAX).is_err(),
+            "u64::MAX generation must overflow"
+        );
+        assert!(lease_from_seeds(u64::MAX, 1).is_err(), "u64::MAX seed must overflow");
     }
 
     #[test]

@@ -182,7 +182,11 @@ fn connectivity_failure(current: &GridSitePhase, reason: &'static str, msg: &str
     ProbeTransition {
         phase: match current {
             GridSitePhase::Active => GridSitePhase::Unreachable,
-            _ => current.clone(),
+            GridSitePhase::Pending
+            | GridSitePhase::Discovered
+            | GridSitePhase::Connecting
+            | GridSitePhase::Unreachable
+            | GridSitePhase::Left => current.clone(),
         },
         reason,
         message: truncate_message(msg),
@@ -703,7 +707,7 @@ mod tests {
     #[test]
     fn valid_single_pin() {
         let pins = vec!["a".repeat(64)];
-        assert!(validate_canonical_pins(&pins).is_ok());
+        validate_canonical_pins(&pins).unwrap();
     }
 
     #[test]
@@ -732,7 +736,9 @@ mod tests {
         let err = validate_canonical_pins(&pins).unwrap_err();
         match err {
             CanonicalPinError::Invalid { index: 1, .. } => {},
-            other => panic!("expected Invalid at index 1, got {other:?}"),
+            CanonicalPinError::Empty | CanonicalPinError::TooMany(_) | CanonicalPinError::Invalid { .. } => {
+                panic!("expected Invalid at index 1, got {err:?}")
+            },
         }
     }
 
@@ -740,12 +746,12 @@ mod tests {
 
     #[test]
     fn valid_server_name() {
-        assert!(validate_server_name("east-provider.grid.internal").is_ok());
+        validate_server_name("east-provider.grid.internal").unwrap();
     }
 
     #[test]
     fn valid_simple_name() {
-        assert!(validate_server_name("provider").is_ok());
+        validate_server_name("provider").unwrap();
     }
 
     #[test]
