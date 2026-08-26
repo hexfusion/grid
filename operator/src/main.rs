@@ -985,7 +985,7 @@ async fn poll_peers_once(
         return;
     }
     let collected = source.collect(&sites).await;
-    ctx.peers().refresh(collected.into_iter().collect(), peer_ttl());
+    ctx.peers().refresh(collected.into_iter().collect());
 }
 
 /// How often this site reads its own providers.
@@ -1002,13 +1002,6 @@ fn scrape_interval() -> std::time::Duration {
     std::time::Duration::from_millis(ms.max(50))
 }
 
-/// How long a peer's data stays served without a successful poll.
-///
-/// Must exceed the peer poll interval, so one failed poll does not remove a
-/// site that is otherwise healthy.
-fn peer_ttl() -> std::time::Duration {
-    std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_TTL_SECS", 90_u64))
-}
 
 /// Client TLS for peer polling, or `None` when the network declares no trust.
 ///
@@ -1200,7 +1193,7 @@ mod tests {
         );
         let mut collected = BTreeMap::new();
         collected.insert("provider".to_owned(), observations);
-        store.refresh(collected, std::time::Duration::from_secs(60));
+        store.refresh(collected);
         store
     }
 

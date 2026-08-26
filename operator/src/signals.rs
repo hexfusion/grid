@@ -174,6 +174,13 @@ pub fn attribute(observations: Vec<Observation>, site: &str, provider: &str) -> 
         .collect()
 }
 
+/// Targets held before the least recently collected is dropped.
+///
+/// Fifty sites with ten providers each is five hundred, so this is headroom
+/// rather than a limit anyone reaches. It exists so the store cannot grow
+/// without bound, which is the only reason to drop anything.
+const MAX_TARGETS: usize = 1024;
+
 /// What is held for one target.
 #[derive(Clone, Debug)]
 struct Cached {
@@ -184,8 +191,6 @@ struct Cached {
     /// Reported as `Age`, which is a duration rather than a time, so a reader
     /// learns how old a value is without either clock being compared.
     collected_at: Instant,
-    /// When this stops being served.
-    expires_at: Instant,
 }
 
 /// Signals held per target, where a target is a provider routing identity.
@@ -389,12 +394,19 @@ impl SignalStore {
         }
     }
 
-    /// Refresh the given targets and drop anything past its deadline.
+    /// Refresh the given targets, bounded by how many are held.
     ///
-    /// A target absent from `collected` is left alone rather than removed, so a
-    /// single failed scrape does not erase what is known. It expires on its own
-    /// once nothing refreshes it.
-    pub fn refresh(&self, collected: BTreeMap<String, Vec<Observation>>, ttl: Duration) {
+    /// A target absent from `collected` is left alone rather than removed, and
+    /// it is not dropped later either. A collector that has broken keeps
+    /// serving what it last read, and reachability is reported separately, so a
+    /// reader can tell a value that has stopped moving from one that was never
+    /// there. Dropping it collapses those two into the same answer and leaves a
+    /// candidate with no score at all.
+    ///
+    /// What bounds the store is the number of targets, not their age. Past
+    /// [`MAX_TARGETS`] the least recently collected is dropped, which is a
+    /// memory bound rather than a staleness rule.
+    pub fn refresh(&self, collected: BTreeMap<String, Vec<Observation>>) {
         let now = Instant::now();
         let Ok(mut guard) = self.inner.write() else {
             return;
@@ -405,11 +417,19 @@ impl SignalStore {
                 Cached {
                     samples: samples.into(),
                     collected_at: now,
-                    expires_at: now + ttl,
                 },
             );
         }
-        guard.retain(|_, held| held.expires_at > now);
+        while guard.len() > MAX_TARGETS {
+            let Some(stalest) = guard
+                .iter()
+                .min_by_key(|(_, held)| held.collected_at)
+                .map(|(name, _)| name.clone())
+            else {
+                break;
+            };
+            guard.remove(&stalest);
+        }
     }
 
     /// Targets this reader may not be served.
@@ -453,7 +473,7 @@ impl SignalStore {
         let mut out = String::new();
         let mut oldest = Duration::ZERO;
         for (name, held) in guard.iter() {
-            if held.expires_at <= now || target.is_some_and(|t| t != name) {
+            if target.is_some_and(|t| t != name) {
                 continue;
             }
             if denied.contains(name.as_str()) {
@@ -485,12 +505,7 @@ impl SignalStore {
         let Ok(guard) = self.inner.read() else {
             return Vec::new();
         };
-        let now = Instant::now();
-        guard
-            .iter()
-            .filter(|(_, held)| held.expires_at > now)
-            .map(|(name, _)| name.clone())
-            .collect()
+        guard.keys().cloned().collect()
     }
 }
 
@@ -1315,13 +1330,10 @@ mod tests {
     /// A store holding one restricted target and one open one.
     fn restricted_store() -> SignalStore {
         let store = SignalStore::new();
-        store.refresh(
-            BTreeMap::from([
-                ("secret-pool".to_owned(), attribute(scraped(), "east", "secret-pool")),
-                ("open-pool".to_owned(), attribute(scraped(), "east", "open-pool")),
-            ]),
-            Duration::from_secs(60),
-        );
+        store.refresh(BTreeMap::from([
+            ("secret-pool".to_owned(), attribute(scraped(), "east", "secret-pool")),
+            ("open-pool".to_owned(), attribute(scraped(), "east", "open-pool")),
+        ]));
         store.set_access(BTreeMap::from([("secret-pool".to_owned(), vec![gold()])]));
         store
     }
@@ -1523,7 +1535,7 @@ mod tests {
                 access.insert(pool, vec![gold()]);
             }
         }
-        store.refresh(held, Duration::from_secs(60));
+        store.refresh(held);
         store.set_access(access);
 
         let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
@@ -1582,10 +1594,10 @@ mod tests {
     #[test]
     fn every_selector_has_to_be_satisfied() {
         let store = SignalStore::new();
-        store.refresh(
-            BTreeMap::from([("pool-a".to_owned(), attribute(scraped(), "east", "pool-a"))]),
-            Duration::from_secs(60),
-        );
+        store.refresh(BTreeMap::from([(
+            "pool-a".to_owned(),
+            attribute(scraped(), "east", "pool-a"),
+        )]));
         // Routing allows the reader, a metrics-specific selector does not.
         store.set_access(BTreeMap::from([(
             "pool-a".to_owned(),
@@ -1601,13 +1613,10 @@ mod tests {
     #[test]
     fn target_selects_one_provider() {
         let store = SignalStore::new();
-        store.refresh(
-            BTreeMap::from([
-                ("pool-a".to_owned(), attribute(scraped(), "east", "pool-a")),
-                ("pool-b".to_owned(), attribute(scraped(), "east", "pool-b")),
-            ]),
-            Duration::from_secs(60),
-        );
+        store.refresh(BTreeMap::from([
+            ("pool-a".to_owned(), attribute(scraped(), "east", "pool-a")),
+            ("pool-b".to_owned(), attribute(scraped(), "east", "pool-b")),
+        ]));
         let (one, _) = store.render(Some("pool-a"), &[], None);
         assert!(one.contains(r#"grid_provider="pool-a""#), "the asked-for target: {one}");
         assert!(!one.contains(r#"grid_provider="pool-b""#), "and only that one: {one}");
@@ -1621,10 +1630,10 @@ mod tests {
     #[test]
     fn collect_selects_signals_by_name() {
         let store = SignalStore::new();
-        store.refresh(
-            BTreeMap::from([("pool-a".to_owned(), attribute(scraped(), "east", "pool-a"))]),
-            Duration::from_secs(60),
-        );
+        store.refresh(BTreeMap::from([(
+            "pool-a".to_owned(),
+            attribute(scraped(), "east", "pool-a"),
+        )]));
         assert_eq!(
             store.render(None, &[QUEUE.to_owned()], None).0.lines().count(),
             1,
@@ -1640,10 +1649,7 @@ mod tests {
     #[test]
     fn age_reports_the_oldest_value_in_the_response() {
         let store = SignalStore::new();
-        store.refresh(
-            BTreeMap::from([("pool-a".to_owned(), scraped())]),
-            Duration::from_secs(60),
-        );
+        store.refresh(BTreeMap::from([("pool-a".to_owned(), scraped())]));
         let (_, age) = store.render(None, &[], None);
         assert!(
             age < Duration::from_secs(1),
@@ -1652,23 +1658,40 @@ mod tests {
     }
 
     #[test]
-    fn a_target_nothing_refreshes_stops_being_served() {
+    fn a_target_nothing_refreshes_keeps_being_served() {
+        // The contract's four states depend on this. A collector that has
+        // broken keeps serving its last reading, and reachability is reported
+        // beside it, so a reader can tell a value that stopped moving from one
+        // that was never there. Dropping it makes those the same answer.
         let store = SignalStore::new();
-        store.refresh(BTreeMap::from([("pool-a".to_owned(), scraped())]), Duration::ZERO);
-        assert_eq!(store.render(None, &[], None).0, "", "absence is what says it is stale");
+        store.refresh(BTreeMap::from([("pool-a".to_owned(), scraped())]));
+        for _ in 0..5 {
+            store.refresh(BTreeMap::new());
+        }
+        assert!(
+            store.render(None, &[], None).0.contains("pool-a"),
+            "a target nothing refreshes is still served, and says how old it is"
+        );
     }
 
     #[test]
-    fn a_target_absent_from_a_refresh_is_kept_until_it_expires() {
+    fn the_store_is_bounded_by_count_rather_than_age() {
         let store = SignalStore::new();
-        store.refresh(
-            BTreeMap::from([("pool-a".to_owned(), scraped())]),
-            Duration::from_secs(60),
+        for n in 0..(MAX_TARGETS + 8) {
+            store.refresh(BTreeMap::from([(format!("pool-{n}"), scraped())]));
+        }
+        assert_eq!(
+            store.targets().len(),
+            MAX_TARGETS,
+            "past the bound the least recently collected is dropped, and nothing else is"
         );
-        store.refresh(
-            BTreeMap::from([("pool-b".to_owned(), scraped())]),
-            Duration::from_secs(60),
-        );
+    }
+
+    #[test]
+    fn a_target_absent_from_a_refresh_is_kept() {
+        let store = SignalStore::new();
+        store.refresh(BTreeMap::from([("pool-a".to_owned(), scraped())]));
+        store.refresh(BTreeMap::from([("pool-b".to_owned(), scraped())]));
         assert_eq!(store.targets().len(), 2, "one failed scrape must not erase a target");
     }
     #[test]

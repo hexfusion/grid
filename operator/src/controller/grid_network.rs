@@ -304,17 +304,6 @@ fn build_signals_server_config(
         .map_err(|e| format!("signals TLS: server config: {e}"))
 }
 
-/// How long a scraped provider stays published without a refresh.
-///
-/// Must exceed the scrape interval, or a record expires between refreshes and
-/// the provider flickers in and out of what this site serves.
-fn local_ttl() -> Duration {
-    let secs = std::env::var("GRID_SIGNALS_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30_u64);
-    Duration::from_secs(secs)
-}
 
 /// Scrape every provider once and publish what was seen.
 ///
@@ -417,7 +406,7 @@ fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Ob
             (provider, attributed)
         })
         .collect();
-    ctx.signals.refresh(attributed, local_ttl());
+    ctx.signals.refresh(attributed);
 }
 
 /// Map an [`InferenceProvider`] change to the [`GridNetwork`] it belongs to.

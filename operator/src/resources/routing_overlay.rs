@@ -1679,10 +1679,10 @@ mod tests {
             };
 
             let store = SignalStore::new();
-            store.refresh(
-                BTreeMap::from([("pool".to_owned(), attribute(parse("q 1"), "east", "pool"))]),
-                std::time::Duration::from_secs(60),
-            );
+            store.refresh(BTreeMap::from([(
+                "pool".to_owned(),
+                attribute(parse("q 1"), "east", "pool"),
+            )]));
             let required = policy.site_selector.match_labels.clone();
             if !required.is_empty() {
                 store.set_access(BTreeMap::from([("pool".to_owned(), vec![required])]));
