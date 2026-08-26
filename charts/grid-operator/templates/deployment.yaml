@@ -46,6 +46,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            {{- with .Values.site.region }}
+            - name: GRID_SITE_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.site.zone }}
+            - name: GRID_SITE_ZONE
+              value: {{ . | quote }}
+            {{- end }}
             - name: GRID_SIGNALS_ADDR
               value: {{ .Values.signals.bindAddress | quote }}
             - name: GRID_SIGNALS_PEER_PORT

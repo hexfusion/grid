@@ -143,6 +143,20 @@
         }
       }
     },
+    "site": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "region": {
+          "type": "string",
+          "description": "Deployment region advertised to peers."
+        },
+        "zone": {
+          "type": "string",
+          "description": "Availability zone advertised to peers."
+        }
+      }
+    },
     "signals": {
       "type": "object",
       "additionalProperties": false,

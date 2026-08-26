@@ -88,6 +88,8 @@ pub struct MemberRecord {
     /// Contains only the public certificate — never a private key.
     /// `None` when the peer has not yet broadcast its site certificate.
     pub site_cert_pem: Option<String>,
+    /// Labels advertised by this site, carrying its geography.
+    pub site_labels: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl MemberRecord {
@@ -177,6 +179,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            site_labels: None,
         }
     }
 

@@ -63,6 +63,14 @@ pub struct StateBroadcast {
     /// `None` when the originating operator has no TLS certificate configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_cert_pem: Option<String>,
+    /// Site labels advertised by this site.
+    ///
+    /// Geography rides here rather than in typed fields: the site selector
+    /// already matches on labels, and a label set absorbs the dimensions a
+    /// deployment weights on without a payload change.  Bounded on receipt by
+    /// [`accept_site_labels`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_labels: Option<BTreeMap<String, String>>,
 }
 
 /// Base wire-format struct.
@@ -92,6 +100,66 @@ struct BroadcastExtension {
     gateway_address: Option<String>,
     /// Optional public site certificate PEM — never a private key.
     site_cert_pem: Option<String>,
+    /// Optional site labels, carrying geography among anything else a
+    /// deployment weights on.
+    site_labels: Option<BTreeMap<String, String>>,
+}
+
+/// The extension shape before site labels.
+///
+/// bincode encodes positionally, so a peer sending two fields leaves this
+/// process a field short. Decoding falls back through this shape.
+#[derive(Serialize, Deserialize)]
+struct BroadcastExtensionV2 {
+    /// Optional data-plane gateway address.
+    gateway_address: Option<String>,
+    /// Optional public site certificate PEM.
+    site_cert_pem: Option<String>,
+}
+
+/// Most labels a site may advertise.
+pub const MAX_SITE_LABELS: usize = 16;
+
+/// Longest label key or value accepted, matching the Kubernetes bound.
+pub const MAX_SITE_LABEL_LEN: usize = 63;
+
+/// Prefix a peer may not claim.
+///
+/// Reserved for what this operator concludes about a site, such as its
+/// admission state. A site describing itself uses [`SITE_REGION_LABEL`] and
+/// friends, which are facts it is entitled to assert.
+pub const RESERVED_LABEL_PREFIX: &str = "grid.praxis-proxy.io/";
+
+/// Well-known key for a site's region.
+pub const SITE_REGION_LABEL: &str = "topology.grid.praxis-proxy.io/region";
+
+/// Well-known key for a site's availability zone.
+pub const SITE_ZONE_LABEL: &str = "topology.grid.praxis-proxy.io/zone";
+
+/// Accept a peer's labels, or reject the set.
+///
+/// Rejects rather than truncates: a smaller set is a different claim about
+/// where a site is, and silently making one is worse than carrying none.
+#[must_use]
+pub fn accept_site_labels(labels: BTreeMap<String, String>, origin: &str) -> Option<BTreeMap<String, String>> {
+    let refuse = |reason: &str| {
+        tracing::warn!(origin, reason, "rejected site labels");
+        None
+    };
+    if labels.len() > MAX_SITE_LABELS {
+        return refuse("too many labels");
+    }
+    for (key, value) in &labels {
+        if key.is_empty() || key.len() > MAX_SITE_LABEL_LEN || value.len() > MAX_SITE_LABEL_LEN {
+            return refuse("label key or value out of bounds");
+        }
+        // A peer relabelling itself into a key this process reads would be
+        // asserting a routing decision rather than a fact about itself.
+        if key.starts_with(RESERVED_LABEL_PREFIX) {
+            return refuse("label claims the reserved prefix");
+        }
+    }
+    Some(labels)
 }
 
 impl StateBroadcast {
@@ -114,6 +182,7 @@ impl StateBroadcast {
             snapshot,
             gateway_address,
             site_cert_pem: None,
+            site_labels: None,
         }
     }
 
@@ -123,6 +192,13 @@ impl StateBroadcast {
     #[must_use]
     pub fn with_cert(mut self, site_cert_pem: Option<String>) -> Self {
         self.site_cert_pem = site_cert_pem;
+        self
+    }
+
+    /// Create a broadcast that also carries this site's labels.
+    #[must_use]
+    pub fn with_labels(mut self, site_labels: Option<BTreeMap<String, String>>) -> Self {
+        self.site_labels = site_labels;
         self
     }
 
@@ -211,10 +287,11 @@ impl StateBroadcast {
             snapshot: self.snapshot.clone(),
         };
         let mut bytes = bincode::serde::encode_to_vec(&v1, bincode::config::standard())?;
-        if self.gateway_address.is_some() || self.site_cert_pem.is_some() {
+        if self.gateway_address.is_some() || self.site_cert_pem.is_some() || self.site_labels.is_some() {
             let ext = BroadcastExtension {
                 gateway_address: self.gateway_address.clone(),
                 site_cert_pem: self.site_cert_pem.clone(),
+                site_labels: self.site_labels.clone(),
             };
             let ext_bytes = bincode::serde::encode_to_vec(&ext, bincode::config::standard())?;
             bytes.extend_from_slice(&ext_bytes);
@@ -241,21 +318,7 @@ impl StateBroadcast {
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (gateway_address, site_cert_pem) = if remaining.is_empty() {
-            (None, None)
-        } else {
-            // Try the current extension struct format.
-            match bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, bincode::config::standard()) {
-                Ok((ext, _)) => (ext.gateway_address, ext.site_cert_pem),
-                Err(_) => {
-                    // Compatibility fallback: bare String encoding for gateway_address only.
-                    match bincode::serde::decode_from_slice::<String, _>(remaining, bincode::config::standard()) {
-                        Ok((gw, _)) => (Some(gw), None),
-                        Err(_) => (None, None),
-                    }
-                },
-            }
-        };
+        let (gateway_address, site_cert_pem, site_labels) = decode_extension(remaining, &v1.origin_site);
 
         Ok(Self {
             version: v1.version,
@@ -264,7 +327,34 @@ impl StateBroadcast {
             snapshot: v1.snapshot,
             gateway_address,
             site_cert_pem,
+            site_labels,
         })
+    }
+}
+
+/// Gateway address, certificate, and labels carried by an extension.
+type DecodedExtension = (Option<String>, Option<String>, Option<BTreeMap<String, String>>);
+
+/// Decode the trailing extension, newest shape first.
+///
+/// bincode is positional, so a peer sending fewer fields leaves this a field
+/// short rather than wrong, and each older shape is tried in turn.
+fn decode_extension(remaining: &[u8], origin: &str) -> DecodedExtension {
+    if remaining.is_empty() {
+        return (None, None, None);
+    }
+    let config = bincode::config::standard();
+    if let Ok((ext, _)) = bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, config) {
+        let labels = ext.site_labels.and_then(|labels| accept_site_labels(labels, origin));
+        return (ext.gateway_address, ext.site_cert_pem, labels);
+    }
+    if let Ok((ext, _)) = bincode::serde::decode_from_slice::<BroadcastExtensionV2, _>(remaining, config) {
+        return (ext.gateway_address, ext.site_cert_pem, None);
+    }
+    // Compatibility fallback: bare String encoding for gateway_address only.
+    match bincode::serde::decode_from_slice::<String, _>(remaining, config) {
+        Ok((gateway, _)) => (Some(gateway), None, None),
+        Err(_) => (None, None, None),
     }
 }
 
@@ -350,6 +440,10 @@ struct RetainedOrigins {
     cert_pems: BTreeMap<String, String>,
     /// Highest certificate revision received from each origin.
     latest_cert_revision_by_origin: BTreeMap<String, u64>,
+    /// Labels advertised per origin site.
+    site_labels: BTreeMap<String, BTreeMap<String, String>>,
+    /// Revision of the newest labels accepted per origin site.
+    latest_labels_revision_by_origin: BTreeMap<String, u64>,
 }
 
 impl RetainedOrigins {
@@ -361,6 +455,8 @@ impl RetainedOrigins {
             .chain(self.latest_gateway_revision_by_origin.keys())
             .chain(self.cert_pems.keys())
             .chain(self.latest_cert_revision_by_origin.keys())
+            .chain(self.site_labels.keys())
+            .chain(self.latest_labels_revision_by_origin.keys())
             .cloned()
             .collect()
     }
@@ -372,6 +468,8 @@ impl RetainedOrigins {
         self.latest_gateway_revision_by_origin.remove(origin);
         self.cert_pems.remove(origin);
         self.latest_cert_revision_by_origin.remove(origin);
+        self.site_labels.remove(origin);
+        self.latest_labels_revision_by_origin.remove(origin);
     }
 }
 
@@ -389,6 +487,8 @@ pub(crate) struct OriginStateHandle {
     gateway_addrs_tx: watch::Sender<BTreeMap<String, String>>,
     /// Public-certificate publisher.
     cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
+    /// Publishes labels per origin site.
+    site_labels_tx: watch::Sender<BTreeMap<String, BTreeMap<String, String>>>,
 }
 
 impl OriginStateHandle {
@@ -423,6 +523,9 @@ impl OriginStateHandle {
         self.state_tx.send_modify(|snapshot| {
             snapshot.remove_origin_providers(origin);
         });
+        self.site_labels_tx.send_modify(|labels| {
+            labels.remove(origin);
+        });
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
@@ -452,6 +555,8 @@ pub struct StateBroadcastHandler {
 
     /// Watch channel for broadcasting public cert PEM updates to observers.
     cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
+    /// Publishes labels per origin site.
+    site_labels_tx: watch::Sender<BTreeMap<String, BTreeMap<String, String>>>,
 
     /// Hard bound for per-origin revision and metadata maps.
     max_origins: usize,
@@ -479,6 +584,7 @@ impl StateBroadcastHandler {
         let (tx, _) = watch::channel(GridStateSnapshot::new(site_id));
         let (gw_tx, _) = watch::channel(BTreeMap::new());
         let (cert_tx, _) = watch::channel(BTreeMap::new());
+        let (labels_tx, _) = watch::channel(BTreeMap::new());
         let max_origins = max_origins.max(1);
         let retained = Arc::new(Mutex::new(RetainedOrigins::default()));
         let control = OriginStateHandle {
@@ -486,6 +592,7 @@ impl StateBroadcastHandler {
             state_tx: tx.clone(),
             gateway_addrs_tx: gw_tx.clone(),
             cert_pems_tx: cert_tx.clone(),
+            site_labels_tx: labels_tx.clone(),
         };
         (
             Self {
@@ -493,6 +600,7 @@ impl StateBroadcastHandler {
                 retained,
                 gateway_addrs_tx: gw_tx,
                 cert_pems_tx: cert_tx,
+                site_labels_tx: labels_tx,
                 max_origins,
             },
             control,
@@ -543,9 +651,18 @@ impl StateBroadcastHandler {
             .clone()
     }
 
+    /// Return a receiver for the live per-site label map.
+    ///
+    /// Create the receiver **before** moving `self` into foca.
+    #[must_use]
+    pub fn subscribe_site_labels(&self) -> watch::Receiver<BTreeMap<String, BTreeMap<String, String>>> {
+        self.site_labels_tx.subscribe()
+    }
+
     /// Return a receiver for the live public cert PEM map.
     ///
     /// Create the receiver **before** moving `self` into foca.
+    #[must_use]
     pub fn subscribe_cert_pems(&self) -> watch::Receiver<BTreeMap<String, String>> {
         self.cert_pems_tx.subscribe()
     }
@@ -561,6 +678,16 @@ impl StateBroadcastHandler {
             .cert_pems
             .get(site)
             .cloned()
+    }
+
+    /// Labels retained per origin site.
+    #[must_use]
+    pub fn site_labels(&self) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .site_labels
+            .clone()
     }
 
     /// Return a snapshot of all known public cert PEMs, keyed by site name.
@@ -591,6 +718,32 @@ impl StateBroadcastHandler {
             drop(retained);
             self.gateway_addrs_tx.send_modify(|map| {
                 map.insert(broadcast.origin_site.clone(), gw.clone());
+            });
+        }
+    }
+
+    /// Store and publish the site labels carried by a broadcast, if any.
+    ///
+    /// Bounds were applied at decode, so anything arriving here was accepted.
+    fn store_site_labels(&self, broadcast: &StateBroadcast) {
+        if let Some(labels) = &broadcast.site_labels {
+            let mut retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+            let latest = retained
+                .latest_labels_revision_by_origin
+                .get(&broadcast.origin_site)
+                .copied();
+            if latest.is_some_and(|revision| revision > broadcast.revision) {
+                return;
+            }
+            retained
+                .latest_labels_revision_by_origin
+                .insert(broadcast.origin_site.clone(), broadcast.revision);
+            retained
+                .site_labels
+                .insert(broadcast.origin_site.clone(), labels.clone());
+            drop(retained);
+            self.site_labels_tx.send_modify(|map| {
+                map.insert(broadcast.origin_site.clone(), labels.clone());
             });
         }
     }
@@ -636,6 +789,9 @@ impl StateBroadcastHandler {
             .remove(origin);
         self.state_tx
             .send_modify(|snapshot| snapshot.remove_origin_providers(origin));
+        self.site_labels_tx.send_modify(|labels| {
+            labels.remove(origin);
+        });
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
@@ -685,6 +841,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
         if broadcast.is_metadata_only() {
             self.store_gateway_address(&broadcast);
             self.store_site_cert_pem(&broadcast);
+            self.store_site_labels(&broadcast);
             return Ok(Some(broadcast.key()));
         }
 
@@ -702,6 +859,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
         // Extensions on a non-stale state broadcast remain authoritative.
         self.store_gateway_address(&broadcast);
         self.store_site_cert_pem(&broadcast);
+        self.store_site_labels(&broadcast);
 
         if latest.is_some_and(|latest| latest == broadcast.revision) {
             return Ok(None);
@@ -733,6 +891,82 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
 
 #[cfg(test)]
 mod tests {
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn site_labels_survive_a_round_trip() {
+        let broadcast = StateBroadcast::new("east".to_owned(), 1, GridStateSnapshot::new("east".to_owned()), None)
+            .with_labels(Some(labels(&[("topology/region", "us-east")])));
+        let decoded =
+            StateBroadcast::decode(&broadcast.encode().unwrap_or_default()).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            decoded
+                .site_labels
+                .unwrap_or_default()
+                .get("topology/region")
+                .map(String::as_str),
+            Some("us-east")
+        );
+    }
+
+    #[test]
+    fn a_peer_sending_the_older_extension_still_decodes() {
+        // bincode is positional, so the two field shape leaves this decode a
+        // field short. The gateway address has to survive that.
+        let older = StateBroadcast::new("east".to_owned(), 1, GridStateSnapshot::new("east".to_owned()), None);
+        let mut bytes = bincode::serde::encode_to_vec(
+            &StateBroadcastV1 {
+                version: older.version,
+                origin_site: older.origin_site,
+                revision: older.revision,
+                snapshot: older.snapshot,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap_or_default();
+        let ext = BroadcastExtensionV2 {
+            gateway_address: Some("10.0.0.1:8443".to_owned()),
+            site_cert_pem: None,
+        };
+        bytes.extend_from_slice(&bincode::serde::encode_to_vec(&ext, bincode::config::standard()).unwrap_or_default());
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| unreachable!());
+        assert_eq!(decoded.gateway_address.as_deref(), Some("10.0.0.1:8443"));
+        assert!(decoded.site_labels.is_none(), "an older peer carries no labels");
+    }
+
+    #[test]
+    fn a_reserved_key_from_a_peer_is_refused() {
+        // A site relabelling itself into a key this process reads would be
+        // asserting a routing decision rather than a fact about itself.
+        let hostile = labels(&[(&format!("{RESERVED_LABEL_PREFIX}region"), "us-east")]);
+        assert!(accept_site_labels(hostile, "east").is_none());
+    }
+
+    #[test]
+    fn a_set_over_the_bounds_is_refused_not_trimmed() {
+        let many: BTreeMap<String, String> = (0..=MAX_SITE_LABELS)
+            .map(|i| (format!("k{i}"), "v".to_owned()))
+            .collect();
+        assert!(
+            accept_site_labels(many, "east").is_none(),
+            "a smaller set is a different claim"
+        );
+
+        let long = labels(&[("k", &"v".repeat(MAX_SITE_LABEL_LEN + 1))]);
+        assert!(accept_site_labels(long, "east").is_none());
+    }
+
+    #[test]
+    fn labels_within_the_bounds_are_accepted() {
+        let ok = labels(&[("topology/region", "us-east"), ("topology/zone", "us-east-1a")]);
+        assert_eq!(accept_site_labels(ok, "east").unwrap_or_default().len(), 2);
+    }
     use crdt::{Capability, GCounter, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
     use foca::{BroadcastHandler as _, Invalidates as _};
 
@@ -1069,6 +1303,33 @@ mod tests {
                 .unwrap_or_else(|_| std::process::abort())
                 .is_none(),
             "duplicate broadcast is stale"
+        );
+    }
+
+    #[test]
+    fn a_full_state_broadcast_stores_the_labels_it_carries() {
+        // The metadata-only path and this one store extensions separately, and
+        // a provider broadcast takes this one. Storing labels on only the other
+        // left every site advertising a region and no site keeping one.
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.5), None)
+            .with_labels(Some(labels(&[(SITE_REGION_LABEL, "us-east")])));
+        assert!(
+            !broadcast.is_metadata_only(),
+            "a snapshot makes this a full-state broadcast"
+        );
+
+        let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        drop(handler.receive_item(&bytes, None));
+
+        assert_eq!(
+            handler
+                .site_labels()
+                .get("site-p")
+                .and_then(|site| site.get(SITE_REGION_LABEL))
+                .map(String::as_str),
+            Some("us-east"),
+            "a full-state broadcast must keep the labels it carried"
         );
     }
 

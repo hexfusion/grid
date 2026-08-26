@@ -201,6 +201,7 @@ impl TrackedMember {
                 .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
             gateway_address: self.gateway_address.clone(),
             site_cert_pem: self.site_cert_pem.clone(),
+            site_labels: None,
         }
     }
 }
@@ -221,6 +222,7 @@ fn members_snapshot(
     now: Instant,
     gateway_addrs: &BTreeMap<String, String>,
     cert_pems: &BTreeMap<String, String>,
+    site_labels: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> MembershipSnapshot {
     MembershipSnapshot {
         members: tracked
@@ -229,6 +231,7 @@ fn members_snapshot(
                 let mut record = t.to_member_record(now);
                 record.gateway_address = gateway_addrs.get(&t.site_id).cloned();
                 record.site_cert_pem = cert_pems.get(&t.site_id).cloned();
+                record.site_labels = site_labels.get(&t.site_id).cloned();
                 record
             })
             .collect(),
@@ -936,6 +939,7 @@ async fn run_loop(
             &channels.snapshot_tx,
             &node.gateway_addrs(),
             &node.cert_pems(),
+            &node.site_labels(),
             startup_key.as_deref(),
         )
         .await;
@@ -983,6 +987,7 @@ async fn run_loop(
                             &channels.snapshot_tx,
                             &node.gateway_addrs(),
                             &node.cert_pems(),
+                            &node.site_labels(),
                             current_key.as_deref(),
                         )
                         .await;
@@ -994,7 +999,7 @@ async fn run_loop(
                         // map but may not emit a membership event.  Republish the
                         // membership snapshot after every inbound packet so callers see the
                         // latest gateway address attached to already-known members.
-                        drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now(), &node.gateway_addrs(), &node.cert_pems())));
+                        drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now(), &node.gateway_addrs(), &node.cert_pems(), &node.site_labels())));
                         if let Some(gateway_address) = gateway_address.as_deref() {
                             let now = Instant::now();
                             if now >= next_gateway_republish_at {
@@ -1018,6 +1023,7 @@ async fn run_loop(
                                     &channels.snapshot_tx,
                                     &node.gateway_addrs(),
                                     &node.cert_pems(),
+                                    &node.site_labels(),
                                     current_key.as_deref(),
                                 )
                                 .await;
@@ -1039,6 +1045,7 @@ async fn run_loop(
                     &channels.snapshot_tx,
                     &node.gateway_addrs(),
                     &node.cert_pems(),
+                    &node.site_labels(),
                     current_key.as_deref(),
                 )
                 .await;
@@ -1078,6 +1085,7 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
+                        &node.site_labels(),
                         current_key.as_deref(),
                     )
                     .await;
@@ -1099,6 +1107,7 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
+                        &node.site_labels(),
                         current_key.as_deref(),
                     )
                     .await;
@@ -1125,6 +1134,7 @@ async fn run_loop(
                                 &channels.snapshot_tx,
                                 &node.gateway_addrs(),
                                 &node.cert_pems(),
+                                &node.site_labels(),
                                 current_key.as_deref(),
                             )
                             .await;
@@ -1147,6 +1157,7 @@ async fn run_loop(
                             &channels.snapshot_tx,
                             &node.gateway_addrs(),
                             &node.cert_pems(),
+                            &node.site_labels(),
                             current_key.as_deref(),
                         )
                         .await;
@@ -1165,6 +1176,7 @@ async fn run_loop(
                         now,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
+                        &node.site_labels(),
                     )));
                 }
             }
@@ -1191,6 +1203,7 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
+                        &node.site_labels(),
                         current_key.as_deref(),
                     )
                     .await;
@@ -1251,6 +1264,7 @@ async fn drain_output(
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
     gateway_addrs: &BTreeMap<String, String>,
     cert_pems: &BTreeMap<String, String>,
+    site_labels: &BTreeMap<String, BTreeMap<String, String>>,
     swim_key: Option<&swim::crypto::SwimKey>,
 ) {
     for msg in output.messages {
@@ -1289,7 +1303,7 @@ async fn drain_output(
         changed = true;
     }
     if changed {
-        drop(snapshot_tx.send(members_snapshot(tracked, now, gateway_addrs, cert_pems)));
+        drop(snapshot_tx.send(members_snapshot(tracked, now, gateway_addrs, cert_pems, site_labels)));
     }
 }
 
@@ -1575,7 +1589,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
         apply_member_event(joined("site-b"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(snap.connected_count(), 2, "two Alive members must give count=2");
     }
 
@@ -1585,7 +1599,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
         apply_member_event(suspect("site-a"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(snap.connected_count(), 0, "Suspect member must not count as connected");
     }
 
@@ -1632,7 +1646,7 @@ mod tests {
         let t = now();
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.age_secs, 0, "Alive member must have age_secs=0");
     }
@@ -1645,7 +1659,13 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
-        let snap = members_snapshot(&tracked, t_suspect, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(
+            &tracked,
+            t_suspect,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Suspect);
         assert_eq!(m.age_secs, 0, "age at the moment of transition must be 0");
@@ -1659,7 +1679,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
-        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Suspect);
         assert_eq!(m.age_secs, 60, "age must be elapsed since transition (70s - 10s = 60s)");
@@ -1678,6 +1698,7 @@ mod tests {
             t0 + Duration::from_secs(70),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.age_secs, 60, "repeated Suspect must not reset age clock");
@@ -1691,7 +1712,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "dead age must be 80s - 20s = 60s");
@@ -1708,6 +1729,7 @@ mod tests {
         let snap = members_snapshot(
             &tracked,
             t0 + Duration::from_secs(70),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         );
@@ -1732,6 +1754,7 @@ mod tests {
             t0 + Duration::from_secs(70),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Alive);
@@ -1745,7 +1768,7 @@ mod tests {
         let t_snap = t0 + Duration::from_secs(75);
         let mut tracked = HashMap::new();
         apply_member_event(left("unknown-site"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "unknown Left tombstone age must be 75s - 15s = 60s");
@@ -1789,6 +1812,7 @@ mod tests {
             age_secs,
             gateway_address: Some("10.0.0.1:8443".to_owned()),
             site_cert_pem: Some("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_owned()),
+            site_labels: None,
         }
     }
 
@@ -2137,6 +2161,7 @@ mod tests {
                 age_secs: 0,
                 gateway_address: None,
                 site_cert_pem: None,
+                site_labels: None,
             }],
         };
         drop(snapshot_tx.send(snap_with_member));

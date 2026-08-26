@@ -17,7 +17,8 @@ spec:
     - name: pool-a
       stacks: [metallb, pool-a-operator-base, llmd-pool-a, pool-a-site, provider-gateway, consumer-gateway]
       properties:
-        region: pool-a
+        region: us-east
+        zone: us-east-1a
         role: combined
         siteName: pool-a
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
@@ -38,7 +39,8 @@ spec:
     - name: pool-b
       stacks: [metallb, pool-b-operator-base, llmd-pool-b, pool-b-site, provider-gateway, consumer-gateway]
       properties:
-        region: pool-b
+        region: us-east
+        zone: us-east-1b
         role: combined
         siteName: pool-b
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
@@ -59,7 +61,8 @@ spec:
     - name: pool-c
       stacks: [metallb, pool-c-operator-base, llmd-pool-c, pool-c-site, provider-gateway, consumer-gateway]
       properties:
-        region: pool-c
+        region: eu-west
+        zone: eu-west-1a
         role: combined
         siteName: pool-c
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
@@ -105,6 +108,9 @@ spec:
               repository: "{{ cluster.properties.operatorImageRepo }}"
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            site:
+              region: "{{ cluster.properties.region }}"
+              zone: "{{ cluster.properties.zone }}"
             swim:
               siteName: "pool-a"
               seeds: ""
@@ -140,6 +146,9 @@ spec:
               repository: "{{ cluster.properties.operatorImageRepo }}"
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            site:
+              region: "{{ cluster.properties.region }}"
+              zone: "{{ cluster.properties.zone }}"
             swim:
               siteName: "pool-b"
               seeds: ""
@@ -174,6 +183,9 @@ spec:
               repository: "{{ cluster.properties.operatorImageRepo }}"
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            site:
+              region: "{{ cluster.properties.region }}"
+              zone: "{{ cluster.properties.zone }}"
             swim:
               siteName: "pool-c"
               seeds: ""
@@ -325,8 +337,8 @@ spec:
             gridNetwork:
               name: grid-llmd-pool-metrics
               gridId: grid-llmd-pool-metrics-v1
-              region: pool-a
-              zone: pool-a-1
+              region: us-east
+              zone: us-east-1a
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
@@ -350,8 +362,8 @@ spec:
                   localSiteName: pool-a
             gridSite:
               name: pool-a
-              region: pool-a
-              zone: pool-a-1
+              region: us-east
+              zone: us-east-1a
               providerSiteLabel: pool-a
             inferenceProviders:
               - name: llmd-pool-a-provider
@@ -400,8 +412,8 @@ spec:
             gridNetwork:
               name: grid-llmd-pool-metrics
               gridId: grid-llmd-pool-metrics-v1
-              region: pool-b
-              zone: pool-b-1
+              region: us-east
+              zone: us-east-1b
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
@@ -425,8 +437,8 @@ spec:
                   localSiteName: pool-b
             gridSite:
               name: pool-b
-              region: pool-b
-              zone: pool-b-1
+              region: us-east
+              zone: us-east-1b
               providerSiteLabel: pool-b
             inferenceProviders:
               - name: llmd-pool-b-provider
@@ -474,8 +486,8 @@ spec:
             gridNetwork:
               name: grid-llmd-pool-metrics
               gridId: grid-llmd-pool-metrics-v1
-              region: pool-c
-              zone: pool-c-1
+              region: eu-west
+              zone: eu-west-1a
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
@@ -499,8 +511,8 @@ spec:
                   localSiteName: pool-c
             gridSite:
               name: pool-c
-              region: pool-c
-              zone: pool-c-1
+              region: eu-west
+              zone: eu-west-1a
               providerSiteLabel: pool-c
             inferenceProviders:
               - name: llmd-pool-c-provider

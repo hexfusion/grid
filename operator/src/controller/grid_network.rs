@@ -1759,10 +1759,35 @@ fn publish_real_provider_state(
     // Use the highest provider revision as this origin's broadcast revision.
     // Duplicate unchanged broadcasts are idempotent; newer Kubernetes writes
     // advance resourceVersion and therefore advance the broadcast revision.
-    let bc = StateBroadcast::new(site_name.to_owned(), max_revision, snap, gateway_address);
+    let bc =
+        StateBroadcast::new(site_name.to_owned(), max_revision, snap, gateway_address).with_labels(local_site_labels());
     if let Err(e) = swim.publish_state_broadcast(bc) {
         tracing::debug!(error = %e, "CRDT broadcast channel unavailable — runtime not yet receiving");
     }
+}
+
+/// This site's own labels, from the environment.
+///
+/// A site's location is deployment configuration rather than something to
+/// discover, and reading it here keeps a reconcile off the API server.
+/// Returns `None` when nothing is configured, so a site that does not know
+/// where it is advertises nothing rather than an empty claim.
+fn local_site_labels() -> Option<std::collections::BTreeMap<String, String>> {
+    let mut labels = std::collections::BTreeMap::new();
+    for (key, var) in [
+        (swim::state_broadcast::SITE_REGION_LABEL, "GRID_SITE_REGION"),
+        (swim::state_broadcast::SITE_ZONE_LABEL, "GRID_SITE_ZONE"),
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                labels.insert(key.to_owned(), value.to_owned());
+            }
+        }
+    }
+    // Bounded on the way out as well as in, so this site never advertises a
+    // set a peer would refuse.
+    swim::state_broadcast::accept_site_labels(labels, "local").filter(|l| !l.is_empty())
 }
 
 /// Count provider records learned from remote sites through distributed state.
@@ -2099,6 +2124,10 @@ pub(crate) struct DiscoveredSite {
     /// Contains only the public certificate — never a private key.
     /// `None` when the remote peer has not yet broadcast its certificate.
     pub site_cert_pem: Option<String>,
+    /// Region advertised by the peer, if it labelled itself.
+    pub region: Option<String>,
+    /// Availability zone advertised by the peer, if it labelled itself.
+    pub zone: Option<String>,
 }
 
 /// Derive the set of remote [`GridSite`]s the operator should maintain from the SWIM snapshot.
@@ -2122,11 +2151,24 @@ pub(crate) fn discovered_sites_from_swim(
         .iter()
         .filter(|m| m.status == MemberStatus::Alive && m.site_id != local_site)
         .filter(|m| !m.site_id.trim().is_empty())
-        .map(|m| DiscoveredSite {
-            name: discovered_site_k8s_name(network_name, &m.site_id),
-            grid_network_ref: network_name.to_owned(),
-            egress_address: m.gateway_address.clone().unwrap_or_default(),
-            site_cert_pem: m.site_cert_pem.clone(),
+        .map(|m| {
+            // A site describes its own location. Without this the tier
+            // lookup finds no region and every remote candidate is Unknown.
+            let label = |key: &str| {
+                m.site_labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(key))
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            };
+            DiscoveredSite {
+                name: discovered_site_k8s_name(network_name, &m.site_id),
+                grid_network_ref: network_name.to_owned(),
+                egress_address: m.gateway_address.clone().unwrap_or_default(),
+                site_cert_pem: m.site_cert_pem.clone(),
+                region: label(swim::state_broadcast::SITE_REGION_LABEL),
+                zone: label(swim::state_broadcast::SITE_ZONE_LABEL),
+            }
         })
         .collect()
 }
@@ -2417,6 +2459,16 @@ async fn reconcile_discovered_sites(
                     );
                 })
             });
+        }
+        // Labels on the wire, typed fields here, because the locality tier
+        // reads region and zone from the site spec.
+        for (field, value) in [("region", site.region.as_ref()), ("zone", site.zone.as_ref())] {
+            if let Some(value) = value {
+                spec_obj.get_mut("spec").and_then(|spec| {
+                    spec.as_object_mut()
+                        .map(|obj| obj.insert(field.to_owned(), serde_json::json!(value)))
+                });
+            }
         }
         let spec_doc = spec_obj;
 
@@ -2862,6 +2914,7 @@ mod tests {
                     age_secs: 0,
                     gateway_address: None,
                     site_cert_pem: None,
+                    site_labels: None,
                 })
                 .collect(),
         }
@@ -2877,6 +2930,7 @@ mod tests {
                 age_secs: 5,
                 gateway_address: None,
                 site_cert_pem: None,
+                site_labels: None,
             }],
         }
     }
@@ -3360,6 +3414,7 @@ mod tests {
                 age_secs: 0,
                 gateway_address: None,
                 site_cert_pem: None,
+                site_labels: None,
             }],
         }
     }
@@ -3489,6 +3544,7 @@ mod tests {
                     age_secs: 0,
                     gateway_address: None,
                     site_cert_pem: None,
+                    site_labels: None,
                 },
                 MemberRecord {
                     site_id: "site-east".to_owned(),
@@ -3498,6 +3554,7 @@ mod tests {
                     age_secs: 0,
                     gateway_address: None,
                     site_cert_pem: None,
+                    site_labels: None,
                 },
             ],
         };
@@ -3623,6 +3680,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            site_labels: None,
         }
     }
 
@@ -3658,6 +3716,36 @@ mod tests {
         let snap = make_snapshot(vec![make_member("local", "127.0.0.1:7946", MemberStatus::Alive)]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert!(sites.is_empty(), "local site must never produce a DiscoveredSite");
+    }
+
+    #[test]
+    fn a_peer_that_labels_itself_gets_a_region_on_its_discovered_site() {
+        // Without this the tier lookup finds no region and every remote
+        // candidate reads as Unknown.
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(
+            swim::state_broadcast::SITE_REGION_LABEL.to_owned(),
+            "us-east".to_owned(),
+        );
+        labels.insert(
+            swim::state_broadcast::SITE_ZONE_LABEL.to_owned(),
+            "us-east-1a".to_owned(),
+        );
+        let mut member = make_member("west", "127.0.0.1:7946", MemberStatus::Alive);
+        member.site_labels = Some(labels);
+
+        let sites = discovered_sites_from_swim("net", "east", &make_snapshot(vec![member]));
+        let site = sites.first().unwrap_or_else(|| unreachable!());
+        assert_eq!(site.region.as_deref(), Some("us-east"));
+        assert_eq!(site.zone.as_deref(), Some("us-east-1a"));
+    }
+
+    #[test]
+    fn a_peer_that_labels_nothing_carries_no_geography() {
+        let snapshot = make_snapshot(vec![make_member("west", "127.0.0.1:7946", MemberStatus::Alive)]);
+        let site = discovered_sites_from_swim("net", "east", &snapshot);
+        let site = site.first().unwrap_or_else(|| unreachable!());
+        assert!(site.region.is_none() && site.zone.is_none());
     }
 
     #[test]
@@ -3700,6 +3788,7 @@ mod tests {
             age_secs: 0,
             gateway_address: Some("10.0.0.2:19080".to_owned()),
             site_cert_pem: None,
+            site_labels: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert_eq!(sites.len(), 1, "exactly one remote Alive member");
@@ -3720,6 +3809,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            site_labels: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert_eq!(sites.len(), 1, "exactly one remote Alive member");
@@ -3741,6 +3831,7 @@ mod tests {
             age_secs: 0,
             gateway_address: Some("10.0.0.2:8080".to_owned()),
             site_cert_pem: Some(sentinel_cert.to_owned()),
+            site_labels: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         let site = sites.first().unwrap_or_else(|| std::process::abort());
@@ -3761,6 +3852,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            site_labels: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         let site = sites.first().unwrap_or_else(|| std::process::abort());
@@ -3784,6 +3876,7 @@ mod tests {
             age_secs: 0,
             gateway_address: Some("10.0.0.2:8080".to_owned()),
             site_cert_pem: Some(sentinel_cert.to_owned()),
+            site_labels: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         let site = sites.first().unwrap_or_else(|| std::process::abort());

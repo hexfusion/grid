@@ -63,6 +63,8 @@ pub struct SwimNode {
     /// Updated by the [`StateBroadcastHandler`] inside foca when a broadcast
     /// carrying a `site_cert_pem` extension is received.
     cert_pems_rx: watch::Receiver<BTreeMap<String, String>>,
+    /// Latest labels advertised per origin site.
+    site_labels_rx: watch::Receiver<BTreeMap<String, BTreeMap<String, String>>>,
 
     /// Immediate control path for coordinated per-origin state eviction.
     origin_state: OriginStateHandle,
@@ -108,6 +110,7 @@ impl SwimNode {
         let state_rx = handler.subscribe();
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
         let cert_pems_rx = handler.subscribe_cert_pems();
+        let site_labels_rx = handler.subscribe_site_labels();
 
         Self {
             foca: foca::Foca::with_custom_broadcast(identity, grid_config(), rng, codec, handler),
@@ -115,6 +118,7 @@ impl SwimNode {
             state_rx,
             gateway_addrs_rx,
             cert_pems_rx,
+            site_labels_rx,
             origin_state,
         }
     }
@@ -243,6 +247,14 @@ impl SwimNode {
     #[must_use]
     pub fn cert_pems(&self) -> BTreeMap<String, String> {
         self.cert_pems_rx.borrow().clone()
+    }
+
+    /// Labels advertised by each site, keyed by origin site name.
+    ///
+    /// Bounded on receipt, so a set that broke the limits never arrives here.
+    #[must_use]
+    pub fn site_labels(&self) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.site_labels_rx.borrow().clone()
     }
 }
 
