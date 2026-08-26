@@ -5457,6 +5457,7 @@ mod tests {
             age_secs,
             gateway_address: None,
             site_cert_pem: None,
+            site_labels: None,
         }
     }
 

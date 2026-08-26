@@ -64,6 +64,13 @@ metrics:
     # -- Service annotations.
     annotations: {}
 
+# -- Where this site is. Advertised to peers, which weigh it when routing.
+site:
+  # -- Deployment region, e.g. "us-east". Empty advertises nothing.
+  region: ""
+  # -- Availability zone, e.g. "us-east-1a". Empty advertises nothing.
+  zone: ""
+
 # -- SWIM protocol configuration.
 swim:
   # -- SWIM bind address (host:port).

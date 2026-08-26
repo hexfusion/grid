@@ -46,6 +46,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            {{- with .Values.site.region }}
+            - name: GRID_SITE_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.site.zone }}
+            - name: GRID_SITE_ZONE
+              value: {{ . | quote }}
+            {{- end }}
             - name: GRID_SWIM_BIND_ADDR
               value: {{ .Values.swim.bindAddress | quote }}
             - name: GRID_SWIM_ADVERTISE_ADDR
