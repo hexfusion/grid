@@ -105,9 +105,7 @@ async fn main() {
     let swim_for_poller = swim.clone();
     let ctx = Arc::new(OperatorCtx::new(client.clone(), swim));
 
-    // Held for the process lifetime. Dropping it also triggers, so an unwind
-    // anywhere still tells the pollers to stand down rather than leaving them
-    // waiting on a signal nobody is left to send.
+    // Dropping it also triggers, so an unwind still stands the pollers down.
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
     tokio::spawn(watch_for_termination(trigger));
 
@@ -627,9 +625,8 @@ async fn run_signals_server(
             local_labels,
         });
 
-    // A listener cannot be promoted from plaintext to TLS in place, and rustls
-    // fixes the client verifier when the config is built, so picking up a new
-    // certificate or a new CA means serving again rather than swapping a field.
+    // rustls fixes the verifier at build time, so new material means serving
+    // again, not swapping a field.
     loop {
         let (tls, own_key) = Box::pin(signals_identity(&client)).await;
         let identity = SignalsIdentity {
@@ -661,9 +658,7 @@ async fn serve_once(
         .local_addr()
         .map_or_else(|_| addr.to_owned(), |a| a.to_string());
     let Some(tls) = tls else {
-        // Nobody can present a key, so nobody can be named. Serving local scope
-        // is a development convenience, and an unauthenticated listener
-        // carrying cross-site load is what the rest of this path prevents.
+        // No key presented means nobody can be named, so local scope only.
         tracing::warn!(
             addr = %bound,
             tls = false,
@@ -835,9 +830,7 @@ async fn run_local_scraper(
     ctx: Arc<OperatorCtx>,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Milliseconds take precedence, because the second-granularity setting
-    // cannot express an interval shorter than one and a local scrape crosses no
-    // network. The seconds form stays for anything already setting it.
+    // Milliseconds win: the seconds form cannot express a sub-second interval.
     let interval = scrape_interval();
     tracing::info!(interval_ms = interval.as_millis(), "local signals scraper started");
     let mut ticker = tokio::time::interval(interval);
@@ -907,10 +900,8 @@ async fn run_peer_poller(
     };
     let port = parse_env_or("GRID_SIGNALS_PEER_PORT", 9091_u16);
     let interval = std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_INTERVAL_SECS", 30_u64));
-    // Rebuilt whenever the material changes, for the same reason the listener
-    // rebinds: a client resolved before its certificate exists speaks plaintext
-    // to peers that have since started requiring TLS, and would keep doing so
-    // for the process lifetime.
+    // Rebuilt on change: a client resolved before its certificate existed would
+    // speak plaintext for the process lifetime.
     while !shutdown.is_triggered() {
         let (source, scheme) = Box::pin(peer_source(&client, shutdown.clone())).await;
         tracing::info!(
@@ -976,8 +967,7 @@ async fn poll_peers_once(
     port: u16,
     scheme: &str,
 ) {
-    // A refusal is symmetric: a peer this site will not answer is a peer this
-    // site does not read from either.
+    // A refusal is symmetric: one we will not answer is one we do not read.
     let identities = ctx.peer_identities();
     let snapshot = swim.snapshot();
     let alive = snapshot
@@ -986,7 +976,11 @@ async fn poll_peers_once(
         .filter(|m| m.status == operator::swim::MemberStatus::Alive)
         .filter(|m| !identities.refuses(&m.site_id))
         .map(|m| (m.site_id.as_str(), m.endpoint.as_str()));
-    let sites = operator::signals::peer_sites(alive, swim.site_name(), port, scheme);
+    // Verified against the keys declared for that peer, not any key the CA signed.
+    let mut sites = operator::signals::peer_sites(alive, swim.site_name(), port, scheme);
+    for site in &mut sites {
+        site.pins = identities.pins_for(&site.name);
+    }
     if sites.is_empty() {
         return;
     }
@@ -1020,19 +1014,7 @@ fn peer_ttl() -> std::time::Duration {
 ///
 /// Logged rather than fatal: a site with no TLS material still polls, and the
 /// scheme in the poller's startup line says which mode it is in.
-async fn peer_tls(client: &Client) -> Option<Arc<rustls::ClientConfig>> {
-    // Off unless asked for. The signals listener does not terminate TLS, so a
-    // client that upgrades on its own speaks TLS to a plaintext server and
-    // every poll fails as a transport error. Deriving this from whether any
-    // material happened to exist meant installing a certificate for something
-    // else switched peer polling off, which is the opposite of what installing
-    // a certificate should do.
-    //
-    // Remove the gate once the listener terminates TLS, at which point the
-    // scope rule has a certificate to decide from as well.
-    if !parse_env_or("GRID_SIGNALS_PEER_TLS", false) {
-        return None;
-    }
+async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMaterial>> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let list = networks.list(&kube::api::ListParams::default()).await.ok()?;
     let network = list.items.into_iter().next()?;
@@ -1142,11 +1124,8 @@ async fn signals_handler(
         .map(|(_, v)| v.clone())
         .collect();
 
-    // Scope is decided from the connection before any parameter is read, so a
-    // request cannot widen it. A peer receives this site alone.
-    // A peer this site holds nothing for is served nothing, rather than being
-    // served whatever happens to carry no policy. Local callers share this
-    // cluster's trust and read as this site.
+    // Scope comes from the connection, so no parameter can widen it.
+    // Holding nothing for a peer serves it nothing, not the no-policy default.
     let reader = match &caller {
         Caller::Local => &*published.local_labels,
         Caller::Peer(Some(labels)) => labels,
@@ -1278,8 +1257,7 @@ mod tests {
 
     #[test]
     fn presenting_nothing_is_not_a_way_to_be_local() {
-        // The bypass this closes: a refused peer reconnecting without a
-        // certificate used to be served everything as an in-cluster consumer.
+        // Closes the bypass: a refused peer reconnecting bare read as local.
         assert_eq!(
             caller_of(None, Some("aa")),
             Caller::Peer(None),
@@ -1309,9 +1287,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_peer_is_told_so() {
-        // Site A's administrator deleted site B's record, or marked it denied.
-        // B has to learn that the answer will not change, rather than reading
-        // an empty exposition and chasing it as a fault.
+        // B must learn the answer will not change, not chase an empty body.
         let (status, body) =
             status_and_body(Caller::Peer(None), store_for("this-site"), Arc::new(BTreeMap::new())).await;
         assert_eq!(

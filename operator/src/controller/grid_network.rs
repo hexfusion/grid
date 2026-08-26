@@ -200,22 +200,20 @@ pub const LABEL_AUTO_DISCOVER_SITES: &str = "grid.praxis-proxy.io/auto-discover-
 pub async fn peer_tls_config(
     network: &GridNetwork,
     client: &Client,
-) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+) -> Result<Option<Arc<signals::PeerTlsMaterial>>, String> {
     let (Some(ca), Some(site)) = (&network.spec.tls.ca_secret_ref, &network.spec.tls.site_secret_ref) else {
         return Ok(None);
     };
-    let tls = crate::crd::inference_provider::EndpointTlsConfig {
-        ca_secret_ref: ca.clone(),
-        client_certificate_secret_ref: Some(crate::crd::inference_provider::ClientCertificateSecretRef {
-            name: site.name.clone(),
-            namespace: site.namespace.clone(),
-            certificate_key: "tls.crt".to_owned(),
-            private_key_key: "tls.key".to_owned(),
+    let ca_pem = read_signals_pem(client, ca, "ca.crt").await?;
+    let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
+    let key_pem = read_signals_pem(client, site, "tls.key").await?;
+    Ok(Some(Arc::new(signals::PeerTlsMaterial {
+        ca: ca_pem,
+        identity: Some(signals::PeerClientIdentity {
+            cert: cert_pem,
+            key: zeroize::Zeroizing::new(key_pem),
         }),
-    };
-    crate::resources::endpoint_tls::resolve_tls_config(Some(&tls), Some(client), "peer-signals")
-        .await
-        .map_err(|(_, message)| message)
+    })))
 }
 
 /// TLS for the signals listener, from the same material peers dial with.

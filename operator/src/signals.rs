@@ -259,6 +259,15 @@ impl PeerIdentities {
         }
     }
 
+    /// Fingerprints declared for `site`, empty when none are.
+    #[must_use]
+    pub fn pins_for(&self, site: &str) -> Vec<String> {
+        let Ok(held) = self.inner.read() else {
+            return Vec::new();
+        };
+        held.get(site).map(|record| record.pins.clone()).unwrap_or_default()
+    }
+
     /// Whether this site refuses `site` outright.
     ///
     /// True when no record is held for the name, or the record refuses. Read
@@ -508,6 +517,14 @@ pub struct PeerSite {
     pub name: String,
     /// Where to read that site's signals.
     pub url: String,
+    /// Fingerprints this site declared for that peer.
+    ///
+    /// The peer's certificate is verified against these rather than against the
+    /// name in the URL. Membership advertises an address and a certificate
+    /// carries a name, so the two rarely match, and the pin says the stronger
+    /// thing anyway: not that an authority signed for some name, but that this
+    /// is a key we wrote down.
+    pub pins: Vec<String>,
 }
 
 /// Alive peers other than this site, addressed at their signals port.
@@ -531,6 +548,7 @@ where
             Some(PeerSite {
                 name: site.to_owned(),
                 url: format!("{scheme}://{host}:{port}/metrics"),
+                pins: Vec::new(),
             })
         })
         .collect()
@@ -685,11 +703,60 @@ fn backoff(base: Duration, attempt: u32, peer: &str) -> Duration {
 }
 
 /// Reads each peer's signals endpoint directly.
+/// One peer's client config, verifying against the keys declared for it.
+fn peer_client_config(material: &PeerTlsMaterial, pins: &[String]) -> Result<rustls::ClientConfig, MetricsScrapeError> {
+    crate::metrics_scraper::build_pinned_client_config(
+        &material.ca,
+        material.identity.as_ref().map(|id| id.cert.as_slice()),
+        material.identity.as_ref().map(|id| id.key.as_slice()),
+        pins,
+    )
+}
+
+/// PEM material a peer client is built from.
+///
+/// Kept as bytes rather than a finished config so a config can be made per
+/// peer, each verifying against that peer's own declared fingerprints.
+#[derive(Clone)]
+pub struct PeerTlsMaterial {
+    /// Authority the peer's chain is verified against, PEM.
+    pub ca: Vec<u8>,
+    /// What this site presents to a peer, which is how the peer names us.
+    pub identity: Option<PeerClientIdentity>,
+}
+
+/// A certificate and the key that goes with it.
+///
+/// One type because the pair is the only legal shape: a certificate without
+/// its key cannot be presented, and the builder rejected the mixed case at
+/// runtime when the two were separate options.
+#[derive(Clone)]
+pub struct PeerClientIdentity {
+    /// Certificate chain, PEM.
+    pub cert: Vec<u8>,
+    /// Private key for `cert`, PEM.
+    pub key: zeroize::Zeroizing<Vec<u8>>,
+}
+
+/// Prints nothing of the key, which this type exists to hold.
+impl std::fmt::Debug for PeerTlsMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTlsMaterial")
+            .field("ca_len", &self.ca.len())
+            .field("identity", &self.identity.is_some())
+            .finish()
+    }
+}
+
+/// Reads each peer's signals endpoint over HTTP.
 pub struct PollPeers {
     /// Per-attempt request timeout.
     pub timeout: Duration,
-    /// Client TLS, once the endpoint requires it.
-    pub tls: Option<Arc<rustls::ClientConfig>>,
+    /// Client TLS material, once peers require it.
+    ///
+    /// The material rather than a built config, because each peer is verified
+    /// against its own declared fingerprints and so needs its own verifier.
+    pub tls: Option<Arc<PeerTlsMaterial>>,
     /// Signals to ask each peer for; empty asks for all of them.
     pub collect: Vec<String>,
     /// How many peers to poll at once.
@@ -741,14 +808,22 @@ impl PollPeers {
     /// Returns the body, or nothing if every attempt failed. The outcome is
     /// recorded either way, because a peer that is never reachable has to be
     /// distinguishable from one that has nothing to say.
-    async fn poll_one(&self, peer: &str, url: &str) -> Option<String> {
-        // The guard owns the accounting. Every path out of this function runs
-        // it, including the one where the future is dropped mid-await, which is
-        // the path that used to leave the in-flight gauge counting a poll that
-        // no longer exists.
+    async fn poll_one(&self, peer: &str, url: &str, pins: &[String]) -> Option<String> {
+        // The guard owns the accounting, including the drop-mid-await path that
+        // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
 
-        let (outcome, body) = self.attempt_until(peer, url, guard.started).await;
+        // Once per peer, not per attempt: this parses a private key.
+        let tls = match self.tls.as_ref().map(|m| peer_client_config(m, pins)) {
+            Some(Ok(config)) => Some(Arc::new(config)),
+            Some(Err(error)) => {
+                tracing::warn!(peer, %error, "peer client config unusable; not polling");
+                guard.finish(PollOutcome::Config, 0);
+                return None;
+            },
+            None => None,
+        };
+        let (outcome, body) = self.attempt_until(peer, url, tls.as_ref(), guard.started).await;
         guard.finish(outcome, body.as_ref().map_or(0, String::len));
         body
     }
@@ -758,11 +833,15 @@ impl PollPeers {
     /// The request races the signal. A peer that is slow to answer must not
     /// hold termination open for the length of a timeout it was never going to
     /// beat. `None` means the signal won.
-    async fn scrape_or_stand_down(&self, url: &str) -> Option<Result<String, MetricsScrapeError>> {
+    async fn scrape_or_stand_down(
+        &self,
+        url: &str,
+        tls: Option<&Arc<rustls::ClientConfig>>,
+    ) -> Option<Result<String, MetricsScrapeError>> {
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => None,
-            result = scrape_metrics(url, self.timeout, self.tls.clone()) => Some(result),
+            result = scrape_metrics(url, self.timeout, tls.cloned()) => Some(result),
         }
     }
 
@@ -781,7 +860,13 @@ impl PollPeers {
     }
 
     /// Attempt until one succeeds, the budget runs out, or retrying is pointless.
-    async fn attempt_until(&self, peer: &str, url: &str, started: Instant) -> (PollOutcome, Option<String>) {
+    async fn attempt_until(
+        &self,
+        peer: &str,
+        url: &str,
+        tls: Option<&Arc<rustls::ClientConfig>>,
+        started: Instant,
+    ) -> (PollOutcome, Option<String>) {
         let attempts = self.attempts.max(1);
         let mut outcome = PollOutcome::Transport;
         for attempt in 0..attempts {
@@ -792,7 +877,7 @@ impl PollPeers {
                 break;
             }
 
-            let Some(scrape) = self.scrape_or_stand_down(url).await else {
+            let Some(scrape) = self.scrape_or_stand_down(url, tls).await else {
                 return (PollOutcome::Cancelled, None);
             };
 
@@ -831,8 +916,8 @@ impl PeerSignals for PollPeers {
 
             let fetches = peer_urls(sites, &collect_query)
                 .into_iter()
-                .map(|(peer, url)| async move {
-                    let body = self.poll_one(&peer, &url).await?;
+                .map(|(peer, url, pins)| async move {
+                    let body = self.poll_one(&peer, &url, &pins).await?;
                     let observations = retain_origin(parse(&body), &peer);
                     Some((peer, observations))
                 });
@@ -919,7 +1004,7 @@ impl Drop for PollGuard<'_> {
 /// No `target`: it names a provider, not a site, so passing a site name matches
 /// nothing and the peer answers empty. Scoping a peer's answer is the
 /// publisher's job; the reader re-checks the site label on receipt.
-fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String)> {
+fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Vec<String>)> {
     sites
         .iter()
         .map(|site| {
@@ -928,7 +1013,7 @@ fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String)> {
             } else {
                 format!("{}?{collect_query}", site.url)
             };
-            (site.name.clone(), url)
+            (site.name.clone(), url, site.pins.clone())
         })
         .collect()
 }
@@ -1004,10 +1089,11 @@ mod tests {
         let sites = vec![PeerSite {
             name: "pool-b".to_owned(),
             url: "http://10.0.0.2:9091/metrics".to_owned(),
+            pins: Vec::new(),
         }];
         let urls = peer_urls(&sites, "");
         assert_eq!(
-            urls.first().map(|(_, u)| u.as_str()),
+            urls.first().map(|(_, u, _)| u.as_str()),
             Some("http://10.0.0.2:9091/metrics"),
             "the whole site is asked for, with no target"
         );
@@ -1018,10 +1104,11 @@ mod tests {
         let sites = vec![PeerSite {
             name: "pool-b".to_owned(),
             url: "http://10.0.0.2:9091/metrics".to_owned(),
+            pins: Vec::new(),
         }];
         let urls = peer_urls(&sites, "collect[]=queue");
         assert_eq!(
-            urls.first().map(|(_, u)| u.as_str()),
+            urls.first().map(|(_, u, _)| u.as_str()),
             Some("http://10.0.0.2:9091/metrics?collect[]=queue")
         );
     }
