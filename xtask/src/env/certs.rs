@@ -6,12 +6,22 @@ use std::{
 };
 
 use certs::{
-    DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_dns_cert, generate_site_cert, load_ca,
+    DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_dns_cert, generate_site_cert_with_names,
+    load_ca,
 };
 use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
 // Constants
+// ---------------------------------------------------------------------------
+
+/// In-cluster name the signals listener is reached by.
+///
+/// A peer dials a site by its grid identity, and the gateway beside the
+/// operator reaches the same listener through this Service. Both names go on
+/// the one certificate.
+const SIGNALS_SERVICE_DNS: &str = "grid-operator-signals.grid-system.svc.cluster.local";
+
 // ---------------------------------------------------------------------------
 
 /// Default output directory for generated certificates.
@@ -61,7 +71,10 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
             eprintln!("  reusing cert for {name}");
             continue;
         }
-        let site = generate_site_cert(&ca, name)?;
+        // The same listener answers peers by grid identity and its own
+        // cluster's workloads through a Service, so one certificate has to
+        // carry both names.
+        let site = generate_site_cert_with_names(&ca, name, &[SIGNALS_SERVICE_DNS.to_owned()])?;
         write_pem(&dir.join(format!("{name}-cert.pem")), &site.cert_pem)?;
         write_pem(&dir.join(format!("{name}-key.pem")), &site.key_pem)?;
         eprintln!("  generated cert for {name} (SAN: {})", site.sans.join(", "));
@@ -313,7 +326,7 @@ mod tests {
         assert!(ca_path.exists(), "CA cert should be written");
 
         for name in &clusters {
-            let site = generate_site_cert(&ca, name).unwrap_or_else(|_| std::process::abort());
+            let site = generate_site_cert_with_names(&ca, name, &[]).unwrap_or_else(|_| std::process::abort());
             let cert_path = test_dir.path().join(format!("{name}-cert.pem"));
             write_pem(&cert_path, &site.cert_pem).unwrap_or_default();
             assert!(cert_path.exists(), "site cert for {name} should exist");

@@ -110,10 +110,6 @@ async fn main() {
     // waiting on a signal nobody is left to send.
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
     tokio::spawn(watch_for_termination(trigger));
-    // Resolved once at startup. Without material the listener stays plaintext
-    // and every caller counts as in-cluster, because none can present a
-    // certificate to be told apart by.
-    let (signals_tls, signals_own_key) = Box::pin(signals_identity(&client)).await;
 
     let result = tokio::try_join!(
         run_network_controller(client.clone(), Arc::clone(&ctx)),
@@ -121,14 +117,11 @@ async fn main() {
         run_provider_controller(client.clone()),
         run_metrics_server(),
         run_signals_server(
+            client.clone(),
             ctx.signals(),
             ctx.peers(),
             Arc::new(grid_network::local_site_labels().unwrap_or_default()),
-            SignalsIdentity {
-                peers: ctx.peer_identities(),
-                own_key: signals_own_key.clone(),
-            },
-            signals_tls.clone(),
+            ctx.peer_identities(),
         ),
         run_peer_poller(Arc::clone(&ctx), swim_for_poller, client.clone(), shutdown.clone()),
         run_local_scraper(Arc::clone(&ctx), client.clone()),
@@ -604,12 +597,26 @@ async fn run_metrics_server() -> Result<(), Box<dyn std::error::Error + Send + S
 /// different audiences: `/metrics` is scraped by the cluster's monitoring, and
 /// this is read by the gateway at a much shorter interval. Keeping them apart
 /// leaves room to require mutual TLS here without touching monitoring.
+/// How often the listener re-reads its own certificate.
+///
+/// Material rarely arrives with the process. cert-manager writes the Secret
+/// when it gets around to it, which is routinely after the operator rolls, and
+/// it rewrites it on every renewal. Resolving once at startup meant a listener
+/// that came up before its certificate stayed plaintext for the process
+/// lifetime, and one that came up after a renewal kept serving the old key.
+const SIGNALS_TLS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serve provider signals, rebinding whenever the material changes.
+///
+/// Separate from the operator's own metrics server because the two have
+/// different audiences: `/metrics` is scraped by the cluster's monitoring, and
+/// this is read by the gateway at a much shorter interval.
 async fn run_signals_server(
+    client: Client,
     site: operator::signals::SignalStore,
     peers: operator::signals::SignalStore,
     local_labels: Arc<BTreeMap<String, String>>,
-    identity: SignalsIdentity,
-    tls: Option<Arc<rustls::ServerConfig>>,
+    peer_identities: operator::signals::PeerIdentities,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("GRID_SIGNALS_ADDR").unwrap_or_else(|_| "0.0.0.0:9091".to_owned());
     let app = axum::Router::new()
@@ -619,26 +626,65 @@ async fn run_signals_server(
             peers,
             local_labels,
         });
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let bound_addr = listener.local_addr().map_or_else(|_| addr.clone(), |a| a.to_string());
 
+    // A listener cannot be promoted from plaintext to TLS in place, and rustls
+    // fixes the client verifier when the config is built, so picking up a new
+    // certificate or a new CA means serving again rather than swapping a field.
+    loop {
+        let (tls, own_key) = Box::pin(signals_identity(&client)).await;
+        let identity = SignalsIdentity {
+            peers: peer_identities.clone(),
+            own_key: own_key.clone(),
+        };
+        serve_once(
+            &addr,
+            app.clone(),
+            tls,
+            identity,
+            material_changed(client.clone(), own_key),
+        )
+        .await?;
+        tracing::info!("signals TLS material changed; serving again");
+    }
+}
+
+/// Bind and serve until `changed` resolves.
+async fn serve_once(
+    addr: &str,
+    app: axum::Router,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    identity: SignalsIdentity,
+    changed: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener
+        .local_addr()
+        .map_or_else(|_| addr.to_owned(), |a| a.to_string());
     let Some(tls) = tls else {
-        // No configured material, so nobody can present a key and nobody can be
-        // named. Serving local scope here is a development convenience and the
-        // log says so, because an unauthenticated listener carrying cross-site
-        // load is exactly what the rest of this path exists to prevent.
+        // Nobody can present a key, so nobody can be named. Serving local scope
+        // is a development convenience, and an unauthenticated listener
+        // carrying cross-site load is what the rest of this path prevents.
         tracing::warn!(
-            addr = %bound_addr,
+            addr = %bound,
             tls = false,
             "signals server started without TLS: every caller is served local scope"
         );
         let app = app.layer(axum::Extension(Caller::Local));
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app).with_graceful_shutdown(changed).await?;
         return Ok(());
     };
+    tracing::info!(addr = %bound, tls = true, "signals server started");
+    serve_signals_tls(listener, app, tls, identity, changed).await
+}
 
-    tracing::info!(addr = %bound_addr, tls = true, "signals server started");
-    serve_signals_tls(listener, app, tls, identity).await
+/// Resolves when this site's certificate stops matching `serving`.
+async fn material_changed(client: Client, serving: Option<String>) {
+    loop {
+        tokio::time::sleep(SIGNALS_TLS_POLL).await;
+        if Box::pin(signals_identity(&client)).await.1 != serving {
+            return;
+        }
+    }
 }
 
 /// Accept signals connections, deciding scope from the certificate presented.
@@ -652,14 +698,16 @@ async fn serve_signals_tls(
     app: axum::Router,
     tls: Arc<rustls::ServerConfig>,
     identity: SignalsIdentity,
+    changed: impl Future<Output = ()> + Send,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-    #[expect(
-        clippy::infinite_loop,
-        reason = "serves for the process lifetime alongside the controllers"
-    )]
+    let mut changed = std::pin::pin!(changed);
     loop {
-        let Ok((stream, remote)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            () = &mut changed => return Ok(()),
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((stream, remote)) = accepted else {
             continue;
         };
         tokio::spawn(serve_signals_connection(
@@ -859,27 +907,32 @@ async fn run_peer_poller(
     };
     let port = parse_env_or("GRID_SIGNALS_PEER_PORT", 9091_u16);
     let interval = std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_INTERVAL_SECS", 30_u64));
-    let (source, scheme) = peer_source(&client, shutdown.clone()).await;
-    tracing::info!(
-        port,
-        interval_secs = interval.as_secs(),
-        source = source.name(),
-        scheme,
-        "peer signals poller started"
-    );
-
-    poll_until_shutdown(&ctx, &swim, source.as_ref(), port, scheme, interval, &shutdown).await;
+    // Rebuilt whenever the material changes, for the same reason the listener
+    // rebinds: a client resolved before its certificate exists speaks plaintext
+    // to peers that have since started requiring TLS, and would keep doing so
+    // for the process lifetime.
+    while !shutdown.is_triggered() {
+        let (source, scheme) = Box::pin(peer_source(&client, shutdown.clone())).await;
+        tracing::info!(
+            port,
+            interval_secs = interval.as_secs(),
+            source = source.name(),
+            scheme,
+            "peer signals poller started"
+        );
+        poll_until_material_changes(&ctx, &swim, source.as_ref(), port, scheme, interval, &shutdown, &client).await;
+    }
     tracing::info!("peer signals poller stopped");
     Ok(())
 }
 
-/// Poll on the interval until told to stand down.
+/// Poll until the peer client's own material changes, or shutdown.
 ///
-/// The signal is checked in place of the tick rather than after it, so a poller
-/// that has just slept out a thirty second interval does not start one more
-/// round of cross-cluster requests on the way out.
+/// A client carries its trust decisions from when it was built, so picking up a
+/// new certificate or a new CA means building again rather than swapping a
+/// field, exactly as the listener rebinds.
 #[expect(clippy::too_many_arguments, reason = "a poll loop needs its whole configuration")]
-async fn poll_until_shutdown(
+async fn poll_until_material_changes(
     ctx: &Arc<OperatorCtx>,
     swim: &Arc<swim_runtime::SwimHandle>,
     source: &dyn operator::signals::PeerSignals,
@@ -887,6 +940,7 @@ async fn poll_until_shutdown(
     scheme: &str,
     interval: std::time::Duration,
     shutdown: &operator::shutdown::Shutdown,
+    client: &Client,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -897,8 +951,22 @@ async fn poll_until_shutdown(
             _ = ticker.tick() => {},
         }
         poll_peers_once(ctx, swim, source, port, scheme).await;
+        if peer_scheme(client).await != scheme {
+            tracing::info!("peer signals TLS material changed; rebuilding the client");
+            return;
+        }
     }
 }
+
+/// The scheme the peer client would use if built now.
+async fn peer_scheme(client: &Client) -> &'static str {
+    if peer_tls(client).await.is_some() {
+        "https"
+    } else {
+        "http"
+    }
+}
+
 
 /// Collect from every alive peer and replace what is published for them.
 async fn poll_peers_once(
