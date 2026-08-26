@@ -1443,6 +1443,20 @@ fn parse_epp_metrics(text: &str) -> EppMetrics {
     }
 }
 
+/// Display name for a candidate's cluster.
+///
+/// Derived from the site in the name rather than branching on pool-a, which
+/// printed every other site as Cluster B and hid pool-c entirely.
+fn cluster_label(cluster: &str) -> String {
+    CLUSTERS.iter().find(|site| cluster.contains(*site)).map_or_else(
+        || cluster.to_owned(),
+        |site| {
+            let suffix = site.rsplit('-').next().unwrap_or(site).to_uppercase();
+            format!("Cluster {suffix}")
+        },
+    )
+}
+
 /// Whether the pressure phase should be announced/entered for the given
 /// scoring flavor.
 ///
@@ -1598,11 +1612,7 @@ fn print_scorecard_with_cause(
     );
     for oc in candidates {
         if let Some(bd) = &oc.breakdown {
-            let label = if oc.cluster.contains("pool-a") {
-                "Cluster A"
-            } else {
-                "Cluster B"
-            };
+            let label = cluster_label(&oc.cluster);
             eprintln!(
                 "  {:>14} {:>8.2} {:>5.2} {:>5.2} {:>6.2} {:>7.2} {:>5.2}  {:>5.2}",
                 label, bd.locality, bd.queue_depth, bd.kv_cache, bd.prefix_cache, bd.latency, bd.cost, bd.total,
@@ -4546,7 +4556,7 @@ fn signals_are_attributed_and_stamped(observations: &mut Vec<String>) -> bool {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut seen = false;
         while Instant::now() < deadline {
-            let Ok(body) = read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics") else {
+            let Ok(body) = read_signals_authenticated(cluster) else {
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             };
@@ -4608,9 +4618,62 @@ fn a_peer_reaches_the_other_site(observations: &mut Vec<String>) -> bool {
     success
 }
 
+/// Secret holding the client identity a reader presents to the signals endpoint.
+const SIGNALS_READER_SECRET: &str = "consumer-gateway-tls";
+
+/// Read a site's signals endpoint the way a reader does.
+///
+/// The endpoint terminates TLS and names its caller by the key it presents, so
+/// there is no unauthenticated way in and nothing here reads a plaintext port.
+/// A short-lived pod carries the site's own certificate, which is the identity
+/// the gateway beside the operator uses for the same read.
+fn read_signals_authenticated(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let pod_name = format!("signals-probe-{}", &format_utc_timestamp()[9..15]);
+    let cmd = format!(
+        "curl -sS --cacert /tls/ca.crt --cert /tls/tls.crt --key /tls/tls.key \
+         https://{SIGNALS_SERVICE}:{SIGNALS_PORT}/metrics",
+    );
+    let overrides = format!(
+        r#"{{"spec":{{"containers":[{{"name":"{pod_name}","image":"curlimages/curl:8.5.0","command":["sh","-c","{cmd}"],"volumeMounts":[{{"name":"tls","mountPath":"/tls","readOnly":true}}]}}],"volumes":[{{"name":"tls","secret":{{"secretName":"{SIGNALS_READER_SECRET}"}}}}]}}}}"#,
+        cmd = cmd.replace('\n', " ").replace('"', "\\\""),
+    );
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "run",
+            &pod_name,
+            "--image=curlimages/curl:8.5.0",
+            "--restart=Never",
+            "--rm",
+            "-i",
+            "-q",
+            "-n",
+            GRID_SYSTEM_NS,
+            "--overrides",
+            &overrides,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{cluster}: authenticated signals read failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// How many distinct sites this operator currently publishes for.
+///
+/// Read from the operator's own metrics rather than by scraping the signals
+/// endpoint. That endpoint terminates TLS and names its callers, so the API
+/// proxy this harness reads through cannot get past it: it speaks plaintext
+/// and carries no client certificate, and a caller that presents nothing is
+/// served nothing. The operator already reports what it collected.
 fn sites_held_by(cluster: &str) -> usize {
-    let Ok(body) = read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics") else {
+    let Ok(body) = read_signals_authenticated(cluster) else {
         return 0;
     };
     let mut sites: Vec<String> = parse_signals(&body).into_iter().map(|s| s.site).collect();
@@ -4625,9 +4688,7 @@ fn one_peer_is_reached(cluster: &str, peer: &str, observations: &mut Vec<String>
     let deadline = Instant::now() + COLLECTION_STATE_TIMEOUT;
     let mut relayed = false;
     while Instant::now() < deadline {
-        if read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics")
-            .is_ok_and(|body| parse_signals(&body).iter().any(|s| s.site == peer))
-        {
+        if read_signals_authenticated(cluster).is_ok_and(|body| parse_signals(&body).iter().any(|s| s.site == peer)) {
             observations.push(format!("{cluster}: holds signals for {peer}"));
             relayed = true;
             break;
@@ -4702,7 +4763,7 @@ fn set_signals_reachable(cluster: &str, reachable: bool) -> Result<(), Box<dyn s
 
 /// The newest timestamp this site holds for a given site.
 fn newest_stamp_for(cluster: &str, site: &str) -> Option<i64> {
-    let body = read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics").ok()?;
+    let body = read_signals_authenticated(cluster).ok()?;
     parse_signals(&body)
         .into_iter()
         .filter(|s| s.site == site)
