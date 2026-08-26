@@ -821,6 +821,9 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     // Proof 5: the signals path — attribution, relay, and reachability
     results.insert("signals".to_owned(), proof_signals(context));
 
+    // Proof 6: the polled signal is what decides, shown by taking it away
+    results.insert("load_drives_routing".to_owned(), proof_load_drives_routing(context));
+
     // TLS proof stages — only in mTLS mode
     if mtls {
         let tls_results = run_tls_proof_stages();
@@ -3782,6 +3785,8 @@ mod tests {
                 site: "pool-a".to_owned(),
                 provider: "pool-a".to_owned(),
                 at_ms: 1_755_791_234_000,
+                metric: "llm_d_epp_average_queue_size".to_owned(),
+                value: 0.5,
             }],
             "the labels are what join a sample to a candidate"
         );
@@ -4475,6 +4480,10 @@ struct SignalSample {
     provider: String,
     /// Sample time in epoch milliseconds, as the publisher stated it.
     at_ms: i64,
+    /// Metric name, so a reader can select the one it scores on.
+    metric: String,
+    /// Value as the provider reported it.
+    value: f64,
 }
 
 /// Parse the signals exposition the way a consumer parses it.
@@ -4489,9 +4498,10 @@ fn parse_signals(body: &str) -> Vec<SignalSample> {
                 return None;
             }
             let (head, timestamp) = line.rsplit_once(' ')?;
-            let (head, _value) = head.rsplit_once(' ')?;
+            let (head, value) = head.rsplit_once(' ')?;
             let at_ms: i64 = timestamp.parse().ok()?;
-            let (_metric, labels) = head.split_once('{')?;
+            let value: f64 = value.parse().ok()?;
+            let (metric, labels) = head.split_once('{')?;
             let labels = labels.strip_suffix('}')?;
             let mut site = None;
             let mut provider = None;
@@ -4506,6 +4516,8 @@ fn parse_signals(body: &str) -> Vec<SignalSample> {
                 site: site?,
                 provider: provider?,
                 at_ms,
+                metric: metric.to_owned(),
+                value,
             })
         })
         .collect()
@@ -4851,4 +4863,226 @@ fn partition_is_reported(observer: &str, target: &str, before: Option<i64>, obse
         },
     }
     success
+}
+
+// ---------------------------------------------------------------------------
+// Proof: the polled signal is what decides
+// ---------------------------------------------------------------------------
+
+/// ConfigMap holding the consumer gateway's filter chain.
+const CONSUMER_CONFIG_MAP: &str = "consumer-gateway-config";
+
+/// Metric the gateway scores on, as its own config names it.
+const GATEWAY_QUEUE_METRIC: &str = "llm_d_epp_average_queue_size";
+
+/// Requests sent per observation window.
+const ROUTING_SAMPLE_REQUESTS: usize = 6;
+
+/// Long enough for every held sample to pass the reader's freshness bound.
+///
+/// The gateway config sets max_age_ms to 15s, so anything shorter leaves the
+/// store still answering from what it collected before the source was taken
+/// away, and the window would compare against a signal that is still working.
+const LOAD_STALENESS_WAIT: Duration = Duration::from_secs(25);
+
+/// Where a run of requests landed, and what the signals said at the time.
+struct RoutingWindow {
+    /// Site with the highest queue when the window opened.
+    busiest: String,
+    /// Queue depth for that site.
+    busiest_queue: f64,
+    /// Destination site per request.
+    destinations: Vec<String>,
+}
+
+impl RoutingWindow {
+    /// How many requests went to the site that was carrying the most work.
+    fn hits_on_busiest(&self) -> usize {
+        self.destinations.iter().filter(|d| **d == self.busiest).count()
+    }
+}
+
+/// Read the queue each site is publishing, newest sample per site.
+fn queue_by_site(cluster: &str) -> Vec<(String, f64)> {
+    let Ok(body) = read_signals_authenticated(cluster) else {
+        return Vec::new();
+    };
+    let mut newest: BTreeMap<String, (i64, f64)> = BTreeMap::new();
+    for sample in parse_signals(&body)
+        .into_iter()
+        .filter(|s| s.metric == GATEWAY_QUEUE_METRIC)
+    {
+        let slot = newest.entry(sample.site).or_insert((i64::MIN, 0.0));
+        if sample.at_ms >= slot.0 {
+            *slot = (sample.at_ms, sample.value);
+        }
+    }
+    newest.into_iter().map(|(site, (_, value))| (site, value)).collect()
+}
+
+/// Send a run of requests and record where each one landed.
+fn observe_routing(cluster: &str) -> RoutingWindow {
+    let queues = queue_by_site(cluster);
+    let (busiest, busiest_queue) = queues
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or_else(|| (String::new(), 0.0), |(s, v)| (s.clone(), *v));
+    let ctx = kind_context(cluster);
+    let destinations = (0..ROUTING_SAMPLE_REQUESTS)
+        .filter_map(|_| send_inference_request(&ctx, VCR_MODEL).ok())
+        .map(|r| r.provider_gateway)
+        .filter(|d| !d.is_empty())
+        .collect();
+    RoutingWindow {
+        busiest,
+        busiest_queue,
+        destinations,
+    }
+}
+
+/// Point the gateway's load endpoint somewhere that does not answer.
+///
+/// Nothing else changes, so a difference in where requests land afterwards is
+/// attributable to the polled signal and to nothing else.
+fn set_load_source_reachable(cluster: &str, reachable: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let current = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "cm",
+            CONSUMER_CONFIG_MAP,
+            "-o",
+            r"jsonpath={.data.praxis\.yaml}",
+        ])
+        .output()?;
+    let body = String::from_utf8_lossy(&current.stdout).to_string();
+    let (from, to) = if reachable {
+        (
+            "https://load-source-withdrawn:9091",
+            "https://grid-operator-signals:9091",
+        )
+    } else {
+        (
+            "https://grid-operator-signals:9091",
+            "https://load-source-withdrawn:9091",
+        )
+    };
+    if !body.contains(from) {
+        return Ok(());
+    }
+    let patched = body.replace(from, to);
+    let mut child = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "cm",
+            CONSUMER_CONFIG_MAP,
+            "--from-file=praxis.yaml=/dev/stdin",
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write as _;
+        stdin.write_all(patched.as_bytes())?;
+    }
+    let rendered = child.wait_with_output()?;
+    let mut apply = Command::new("kubectl")
+        .args(["--context", &ctx, "-n", GRID_SYSTEM_NS, "apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = apply.stdin.as_mut() {
+        use std::io::Write as _;
+        stdin.write_all(&rendered.stdout)?;
+    }
+    apply.wait()?;
+    rollout_restart(&ctx, "consumer-gateway")?;
+    Ok(())
+}
+
+/// Prove the polled signal is what decides, by taking it away.
+///
+/// A routing decision that matches the signal is not evidence on its own: the
+/// rendered overlay order usually agrees, so the same choice would be made with
+/// an empty store. The load source is withdrawn instead, and the difference in
+/// where requests land is attributable to the signal and to nothing else.
+fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
+    let mut observations = Vec::new();
+    let mut success = true;
+    let Some(cluster) = CLUSTERS.first().copied() else {
+        return ProofResult {
+            success: false,
+            description: "Withdrawing the polled load source changes where requests go".to_owned(),
+            observations: vec!["no clusters configured".to_owned()],
+        };
+    };
+
+    if let Err(error) = scale_pressure_generator(cluster, PRESSURE_REPLICAS) {
+        observations.push(format!("{cluster}: could not apply pressure: {error}"));
+    }
+    let with_load = observe_routing(cluster);
+    observations.push(format!(
+        "{cluster}: with the load source, {} of {} requests went to {} (queue {:.1}, the busiest)",
+        with_load.hits_on_busiest(),
+        with_load.destinations.len(),
+        with_load.busiest,
+        with_load.busiest_queue,
+    ));
+
+    let withdrawn = set_load_source_reachable(cluster, false);
+    if let Err(error) = &withdrawn {
+        observations.push(format!("{cluster}: could not withdraw the load source: {error}"));
+        success = false;
+    }
+
+    if withdrawn.is_ok() {
+        // Every held sample has to age out before the store is empty.
+        std::thread::sleep(LOAD_STALENESS_WAIT);
+        let without_load = observe_routing(cluster);
+        observations.push(format!(
+            "{cluster}: without it, {} of {} requests went to {} (queue {:.1}, the busiest)",
+            without_load.hits_on_busiest(),
+            without_load.destinations.len(),
+            without_load.busiest,
+            without_load.busiest_queue,
+        ));
+        if without_load.destinations.is_empty() {
+            observations.push(format!("{cluster}: no request completed without the load source"));
+            success = false;
+        } else if with_load.hits_on_busiest() >= without_load.hits_on_busiest() && without_load.hits_on_busiest() > 0 {
+            observations.push(format!(
+                "{cluster}: withdrawing the signal did not change where requests went, so nothing here shows it decided"
+            ));
+            success = false;
+        } else {
+            observations.push(format!(
+                "{cluster}: the busiest site gained traffic once the signal was gone, so the signal is what kept it away"
+            ));
+        }
+    }
+
+    if let Err(error) = set_load_source_reachable(cluster, true) {
+        observations.push(format!("{cluster}: could not restore the load source: {error}"));
+        success = false;
+    }
+    if let Err(error) = scale_pressure_generator(cluster, 0) {
+        observations.push(format!("{cluster}: could not stop pressure: {error}"));
+    }
+
+    let _ = context;
+    ProofResult {
+        success,
+        description: "Withdrawing the polled load source changes where requests go".to_owned(),
+        observations,
+    }
 }
