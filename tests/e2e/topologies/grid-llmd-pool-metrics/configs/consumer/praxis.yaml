@@ -20,6 +20,7 @@ filter_chains:
         provider_hop_clusters:
           - llmd-pool-a-provider
           - llmd-pool-b-provider
+          - llmd-pool-c-provider
         expected_overlay_scope:
           network: grid-llmd-pool-metrics
           gateway: consumer-gateway
@@ -56,6 +57,17 @@ filter_chains:
               verify: true
             endpoints:
               - "{{ captures.pool-b.provider-gateway-ip }}:8443"
+          - name: llmd-pool-c-provider
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: pool-c.grid.internal
+              verify: true
+            endpoints:
+              - "{{ captures.pool-c.provider-gateway-ip }}:8443"
 
 admin:
   address: "127.0.0.1:9901"

@@ -13,7 +13,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
-use mock_providers::{AppState, anthropic, bedrock, openai, vertex};
+use mock_providers::{AppState, anthropic, bedrock, llmd, openai, vertex};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -97,6 +97,9 @@ enum ProviderKind {
 
     /// Google `Vertex` AI `generateContent` API.
     Vertex,
+
+    /// llm-d inference pool, fronted by an endpoint picker.
+    Llmd,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +138,7 @@ async fn main() {
         ProviderKind::Anthropic => anthropic::router(state),
         ProviderKind::Bedrock => bedrock::router(state),
         ProviderKind::Vertex => vertex::router(state),
+        ProviderKind::Llmd => llmd::router(state),
     };
 
     let addr = format!("0.0.0.0:{}", cli.port);
@@ -159,7 +163,24 @@ fn app_state() -> AppState {
     AppState {
         provider_site: Arc::<str>::from(provider_site),
         queue_depth,
+        load: Arc::new(mock_providers::load::Load::new(
+            bounded_env("MOCK_CAPACITY", 8, 1, 4_096),
+            bounded_env("MOCK_SERVICE_MS", 200, 0, 60_000),
+        )),
     }
+}
+
+/// Read a whole-number environment value, clamped to a sane range.
+///
+/// Out-of-range and unparsable values fall back to the default rather than
+/// failing startup, because a demo that refuses to boot over a typo in one
+/// site's settings is worse than one that boots with a stated default.
+fn bounded_env(key: &str, default: u64, low: u64, high: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|parsed| (low..=high).contains(parsed))
+        .unwrap_or(default)
 }
 
 /// Parse a normalized queue-depth metric, falling back to a ready provider.

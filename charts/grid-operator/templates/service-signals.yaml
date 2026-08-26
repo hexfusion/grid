@@ -1,0 +1,21 @@
+{{- if .Values.signals.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "grid-operator.fullname" . }}-signals
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+  {{- with .Values.signals.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: signals
+      port: {{ .Values.signals.service.port }}
+      targetPort: signals
+      protocol: TCP
+  selector:
+    {{- include "grid-operator.selectorLabels" . | nindent 4 }}
+{{- end }}

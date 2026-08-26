@@ -24,6 +24,14 @@ spec:
       port: {{ .Values.swim.service.port }}
       targetPort: swim-udp
       protocol: UDP
+    {{- if .Values.signals.onSwimService }}
+    {{- /* A peer changes only the port on the address SWIM advertised, so
+           signals has to answer there too. */}}
+    - name: signals
+      port: {{ .Values.signals.service.port }}
+      targetPort: signals
+      protocol: TCP
+    {{- end }}
   selector:
     {{- include "grid-operator.selectorLabels" . | nindent 4 }}
 {{- end }}

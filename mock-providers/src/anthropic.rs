@@ -192,6 +192,7 @@ mod tests {
         AppState {
             provider_site: Arc::from("test-site"),
             queue_depth: 0.1,
+            load: Arc::new(crate::load::Load::new(8, 0)),
         }
     }
 

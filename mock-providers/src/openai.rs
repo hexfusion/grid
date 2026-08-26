@@ -38,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/responses", post(responses))
         .route("/v1/models", get(list_models))
         .route("/metrics", get(metrics))
+        .route("/admin/capacity", post(set_capacity))
         .route("/health", get(common::health_ok))
         .layer(from_fn_with_state(state.clone(), common::inject_provider_header))
         .with_state(state)
@@ -76,7 +77,10 @@ struct ResponsesRequest {
 // ---------------------------------------------------------------------------
 
 /// Handle `POST /v1/chat/completions`.
-async fn chat_completions(req: Request<Body>) -> Response<Body> {
+async fn chat_completions(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: Request<Body>,
+) -> Response<Body> {
     if let Err(resp) = common::validate_bearer(req.headers(), expected_bearer_token().as_deref()) {
         return resp;
     }
@@ -94,6 +98,11 @@ async fn chat_completions(req: Request<Body>) -> Response<Body> {
             );
         },
     };
+
+    // Occupying a slot for the request's service time is what makes the
+    // exported queue depth mean anything. A rejected request never got this
+    // far, so it never counts toward the backlog.
+    state.load.serve().await;
 
     if chat_req.stream {
         streaming_response(&chat_req.model)
@@ -156,10 +165,27 @@ async fn list_models(req: Request<Body>) -> Response<Body> {
 
 /// Export the normalized queue-depth signal consumed by the Grid operator.
 async fn metrics(axum::extract::State(state): axum::extract::State<AppState>) -> Response<Body> {
+    // These are the three series the model server protocol requires, under the
+    // names it gives them, because a harness that invents names proves nothing
+    // about a consumer that reads the real ones. See the protocol table in
+    // gateway-api-inference-extension proposal 003.
+    let body = format!(
+        "grid_demo_queue_depth {}\n\
+         vllm:num_requests_waiting {}\n\
+         vllm:num_requests_running {}\n\
+         vllm:kv_cache_usage_perc {}\n\
+         vllm:cache_config_info{{block_size=\"16\",num_gpu_blocks=\"2048\"}} 1\n\
+         vllm:request_success_total {}\n",
+        state.queue_depth,
+        state.load.waiting(),
+        state.load.running(),
+        state.load.utilization(),
+        state.load.served(),
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
-        .body(Body::from(format!("grid_demo_queue_depth {}\n", state.queue_depth)))
+        .body(Body::from(body))
         .unwrap_or_default()
 }
 
@@ -287,6 +313,30 @@ fn responses_streaming_chunks(model: &str) -> Vec<Value> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Resize serving capacity, staging a site that gained or lost replicas.
+///
+/// Unauthenticated on purpose. This is a harness control, not a provider API,
+/// and the mock has no business growing an auth model for it. It is one more
+/// reason the mock belongs in a compose network and nowhere else.
+async fn set_capacity(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>,
+) -> Response<Body> {
+    let Some(value) = params
+        .iter()
+        .find(|(key, _)| key == "value")
+        .and_then(|(_, raw)| raw.parse::<u64>().ok())
+        .filter(|parsed| (1..=4_096).contains(parsed))
+    else {
+        return common::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": {"message": "value must be a whole number from 1 to 4096"}}),
+        );
+    };
+    let previous = state.load.resize(value);
+    common::json_response(StatusCode::OK, &json!({"previous": previous, "capacity": value}))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -305,6 +355,7 @@ mod tests {
         AppState {
             provider_site: Arc::from("test-site"),
             queue_depth: 0.25,
+            load: Arc::new(crate::load::Load::new(8, 0)),
         }
     }
 
@@ -448,7 +499,89 @@ mod tests {
         let resp = send(req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 4096).await.unwrap_or_default();
-        assert_eq!(body.as_ref(), b"grid_demo_queue_depth 0.25\n");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("grid_demo_queue_depth 0.25\n"),
+            "the configured value still exports: {text}"
+        );
+        // The three the model server protocol requires, by their protocol
+        // names. A rename here is a break for every consumer, so it is worth
+        // failing a test over.
+        for series in [
+            "vllm:num_requests_waiting",
+            "vllm:num_requests_running",
+            "vllm:kv_cache_usage_perc",
+            "vllm:cache_config_info",
+        ] {
+            assert!(text.contains(series), "{series} exports: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn losing_capacity_deepens_the_queue_without_dropping_work() {
+        // The other half of a load shift. Offered load is unchanged; the site
+        // just has less to serve it with, and the backlog has to show that.
+        let load = Arc::new(crate::load::Load::new(4, 10_000));
+        let tasks: Vec<_> = std::iter::repeat_with(|| {
+            let load = Arc::clone(&load);
+            tokio::spawn(async move { load.serve().await })
+        })
+        .take(4)
+        .collect();
+        for _ in 0..64 {
+            if load.running() == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(load.waiting(), 0, "four slots, four requests, nothing queued");
+
+        assert_eq!(load.resize(1), 4, "resize reports what it replaced");
+        assert_eq!(load.capacity(), 1, "and takes effect");
+        assert_eq!(load.served(), 0, "the work in flight was not dropped");
+
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn offered_load_past_capacity_shows_up_as_waiting() {
+        // One slot, and a service time long enough that both requests are still
+        // outstanding when the assertion runs. Capacity is what turns offered
+        // load into a backlog, so a site that is merely busy and a site that is
+        // over capacity have to read differently.
+        let load = Arc::new(crate::load::Load::new(1, 10_000));
+        assert_eq!(load.running(), 0, "idle to begin with");
+        assert_eq!(load.waiting(), 0, "and nothing queued");
+
+        let tasks: Vec<_> = std::iter::repeat_with(|| {
+            let load = Arc::clone(&load);
+            tokio::spawn(async move { load.serve().await })
+        })
+        .take(2)
+        .collect();
+
+        // Each task has to be polled once before it registers. Yielding until
+        // it settles keeps the test off a timing guess.
+        for _ in 0..64 {
+            if load.running() == 1 && load.waiting() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(load.running(), 1, "one request holds the only slot");
+        assert_eq!(load.waiting(), 1, "the other is queued behind it");
+        assert!(
+            (load.utilization() - 1.0).abs() < f64::EPSILON,
+            "and the site reads as full"
+        );
+        assert_eq!(load.served(), 0, "neither has finished");
+
+        for task in tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]

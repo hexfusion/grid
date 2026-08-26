@@ -27,6 +27,7 @@ use crate::{
     metrics_parser::{MetricNames, parse_prometheus_text},
     metrics_scraper::{self, scrape_metrics},
     resources::routing_overlay::routing_identity,
+    signals,
 };
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,8 @@ pub(crate) struct TimestampedMetrics {
     pub(crate) scraped_at: Instant,
     /// Monotonic scrape generation assigned when this sample was collected.
     pub(crate) generation: u64,
+    /// Sample lines as scraped, shared rather than copied per reconcile.
+    pub(crate) signals: Arc<[signals::Observation]>,
 }
 
 /// Cross-reconcile cache for recently-scraped provider metrics.
@@ -83,6 +86,28 @@ pub(crate) struct MetricsCache {
     entries: HashMap<(String, String), TimestampedMetrics>,
     /// Monotonic counter incremented on each scrape call.
     next_generation: u64,
+}
+
+/// Label value for why a provider scrape ended.
+///
+/// The same distinctions the peer poller draws, for the same reason: a refused
+/// connection, a trust failure and a provider answering with an error call for
+/// different responses, and an error rate cannot tell them apart.
+///
+/// Separate from [`classify_scrape_error`], which names condition reasons for a
+/// resource status. Those are CamelCase and read by people; these are label
+/// values and have to match the ones the peer poller already emits, or the two
+/// halves of collection cannot be graphed together.
+fn scrape_outcome(error: &metrics_scraper::MetricsScrapeError) -> &'static str {
+    use metrics_scraper::MetricsScrapeError as E;
+    match error {
+        E::Timeout(_) => "timeout",
+        E::NonOkStatus { status, .. } if (500..600).contains(status) => "server_error",
+        E::NonOkStatus { .. } => "client_error",
+        E::Encoding(_) => "encoding",
+        E::InvalidUrl(_) | E::HttpWithTls(_) | E::TlsMaterial(_) => "config",
+        E::Transport(_) => "transport",
+    }
 }
 
 impl MetricsCache {
@@ -101,6 +126,12 @@ pub(crate) struct CollectedMetrics {
     pub(crate) metrics: HashMap<String, scoring::BackendMetrics>,
     /// Scrape generation per provider, monotonically increasing per successful scrape.
     pub(crate) generations: HashMap<String, u64>,
+    /// Parsed observations keyed by provider identity.
+    ///
+    /// Kept so this site can publish what it observed without a reader having to
+    /// scrape the provider itself. Values are not parsed or altered here, and
+    /// nothing is filtered: narrowing belongs to whoever reads the endpoint.
+    pub(crate) signals: HashMap<String, Vec<signals::Observation>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +298,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
 
     let mut result = HashMap::new();
     let mut generations: HashMap<String, u64> = HashMap::new();
+    let mut signals: HashMap<String, Vec<signals::Observation>> = HashMap::new();
     let mut cache_updates: Vec<((String, String), TimestampedMetrics)> = Vec::new();
 
     for provider in providers {
@@ -312,6 +344,12 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         {
             result.insert(identity.to_owned(), cached.metrics);
             generations.insert(identity.to_owned(), cached.generation);
+            // Republish the cached lines under their original observation time.
+            // Dropping them here would remove the provider from the signals
+            // endpoint until its next scrape.
+            if !cached.signals.is_empty() {
+                signals.insert(identity.to_owned(), cached.signals.to_vec());
+            }
             continue;
         }
 
@@ -353,7 +391,30 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
             },
         };
 
+        let scrape_started = Instant::now();
         let scrape_result = scrape_metrics(&url, timeout, tls_config).await;
+        let scraped_signals = scrape_result
+            .as_ref()
+            .map(|text| Arc::<[signals::Observation]>::from(signals::parse(text)));
+
+        // The other half of collection. A peer poll that fails is visible; this
+        // was not, so a site that could not read its own provider looked like
+        // one whose provider had nothing to say.
+        let outcome = match &scrape_result {
+            Ok(_) => "ok",
+            Err(error) => scrape_outcome(error),
+        };
+        crate::metrics::record_provider_scrape(
+            identity,
+            outcome,
+            scrape_started.elapsed(),
+            scraped_signals.as_ref().map_or(0, |o| o.len()),
+        );
+        if let Ok(observations) = &scraped_signals
+            && !observations.is_empty()
+        {
+            signals.insert(identity.to_owned(), observations.to_vec());
+        }
         let parse_result = match &scrape_result {
             Ok(text) => parse_prometheus_text(text, &names),
             Err(e) => Err(e.to_string()),
@@ -367,6 +428,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
                         metrics: bm,
                         scraped_at: now,
                         generation: scrape_generation,
+                        signals: scraped_signals.clone().unwrap_or_default(),
                     },
                 ));
                 result.insert(identity.to_owned(), bm);
@@ -429,8 +491,10 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     CollectedMetrics {
         metrics: result,
         generations,
+        signals,
     }
 }
+
 
 /// Attempt to populate `result` with a cached metric sample for `identity`.
 ///
@@ -549,6 +613,30 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_scrape_outcome_names_what_a_reader_can_act_on() {
+        // The same vocabulary the peer poller uses, so both halves of
+        // collection can be read from one graph.
+        use metrics_scraper::MetricsScrapeError as E;
+        assert_eq!(scrape_outcome(&E::Timeout(Duration::from_secs(1))), "timeout");
+        assert_eq!(
+            scrape_outcome(&E::NonOkStatus {
+                status: 503,
+                url: "http://p/metrics".to_owned()
+            }),
+            "server_error"
+        );
+        assert_eq!(
+            scrape_outcome(&E::NonOkStatus {
+                status: 403,
+                url: "http://p/metrics".to_owned()
+            }),
+            "client_error"
+        );
+        assert_eq!(scrape_outcome(&E::InvalidUrl("nope".to_owned())), "config");
+        assert_eq!(scrape_outcome(&E::TlsMaterial("bad".to_owned())), "config");
+    }
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
@@ -1035,6 +1123,7 @@ mod tests {
                     },
                     scraped_at: t0,
                     generation: 0,
+                    signals: Arc::from([]),
                 },
             );
         }
@@ -1077,6 +1166,7 @@ mod tests {
                     },
                     scraped_at: t0,
                     generation: 0,
+                    signals: Arc::from([]),
                 },
             );
         }
@@ -1107,6 +1197,7 @@ mod tests {
                     },
                     scraped_at: Instant::now(),
                     generation: 0,
+                    signals: Arc::from([]),
                 },
             );
         }
@@ -1161,6 +1252,7 @@ mod tests {
                     },
                     scraped_at: Instant::now(),
                     generation: 0,
+                    signals: Arc::from([]),
                 },
             );
         }

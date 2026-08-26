@@ -15,6 +15,10 @@ pub mod anthropic;
 pub mod bedrock;
 /// Shared HTTP response utilities.
 mod common;
+/// Mock llm-d inference pool, fronted by an endpoint picker.
+pub mod llmd;
+/// Serving capacity and the queue depth it produces.
+pub mod load;
 /// Mock `OpenAI` chat completions and Responses API.
 pub mod openai;
 /// Mock Google Vertex AI `generateContent` API.
@@ -27,5 +31,11 @@ pub struct AppState {
     pub provider_site: Arc<str>,
 
     /// Normalized queue depth exported by the demo metrics endpoint.
+    ///
+    /// A fixed setting, kept for callers that want a site pinned to a value.
+    /// The vLLM-shaped series alongside it are measured instead.
     pub queue_depth: f64,
+
+    /// Serving capacity, and the backlog that offered load produces against it.
+    pub load: Arc<load::Load>,
 }

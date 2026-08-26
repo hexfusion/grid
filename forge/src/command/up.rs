@@ -25,7 +25,7 @@ use crate::{
 pub fn run(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeError> {
     let resolved = runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
     if wants_network(ctx) {
-        networking::require_docker_for_cross_cluster(&resolved.binary)?;
+        networking::require_supported_runtime_for_cross_cluster(&resolved.binary)?;
     }
     let _lock = lock::acquire(&ctx.state_dir)?;
     let mut state = state::load(&ctx.state_dir)?;
@@ -889,11 +889,13 @@ spec:
         }
     }
 
-    /// Formatted Docker IPAM response for the test network.
+    /// A Docker `network inspect` document for the test network.
     fn network_cidr(cidr: &str) -> CommandOutput {
         CommandOutput {
             status: 0,
-            stdout: format!(r#"[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]"#),
+            stdout: format!(
+                r#"[{{"Name":"test-net","IPAM":{{"Driver":"default","Config":[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]}}}}]"#
+            ),
             stderr: String::new(),
         }
     }
@@ -906,7 +908,7 @@ spec:
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
         );
         runner.respond("docker", empty_ok());
@@ -1020,7 +1022,7 @@ spec:
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
         );
         runner.respond("docker", empty_ok());
@@ -1042,12 +1044,24 @@ spec:
     }
 
     #[test]
-    fn cross_cluster_auto_resolved_podman_fails() {
+    fn cross_cluster_auto_resolved_podman_is_allowed() {
+        // kind reads KIND_EXPERIMENTAL_PODMAN_NETWORK under Podman and the
+        // Docker-named one under Docker. Forge sets both, so Podman is no
+        // longer refused here; it used to be, and the refusal was the reason
+        // cross-cluster looked Docker-only.
         let config = test_config_cross_auto();
         let dir = test_dir();
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_not_found());
         runner.respond("podman version", podman_ok());
+        runner.respond("podman network inspect test-net", net_not_found());
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            network_cidr("172.18.0.0/16"),
+        );
+        runner.respond("podman", empty_ok());
+        runner.respond("kind get clusters", empty_ok());
+        runner.respond("kind", empty_ok());
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -1056,14 +1070,11 @@ spec:
             format: OutputFormat::Text,
             dry_run: false,
         };
-        let mut buf = Vec::new();
-        let result = run(&ctx, &mut buf);
-        assert!(result.is_err(), "auto+podman+crossCluster should fail");
-        let Err(err) = result else {
-            std::process::abort();
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Docker"), "error should mention Docker: {msg}");
+        let text = run_up(&ctx);
+        assert!(
+            text.contains("network 'test-net' ready"),
+            "auto+podman should now succeed: {text}"
+        );
     }
 
     #[test]
@@ -1074,7 +1085,7 @@ spec:
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
         );
         runner.respond("docker", empty_ok());

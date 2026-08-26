@@ -64,6 +64,26 @@ metrics:
     # -- Service annotations.
     annotations: {}
 
+# -- Provider signals endpoint, served for peer operators and the local gateway.
+signals:
+  # -- Signals server bind address (host:port).
+  bindAddress: "0.0.0.0:9091"
+  # -- ClusterIP Service, which is how the gateway beside this operator reads it.
+  service:
+    # -- Create a ClusterIP Service for the signals port.
+    enabled: true
+    # -- Service port number.
+    port: 9091
+    # -- Service annotations.
+    annotations: {}
+  # -- Publish the signals port on the SWIM Service as well.
+  #
+  # A peer derives this address from what SWIM advertises, changing only the
+  # port, so across a cluster boundary the two have to answer on one address.
+  # A separate LoadBalancer would get its own IP and peers would look for
+  # signals where nothing is listening.
+  onSwimService: true
+
 # -- SWIM protocol configuration.
 swim:
   # -- SWIM bind address (host:port).

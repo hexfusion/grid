@@ -127,12 +127,17 @@ pub enum ConsumerConfigError {
     clippy::too_many_lines,
     reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rendering inputs; a struct to carry them would exist only to satisfy the lint"
+)]
 pub(crate) fn generate_consumer_praxis_config(
     overlay: &RoutingOverlay,
     credential_mount_base: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
+    load: Option<&LoadSource>,
 ) -> Result<String, ConsumerConfigError> {
     if overlay.local_site.trim().is_empty() {
         return Err(ConsumerConfigError::BlankLocalSite);
@@ -149,6 +154,7 @@ pub(crate) fn generate_consumer_praxis_config(
         }
     }
 
+    let load_section = render_load(load);
     let candidates_yaml = render_candidates(&overlay.candidates);
     let local_site = yaml_scalar(&overlay.local_site)?;
 
@@ -171,6 +177,7 @@ pub(crate) fn generate_consumer_praxis_config(
          \x20     - filter: intelligent_route\n\
          \x20       local_site: {local_site}\n\
          \x20       model_header: \"X-Model\"\n\
+         {load_section}\
          \x20       candidates:\n\
          {candidates_yaml}"
     );
@@ -221,6 +228,58 @@ pub(crate) fn build_consumer_config_map(
 // ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
+
+/// Where a gateway reads live load, and which metric carries queue depth.
+///
+/// Mirrors the `load` block of the gateway's `intelligent_route`, which is
+/// `deny_unknown_fields`: a key it does not know is not ignored, it stops the
+/// gateway parsing its own config.
+///
+/// Both values are already known here. The endpoint is this operator's own
+/// signals address, left unqualified so it carries every peer collected;
+/// `?target=` would narrow it to one site and leave remote candidates
+/// unscored. The metric name comes from the providers it scrapes.
+///
+/// No join is configured: the gateway attributes a series by the `grid_site`
+/// and `grid_provider` labels the relay already stamps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoadSource {
+    /// Signals endpoint the gateway polls.
+    pub endpoint: String,
+    /// Metric name carrying queue depth.
+    pub queue_metric: String,
+    /// Metric names sent as `collect[]`, narrowing what the operator returns.
+    pub collect: Vec<String>,
+}
+
+/// Render the `intelligent_route` load block, or nothing when unconfigured.
+///
+/// Absent, the gateway keeps the rendered order and behaves as it did before,
+/// which is what makes enabling this a configuration change rather than a
+/// rollback.
+fn render_load(load: Option<&LoadSource>) -> String {
+    load.map_or_else(String::new, |l| {
+        // Every value originates in an InferenceProvider, which a tenant may
+        // write, so quote them the way every other renderer here does.
+        let endpoint = yaml_scalar(&l.endpoint).unwrap_or_else(|_| "\"\"".to_owned());
+        let queue_metric = yaml_scalar(&l.queue_metric).unwrap_or_else(|_| "\"\"".to_owned());
+        let mut out = format!(
+            "\x20       load:\n\
+             \x20         endpoint: {endpoint}\n\
+             \x20         queue_metric: {queue_metric}\n",
+        );
+        if !l.collect.is_empty() {
+            out.push_str("\x20         collect:\n");
+            for name in &l.collect {
+                let quoted = yaml_scalar(name).unwrap_or_else(|_| "\"\"".to_owned());
+                out.push_str("\x20           - ");
+                out.push_str(&quoted);
+                out.push('\n');
+            }
+        }
+        out
+    })
+}
 
 /// Render `intelligent_route` candidates YAML block.
 ///
@@ -595,6 +654,65 @@ mod tests {
     // Renderer: basic structure
     // -----------------------------------------------------------------------
 
+    /// A load block as `grid_network::load_source` would build one: the site's
+    /// own signals endpoint and the queue metric its providers declared.
+    fn a_load_block() -> LoadSource {
+        LoadSource {
+            endpoint: "http://grid-operator-signals:9091/metrics".to_owned(),
+            queue_metric: "vllm:num_requests_waiting".to_owned(),
+            collect: vec!["vllm:num_requests_waiting".to_owned()],
+        }
+    }
+
+    #[test]
+    fn a_load_source_renders_into_intelligent_route() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "llama-3-8b",
+            "site-b",
+            "pool-b",
+            true,
+        )]);
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+            Some(&a_load_block()),
+        )
+        .unwrap();
+        assert!(yaml.contains("load:"), "load block present:\n{yaml}");
+        assert!(
+            yaml.contains(r#"endpoint: "http://grid-operator-signals:9091/metrics""#),
+            "endpoint rendered:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(r#"queue_metric: "vllm:num_requests_waiting""#),
+            "metric rendered:\n{yaml}"
+        );
+        assert!(
+            yaml.find("load:") < yaml.find("candidates:"),
+            "load belongs to intelligent_route, before its candidates:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn no_load_source_renders_the_config_as_before() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "llama-3-8b",
+            "site-b",
+            "pool-b",
+            true,
+        )]);
+        let endpoints = endpoint_coverage(&overlay);
+        let with_none =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
+        assert!(!with_none.contains("load:"), "no block when unconfigured:\n{with_none}");
+        assert!(with_none.contains("filter: intelligent_route"), "the rest is unchanged");
+    }
+
     #[test]
     fn plain_candidates_produce_intelligent_route_and_load_balancer() {
         let overlay = simple_overlay(vec![plain_candidate(
@@ -610,6 +728,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(
@@ -643,6 +762,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
 
@@ -669,6 +789,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(
@@ -694,6 +815,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(
@@ -739,6 +861,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         // Count occurrences of the file path — should be exactly 1.
@@ -780,6 +903,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("creds-a"), "first credential name must appear");
@@ -811,6 +935,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(
@@ -836,6 +961,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         // Ensure 'value:' does not appear — that would indicate static header injection.
@@ -859,6 +985,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(
@@ -885,6 +1012,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("my-api-creds"), "secretRef.name must appear");
@@ -906,6 +1034,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(
@@ -940,7 +1069,8 @@ mod tests {
                 MOUNT_BASE,
                 &endpoint_coverage(&overlay),
                 "/etc/praxis/tls",
-                8080
+                8080,
+                None
             )
             .is_err(),
             "blank local_site must return error"
@@ -951,7 +1081,7 @@ mod tests {
     fn blank_mount_base_returns_error() {
         let overlay = simple_overlay(vec![]);
         assert!(
-            generate_consumer_praxis_config(&overlay, "", &[], "/etc/praxis/tls", 8080).is_err(),
+            generate_consumer_praxis_config(&overlay, "", &[], "/etc/praxis/tls", 8080, None).is_err(),
             "blank credential_mount_base must return error"
         );
     }
@@ -965,7 +1095,8 @@ mod tests {
                 MOUNT_BASE,
                 &endpoint_coverage(&overlay),
                 "/etc/praxis/tls",
-                8080
+                8080,
+                None
             )
             .is_err(),
             "blank candidate cluster must return error"
@@ -988,6 +1119,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         let yaml2 = generate_consumer_praxis_config(
@@ -996,6 +1128,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert_eq!(yaml1, yaml2, "output must be deterministic");
@@ -1013,6 +1146,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         // Search within the credential_inject section only (after the section header).
@@ -1042,7 +1176,8 @@ mod tests {
             true,
         )]);
         let endpoints = vec![plain_ep("gateway-site-a", "10.0.0.10:30080")];
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(
             yaml.contains("name: \"gateway-site-a\""),
             "cluster name must be rendered"
@@ -1064,7 +1199,8 @@ mod tests {
             true,
         )]);
         let endpoints = vec![mtls_ep("gateway-site-a", "10.0.0.10:30080", "site-a.grid.internal")];
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(yaml.contains("tls:"), "mTLS endpoint must render TLS config");
         assert!(
             yaml.contains("ca_path: /etc/praxis/tls/ca.crt"),
@@ -1094,7 +1230,7 @@ mod tests {
             "gateway-site-a",
             true,
         )]);
-        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080)
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080, None)
             .expect_err("missing endpoint topology must fail config generation");
         assert!(
             matches!(
@@ -1112,7 +1248,8 @@ mod tests {
             plain_candidate("inference_model", "model-b", "site-a", "gateway-site-a", true),
         ]);
         let endpoints = vec![plain_ep("gateway-site-a", "10.0.0.10:30080")];
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert_eq!(
             yaml.matches("name: \"gateway-site-a\"").count(),
             1,
@@ -1146,6 +1283,7 @@ mod tests {
             &endpoint_coverage(&overlay),
             "/etc/praxis/tls",
             8080,
+            None,
         )
         .unwrap();
         assert!(
@@ -1264,7 +1402,8 @@ mod tests {
             "site-a",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(yaml.contains("172.18.0.4:30080"), "endpoint address must appear");
         assert!(yaml.contains("site-a.grid.internal"), "SNI must appear");
         assert!(yaml.contains("ca_path: /etc/praxis/tls/ca.crt"), "CA path must appear");
@@ -1289,7 +1428,8 @@ mod tests {
             "api-cluster",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(
             yaml.contains("mock-api.default.svc:8080"),
             "endpoint address must appear"
@@ -1308,7 +1448,7 @@ mod tests {
             "cluster-no-ep",
             true,
         )]);
-        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080)
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080, None)
             .expect_err("missing cluster endpoint must fail config generation");
         assert!(
             matches!(
@@ -1333,7 +1473,7 @@ mod tests {
             "no-transport-cluster",
             true,
         )]);
-        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None)
             .expect_err("missing transport must fail closed");
         assert!(
             matches!(
@@ -1355,7 +1495,7 @@ mod tests {
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "mtls-no-sni", true)]);
-        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None)
             .expect_err("mutual_tls without sni must fail");
         assert!(
             matches!(
@@ -1383,7 +1523,7 @@ mod tests {
             "mtls-blank-sni",
             true,
         )]);
-        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None)
             .expect_err("mutual_tls with blank sni must fail");
         assert!(
             matches!(
@@ -1411,7 +1551,7 @@ mod tests {
             "plain-with-sni",
             true,
         )]);
-        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None)
             .expect_err("plaintext with sni must fail");
         assert!(
             matches!(
@@ -1439,7 +1579,8 @@ mod tests {
             "plain-blank-sni",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(
             !yaml.contains("tls:"),
             "plaintext with blank sni must render as plain HTTP"
@@ -1457,7 +1598,8 @@ mod tests {
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "trim-test", true)]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(
             yaml.contains("sni: \"site-a.grid.internal\""),
             "SNI must be trimmed of leading/trailing whitespace: {yaml}"
@@ -1471,7 +1613,8 @@ mod tests {
             plain_candidate("inference_model", "model-a", "site-a", "shared-cluster", true),
             plain_candidate("inference_model", "model-b", "site-b", "shared-cluster", true),
         ]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         let count = yaml.matches("10.0.0.1:30080").count();
         assert_eq!(
             count, 1,
@@ -1489,7 +1632,8 @@ mod tests {
             plain_candidate("inference_model", "model-x", "s1", "provider-cluster", true),
             plain_candidate("inference_model", "model-z", "s2", "api-cluster", true),
         ]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(yaml.contains("provider.grid.internal"), "mTLS cluster SNI must appear");
         assert!(
             yaml.contains("mock-api.default.svc:8080"),
@@ -1507,7 +1651,8 @@ mod tests {
             "site-a.grid.internal",
         )];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "site-a", true)]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert!(
             !yaml.contains(sentinel),
             "token bytes must not appear in any cluster entry"
@@ -1518,7 +1663,8 @@ mod tests {
     fn custom_tls_cert_mount_path_used_in_cluster_entry() {
         let endpoints = [mtls_ep("site-a", "10.0.0.1:8080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "site-a", true)]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/custom/tls/path", 8080).unwrap();
+        let yaml =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/custom/tls/path", 8080, None).unwrap();
         assert!(
             yaml.contains("ca_path: /custom/tls/path/ca.crt"),
             "custom TLS path must be used"
@@ -1535,8 +1681,10 @@ mod tests {
             plain_candidate("inference_model", "m1", "s1", "zzz-cluster", true),
             plain_candidate("inference_model", "m2", "s2", "aaa-cluster", true),
         ]);
-        let yaml1 = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
-        let yaml2 = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        let yaml1 =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
+        let yaml2 =
+            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080, None).unwrap();
         assert_eq!(yaml1, yaml2, "output must be deterministic");
 
         // aaa-cluster should appear before zzz-cluster (BTreeSet ordering).
@@ -1551,5 +1699,55 @@ mod tests {
             "aaa-cluster endpoint must appear before zzz-cluster endpoint in load_balancer"
         );
         let _ = (pos_aaa, pos_zzz); // used only for determinism check above
+    }
+    #[test]
+    fn the_load_block_carries_only_keys_the_gateway_accepts() {
+        // intelligent_route's load config is deny_unknown_fields, so a key it
+        // does not know stops the gateway parsing its own config rather than
+        // being ignored. This is the whole reason the block is this narrow.
+        const ACCEPTED: [&str; 7] = [
+            "endpoint",
+            "queue_metric",
+            "collect",
+            "interval_ms",
+            "window_secs",
+            "max_age_ms",
+            "timeout_ms",
+        ];
+        let rendered = render_load(Some(&a_load_block()));
+        for line in rendered.lines().skip(1) {
+            let line = line.trim();
+            // A collect[] entry is a value, and its own name contains a colon.
+            if line.starts_with('-') {
+                continue;
+            }
+            let Some((key, _)) = line.split_once(':') else {
+                continue;
+            };
+            assert!(
+                ACCEPTED.contains(&key.trim()),
+                "load block emits {key:?}, which the gateway rejects: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crafted_queue_metric_cannot_inject_config_keys() {
+        // signalNames.queueDepth is tenant-writable on the InferenceProvider.
+        let payload = "q\"\n         transport:\n           mode: plaintext\n         x: \"".to_owned();
+        let hostile = LoadSource {
+            endpoint: "http://operator:9091/metrics".to_owned(),
+            queue_metric: payload.clone(),
+            // Tenant-writable too, so it carries the same payload.
+            collect: vec![payload],
+        };
+        let rendered = render_load(Some(&hostile));
+        // The payload may appear inside the quoted scalar; what must not happen
+        // is a real newline turning it into a key the gateway would honour.
+        assert_eq!(rendered.lines().count(), 5, "one block, five lines: {rendered}");
+        assert!(
+            !rendered.lines().any(|l| l.trim_start().starts_with("transport:")),
+            "injected key reached the gateway config: {rendered}"
+        );
     }
 }

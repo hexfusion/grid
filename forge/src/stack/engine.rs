@@ -169,7 +169,7 @@ fn build_step_context(
     let resolved = runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
     let wants_cross = ctx.config.spec.network.as_ref().is_some_and(|net| net.cross_cluster);
     if wants_cross {
-        networking::require_docker_for_cross_cluster(&resolved.binary)?;
+        networking::require_supported_runtime_for_cross_cluster(&resolved.binary)?;
     }
     let network_name = wants_cross.then(|| networking::network_name(env_name));
     Ok(StepContext {

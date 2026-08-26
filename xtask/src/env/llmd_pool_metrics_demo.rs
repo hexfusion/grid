@@ -1,6 +1,6 @@
 //! llm-d pool-metrics routing demo orchestration.
 //!
-//! Deploys two Kind clusters, each running an llm-d EPP backed by two
+//! Deploys a Kind cluster per pool, each running an llm-d EPP backed by two
 //! vllm-vcr inference backends. Grid scrapes EPP pool-level metrics and
 //! adjusts routing when controlled HTTP load changes one pool's state.
 #![expect(
@@ -35,7 +35,7 @@ const CERTS_DIR: &str = "tests/env/certs";
 // ---------------------------------------------------------------------------
 
 /// Ordered cluster names in the llm-d pool-metrics demo.
-const CLUSTERS: &[&str] = &["pool-a", "pool-b"];
+const CLUSTERS: &[&str] = &["pool-a", "pool-b", "pool-c"];
 
 /// Kubernetes namespace for all Grid and llm-d components.
 const GRID_SYSTEM_NS: &str = "grid-system";
@@ -125,7 +125,7 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
 const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.3";
 
 /// Default EPP image reference required by this demo.
-const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0";
+const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.10.0";
 
 /// Default vllm-vcr image reference required by this demo.
 const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
@@ -691,9 +691,11 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     // Phase 3: Create Kind clusters
     eprintln!();
     eprintln!(
-        "[SETUP {}/{}] Creating two Kind clusters: pool-a, pool-b",
+        "[SETUP {}/{}] Creating {} Kind clusters: {}",
         next(),
-        total
+        total,
+        CLUSTERS.len(),
+        CLUSTERS.join(", ")
     );
     run_forge(&context.forge_bin, &context.resolved_config, &["up"])?;
 
@@ -816,6 +818,9 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
         results.insert("recovery".to_owned(), proof_recovery(context, table_start));
     }
 
+    // Proof 5: the signals path — attribution, relay, and reachability
+    results.insert("signals".to_owned(), proof_signals(context));
+
     // TLS proof stages — only in mTLS mode
     if mtls {
         let tls_results = run_tls_proof_stages();
@@ -836,15 +841,12 @@ fn proof_provenance(mtls: bool) -> ProofResult {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster, mtls) {
-                let has_kv = metrics_text.contains("llm_d_epp_average_kv_cache_utilization")
-                    || metrics_text.contains("inference_pool_average_kv_cache_utilization")
-                    || metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
-                let has_queue = metrics_text.contains("llm_d_epp_average_queue_size")
-                    || metrics_text.contains("inference_pool_average_queue_size")
-                    || metrics_text.contains("llm_d_router_epp_average_queue_size");
-                let has_ready = metrics_text.contains("llm_d_epp_ready_endpoints")
-                    || metrics_text.contains("inference_pool_ready_pods")
-                    || metrics_text.contains("llm_d_router_epp_ready_endpoints");
+                // Three namings, because the endpoint picker has been renamed
+                // twice and which one answers depends on the image tag rather
+                // than on anything the demo controls.
+                let has_kv = EPP_KV_METRICS.iter().any(|m| metrics_text.contains(m));
+                let has_queue = EPP_QUEUE_METRICS.iter().any(|m| metrics_text.contains(m));
+                let has_ready = EPP_READY_METRICS.iter().any(|m| metrics_text.contains(m));
                 if has_kv && has_queue && has_ready {
                     observations.push(format!("{cluster}: all 3 EPP pool metrics present"));
                     metrics_ok = true;
@@ -1391,22 +1393,53 @@ fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
     parse_epp_metrics(&text)
 }
 
-/// Parse `EppMetrics` out of raw Prometheus text (functional core of
-/// [`scrape_epp_metrics`], separated out so metric-name-fallback behavior is
-/// unit-testable without a live EPP).
+/// Queue depth, under every name the endpoint picker has published it as.
 ///
-/// Both `queue_size` and `kv_cache` prefer the canonical `llm_d_epp_*`
-/// series and fall back symmetrically to the legacy metric names.
+/// The series was renamed when the package was renamed, and again when the
+/// picker moved out of gateway-api-inference-extension. A run pins an image
+/// tag, not a naming, so all three have to be accepted or a demo against the
+/// wrong tag reads every pool as idle.
+const EPP_QUEUE_METRICS: &[&str] = &[
+    "llm_d_epp_average_queue_size",
+    "llm_d_router_epp_average_queue_size",
+    "inference_pool_average_queue_size",
+];
+
+/// Cache utilisation, under every name it has been published as.
+const EPP_KV_METRICS: &[&str] = &[
+    "llm_d_epp_average_kv_cache_utilization",
+    "llm_d_router_epp_average_kv_cache_utilization",
+    "inference_pool_average_kv_cache_utilization",
+];
+
+/// Ready endpoints, under every name they have been published as.
+const EPP_READY_METRICS: &[&str] = &[
+    "llm_d_epp_ready_endpoints",
+    "llm_d_router_epp_ready_endpoints",
+    "inference_pool_ready_pods",
+];
+
+/// First value found under any of `names`.
+fn first_prom_value(text: &str, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| extract_prom_value(text, name))
+}
+
+/// Parse `EppMetrics` out of raw Prometheus text.
+///
+/// The functional core of [`scrape_epp_metrics`], separated out so the
+/// metric-name fallback is testable without a live endpoint picker.
+///
+/// Queue depth and cache utilisation fall back over the same list of namings.
+/// Letting them differ would allow a run to read queue depth under one naming
+/// and cache utilisation as a permanent zero under another, so a kvCachePressure
+/// phase would never announce despite real pressure driving the flip.
 fn parse_epp_metrics(text: &str) -> EppMetrics {
     EppMetrics {
-        queue_size: extract_prom_value(text, "llm_d_epp_average_queue_size")
-            .or_else(|| extract_prom_value(text, "inference_pool_average_queue_size"))
-            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_queue_size"))
-            .unwrap_or(0.0),
-        kv_cache: extract_prom_value(text, "llm_d_epp_average_kv_cache_utilization")
-            .or_else(|| extract_prom_value(text, "inference_pool_average_kv_cache_utilization"))
-            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization"))
-            .unwrap_or(0.0),
+        queue_size: first_prom_value(text, EPP_QUEUE_METRICS).unwrap_or(0.0),
+        // Falls back over the same list as queue depth. Splitting them would
+        // let a kvCachePressure run read queue depth from one naming and cache
+        // utilisation as zero from another, and never detect pressure.
+        kv_cache: first_prom_value(text, EPP_KV_METRICS).unwrap_or(0.0),
     }
 }
 
@@ -1918,7 +1951,7 @@ fn seed_swim_membership() -> Result<(), Box<dyn std::error::Error>> {
 // Certificate and trust staging
 // ---------------------------------------------------------------------------
 
-/// Generate TLS certificates for both clusters and metrics TLS.
+/// Generate TLS certificates for every cluster and metrics TLS.
 fn stage_certificates() -> Result<(), Box<dyn std::error::Error>> {
     let clusters: Vec<String> = CLUSTERS.iter().map(|s| (*s).to_owned()).collect();
     certs::generate_all(&clusters)?;
@@ -1929,7 +1962,7 @@ fn stage_certificates() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Install provider trust secrets into both clusters.
+/// Install provider trust secrets into every cluster.
 ///
 /// Metrics TLS secrets are installed earlier in phase 7 (before EPP
 /// deployment) since the nginx sidecar mounts them at startup.
@@ -2353,7 +2386,9 @@ fn materialize_config(
         let rbac_with_proxy = format!(
             "{rbac_step}\n        - type: manifest\n          path: resources/common/metrics-tls-proxy-config.yaml"
         );
-        result = checked_replace(&result, rbac_step, &rbac_with_proxy, 2, "epp-rbac anchor")?;
+        // One per pool stack, so the count follows the grid rather than being
+        // fixed at the two it happened to have.
+        result = checked_replace(&result, rbac_step, &rbac_with_proxy, CLUSTERS.len(), "epp-rbac anchor")?;
 
         // Change metricsEndpoint from HTTP :9090 to HTTPS :9443
         result = checked_replace(
@@ -3691,6 +3726,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_endpoint_picker_naming_is_read() {
+        // The picker was renamed twice. A run pins an image tag, not a naming,
+        // so reading only the newest would make an older tag look idle.
+        for (queue, kv) in [
+            ("llm_d_epp_average_queue_size", "llm_d_epp_average_kv_cache_utilization"),
+            (
+                "llm_d_router_epp_average_queue_size",
+                "llm_d_router_epp_average_kv_cache_utilization",
+            ),
+            (
+                "inference_pool_average_queue_size",
+                "inference_pool_average_kv_cache_utilization",
+            ),
+        ] {
+            let text = format!("{queue}{{name=\"pool-a\"}} 6\n{kv}{{name=\"pool-a\"}} 0.42\n");
+            let epp = parse_epp_metrics(&text);
+            assert!((epp.queue_size - 6.0).abs() < f64::EPSILON, "{queue} is read");
+            assert!((epp.kv_cache - 0.42).abs() < f64::EPSILON, "{kv} is read");
+        }
+    }
+
+    #[test]
+    fn an_unknown_naming_reads_as_zero_rather_than_wrong() {
+        let epp = parse_epp_metrics("some_other_queue_metric{name=\"pool-a\"} 9\n");
+        assert!(epp.queue_size.abs() < f64::EPSILON);
+        assert!(epp.kv_cache.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_signal_sample_carries_its_site_provider_and_time() {
+        let body = concat!(
+            "# HELP llm_d_epp_average_queue_size depth\n",
+            "llm_d_epp_average_queue_size{grid_provider=\"pool-a\",grid_site=\"pool-a\",name=\"pool-a\"} 0.5 1755791234000\n",
+        );
+        assert_eq!(
+            parse_signals(body),
+            vec![SignalSample {
+                site: "pool-a".to_owned(),
+                provider: "pool-a".to_owned(),
+                at_ms: 1_755_791_234_000,
+            }],
+            "the labels are what join a sample to a candidate"
+        );
+    }
+
+    #[test]
+    fn a_label_value_with_a_space_does_not_shift_the_timestamp() {
+        // Taking the value and timestamp from the left would split on this.
+        let body = r#"q{grid_site="a",grid_provider="p",path="/a b"} 3 1755791234000"#;
+        assert_eq!(parse_signals(body).first().map(|s| s.at_ms), Some(1_755_791_234_000));
+    }
+
+    #[test]
+    fn a_sample_without_a_timestamp_is_not_read() {
+        // The shape the operator published before it stamped its samples. It
+        // has to fail here rather than parse as something plausible.
+        let body = r#"q{grid_site="a",grid_provider="p"} 3"#;
+        assert!(parse_signals(body).is_empty());
+    }
+
+    #[test]
+    fn an_unattributed_sample_is_skipped() {
+        // Without a site there is nothing to join it to.
+        assert!(parse_signals("q 3 1755791234000").is_empty());
+        assert!(parse_signals(r#"q{name="pool-a"} 3 1755791234000"#).is_empty());
+    }
+
+    #[test]
+    fn reachability_reads_off_the_operator_gauge() {
+        let body = concat!(
+            "grid_collection_up{peer=\"pool-a\"} 1\n",
+            "grid_collection_up{peer=\"pool-b\"} 0\n",
+        );
+        assert_eq!(
+            gauge_with_label(body, "grid_collection_up", "peer", "pool-a"),
+            Some(1.0)
+        );
+        assert_eq!(
+            gauge_with_label(body, "grid_collection_up", "peer", "pool-b"),
+            Some(0.0)
+        );
+        assert_eq!(
+            gauge_with_label(body, "grid_collection_up", "peer", "pool-c"),
+            None,
+            "a peer nobody polled is absent, not zero"
+        );
+    }
+
+    #[test]
     fn utc_timestamp_format_is_valid() {
         let ts = format_utc_timestamp();
         assert_eq!(ts.len(), 16, "expected YYYYMMDDTHHMMSSz format");
@@ -3716,10 +3840,14 @@ mod tests {
     }
 
     #[test]
-    fn clusters_are_two_pools() {
-        assert_eq!(CLUSTERS.len(), 2);
-        assert!(CLUSTERS.contains(&"pool-a"));
-        assert!(CLUSTERS.contains(&"pool-b"));
+    fn every_pool_in_the_topology_is_a_cluster() {
+        // Three, so each site polls two peers rather than one. A grid where
+        // every site has exactly one peer cannot show a relayed view diverging
+        // from a directly held one, which is the thing worth watching.
+        assert_eq!(CLUSTERS.len(), 3);
+        for pool in ["pool-a", "pool-b", "pool-c"] {
+            assert!(CLUSTERS.contains(&pool), "{pool} is part of the grid");
+        }
     }
 
     #[test]
@@ -3996,6 +4124,9 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
       properties:
         poolName: pool-b
 
+      properties:
+        poolName: pool-c
+
     llmd-pool-a:
       steps:
         - type: manifest
@@ -4009,6 +4140,13 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
           path: resources/common/epp-rbac.yaml
         - type: manifest
           path: resources/pool-b/epp-deployment.yaml
+
+    llmd-pool-c:
+      steps:
+        - type: manifest
+          path: resources/common/epp-rbac.yaml
+        - type: manifest
+          path: resources/pool-c/epp-deployment.yaml
 
                   metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
@@ -4270,4 +4408,380 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         assert!(images.nginx.is_some(), "mTLS must resolve nginx image");
         assert_eq!(images.nginx.unwrap(), DEFAULT_NGINX_IMAGE);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Proof 5: the signals path
+//
+// Everything above reads the endpoint picker directly. This reads what the
+// operator republishes, which is the path a peer in another cluster actually
+// has, and the only one that carries a site and a provider on every sample.
+// ---------------------------------------------------------------------------
+
+/// Signals endpoint name, from the operator chart.
+const SIGNALS_SERVICE: &str = "grid-operator-signals";
+/// Operator telemetry endpoint name, from the operator chart.
+const OPERATOR_METRICS_SERVICE: &str = "grid-operator-metrics";
+/// Signals port, matching the chart default.
+const SIGNALS_PORT: u16 = 9091;
+/// Operator telemetry port, matching the chart default.
+const OPERATOR_METRICS_PORT: u16 = 9090;
+/// How long a peer may take to notice its neighbour stopped answering.
+const COLLECTION_STATE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Read a Service through the API server proxy.
+///
+/// The proxy is used rather than an exec because it needs nothing inside the
+/// pod: no shell, no curl, no second container to borrow. The operator image
+/// has none of those.
+fn read_service(cluster: &str, service: &str, port: u16, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let raw = format!("/api/v1/namespaces/{GRID_SYSTEM_NS}/services/{service}:{port}/proxy/{path}");
+    let output = Command::new("kubectl")
+        .args(["--context", &ctx, "get", "--raw", &raw])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{cluster}: reading {service}:{port}/{path} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// One sample, reduced to what this proof asserts about it.
+#[derive(Debug, PartialEq)]
+struct SignalSample {
+    /// Site the sample describes.
+    site: String,
+    /// Provider within that site.
+    provider: String,
+    /// Sample time in epoch milliseconds, as the publisher stated it.
+    at_ms: i64,
+}
+
+/// Parse the signals exposition the way a consumer parses it.
+///
+/// The value and the timestamp are taken from the right, because a label value
+/// may contain a space and taking them from the left would split on it.
+fn parse_signals(body: &str) -> Vec<SignalSample> {
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (head, timestamp) = line.rsplit_once(' ')?;
+            let (head, _value) = head.rsplit_once(' ')?;
+            let at_ms: i64 = timestamp.parse().ok()?;
+            let (_metric, labels) = head.split_once('{')?;
+            let labels = labels.strip_suffix('}')?;
+            let mut site = None;
+            let mut provider = None;
+            for pair in labels.split(',') {
+                match pair.trim().split_once('=') {
+                    Some(("grid_site", v)) => site = Some(v.trim_matches('"').to_owned()),
+                    Some(("grid_provider", v)) => provider = Some(v.trim_matches('"').to_owned()),
+                    _ => {},
+                }
+            }
+            Some(SignalSample {
+                site: site?,
+                provider: provider?,
+                at_ms,
+            })
+        })
+        .collect()
+}
+
+/// Value of a gauge with one label, from the operator's own telemetry.
+fn gauge_with_label(body: &str, metric: &str, label: &str, value: &str) -> Option<f64> {
+    let needle = format!("{metric}{{{label}=\"{value}\"}}");
+    body.lines()
+        .find(|l| l.trim_start().starts_with(&needle))
+        .and_then(|l| l.rsplit_once(' '))
+        .and_then(|(_, v)| v.trim().parse().ok())
+}
+
+/// Wait until this site reports a given reachability for a peer.
+fn await_collection_state(cluster: &str, peer: &str, want_up: bool) -> bool {
+    let deadline = Instant::now() + COLLECTION_STATE_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Ok(body) = read_service(cluster, OPERATOR_METRICS_SERVICE, OPERATOR_METRICS_PORT, "metrics") {
+            let up = gauge_with_label(&body, "grid_collection_up", "peer", peer);
+            if up == Some(if want_up { 1.0 } else { 0.0 }) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    false
+}
+
+/// Proof 5: the operator republishes signals, relays a peer's, and says so when it cannot.
+fn proof_signals(_context: &DemoContext) -> ProofResult {
+    let mut observations = Vec::new();
+    let mut success = true;
+
+    success &= signals_are_attributed_and_stamped(&mut observations);
+    success &= a_peer_reaches_the_other_site(&mut observations);
+    success &= a_broken_collector_is_distinguishable(&mut observations);
+
+    ProofResult {
+        success,
+        description: "Operator republishes attributed, timestamped signals and reports its own reachability".to_owned(),
+        observations,
+    }
+}
+
+/// Every sample names the site and provider it came from, and when it was taken.
+///
+/// Without the labels a consumer cannot join a sample to a routing candidate;
+/// without the timestamp it cannot tell a fresh value from one the publisher
+/// has been holding since its collector broke.
+fn signals_are_attributed_and_stamped(observations: &mut Vec<String>) -> bool {
+    let mut success = true;
+    for cluster in CLUSTERS {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            let Ok(body) = read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics") else {
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
+            };
+            let own: Vec<_> = parse_signals(&body)
+                .into_iter()
+                .filter(|s| s.site == *cluster)
+                .collect();
+            if let Some(sample) = own.first() {
+                let age_ms = now_ms().saturating_sub(sample.at_ms);
+                observations.push(format!(
+                    "{cluster}: publishes {} attributed samples, provider={}, newest {age_ms}ms old",
+                    own.len(),
+                    sample.provider
+                ));
+                if age_ms > 120_000 {
+                    observations.push(format!(
+                        "{cluster}: newest sample is {age_ms}ms old, collection has stalled"
+                    ));
+                    success = false;
+                }
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        if !seen {
+            observations.push(format!("{cluster}: no attributed, timestamped samples within 60s"));
+            success = false;
+        }
+    }
+    success
+}
+
+/// Every site holds every other site's signals, which only polling can do.
+///
+/// All peers rather than one. Checking a single peer passes on a grid where a
+/// site reached one neighbour and never saw the rest, which is the failure that
+/// matters most as the grid grows: convergence is the claim, and a partial view
+/// is what a router silently makes bad decisions from.
+fn a_peer_reaches_the_other_site(observations: &mut Vec<String>) -> bool {
+    let mut success = true;
+    for cluster in CLUSTERS {
+        let peers: Vec<&&str> = CLUSTERS.iter().filter(|c| *c != cluster).collect();
+        for peer in &peers {
+            success &= one_peer_is_reached(cluster, peer, observations);
+        }
+        // Its own providers plus every peer, which is the whole grid.
+        let held = sites_held_by(cluster);
+        if held == CLUSTERS.len() {
+            observations.push(format!("{cluster}: serves all {held} sites"));
+        } else {
+            observations.push(format!(
+                "{cluster}: serves {held} of {} sites, so some peer never arrived",
+                CLUSTERS.len()
+            ));
+            success = false;
+        }
+    }
+    success
+}
+
+/// How many distinct sites this operator currently publishes for.
+fn sites_held_by(cluster: &str) -> usize {
+    let Ok(body) = read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics") else {
+        return 0;
+    };
+    let mut sites: Vec<String> = parse_signals(&body).into_iter().map(|s| s.site).collect();
+    sites.sort_unstable();
+    sites.dedup();
+    sites.len()
+}
+
+/// Wait for one site to hold one peer's signals, and to say it can reach it.
+fn one_peer_is_reached(cluster: &str, peer: &str, observations: &mut Vec<String>) -> bool {
+    let mut success = true;
+    let deadline = Instant::now() + COLLECTION_STATE_TIMEOUT;
+    let mut relayed = false;
+    while Instant::now() < deadline {
+        if read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics")
+            .is_ok_and(|body| parse_signals(&body).iter().any(|s| s.site == peer))
+        {
+            observations.push(format!("{cluster}: holds signals for {peer}"));
+            relayed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    if !relayed {
+        observations.push(format!("{cluster}: never saw signals for {peer}"));
+        success = false;
+    }
+    if await_collection_state(cluster, peer, true) {
+        observations.push(format!("{cluster}: grid_collection_up{{peer={peer}}}=1"));
+    } else {
+        observations.push(format!("{cluster}: {peer} never reported reachable"));
+        success = false;
+    }
+    success
+}
+
+/// Now, in epoch milliseconds.
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// Publish or withdraw the signals port on a site's SWIM Service.
+///
+/// This is how the proof stages a partition of the signals path alone. Scaling
+/// the operator down would stop it answering and stop it polling, which is a
+/// peer that left rather than a peer that cannot be reached. Withdrawing one
+/// TCP port leaves SWIM on UDP untouched, so membership still says the site is
+/// alive while its signals stop being reachable, and that is the state the
+/// design has to be able to report.
+fn set_signals_reachable(cluster: &str, reachable: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let swim_port = r#"{"name":"swim-udp","port":7946,"targetPort":"swim-udp","protocol":"UDP"}"#;
+    let signals_port = format!(r#"{{"name":"signals","port":{SIGNALS_PORT},"targetPort":"signals","protocol":"TCP"}}"#);
+    let ports = if reachable {
+        format!("[{swim_port},{signals_port}]")
+    } else {
+        format!("[{swim_port}]")
+    };
+    let patch = format!(r#"{{"spec":{{"ports":{ports}}}}}"#);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "svc",
+            "grid-operator-swim",
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{cluster}: patching swim service failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The newest timestamp this site holds for a given site.
+fn newest_stamp_for(cluster: &str, site: &str) -> Option<i64> {
+    let body = read_service(cluster, SIGNALS_SERVICE, SIGNALS_PORT, "metrics").ok()?;
+    parse_signals(&body)
+        .into_iter()
+        .filter(|s| s.site == site)
+        .map(|s| s.at_ms)
+        .max()
+}
+
+/// A site that cannot reach its peer says so, and keeps serving what it has.
+///
+/// This is the case the existing lost-peer test cannot produce. It kills the
+/// operator, so the peer stops answering and stops polling. Here both keep
+/// running, and the question is whether a reader can tell a value that is
+/// merely old from a collector that has stopped working. Four things have to
+/// hold at once: the gauge drops, the value is still served, its timestamp
+/// stops advancing, and none of it recovers by accident.
+fn a_broken_collector_is_distinguishable(observations: &mut Vec<String>) -> bool {
+    let (Some(observer), Some(target)) = (CLUSTERS.first(), CLUSTERS.get(1)) else {
+        observations.push("need two clusters to stage a partition".to_owned());
+        return false;
+    };
+
+    let before = newest_stamp_for(observer, target);
+    if let Err(error) = set_signals_reachable(target, false) {
+        observations.push(format!("could not withdraw {target} signals port: {error}"));
+        return false;
+    }
+    observations.push(format!("withdrew the signals port from {target}, SWIM left alone"));
+
+    let mut success = partition_is_reported(observer, target, before, observations);
+
+    if let Err(error) = set_signals_reachable(target, true) {
+        observations.push(format!("could not restore {target} signals port: {error}"));
+        return false;
+    }
+    if await_collection_state(observer, target, true) {
+        observations.push(format!("{observer}: {target} reachable again once the port returned"));
+    } else {
+        observations.push(format!("{observer}: {target} never recovered"));
+        success = false;
+    }
+    success
+}
+
+/// Assert the three things that have to be true while the peer is unreachable.
+fn partition_is_reported(observer: &str, target: &str, before: Option<i64>, observations: &mut Vec<String>) -> bool {
+    let mut success = true;
+
+    if await_collection_state(observer, target, false) {
+        observations.push(format!("{observer}: grid_collection_up{{peer={target}}}=0"));
+    } else {
+        observations.push(format!("{observer}: never reported {target} unreachable"));
+        success = false;
+    }
+
+    match (before, newest_stamp_for(observer, target)) {
+        (Some(was), Some(now)) => {
+            // Still served, because the last reading is the best available and
+            // dropping it would leave a candidate with no score at all.
+            observations.push(format!(
+                "{observer}: still serving {target}, timestamp {} while unreachable",
+                if now == was { "frozen" } else { "moved" }
+            ));
+            if now != was {
+                observations.push(format!(
+                    "{observer}: {target} timestamp advanced from {was} to {now} with the peer unreachable"
+                ));
+                success = false;
+            }
+        },
+        (Some(_), None) => {
+            observations.push(format!(
+                "{observer}: dropped {target} entirely, so a reader cannot tell stale from absent"
+            ));
+            success = false;
+        },
+        _ => {
+            observations.push(format!("{observer}: had no {target} samples to begin with"));
+            success = false;
+        },
+    }
+    success
 }

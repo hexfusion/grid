@@ -15,27 +15,28 @@ use crate::{
 // Naming
 // ---------------------------------------------------------------
 
+/// Name of the shared network for an environment.
+pub fn network_name(env_name: &str) -> String {
+    format!("{env_name}-net")
+}
+
 /// Verify the resolved runtime supports cross-cluster networking.
 ///
-/// `KIND_EXPERIMENTAL_DOCKER_NETWORK` is Docker-only; Podman does not
-/// support it.  Call after `runtime::resolve()` when cross-cluster
-/// networking is configured.
+/// kind names the override after the provider it chose for itself, so Docker
+/// reads `KIND_EXPERIMENTAL_DOCKER_NETWORK` and Podman reads
+/// `KIND_EXPERIMENTAL_PODMAN_NETWORK`. Forge sets both, so either runtime
+/// works and only a third one is refused.
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::Config`] if the resolved binary is not Docker.
-pub fn require_docker_for_cross_cluster(binary: &str) -> Result<(), ForgeError> {
-    if binary == "docker" {
+/// Returns [`ForgeError::Config`] if the runtime is neither Docker nor Podman.
+pub fn require_supported_runtime_for_cross_cluster(binary: &str) -> Result<(), ForgeError> {
+    if matches!(binary, "docker" | "podman") {
         return Ok(());
     }
     Err(ForgeError::Config(format!(
-        "cross-cluster networking requires Docker, but runtime resolved to {binary:?}"
+        "cross-cluster networking needs Docker or Podman, but the runtime resolved to {binary:?}"
     )))
-}
-
-/// Build the deterministic network name: `"{env_name}-net"`.
-pub fn network_name(env_name: &str) -> String {
-    format!("{env_name}-net")
 }
 
 // ---------------------------------------------------------------
@@ -225,6 +226,11 @@ fn labels_spec(binary: &str, net_name: &str) -> CommandSpec {
 
 /// Build a `<binary> network inspect --format` spec for the IPAM config.
 fn cidr_spec(binary: &str, net_name: &str) -> CommandSpec {
+    // `{{json .}}` rather than `{{json .IPAM.Config}}`. Podman has no IPAM
+    // field, so asking it to evaluate the Docker path fails before the subnet
+    // is ever reached. Asking for the whole document works on both runtimes,
+    // and keeps this call distinct from the bare inspect used to test whether
+    // the network exists at all.
     CommandSpec {
         program: binary.into(),
         args: vec![
@@ -232,7 +238,7 @@ fn cidr_spec(binary: &str, net_name: &str) -> CommandSpec {
             "inspect".into(),
             net_name.into(),
             "--format".into(),
-            "{{json .IPAM.Config}}".into(),
+            "{{json .}}".into(),
         ],
         env: BTreeMap::default(),
         stdin: None,
@@ -255,15 +261,45 @@ fn parse_labels(stdout: &str) -> Result<BTreeMap<String, String>, ForgeError> {
 
 /// Parse and validate the first IPv4 subnet in a formatted IPAM config.
 fn parse_ipam_config(stdout: &str) -> Result<String, ForgeError> {
-    let config: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
+    let document: serde_json::Value = serde_json::from_str(stdout.trim())
         .map_err(|err| ForgeError::State(format!("cannot parse network IPAM config: {err}")))?;
-    let subnet = config
-        .first()
-        .and_then(|entry| entry.get("Subnet"))
-        .and_then(serde_json::Value::as_str)
+    let subnet = first_ipv4_subnet(&document)
         .ok_or_else(|| ForgeError::State("network IPAM config has no subnet".to_owned()))?;
-    validate_ipv4_cidr(subnet)?;
-    Ok(subnet.to_owned())
+    validate_ipv4_cidr(&subnet)?;
+    Ok(subnet)
+}
+
+/// Find the first IPv4 subnet, whichever runtime described the network.
+///
+/// Docker nests it under `IPAM.Config[].Subnet`; Podman puts it in
+/// `subnets[].subnet`. The two also differ on whether the document is a list
+/// of networks or the config array itself, so this walks whatever it is
+/// looking for either key rather than encoding four shapes.
+pub(crate) fn first_ipv4_subnet(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Array(items) => items.iter().find_map(first_ipv4_subnet),
+        serde_json::Value::Object(fields) => {
+            for key in ["Subnet", "subnet"] {
+                if let Some(found) = fields.get(key).and_then(serde_json::Value::as_str) {
+                    // IPv6 entries sit alongside IPv4 ones and are not what the
+                    // caller wants, so keep looking rather than failing here.
+                    if validate_ipv4_cidr(found).is_ok() {
+                        return Some(found.to_owned());
+                    }
+                }
+            }
+            for key in ["IPAM", "Config", "subnets"] {
+                if let Some(found) = fields.get(key).and_then(first_ipv4_subnet) {
+                    return Some(found);
+                }
+            }
+            None
+        },
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => None,
+    }
 }
 
 /// Validate an IPv4 CIDR without accepting host-only or IPv6 forms.
@@ -338,12 +374,47 @@ mod tests {
     }
 
     /// Formatted Docker IPAM response for one IPv4 subnet.
-    fn ipam_config(cidr: &str) -> CommandOutput {
+    /// A Docker `network inspect` document.
+    fn docker_network(cidr: &str) -> CommandOutput {
         CommandOutput {
             status: 0,
-            stdout: format!(r#"[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]"#),
+            stdout: format!(
+                r#"[{{"Name":"test-net","IPAM":{{"Driver":"default","Config":[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]}}}}]"#
+            ),
             stderr: String::new(),
         }
+    }
+
+    /// A Podman `network inspect` document, which nests the subnet elsewhere
+    /// and spells the keys in lower case.
+    fn podman_network(cidr: &str) -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: format!(
+                r#"[{{"name":"test-net","driver":"bridge","subnets":[{{"subnet":"{cidr}","gateway":"172.18.0.1"}}]}}]"#
+            ),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn either_runtime_can_do_cross_cluster() {
+        // kind names the override after the provider it chose for itself, and
+        // forge sets both, so neither runtime is the special one.
+        assert!(
+            matches!(require_supported_runtime_for_cross_cluster("docker"), Ok(())),
+            "docker is supported"
+        );
+        assert!(
+            matches!(require_supported_runtime_for_cross_cluster("podman"), Ok(())),
+            "podman is supported"
+        );
+    }
+
+    #[test]
+    fn a_third_runtime_is_refused() {
+        let refused = require_supported_runtime_for_cross_cluster("nerdctl");
+        assert!(refused.is_err(), "only docker and podman set a kind network");
     }
 
     #[test]
@@ -500,8 +571,8 @@ mod tests {
     fn inspect_network_cidr_reads_formatted_ipam_config() {
         let mut runner = MockRunner::new();
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
-            ipam_config("172.18.0.0/16"),
+            "docker network inspect test-net --format {{json .}}",
+            docker_network("172.18.0.0/16"),
         );
 
         let cidr = inspect_network_cidr(&runner, "docker", "test-net").unwrap_or_else(|_| std::process::abort());
@@ -509,11 +580,45 @@ mod tests {
     }
 
     #[test]
+    fn inspect_network_cidr_reads_a_podman_document() {
+        // Podman has no IPAM field at all, so asking it to evaluate the Docker
+        // template fails before the subnet is ever reached. This is the shape
+        // it returns instead.
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            podman_network("10.89.0.0/24"),
+        );
+
+        let cidr = inspect_network_cidr(&runner, "podman", "test-net").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(cidr, "10.89.0.0/24");
+    }
+
+    #[test]
+    fn an_ipv6_entry_beside_an_ipv4_one_does_not_win() {
+        // Dual-stack networks list both. The MetalLB allocator is IPv4, so the
+        // IPv6 entry has to be stepped over rather than taken and rejected.
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: r#"[{"name":"test-net","subnets":[{"subnet":"fd00::/64"},{"subnet":"10.89.0.0/24"}]}]"#
+                    .to_owned(),
+                stderr: String::new(),
+            },
+        );
+
+        let cidr = inspect_network_cidr(&runner, "podman", "test-net").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(cidr, "10.89.0.0/24");
+    }
+
+    #[test]
     fn inspect_network_cidr_rejects_invalid_subnet() {
         let mut runner = MockRunner::new();
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
-            ipam_config("fd00::/64"),
+            "docker network inspect test-net --format {{json .}}",
+            docker_network("fd00::/64"),
         );
 
         assert!(

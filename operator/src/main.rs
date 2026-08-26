@@ -48,6 +48,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use axum::response::IntoResponse as _;
 use clap::Parser as _;
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -72,7 +73,11 @@ use operator::{
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
-#[expect(clippy::large_stack_frames, reason = "top-level binary with tokio runtime")]
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    reason = "top-level binary with tokio runtime; the startup sequence reads better whole"
+)]
 async fn main() {
     tracing_subscriber::fmt::init();
     tracing::info!("starting grid-operator");
@@ -97,17 +102,57 @@ async fn main() {
         ));
     }
 
+    let swim_for_poller = swim.clone();
     let ctx = Arc::new(OperatorCtx::new(client.clone(), swim));
+
+    // Held for the process lifetime. Dropping it also triggers, so an unwind
+    // anywhere still tells the pollers to stand down rather than leaving them
+    // waiting on a signal nobody is left to send.
+    let (trigger, shutdown) = operator::shutdown::Trigger::new();
+    tokio::spawn(watch_for_termination(trigger));
 
     let result = tokio::try_join!(
         run_network_controller(client.clone(), Arc::clone(&ctx)),
         run_site_controller(client.clone()),
         run_provider_controller(client.clone()),
         run_metrics_server(),
+        run_signals_server(ctx.signals(), ctx.peers()),
+        run_peer_poller(Arc::clone(&ctx), swim_for_poller, client.clone(), shutdown.clone()),
+        run_local_scraper(Arc::clone(&ctx), client.clone()),
     );
 
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
+    }
+}
+
+/// Trigger shutdown on the signals a container runtime actually sends.
+///
+/// SIGTERM is what Kubernetes sends before it waits out the grace period, so it
+/// is the one that matters; SIGINT is here so a run in a terminal behaves the
+/// same way. Losing the handler is not fatal: the process still stops, it just
+/// stops without letting anything stand down first, and saying so beats
+/// pretending shutdown is graceful when it is not.
+async fn watch_for_termination(trigger: operator::shutdown::Trigger) {
+    let signal = first_termination_signal().await;
+    tracing::info!(signal, "standing down");
+    trigger.trigger();
+}
+
+/// Wait for whichever termination signal arrives first, and name it.
+///
+/// SIGTERM is what a container runtime sends before it waits out the grace
+/// period, so it is the one that matters. SIGINT is here so a run in a terminal
+/// behaves the same way.
+async fn first_termination_signal() -> &'static str {
+    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else {
+        tracing::warn!("cannot watch for SIGTERM; only an interrupt will stand down cleanly");
+        drop(tokio::signal::ctrl_c().await);
+        return "SIGINT";
+    };
+    tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = tokio::signal::ctrl_c() => "SIGINT",
     }
 }
 
@@ -538,6 +583,316 @@ async fn run_metrics_server() -> Result<(), Box<dyn std::error::Error + Send + S
     tracing::info!(addr = %bound_addr, "metrics server started");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Serve this site's scraped provider signals for its gateway to read.
+///
+/// Separate from the operator's own metrics server because the two have
+/// different audiences: `/metrics` is scraped by the cluster's monitoring, and
+/// this is read by the gateway at a much shorter interval. Keeping them apart
+/// leaves room to require mutual TLS here without touching monitoring.
+async fn run_signals_server(
+    site: operator::signals::SignalStore,
+    peers: operator::signals::SignalStore,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = std::env::var("GRID_SIGNALS_ADDR").unwrap_or_else(|_| "0.0.0.0:9091".to_owned());
+    let app = axum::Router::new()
+        .route("/metrics", axum::routing::get(signals_handler))
+        // Until the listener terminates TLS, no caller can present a peer
+        // certificate, so every request is treated as in-cluster.
+        .layer(axum::Extension(Caller::Local))
+        .with_state(Published { site, peers });
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bound_addr = listener.local_addr().map_or_else(|_| addr.clone(), |a| a.to_string());
+    tracing::info!(addr = %bound_addr, "signals server started");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Scrape this site's providers on their own interval and publish the result.
+///
+/// Separate from reconcile, which runs on an interval sized for declarations
+/// and is two orders of magnitude slower than these values move.
+async fn run_local_scraper(
+    ctx: Arc<OperatorCtx>,
+    client: Client,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Milliseconds take precedence, because the second-granularity setting
+    // cannot express an interval shorter than one and a local scrape crosses no
+    // network. The seconds form stays for anything already setting it.
+    let interval = scrape_interval();
+    tracing::info!(interval_ms = interval.as_millis(), "local signals scraper started");
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    #[expect(
+        clippy::infinite_loop,
+        reason = "runs for the process lifetime alongside the controllers"
+    )]
+    loop {
+        ticker.tick().await;
+        let networks: Api<GridNetwork> = Api::all(client.clone());
+        let Ok(list) = networks.list(&kube::api::ListParams::default()).await else {
+            continue;
+        };
+        for network in list.items.iter().filter_map(|n| n.metadata.name.as_deref()) {
+            if let Err(error) = grid_network::refresh_signals(&ctx, &client, network).await {
+                tracing::warn!(network, %error, "peer signals refresh failed");
+            }
+        }
+    }
+}
+
+/// Poll every alive peer's signals endpoint on a coarse interval.
+///
+/// Addresses come from SWIM membership, which already carries each site's
+/// advertised address, so no field is added to a broadcast payload.
+///
+/// The interval is much longer than a gateway's read of its own operator: this
+/// crosses an administrative boundary and carries another site's aggregate.
+/// Build the peer poller and report the scheme it will use.
+///
+/// Split out so the poll loop stays short; the scheme follows the TLS material
+/// because a client configured for TLS cannot speak to a plaintext peer.
+async fn peer_source(
+    client: &Client,
+    shutdown: operator::shutdown::Shutdown,
+) -> (Box<dyn operator::signals::PeerSignals>, &'static str) {
+    let tls = peer_tls(client).await;
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let source: Box<dyn operator::signals::PeerSignals> = Box::new(operator::signals::PollPeers {
+        timeout: std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_TIMEOUT_SECS", 5_u64)),
+        tls,
+        collect: parse_peer_collect(),
+        concurrency: parse_env_or("GRID_SIGNALS_PEER_CONCURRENCY", 8_usize),
+        attempts: parse_env_or("GRID_SIGNALS_PEER_ATTEMPTS", 3_u32),
+        backoff: std::time::Duration::from_millis(parse_env_or("GRID_SIGNALS_PEER_BACKOFF_MS", 50_u64)),
+        budget: std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_BUDGET_SECS", 10_u64)),
+        slow_after: std::time::Duration::from_millis(parse_env_or("GRID_SIGNALS_PEER_SLOW_MS", 1_000_u64)),
+        shutdown,
+    });
+    (source, scheme)
+}
+
+/// Poll every alive peer for its signals on a coarse interval.
+///
+/// Coarser than the local scrape because each request crosses a cluster
+/// boundary, and a peer's values are only as fresh as its own collection.
+async fn run_peer_poller(
+    ctx: Arc<OperatorCtx>,
+    swim: Option<Arc<swim_runtime::SwimHandle>>,
+    client: Client,
+    shutdown: operator::shutdown::Shutdown,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(swim) = swim else {
+        tracing::info!("peer signals poller disabled: SWIM is not running");
+        return Ok(());
+    };
+    let port = parse_env_or("GRID_SIGNALS_PEER_PORT", 9091_u16);
+    let interval = std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_INTERVAL_SECS", 30_u64));
+    let (source, scheme) = peer_source(&client, shutdown.clone()).await;
+    tracing::info!(
+        port,
+        interval_secs = interval.as_secs(),
+        source = source.name(),
+        scheme,
+        "peer signals poller started"
+    );
+
+    poll_until_shutdown(&ctx, &swim, source.as_ref(), port, scheme, interval, &shutdown).await;
+    tracing::info!("peer signals poller stopped");
+    Ok(())
+}
+
+/// Poll on the interval until told to stand down.
+///
+/// The signal is checked in place of the tick rather than after it, so a poller
+/// that has just slept out a thirty second interval does not start one more
+/// round of cross-cluster requests on the way out.
+#[expect(clippy::too_many_arguments, reason = "a poll loop needs its whole configuration")]
+async fn poll_until_shutdown(
+    ctx: &Arc<OperatorCtx>,
+    swim: &Arc<swim_runtime::SwimHandle>,
+    source: &dyn operator::signals::PeerSignals,
+    port: u16,
+    scheme: &str,
+    interval: std::time::Duration,
+    shutdown: &operator::shutdown::Shutdown,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.triggered() => return,
+            _ = ticker.tick() => {},
+        }
+        poll_peers_once(ctx, swim, source, port, scheme).await;
+    }
+}
+
+/// Collect from every alive peer and replace what is published for them.
+async fn poll_peers_once(
+    ctx: &OperatorCtx,
+    swim: &swim_runtime::SwimHandle,
+    source: &dyn operator::signals::PeerSignals,
+    port: u16,
+    scheme: &str,
+) {
+    let snapshot = swim.snapshot();
+    let alive = snapshot
+        .members
+        .iter()
+        .filter(|m| m.status == operator::swim::MemberStatus::Alive)
+        .map(|m| (m.site_id.as_str(), m.endpoint.as_str()));
+    let sites = operator::signals::peer_sites(alive, swim.site_name(), port, scheme);
+    if sites.is_empty() {
+        return;
+    }
+    let collected = source.collect(&sites).await;
+    ctx.peers().refresh(collected.into_iter().collect(), peer_ttl());
+}
+
+/// How often this site reads its own providers.
+///
+/// `GRID_SIGNALS_SCRAPE_INTERVAL_MS` wins when set, since the seconds form
+/// bottoms out at one and this scrape never leaves the node. Floors at 50ms:
+/// below that the operator spends more time scraping than the provider spends
+/// changing, and every sample it publishes is the same one.
+fn scrape_interval() -> std::time::Duration {
+    let ms = parse_env_or(
+        "GRID_SIGNALS_SCRAPE_INTERVAL_MS",
+        parse_env_or("GRID_SIGNALS_SCRAPE_INTERVAL_SECS", 5_u64).saturating_mul(1_000),
+    );
+    std::time::Duration::from_millis(ms.max(50))
+}
+
+/// How long a peer's data stays served without a successful poll.
+///
+/// Must exceed the peer poll interval, so one failed poll does not remove a
+/// site that is otherwise healthy.
+fn peer_ttl() -> std::time::Duration {
+    std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_TTL_SECS", 90_u64))
+}
+
+/// Client TLS for peer polling, or `None` when the network declares no trust.
+///
+/// Logged rather than fatal: a site with no TLS material still polls, and the
+/// scheme in the poller's startup line says which mode it is in.
+async fn peer_tls(client: &Client) -> Option<Arc<rustls::ClientConfig>> {
+    // Off unless asked for. The signals listener does not terminate TLS, so a
+    // client that upgrades on its own speaks TLS to a plaintext server and
+    // every poll fails as a transport error. Deriving this from whether any
+    // material happened to exist meant installing a certificate for something
+    // else switched peer polling off, which is the opposite of what installing
+    // a certificate should do.
+    //
+    // Remove the gate once the listener terminates TLS, at which point the
+    // scope rule has a certificate to decide from as well.
+    if !parse_env_or("GRID_SIGNALS_PEER_TLS", false) {
+        return None;
+    }
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let list = networks.list(&kube::api::ListParams::default()).await.ok()?;
+    let network = list.items.into_iter().next()?;
+    match grid_network::peer_tls_config(&network, client).await {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            tracing::warn!(%error, "peer signals TLS unavailable; polling peers without it");
+            None
+        },
+    }
+}
+
+/// Signals asked of each peer, from `GRID_SIGNALS_PEER_COLLECT`.
+///
+/// Newline-separated metric names. Empty asks a peer for everything it holds,
+/// which is fine at a handful of providers and wasteful at many.
+fn parse_peer_collect() -> Vec<String> {
+    std::env::var("GRID_SIGNALS_PEER_COLLECT")
+        .map(|raw| {
+            raw.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read an environment variable, falling back when unset or unparseable.
+fn parse_env_or<T: std::str::FromStr + std::fmt::Display + Copy>(name: &str, fallback: T) -> T {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            tracing::warn!(var = name, value = raw, default = %fallback, "unparseable; using default");
+            fallback
+        }),
+        Err(_) => fallback,
+    }
+}
+
+/// Who is asking, which decides what they are served.
+///
+/// A peer presented a certificate signed by the grid CA and speaks for another
+/// site. Anything else is in-cluster and is served the whole grid.
+#[expect(
+    dead_code,
+    reason = "Peer is set once the listener terminates TLS; until then no caller can present a certificate"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Caller {
+    /// Another site.
+    Peer,
+    /// A consumer inside this cluster.
+    Local,
+}
+
+/// Everything this operator publishes.
+#[derive(Clone)]
+struct Published {
+    /// This site's own signals.
+    site: operator::signals::SignalStore,
+    /// What peers reported about themselves.
+    peers: operator::signals::SignalStore,
+}
+
+/// Serve provider signals, following the multi-target exporter pattern.
+///
+/// `target` names one provider, and `collect[]` names the signals wanted.
+/// Both absent returns everything held, which is what the local gateway asks
+/// for. A peer names the targets it wants, so what crosses a boundary is what
+/// the reader asked for rather than whatever this site happens to hold.
+///
+/// Samples carry no timestamp. A target this operator has stopped refreshing
+/// stops appearing, so a scraper's own staleness handling applies.
+async fn signals_handler(
+    axum::extract::State(published): axum::extract::State<Published>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>,
+) -> axum::response::Response {
+    let target = params.iter().find(|(k, _)| k == "target").map(|(_, v)| v.as_str());
+    let collect: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| k == "collect[]" || k == "collect")
+        .map(|(_, v)| v.clone())
+        .collect();
+
+    // Scope is decided from the connection before any parameter is read, so a
+    // request cannot widen it. A peer receives this site alone.
+    let (mut body, mut oldest) = published.site.render(target, &collect);
+    if caller == Caller::Local {
+        let (relayed, relayed_age) = published.peers.render(target, &collect);
+        body.push_str(&relayed);
+        oldest = oldest.max(relayed_age);
+    }
+
+    (
+        [
+            (http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
+            (http::header::AGE, &*oldest.as_secs().to_string()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Prometheus text-format metrics handler.

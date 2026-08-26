@@ -46,6 +46,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: GRID_SIGNALS_ADDR
+              value: {{ .Values.signals.bindAddress | quote }}
+            - name: GRID_SIGNALS_PEER_PORT
+              value: {{ .Values.signals.service.port | quote }}
             - name: GRID_SWIM_BIND_ADDR
               value: {{ .Values.swim.bindAddress | quote }}
             - name: GRID_SWIM_ADVERTISE_ADDR
@@ -84,6 +88,9 @@ spec:
               protocol: UDP
             - name: metrics
               containerPort: {{ splitList ":" .Values.metrics.bindAddress | last }}
+              protocol: TCP
+            - name: signals
+              containerPort: {{ splitList ":" .Values.signals.bindAddress | last }}
               protocol: TCP
           livenessProbe:
             httpGet:

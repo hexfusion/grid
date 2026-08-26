@@ -28,7 +28,7 @@ spec:
           image: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.10.0"
           imagePullPolicy: "IfNotPresent"
           args:
-            - --pool-name=pool-a
+            - --pool-name=pool-c
             - --pool-namespace=grid-system
             - --grpc-port=9002
             - --grpc-health-port=9003
@@ -65,44 +65,6 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-        - name: metrics-tls-proxy
-          image: "docker.io/library/nginx:1.27.4-alpine"
-          imagePullPolicy: "IfNotPresent"
-          ports:
-            - name: metrics-tls
-              containerPort: 9443
-          volumeMounts:
-            - name: metrics-proxy-config
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
-            - name: metrics-server-tls
-              mountPath: /etc/nginx/server-tls
-              readOnly: true
-            - name: metrics-client-ca
-              mountPath: /etc/nginx/client-ca
-              readOnly: true
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            runAsNonRoot: true
-          resources:
-            requests:
-              cpu: 50m
-              memory: 32Mi
-            limits:
-              cpu: 200m
-              memory: 64Mi
-      volumes:
-        - name: metrics-proxy-config
-          configMap:
-            name: metrics-tls-proxy-config
-        - name: metrics-server-tls
-          secret:
-            secretName: metrics-server-tls
-        - name: metrics-client-ca
-          secret:
-            secretName: metrics-ca
 ---
 apiVersion: v1
 kind: Service
@@ -137,6 +99,6 @@ spec:
   selector:
     app.kubernetes.io/name: llmd-epp
   ports:
-    - name: metrics-tls
-      port: 9443
-      targetPort: 9443
+    - name: metrics
+      port: 9090
+      targetPort: 9090

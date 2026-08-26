@@ -43,7 +43,7 @@ pub fn cluster_exists(runner: &dyn CommandRunner, kind_name: &str) -> Result<boo
 /// Create a KIND cluster with a generated config.
 ///
 /// When `docker_network` is `Some`, the cluster nodes join that
-/// Docker network via `KIND_EXPERIMENTAL_DOCKER_NETWORK`.
+/// Shared network via `KIND_EXPERIMENTAL_DOCKER_NETWORK` and its Podman twin.
 ///
 /// # Errors
 ///
@@ -167,7 +167,12 @@ fn cleanup_kind_config(path: &std::path::Path) {
 fn create_spec(kind_name: &str, config_path: &std::path::Path, docker_network: Option<&str>) -> CommandSpec {
     let mut env = BTreeMap::default();
     if let Some(net) = docker_network {
+        // Both, because which one kind reads depends on the provider it picked
+        // for itself, not on the runtime forge resolved. kind ignores the one
+        // that does not match, so setting both works under either without
+        // forge having to predict that choice.
         env.insert("KIND_EXPERIMENTAL_DOCKER_NETWORK".into(), net.into());
+        env.insert("KIND_EXPERIMENTAL_PODMAN_NETWORK".into(), net.into());
     }
     CommandSpec {
         program: "kind".into(),
@@ -342,9 +347,15 @@ mod tests {
     #[test]
     fn create_spec_sets_docker_network_env() {
         let spec = create_spec("forge-hub", std::path::Path::new("/tmp/cfg.yaml"), Some("test-net"));
-        let key = std::ffi::OsString::from("KIND_EXPERIMENTAL_DOCKER_NETWORK");
+        // Both names, because kind reads the one matching the provider it
+        // chose for itself and ignores the other. Setting only the Docker name
+        // leaves a Podman run on the default network while the shared one sits
+        // empty, and nothing says so until the clusters cannot reach each other.
         let expected = std::ffi::OsString::from("test-net");
-        assert_eq!(spec.env.get(&key), Some(&expected), "should set network env");
+        for name in ["KIND_EXPERIMENTAL_DOCKER_NETWORK", "KIND_EXPERIMENTAL_PODMAN_NETWORK"] {
+            let key = std::ffi::OsString::from(name);
+            assert_eq!(spec.env.get(&key), Some(&expected), "{name} should be set");
+        }
     }
 
     #[test]

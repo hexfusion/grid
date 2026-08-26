@@ -38,6 +38,7 @@ use crate::{
         overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
         trust_bundle::{self, CertPemStatus},
     },
+    signals,
     swim::{MemberStatus, MembershipSnapshot},
     swim_runtime::SwimHandle,
 };
@@ -95,6 +96,19 @@ pub struct OperatorCtx {
     /// Uses [`std::sync::Mutex`] because [`announce_crd_seeds`] is a synchronous
     /// function called from within the async reconcile loop.
     pub(crate) last_seeds: std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
+
+    /// Signals polled from peer operators, keyed by their site name.
+    ///
+    /// Kept apart from this site's own so that a scoped request can answer with only
+    /// what this site observed. Relaying a peer's copy of a third site would
+    /// make its data second hand, and its age unknowable.
+    pub(crate) peers: signals::SignalStore,
+
+    /// This site's scraped signals, as published to gateways and peers.
+    ///
+    /// Filled on each reconcile from what the provider scrape observed, and read
+    /// by the signals listener. Cloning it shares the same contents.
+    pub(crate) signals: signals::SignalStore,
 }
 
 impl OperatorCtx {
@@ -110,7 +124,21 @@ impl OperatorCtx {
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
+            signals: signals::SignalStore::new(),
+            peers: signals::SignalStore::new(),
         }
+    }
+
+    /// A handle to what this site publishes, for the signals listener.
+    #[must_use]
+    pub fn signals(&self) -> signals::SignalStore {
+        self.signals.clone()
+    }
+
+    /// A handle to what peers publish, for the signals listener and poller.
+    #[must_use]
+    pub fn peers(&self) -> signals::SignalStore {
+        self.peers.clone()
     }
 }
 
@@ -145,6 +173,91 @@ pub const LABEL_AUTO_DISCOVER_SITES: &str = "grid.praxis-proxy.io/auto-discover-
 // ---------------------------------------------------------------------------
 // Cross-resource watch mappers
 // ---------------------------------------------------------------------------
+
+/// Client TLS for polling peer operators, built from the network's own trust.
+///
+/// The same CA and site identity the gateways already use between sites. A peer
+/// therefore proves which site it is, rather than proving only that it holds a
+/// key the whole mesh shares, and what it says can be attributed to it.
+///
+/// # Errors
+///
+/// Returns the reason when the referenced Secrets are missing or unusable.
+pub async fn peer_tls_config(
+    network: &GridNetwork,
+    client: &Client,
+) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+    let (Some(ca), Some(site)) = (&network.spec.tls.ca_secret_ref, &network.spec.tls.site_secret_ref) else {
+        return Ok(None);
+    };
+    let tls = crate::crd::inference_provider::EndpointTlsConfig {
+        ca_secret_ref: ca.clone(),
+        client_certificate_secret_ref: Some(crate::crd::inference_provider::ClientCertificateSecretRef {
+            name: site.name.clone(),
+            namespace: site.namespace.clone(),
+            certificate_key: "tls.crt".to_owned(),
+            private_key_key: "tls.key".to_owned(),
+        }),
+    };
+    crate::resources::endpoint_tls::resolve_tls_config(Some(&tls), Some(client), "peer-signals")
+        .await
+        .map_err(|(_, message)| message)
+}
+
+/// How long a scraped provider stays published without a refresh.
+///
+/// Must exceed the scrape interval, or a record expires between refreshes and
+/// the provider flickers in and out of what this site serves.
+fn local_ttl() -> Duration {
+    let secs = std::env::var("GRID_SIGNALS_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_u64);
+    Duration::from_secs(secs)
+}
+
+/// Scrape every provider once and publish what was seen.
+///
+/// Called from its own loop rather than from reconcile. Reconcile runs on an
+/// interval sized for declarations, which is two orders of magnitude slower than
+/// the signals published here move: driving publication from it would leave a
+/// reader polling every few seconds re-reading one observation for minutes, and
+/// unable to tell, because the sample would carry the same timestamp throughout.
+///
+/// # Errors
+///
+/// Returns [`OperatorError`] when providers cannot be listed.
+pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
+    let providers = list_all_inference_providers(client).await?;
+    let collected = provider_metrics::collect_provider_metrics_with_refresh_interval(
+        network_name,
+        &providers,
+        &ctx.metrics_cache,
+        Instant::now(),
+        Duration::ZERO,
+        Some(client),
+    )
+    .await;
+    publish_signals(ctx, collected.signals);
+    Ok(())
+}
+
+/// Attribute this cycle's observations to this site and publish them.
+///
+/// The site label is applied here because this is where the membership identity
+/// is known. A provider that set it itself keeps its value under an exported
+/// name, so what a reader sees as the origin is what this site says it is.
+fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Observation>>) {
+    let site = ctx.swim.as_ref().map(|s| s.site_name().to_owned()).unwrap_or_default();
+    let attributed = collected
+        .into_iter()
+        .map(|(provider, observations)| {
+            let attributed = signals::attribute(observations, &site, &provider);
+            (provider, attributed)
+        })
+        .collect();
+    ctx.signals.refresh(attributed, local_ttl());
+}
 
 /// Map an [`InferenceProvider`] change to the [`GridNetwork`] it belongs to.
 ///
@@ -288,6 +401,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         Some(client),
     )
     .await;
+    publish_signals(&ctx, collected.signals);
     let raw_metrics = collected.metrics;
 
     let scoring_strategy = network
@@ -813,6 +927,7 @@ async fn reconcile_routing_overlay_inner(
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
+    let load = load_source(providers);
 
     let sites = list_all_grid_sites(client).await?;
 
@@ -976,7 +1091,7 @@ async fn reconcile_routing_overlay_inner(
         // Gateways with consumerConfig.enabled=false get a Disabled entry.
         // Gateways without a consumerConfig block are omitted from status.
         if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
-            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await {
+            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client, load.as_ref()).await {
                 Ok(()) => {
                     consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
                 },
@@ -1128,17 +1243,69 @@ async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorE
     Ok(list.items)
 }
 
+/// Where the gateway should read live load, if it can be stated unambiguously.
+///
+/// The endpoint comes from `GRID_SIGNALS_CONSUMER_URL`; unset means this
+/// operator does not offer live load, and the rendered config omits the block.
+/// Making it opt-in this way keeps generated config unchanged for anyone who has
+/// not deployed the signals endpoint.
+///
+/// The metric name comes from the providers themselves. Returns `None` when they
+/// do not agree on one, because the gateway can name a single queue metric and
+/// guessing which to use would silently score some providers and not others.
+fn load_source(providers: &[InferenceProvider]) -> Option<consumer_config::LoadSource> {
+    let endpoint = std::env::var("GRID_SIGNALS_CONSUMER_URL").ok()?;
+    let queue_metric = agreed_signal_name(providers, |sn| sn.queue_depth.as_deref()).or_else(|| {
+        tracing::warn!("providers disagree on the queue-depth metric; omitting live load from consumer config");
+        None
+    })?;
+    // Narrowing the response to what the gateway scores on. Only queue depth
+    // today, because that is the only signal it reads; naming more would grow
+    // the payload without changing a decision.
+    let collect = vec![queue_metric.clone()];
+    Some(consumer_config::LoadSource {
+        endpoint,
+        queue_metric,
+        collect,
+    })
+}
+
+/// The one name every provider that declares this signal uses for it.
+///
+/// `None` when nobody declares it, or when two providers declare different
+/// names. Disagreement is not resolvable here: the gateway can name one metric
+/// per signal, and picking a side would score some providers on live data and
+/// leave the rest on whatever the absent series defaults to.
+fn agreed_signal_name(
+    providers: &[InferenceProvider],
+    pick: impl Fn(&crate::crd::inference_provider::MetricSignalNames) -> Option<&str>,
+) -> Option<String> {
+    let mut names = providers
+        .iter()
+        .filter_map(|p| p.spec.metrics_config.as_ref())
+        .filter_map(|mc| pick(&mc.signal_names))
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    let first = names.next()?;
+    names.all(|n| n == first).then(|| first.to_owned())
+}
+
 /// Server-side apply the operator-generated consumer Praxis config `ConfigMap`.
 ///
 /// Only called when `gw_ref.consumer_config.enabled` is `true`.  Renders the
 /// consumer Praxis YAML from the routing overlay and applies it to the gateway
 /// namespace.  The generated config never contains credential token bytes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rendering inputs; a struct to carry them would exist only to satisfy the lint"
+)]
 async fn apply_consumer_config_for_gateway(
     overlay: &routing_overlay::RoutingOverlay,
     network_name: &str,
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
     client: &Client,
+    load: Option<&consumer_config::LoadSource>,
 ) -> Result<(), OperatorError> {
     let config_yaml = consumer_config::generate_consumer_praxis_config(
         overlay,
@@ -1146,6 +1313,7 @@ async fn apply_consumer_config_for_gateway(
         &cc.cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
+        load,
     )?;
     let cm = consumer_config::build_consumer_config_map(
         &config_yaml,
@@ -2421,6 +2589,79 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn provider_with_signals(name: &str, queue: Option<&str>, kv: Option<&str>) -> InferenceProvider {
+        let mut signal_names = serde_json::Map::new();
+        if let Some(q) = queue {
+            signal_names.insert("queueDepth".to_owned(), serde_json::Value::String(q.to_owned()));
+        }
+        if let Some(k) = kv {
+            signal_names.insert("kvCacheUtilization".to_owned(), serde_json::Value::String(k.to_owned()));
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [],
+                "metricsConfig": { "signalNames": signal_names }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    // -----------------------------------------------------------------------
+    // Signal names offered to the gateway
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn one_signal_disagreeing_does_not_withhold_the_others() {
+        // The whole point of naming signals separately. Under the earlier
+        // all-or-nothing rule this left the gateway with nothing to route on
+        // but the order the operator had already chosen.
+        let providers = [
+            provider_with_signals("a", Some("q_one"), Some("kv")),
+            provider_with_signals("b", Some("q_two"), Some("kv")),
+        ];
+        assert_eq!(
+            agreed_signal_name(&providers, |sn| sn.queue_depth.as_deref()),
+            None,
+            "two names for one signal is not resolvable here"
+        );
+        assert_eq!(
+            agreed_signal_name(&providers, |sn| sn.kv_cache_utilization.as_deref()),
+            Some("kv".to_owned()),
+            "the signal they do agree on still reaches the gateway"
+        );
+    }
+
+    #[test]
+    fn a_signal_nobody_declares_has_no_name() {
+        let providers = [provider_with_signals("a", Some("q"), None)];
+        assert_eq!(
+            agreed_signal_name(&providers, |sn| sn.kv_cache_utilization.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_blank_signal_name_is_not_a_name() {
+        // An empty string renders as a real key with an empty value, which the
+        // gateway would read as a metric that never matches anything.
+        let providers = [
+            provider_with_signals("a", Some("   "), None),
+            provider_with_signals("b", Some("q"), None),
+        ];
+        assert_eq!(
+            agreed_signal_name(&providers, |sn| sn.queue_depth.as_deref()),
+            Some("q".to_owned()),
+            "blank is skipped, not treated as a competing name"
+        );
     }
 
     fn make_grid_site(name: &str, network_ref: &str) -> GridSite {

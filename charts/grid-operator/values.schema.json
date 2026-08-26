@@ -143,6 +143,41 @@
         }
       }
     },
+    "signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindAddress": {
+          "type": "string",
+          "description": "Provider signals server bind address."
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Create a ClusterIP Service for the signals port."
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "Service port number."
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Annotations on the signals Service."
+            }
+          }
+        },
+        "onSwimService": {
+          "type": "boolean",
+          "description": "Also publish the signals port on the SWIM Service, so peers reach it on the address membership already advertises."
+        }
+      }
+    },
     "swim": {
       "type": "object",
       "additionalProperties": false,

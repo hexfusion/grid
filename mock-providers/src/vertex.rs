@@ -32,8 +32,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/projects/{project}/locations/{location}/publishers/google/models/{*rest}",
             post(dispatch),
         )
+        .route("/metrics", get(metrics))
         .route("/health", get(common::health_ok))
-        .layer(from_fn_with_state(state, common::inject_provider_header))
+        .layer(from_fn_with_state(state.clone(), common::inject_provider_header))
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -41,10 +43,11 @@ pub fn router(state: AppState) -> Router {
 // ---------------------------------------------------------------------------
 
 /// Dispatch based on the wildcard path suffix.
-async fn dispatch(req: Request<Body>) -> Response<Body> {
+async fn dispatch(axum::extract::State(state): axum::extract::State<AppState>, req: Request<Body>) -> Response<Body> {
     if common::extract_bearer(req.headers()).is_none() {
         return oauth2_unauthorized();
     }
+    state.load.serve().await;
     let path = req.uri().path();
     if path.ends_with(":streamGenerateContent") {
         streaming_response()
@@ -120,6 +123,30 @@ fn streaming_chunks() -> Vec<Value> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Vertex-shaped metrics.
+///
+/// Vertex publishes utilization and replica counts. It publishes no queue depth
+/// and nothing about cache residency, so a site backed by it cannot answer the
+/// question the other providers answer directly. That gap is the point: the
+/// contract carries whatever a provider exposes, and the caller is configured
+/// with which name means what.
+async fn metrics(axum::extract::State(state): axum::extract::State<AppState>) -> Response<Body> {
+    let replicas = state.load.running().max(1);
+    let body = format!(
+        "vertex_accelerator_duty_cycle {}\n\
+         vertex_replicas {replicas}\n\
+         vertex_target_replicas {replicas}\n\
+         vertex_prediction_count_total {}\n",
+        state.load.utilization(),
+        state.load.served(),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -137,6 +164,7 @@ mod tests {
         AppState {
             provider_site: Arc::from("test-site"),
             queue_depth: 0.1,
+            load: Arc::new(crate::load::Load::new(8, 0)),
         }
     }
 

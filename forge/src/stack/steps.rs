@@ -405,16 +405,13 @@ pub fn parse_network_cidr(inspect_output: &str) -> Result<String, ForgeError> {
 
 /// Navigate the nested IPAM config to extract and validate the first subnet.
 fn extract_subnet_from_ipam(entry: &serde_json::Value) -> Result<String, ForgeError> {
-    let subnet = entry
-        .get("IPAM")
-        .and_then(|ipam| ipam.get("Config"))
-        .and_then(|config| config.get(0))
-        .and_then(|cfg| cfg.get("Subnet"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| cmd_error("network inspect", "no Subnet in IPAM.Config"))?;
-    parse_cidr_parts(subnet)
-        .map_err(|_err| cmd_error("network inspect", &format!("invalid CIDR in IPAM.Config: {subnet:?}")))?;
-    Ok(subnet.to_owned())
+    // Shared with the network module rather than reimplemented, because the
+    // two runtimes describe a network differently and having two parsers means
+    // fixing the second one the next time somebody hits it.
+    let subnet = crate::networking::first_ipv4_subnet(entry)
+        .ok_or_else(|| cmd_error("network inspect", "no IPv4 subnet in the network description"))?;
+    parse_cidr_parts(&subnet).map_err(|_err| cmd_error("network inspect", &format!("invalid CIDR: {subnet:?}")))?;
+    Ok(subnet)
 }
 
 /// Compute a `MetalLB` address range from a CIDR string.

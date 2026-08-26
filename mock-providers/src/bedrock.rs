@@ -25,8 +25,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/model/{model_id}/converse", post(converse))
         .route("/model/{model_id}/converse-stream", post(converse_stream))
+        .route("/metrics", get(metrics))
         .route("/health", get(common::health_ok))
-        .layer(from_fn_with_state(state, common::inject_provider_header))
+        .layer(from_fn_with_state(state.clone(), common::inject_provider_header))
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -57,19 +59,24 @@ fn sigv4_forbidden() -> Response<Body> {
 // ---------------------------------------------------------------------------
 
 /// Handle `POST /model/{model_id}/converse`.
-async fn converse(req: Request<Body>) -> Response<Body> {
+async fn converse(axum::extract::State(state): axum::extract::State<AppState>, req: Request<Body>) -> Response<Body> {
     if !has_sigv4_auth(req.headers()) {
         return sigv4_forbidden();
     }
+    state.load.serve().await;
     let model_id = extract_model_id(req.uri().path());
     non_streaming_response(&model_id)
 }
 
 /// Handle `POST /model/{model_id}/converse-stream`.
-async fn converse_stream(req: Request<Body>) -> Response<Body> {
+async fn converse_stream(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: Request<Body>,
+) -> Response<Body> {
     if !has_sigv4_auth(req.headers()) {
         return sigv4_forbidden();
     }
+    state.load.serve().await;
     let model_id = extract_model_id(req.uri().path());
     binary_event_stream_response(&model_id)
 }
@@ -155,6 +162,28 @@ fn write_binary_event(buf: &mut Vec<u8>, payload: &[u8]) {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Bedrock-shaped metrics.
+///
+/// Bedrock reports through `CloudWatch`: invocation counts, concurrency,
+/// throttles. Throttling is the closest thing it has to a backpressure signal,
+/// and it arrives as a count of rejections rather than a depth, so a caller
+/// reading it learns what already failed rather than what is about to.
+async fn metrics(axum::extract::State(state): axum::extract::State<AppState>) -> Response<Body> {
+    let body = format!(
+        "bedrock_invocations_total {}\n\
+         bedrock_invocation_throttles_total {}\n\
+         bedrock_invocation_concurrency {}\n",
+        state.load.served(),
+        state.load.waiting(),
+        state.load.running(),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -172,6 +201,7 @@ mod tests {
         AppState {
             provider_site: Arc::from("test-site"),
             queue_depth: 0.1,
+            load: Arc::new(crate::load::Load::new(8, 0)),
         }
     }
 

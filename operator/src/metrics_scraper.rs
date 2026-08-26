@@ -176,7 +176,12 @@ pub async fn scrape_metrics(
         })?
         .to_bytes();
 
-    String::from_utf8(body_bytes.to_vec()).map_err(MetricsScrapeError::Encoding)
+    // Vec::from reclaims the buffer when this Bytes uniquely owns it, which it
+    // does whenever the body arrived in one chunk or was aggregated into one.
+    // to_vec copied the whole body unconditionally, up to the megabyte cap,
+    // once per peer per round, to hand it straight to a validator that would
+    // have been happy to read it where it lay.
+    String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)
 }
 
 // ---------------------------------------------------------------------------

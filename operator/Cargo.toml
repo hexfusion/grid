@@ -22,6 +22,7 @@ hyper-util = { workspace = true }
 scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+percent-encoding = { workspace = true }
 prometheus = { workspace = true }
 schemars = { workspace = true }
 rustls = { workspace = true }
