@@ -685,7 +685,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         );
         let clusters: Vec<String> = CLUSTERS.iter().map(|s| (*s).to_owned()).collect();
         certs::generate_all(&clusters)?;
-        eprintln!("  [OK] TLS certificates generated for pool-a, pool-b");
+        eprintln!("  [OK] TLS certificates generated for {}", CLUSTERS.join(", "));
     }
 
     // Phase 3: Create Kind clusters
@@ -1955,7 +1955,7 @@ fn seed_swim_membership() -> Result<(), Box<dyn std::error::Error>> {
 fn stage_certificates() -> Result<(), Box<dyn std::error::Error>> {
     let clusters: Vec<String> = CLUSTERS.iter().map(|s| (*s).to_owned()).collect();
     certs::generate_all(&clusters)?;
-    eprintln!("  [OK] TLS certificates generated for pool-a, pool-b");
+    eprintln!("  [OK] TLS certificates generated for {}", CLUSTERS.join(", "));
 
     certs::generate_metrics_certs(METRICS_CA_CN, METRICS_SERVER_DNS)?;
     eprintln!("  [OK] Metrics TLS certificates generated (separate CA)");

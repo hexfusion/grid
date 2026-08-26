@@ -21,7 +21,7 @@ filter_chains:
         # site and every peer the operator collected; ?target= would narrow it
         # to one site and leave the remote candidates unscored.
         load:
-          endpoint: "https://grid-operator-signals.grid-system.svc.cluster.local:9091/metrics"
+          endpoint: "https://grid-operator-signals:9091/metrics"
           queue_metric: "llm_d_epp_average_queue_size"
           collect:
             - "llm_d_epp_average_queue_size"

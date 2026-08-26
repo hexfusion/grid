@@ -370,7 +370,7 @@ spec:
                 gridNetworkRef: grid-llmd-pool-metrics
                 providerKind: vllm-vcr
                 backendKind: local
-                endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
+                endpoint: "http://vcr-service:8000"
                 siteSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: pool-a
@@ -390,7 +390,7 @@ spec:
                   path: /metrics
                   timeout: "2s"
                   staleMetricsSeconds: 20
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  metricsEndpoint: "http://llmd-epp-metrics:9090"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:
@@ -445,7 +445,7 @@ spec:
                 gridNetworkRef: grid-llmd-pool-metrics
                 providerKind: vllm-vcr
                 backendKind: local
-                endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
+                endpoint: "http://vcr-service:8000"
                 siteSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: pool-b
@@ -465,7 +465,7 @@ spec:
                   path: /metrics
                   timeout: "2s"
                   staleMetricsSeconds: 20
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  metricsEndpoint: "http://llmd-epp-metrics:9090"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:
@@ -519,7 +519,7 @@ spec:
                 gridNetworkRef: grid-llmd-pool-metrics
                 providerKind: vllm-vcr
                 backendKind: local
-                endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
+                endpoint: "http://vcr-service:8000"
                 siteSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: pool-c
@@ -539,7 +539,7 @@ spec:
                   path: /metrics
                   timeout: "2s"
                   staleMetricsSeconds: 20
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  metricsEndpoint: "http://llmd-epp-metrics:9090"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:

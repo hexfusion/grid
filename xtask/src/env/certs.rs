@@ -20,7 +20,18 @@ use sha2::{Digest as _, Sha256};
 /// A peer dials a site by its grid identity, and the gateway beside the
 /// operator reaches the same listener through this Service. Both names go on
 /// the one certificate.
-const SIGNALS_SERVICE_DNS: &str = "grid-operator-signals.grid-system.svc.cluster.local";
+///
+/// Every form of the Service name is carried, because a pod resolv.conf here
+/// sets ndots:5 and a four-dot name is tried against the search list first.
+/// One of those search domains is podman's, so the fully qualified spelling
+/// fails to resolve while the short one succeeds, and a reader has to be free
+/// to use the name that works without failing hostname verification.
+const SIGNALS_SERVICE_DNS: &[&str] = &[
+    "grid-operator-signals.grid-system.svc.cluster.local",
+    "grid-operator-signals.grid-system.svc",
+    "grid-operator-signals.grid-system",
+    "grid-operator-signals",
+];
 
 // ---------------------------------------------------------------------------
 
@@ -74,7 +85,8 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
         // The same listener answers peers by grid identity and its own
         // cluster's workloads through a Service, so one certificate has to
         // carry both names.
-        let site = generate_site_cert_with_names(&ca, name, &[SIGNALS_SERVICE_DNS.to_owned()])?;
+        let names: Vec<String> = SIGNALS_SERVICE_DNS.iter().map(|n| (*n).to_owned()).collect();
+        let site = generate_site_cert_with_names(&ca, name, &names)?;
         write_pem(&dir.join(format!("{name}-cert.pem")), &site.cert_pem)?;
         write_pem(&dir.join(format!("{name}-key.pem")), &site.key_pem)?;
         eprintln!("  generated cert for {name} (SAN: {})", site.sans.join(", "));
