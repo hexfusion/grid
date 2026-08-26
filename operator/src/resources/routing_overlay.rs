@@ -710,9 +710,7 @@ pub(crate) fn evaluate_access_policy(
     };
 
     // Check if all required labels are present and match
-    let matches = required_labels
-        .iter()
-        .all(|(required_key, required_value)| site_labels.get(required_key) == Some(required_value));
+    let matches = crate::signals::labels_satisfy(required_labels, site_labels);
 
     if matches {
         AccessPolicyResult::Allow
@@ -1643,6 +1641,59 @@ fn overlay_labels(network_name: &str, gateway_name: &str) -> BTreeMap<String, St
     reason = "tests"
 )]
 mod tests {
+
+    /// The same `accessPolicy` decided on both paths, over the same inputs.
+    ///
+    /// The gossip path evaluates it about this site, since we are the consumer
+    /// deciding whether to use a remote provider. The signals endpoint evaluates
+    /// it about the caller, since they are the consumer asking to read ours.
+    /// Different subject, and it has to be the same rule: a provider that
+    /// refuses a label set must refuse it whichever path asks.
+    #[test]
+    fn both_paths_decide_access_policy_alike() {
+        use crate::signals::{SignalStore, attribute, parse};
+
+        let gold = || BTreeMap::from([("tier".to_owned(), "gold".to_owned())]);
+        let silver = || BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
+        let unrestricted = AccessPolicy::default();
+        let restricted = AccessPolicy {
+            site_selector: crate::crd::auth::SelectorConfig { match_labels: gold() },
+        };
+
+        // (policy, reader labels, expected to be served)
+        let cases = [
+            (&unrestricted, Some(gold()), true),
+            (&unrestricted, None, true),
+            (&restricted, Some(gold()), true),
+            (&restricted, Some(silver()), false),
+            (&restricted, None, false),
+        ];
+
+        for (policy, labels, expected) in cases {
+            let overlay = match evaluate_access_policy(policy, labels.as_ref()) {
+                AccessPolicyResult::Allow => true,
+                AccessPolicyResult::Deny => false,
+                // The caller reads the empty case as allow, which is what
+                // `permits` does in one step.
+                AccessPolicyResult::Unknown => policy.site_selector.match_labels.is_empty(),
+            };
+
+            let store = SignalStore::new();
+            store.refresh(
+                BTreeMap::from([("pool".to_owned(), attribute(parse("q 1"), "east", "pool"))]),
+                std::time::Duration::from_secs(60),
+            );
+            let required = policy.site_selector.match_labels.clone();
+            if !required.is_empty() {
+                store.set_access(BTreeMap::from([("pool".to_owned(), vec![required])]));
+            }
+            let served = store.render(None, &[], labels.as_ref()).0.contains("pool");
+
+            assert_eq!(overlay, expected, "overlay disagreed for {labels:?}");
+            assert_eq!(served, expected, "signals disagreed for {labels:?}");
+        }
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------------

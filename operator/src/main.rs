@@ -110,13 +110,26 @@ async fn main() {
     // waiting on a signal nobody is left to send.
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
     tokio::spawn(watch_for_termination(trigger));
+    // Resolved once at startup. Without material the listener stays plaintext
+    // and every caller counts as in-cluster, because none can present a
+    // certificate to be told apart by.
+    let (signals_tls, signals_own_key) = Box::pin(signals_identity(&client)).await;
 
     let result = tokio::try_join!(
         run_network_controller(client.clone(), Arc::clone(&ctx)),
         run_site_controller(client.clone()),
         run_provider_controller(client.clone()),
         run_metrics_server(),
-        run_signals_server(ctx.signals(), ctx.peers()),
+        run_signals_server(
+            ctx.signals(),
+            ctx.peers(),
+            Arc::new(grid_network::local_site_labels().unwrap_or_default()),
+            SignalsIdentity {
+                peers: ctx.peer_identities(),
+                own_key: signals_own_key.clone(),
+            },
+            signals_tls.clone(),
+        ),
         run_peer_poller(Arc::clone(&ctx), swim_for_poller, client.clone(), shutdown.clone()),
         run_local_scraper(Arc::clone(&ctx), client.clone()),
     );
@@ -594,19 +607,176 @@ async fn run_metrics_server() -> Result<(), Box<dyn std::error::Error + Send + S
 async fn run_signals_server(
     site: operator::signals::SignalStore,
     peers: operator::signals::SignalStore,
+    local_labels: Arc<BTreeMap<String, String>>,
+    identity: SignalsIdentity,
+    tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("GRID_SIGNALS_ADDR").unwrap_or_else(|_| "0.0.0.0:9091".to_owned());
     let app = axum::Router::new()
         .route("/metrics", axum::routing::get(signals_handler))
-        // Until the listener terminates TLS, no caller can present a peer
-        // certificate, so every request is treated as in-cluster.
-        .layer(axum::Extension(Caller::Local))
-        .with_state(Published { site, peers });
+        .with_state(Published {
+            site,
+            peers,
+            local_labels,
+        });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound_addr = listener.local_addr().map_or_else(|_| addr.clone(), |a| a.to_string());
-    tracing::info!(addr = %bound_addr, "signals server started");
-    axum::serve(listener, app).await?;
-    Ok(())
+
+    let Some(tls) = tls else {
+        // No configured material, so nobody can present a key and nobody can be
+        // named. Serving local scope here is a development convenience and the
+        // log says so, because an unauthenticated listener carrying cross-site
+        // load is exactly what the rest of this path exists to prevent.
+        tracing::warn!(
+            addr = %bound_addr,
+            tls = false,
+            "signals server started without TLS: every caller is served local scope"
+        );
+        let app = app.layer(axum::Extension(Caller::Local));
+        axum::serve(listener, app).await?;
+        return Ok(());
+    };
+
+    tracing::info!(addr = %bound_addr, tls = true, "signals server started");
+    serve_signals_tls(listener, app, tls, identity).await
+}
+
+/// Accept signals connections, deciding scope from the certificate presented.
+///
+/// Client auth is optional, so the handshake tells a peer from a local
+/// consumer: one presents a certificate the grid CA signed, the other does not.
+/// Scope is fixed here, before any request parameter is read, so a caller
+/// cannot widen what it receives by asking differently.
+async fn serve_signals_tls(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    tls: Arc<rustls::ServerConfig>,
+    identity: SignalsIdentity,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    #[expect(
+        clippy::infinite_loop,
+        reason = "serves for the process lifetime alongside the controllers"
+    )]
+    loop {
+        let Ok((stream, remote)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(serve_signals_connection(
+            acceptor.clone(),
+            app.clone(),
+            stream,
+            remote,
+            identity.clone(),
+        ));
+    }
+}
+
+/// Who a connection speaks for, decided from the key it presented.
+///
+/// Every caller is named by a key. A peer holds one this site wrote down in a
+/// `GridSite`; this site's own workloads hold the site certificate itself,
+/// which the operator already loads to serve this listener and so can recognise
+/// without anybody declaring it.
+///
+/// Nothing is trusted for presenting nothing. A caller with no certificate, or
+/// one carrying a key nobody declared, is served nothing, so refusing a peer
+/// cannot be undone by reconnecting without credentials.
+fn caller_for(
+    presented: Option<&[rustls::pki_types::CertificateDer<'static>]>,
+    identity: &SignalsIdentity,
+    remote: SocketAddr,
+) -> Caller {
+    let Some(leaf) = presented.and_then(<[_]>::first) else {
+        tracing::debug!(%remote, "signals caller presented no certificate");
+        return Caller::Peer(None);
+    };
+    let fingerprint = operator::signals::leaf_fingerprint(leaf);
+    if identity.own_key.as_deref() == Some(fingerprint.as_str()) {
+        return Caller::Local;
+    }
+    let named = identity.peers.resolve_by_key(&fingerprint);
+    if named.is_none() {
+        tracing::debug!(%remote, "signals caller presented a key this site has not declared");
+    }
+    Caller::Peer(named)
+}
+
+/// Handshake one connection, then serve it with the scope its certificate earns.
+#[expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")]
+async fn serve_signals_connection(
+    acceptor: tokio_rustls::TlsAcceptor,
+    app: axum::Router,
+    stream: tokio::net::TcpStream,
+    remote: SocketAddr,
+    identity: SignalsIdentity,
+) {
+    let Ok(stream) = acceptor.accept(stream).await else {
+        tracing::debug!(%remote, "signals handshake failed");
+        return;
+    };
+    let caller = caller_for(stream.get_ref().1.peer_certificates(), &identity, remote);
+    let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+        use tower::Service as _;
+        let mut request = request;
+        request.extensions_mut().insert(caller.clone());
+        app.clone().call(request)
+    });
+    let io = hyper_util::rt::TokioIo::new(stream);
+    if let Err(error) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .await
+    {
+        tracing::debug!(%remote, %error, "signals connection ended");
+    }
+}
+
+/// TLS material for the signals listener, or `None` to serve plaintext.
+///
+/// Read once. A network without configured TLS, or material that cannot be
+/// read, leaves the listener plaintext rather than refusing to start, so a
+/// grid that never wanted peer TLS is unaffected.
+async fn signals_identity(client: &Client) -> (Option<Arc<rustls::ServerConfig>>, Option<String>) {
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let network = networks
+        .list(&kube::api::ListParams::default())
+        .await
+        .ok()
+        .and_then(|list| list.items.into_iter().next());
+    let Some(network) = network else {
+        return (None, None);
+    };
+    (
+        Box::pin(signals_listener_tls(&network, client)).await,
+        Box::pin(signals_own_key(&network, client)).await,
+    )
+}
+
+/// TLS for the listener, or `None` when nothing is configured.
+async fn signals_listener_tls(network: &GridNetwork, client: &Client) -> Option<Arc<rustls::ServerConfig>> {
+    match grid_network::signals_server_config(network, client).await {
+        Ok(config) => {
+            if config.is_none() {
+                tracing::info!("signals TLS not configured; nobody can be named");
+            }
+            config
+        },
+        Err(error) => {
+            tracing::warn!(%error, "signals TLS unavailable; serving plaintext");
+            None
+        },
+    }
+}
+
+/// This site's own certificate fingerprint, for recognising its own workloads.
+async fn signals_own_key(network: &GridNetwork, client: &Client) -> Option<String> {
+    match grid_network::signals_own_key(network, client).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(%error, "this site's own certificate is unreadable; its workloads cannot be recognised");
+            None
+        },
+    }
 }
 
 /// Scrape this site's providers on their own interval and publish the result.
@@ -738,11 +908,15 @@ async fn poll_peers_once(
     port: u16,
     scheme: &str,
 ) {
+    // A refusal is symmetric: a peer this site will not answer is a peer this
+    // site does not read from either.
+    let identities = ctx.peer_identities();
     let snapshot = swim.snapshot();
     let alive = snapshot
         .members
         .iter()
         .filter(|m| m.status == operator::swim::MemberStatus::Alive)
+        .filter(|m| !identities.refuses(&m.site_id))
         .map(|m| (m.site_id.as_str(), m.endpoint.as_str()));
     let sites = operator::signals::peer_sites(alive, swim.site_name(), port, scheme);
     if sites.is_empty() {
@@ -834,16 +1008,34 @@ fn parse_env_or<T: std::str::FromStr + std::fmt::Display + Copy>(name: &str, fal
 ///
 /// A peer presented a certificate signed by the grid CA and speaks for another
 /// site. Anything else is in-cluster and is served the whole grid.
-#[expect(
-    dead_code,
-    reason = "Peer is set once the listener terminates TLS; until then no caller can present a certificate"
-)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Caller {
-    /// Another site.
-    Peer,
+    /// Another site, named by the certificate it presented.
+    ///
+    /// Carries the labels this site holds for that peer, so a policy is matched
+    /// against local record rather than against the peer's own claim.
+    ///
+    /// `None` when this site holds no record for the name, holds one that
+    /// refuses reads, or holds pins the presented key does not match. A peer
+    /// this site cannot place is served nothing at all: deleting its record is
+    /// how a site is cut off, and an unrestricted target is unrestricted
+    /// within this cluster rather than to the grid.
+    Peer(Option<BTreeMap<String, String>>),
     /// A consumer inside this cluster.
     Local,
+}
+
+/// How a caller is named on the signals listener.
+///
+/// The two travel together everywhere: a peer is matched against what its
+/// `GridSite` declares, and this site's own workloads against the certificate
+/// the operator already serves with.
+#[derive(Clone)]
+struct SignalsIdentity {
+    /// Keys peers have declared, and the labels held for each.
+    peers: operator::signals::PeerIdentities,
+    /// This site's own certificate fingerprint, when it has one.
+    own_key: Option<String>,
 }
 
 /// Everything this operator publishes.
@@ -853,6 +1045,12 @@ struct Published {
     site: operator::signals::SignalStore,
     /// What peers reported about themselves.
     peers: operator::signals::SignalStore,
+    /// Labels a local consumer reads as, which are this site's own.
+    ///
+    /// A peer reads as itself, and naming it needs the identity in its
+    /// certificate rather than this. Until that lands a peer is unnamed, so a
+    /// restricted target is withheld from it.
+    local_labels: Arc<BTreeMap<String, String>>,
 }
 
 /// Serve provider signals, following the multi-target exporter pattern.
@@ -878,13 +1076,45 @@ async fn signals_handler(
 
     // Scope is decided from the connection before any parameter is read, so a
     // request cannot widen it. A peer receives this site alone.
-    let (mut body, mut oldest) = published.site.render(target, &collect);
+    // A peer this site holds nothing for is served nothing, rather than being
+    // served whatever happens to carry no policy. Local callers share this
+    // cluster's trust and read as this site.
+    let reader = match &caller {
+        Caller::Local => &*published.local_labels,
+        Caller::Peer(Some(labels)) => labels,
+        Caller::Peer(None) => return refused(),
+    };
+    let reader = Some(reader);
+    let (mut body, mut oldest) = published.site.render(target, &collect, reader);
     if caller == Caller::Local {
-        let (relayed, relayed_age) = published.peers.render(target, &collect);
+        let (relayed, relayed_age) = published.peers.render(target, &collect, reader);
         body.push_str(&relayed);
         oldest = oldest.max(relayed_age);
     }
 
+    served(body, oldest)
+}
+
+/// Refuse a caller this site will not serve.
+///
+/// A status rather than an empty body, because the two mean different things to
+/// whoever is reading. An empty exposition says nothing is held right now, which
+/// a peer operator would chase as a fault; a refusal says the answer will not
+/// change until an administrator changes it.
+///
+/// The reason is deliberately the same for every cause. A caller learns that it
+/// is refused, and not whether the name is unknown, the record refuses reads, or
+/// a pinned key did not match.
+fn refused() -> axum::response::Response {
+    (
+        http::StatusCode::FORBIDDEN,
+        "signals: caller is not permitted to read this site\n",
+    )
+        .into_response()
+}
+
+/// One exposition response, with `Age` bounding the whole body.
+fn served(body: String, oldest: std::time::Duration) -> axum::response::Response {
     (
         [
             (http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
@@ -912,6 +1142,135 @@ async fn health_handler() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store holding one observation attributed to `site`.
+    fn store_for(site: &str) -> operator::signals::SignalStore {
+        let store = operator::signals::SignalStore::new();
+        let observations = operator::signals::attribute(
+            operator::signals::parse("llm_d_epp_average_queue_size{name=\"pool\"} 7"),
+            site,
+            "provider",
+        );
+        let mut collected = BTreeMap::new();
+        collected.insert("provider".to_owned(), observations);
+        store.refresh(collected, std::time::Duration::from_secs(60));
+        store
+    }
+
+    async fn body_for(caller: Caller) -> String {
+        body_for_scoped(caller, store_for("this-site"), Arc::new(BTreeMap::new())).await
+    }
+
+    /// Serve one request against a given local store and reader identity.
+    async fn body_for_scoped(
+        caller: Caller,
+        site: operator::signals::SignalStore,
+        local_labels: Arc<BTreeMap<String, String>>,
+    ) -> String {
+        let (_, body) = status_and_body(caller, site, local_labels).await;
+        body
+    }
+
+    /// Serve one request and report both what it answered and what it said.
+    async fn status_and_body(
+        caller: Caller,
+        site: operator::signals::SignalStore,
+        local_labels: Arc<BTreeMap<String, String>>,
+    ) -> (http::StatusCode, String) {
+        let published = Published {
+            site,
+            peers: store_for("a-peer"),
+            local_labels,
+        };
+        let response = signals_handler(
+            axum::extract::State(published),
+            axum::Extension(caller),
+            axum::extract::Query(Vec::new()),
+        )
+        .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A caller presenting `leaf`, against a site whose own key is `own`.
+    fn caller_of(leaf: Option<&[u8]>, own: Option<&str>) -> Caller {
+        let der = leaf.map(|b| vec![rustls::pki_types::CertificateDer::from(b.to_vec())]);
+        caller_for(
+            der.as_deref(),
+            &SignalsIdentity {
+                peers: operator::signals::PeerIdentities::new(),
+                own_key: own.map(ToOwned::to_owned),
+            },
+            "10.0.0.1:1".parse().unwrap_or_else(|_| std::process::abort()),
+        )
+    }
+
+    #[test]
+    fn presenting_nothing_is_not_a_way_to_be_local() {
+        // The bypass this closes: a refused peer reconnecting without a
+        // certificate used to be served everything as an in-cluster consumer.
+        assert_eq!(
+            caller_of(None, Some("aa")),
+            Caller::Peer(None),
+            "no certificate names nobody, so a refusal cannot be undone by omitting one"
+        );
+    }
+
+    #[test]
+    fn this_sites_own_key_is_recognised_without_being_declared() {
+        let own = operator::signals::leaf_fingerprint(b"site-cert");
+        assert_eq!(
+            caller_of(Some(b"site-cert"), Some(&own)),
+            Caller::Local,
+            "a workload holding this site's certificate speaks for this site"
+        );
+    }
+
+    #[test]
+    fn another_key_is_not_this_site() {
+        let own = operator::signals::leaf_fingerprint(b"site-cert");
+        assert_eq!(
+            caller_of(Some(b"somebody-else"), Some(&own)),
+            Caller::Peer(None),
+            "an undeclared key is a peer this site holds nothing for, never local"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_peer_is_told_so() {
+        // Site A's administrator deleted site B's record, or marked it denied.
+        // B has to learn that the answer will not change, rather than reading
+        // an empty exposition and chasing it as a fault.
+        let (status, body) =
+            status_and_body(Caller::Peer(None), store_for("this-site"), Arc::new(BTreeMap::new())).await;
+        assert_eq!(
+            status,
+            http::StatusCode::FORBIDDEN,
+            "a refusal is a status, not silence"
+        );
+        assert!(!body.contains("this-site"), "and carries none of this site: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_named_peer_is_served_this_site() {
+        let body = body_for(Caller::Peer(Some(BTreeMap::new()))).await;
+        assert!(
+            body.contains("this-site"),
+            "a placed peer still reads this site: {body}"
+        );
+        assert!(!body.contains("a-peer"), "and nothing relayed about another: {body}");
+    }
+
+
+    #[tokio::test]
+    async fn a_local_consumer_receives_everything_held() {
+        let body = body_for(Caller::Local).await;
+        assert!(body.contains("this-site"), "a local caller receives this site: {body}");
+        assert!(body.contains("a-peer"), "and everything relayed: {body}");
+    }
 
     #[test]
     fn lease_from_seeds_reserves_full_disjoint_block() {

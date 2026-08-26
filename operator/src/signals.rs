@@ -193,6 +193,138 @@ struct Cached {
 pub struct SignalStore {
     /// Target to what is held for it.
     inner: Arc<RwLock<BTreeMap<String, Cached>>>,
+    /// Target to the selectors a reader must satisfy to be served it.
+    ///
+    /// Every selector in the list applies, so routing permission and metrics
+    /// readability compose without either widening the other. Two selectors
+    /// demanding different values for one key deny everyone, which is what
+    /// asking for both should mean.
+    ///
+    /// Held apart from the samples because the two move at different rates: a
+    /// policy changes when its provider is edited, samples change every scrape.
+    access: Arc<RwLock<AccessMap>>,
+}
+
+/// SHA-256 of a DER certificate, lowercase hex.
+///
+/// The key [`PeerIdentities`] is built on. Matches the canonical fingerprint the
+/// gateway probe pins with, so a site is known by one hash everywhere.
+#[must_use]
+pub fn leaf_fingerprint(der: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(der).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What this site holds about one peer.
+#[derive(Clone, Debug, Default)]
+pub struct PeerRecord {
+    /// Labels a policy is matched against.
+    ///
+    /// The local `GridSite` object's, never the peer's own claim: a peer that
+    /// asserted its labels could assert past any policy written about it.
+    pub labels: BTreeMap<String, String>,
+
+    /// Optional leaf fingerprints, from `spec.trust.canonicalFingerprints`.
+    ///
+    /// Empty is the normal case, and then the certificate's own name is what
+    /// identifies the caller. A pin narrows that to specific key material,
+    /// which is worth having where certificates are deliberately long lived and
+    /// a burden where they rotate, since every renewal changes the hash.
+    pub pins: Vec<String>,
+}
+
+/// Who may read, resolved from the certificate a caller presents.
+///
+/// Keyed by site name, because that is what a certificate carries in its DNS
+/// SAN and what survives a renewal. Naming a caller therefore costs nothing
+/// when its key rotates, which is the difference between an identity and a
+/// maintenance burden.
+#[derive(Clone, Debug, Default)]
+pub struct PeerIdentities {
+    /// Site name to what is held for it.
+    inner: Arc<RwLock<BTreeMap<String, PeerRecord>>>,
+}
+
+impl PeerIdentities {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace what is known about every peer.
+    pub fn set(&self, identities: BTreeMap<String, PeerRecord>) {
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = identities;
+        }
+    }
+
+    /// Whether this site refuses `site` outright.
+    ///
+    /// True when no record is held for the name, or the record refuses. Read
+    /// before polling as well as before serving, so a refusal stops traffic in
+    /// both directions.
+    #[must_use]
+    pub fn refuses(&self, site: &str) -> bool {
+        let Ok(held) = self.inner.read() else {
+            return true;
+        };
+        held.get(site).is_none_or(|record| record.pins.is_empty())
+    }
+
+    /// Labels for a caller presenting `leaf_sha256`.
+    ///
+    /// The declared key is the identity: a record names the fingerprints it will
+    /// accept, so a caller is whoever holds one of them. A key nobody declared
+    /// names nobody, which is what makes an unknown peer refused rather than
+    /// merely unprivileged.
+    ///
+    /// Preferred over reading a name out of the certificate because a stolen CA
+    /// can mint any name and cannot mint another site's key.
+    ///
+    /// Scans rather than indexes: a grid is sites, not endpoints, and the cost
+    /// is a handful of string comparisons on a connection that just completed a
+    /// TLS handshake.
+    #[must_use]
+    pub fn resolve_by_key(&self, leaf_sha256: &str) -> Option<BTreeMap<String, String>> {
+        let Ok(held) = self.inner.read() else {
+            return None;
+        };
+        let labels = held
+            .values()
+            .find(|record| record.pins.iter().any(|pin| pin == leaf_sha256))
+            .map(|record| record.labels.clone());
+        drop(held);
+        labels
+    }
+}
+
+/// Selectors a reader must satisfy, all of them, to be served one target.
+pub type Selectors = Vec<BTreeMap<String, String>>;
+
+/// Access rules per target.
+pub type AccessMap = BTreeMap<String, Selectors>;
+
+/// Whether `have` carries every label `required` demands.
+///
+/// The one place this rule is written. `evaluate_access_policy` calls it too,
+/// so an overlay decision and an endpoint decision cannot disagree.
+#[must_use]
+pub fn labels_satisfy(required: &BTreeMap<String, String>, have: &BTreeMap<String, String>) -> bool {
+    required.iter().all(|(key, value)| have.get(key) == Some(value))
+}
+
+/// Whether a reader carrying `have` may be served a target.
+///
+/// Every selector applies. Fails closed: a restricted target is withheld from a
+/// reader whose labels are unknown, which is what `AccessPolicyResult::Unknown`
+/// means on the overlay.
+#[must_use]
+fn permits(required: &Selectors, have: Option<&BTreeMap<String, String>>) -> bool {
+    if required.iter().all(BTreeMap::is_empty) {
+        return true;
+    }
+    have.is_some_and(|labels| required.iter().all(|selector| labels_satisfy(selector, labels)))
 }
 
 impl SignalStore {
@@ -200,6 +332,16 @@ impl SignalStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the access rules for every target.
+    ///
+    /// A target absent from `access` is unrestricted, which is what an empty
+    /// `siteSelector` means on the provider.
+    pub fn set_access(&self, access: AccessMap) {
+        if let Ok(mut guard) = self.access.write() {
+            *guard = access;
+        }
     }
 
     /// Refresh the given targets and drop anything past its deadline.
@@ -225,14 +367,39 @@ impl SignalStore {
         guard.retain(|_, held| held.expires_at > now);
     }
 
+    /// Targets this reader may not be served.
+    ///
+    /// Decided before the samples are locked, so a denial costs no work and the
+    /// two locks are never held together.
+    fn denied(&self, reader: Option<&BTreeMap<String, String>>) -> std::collections::BTreeSet<String> {
+        let Ok(access) = self.access.read() else {
+            return std::collections::BTreeSet::new();
+        };
+        access
+            .iter()
+            .filter(|(_, required)| !permits(required, reader))
+            .map(|(target, _)| target.clone())
+            .collect()
+    }
+
     /// Render exposition for `target`, or for every target when it is `None`.
     ///
-    /// `collect` narrows to the named metrics; empty returns all of them.
+    /// `reader` is the site labels the caller carries, established from the
+    /// connection rather than from a parameter. A target the reader may not see
+    /// is never rendered, so a denial withholds data rather than trimming it
+    /// afterwards. `collect` then narrows within what the reader is allowed,
+    /// which is why permission is read first and cannot be widened by asking.
     ///
     /// Returns the body and the age of its oldest value, so `Age` bounds the
     /// whole response rather than describing it on average.
     #[must_use]
-    pub fn render(&self, target: Option<&str>, collect: &[String]) -> (String, Duration) {
+    pub fn render(
+        &self,
+        target: Option<&str>,
+        collect: &[String],
+        reader: Option<&BTreeMap<String, String>>,
+    ) -> (String, Duration) {
+        let denied = self.denied(reader);
         let Ok(guard) = self.inner.read() else {
             return (String::new(), Duration::ZERO);
         };
@@ -242,6 +409,9 @@ impl SignalStore {
         let mut oldest = Duration::ZERO;
         for (name, held) in guard.iter() {
             if held.expires_at <= now || target.is_some_and(|t| t != name) {
+                continue;
+            }
+            if denied.contains(name.as_str()) {
                 continue;
             }
             // TTL is measured against a monotonic instant, immune to clock
@@ -1014,6 +1184,297 @@ mod tests {
         assert_eq!(names, vec!["q".to_owned()], "only the plain gauge survives: {names:?}");
     }
 
+    /// Labels a restricted provider demands.
+    fn gold() -> BTreeMap<String, String> {
+        BTreeMap::from([("tier".to_owned(), "gold".to_owned())])
+    }
+
+    /// A store holding one restricted target and one open one.
+    fn restricted_store() -> SignalStore {
+        let store = SignalStore::new();
+        store.refresh(
+            BTreeMap::from([
+                ("secret-pool".to_owned(), attribute(scraped(), "east", "secret-pool")),
+                ("open-pool".to_owned(), attribute(scraped(), "east", "open-pool")),
+            ]),
+            Duration::from_secs(60),
+        );
+        store.set_access(BTreeMap::from([("secret-pool".to_owned(), vec![gold()])]));
+        store
+    }
+
+
+    #[test]
+    fn removing_the_declared_key_refuses_the_peer() {
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([(
+            "site-a".to_owned(),
+            PeerRecord {
+                labels: gold(),
+                pins: Vec::new(),
+            },
+        )]));
+        assert_eq!(
+            identities.resolve_by_key(&"ab".repeat(32)),
+            None,
+            "a record declaring no key names nobody, whatever labels it carries"
+        );
+        assert!(identities.refuses("site-a"), "and it is not polled either");
+    }
+
+    #[test]
+    fn a_peer_is_named_by_the_key_it_presents() {
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([(
+            "site-c".to_owned(),
+            PeerRecord {
+                labels: gold(),
+                pins: vec!["ab".repeat(32)],
+            },
+        )]));
+        assert_eq!(
+            identities.resolve_by_key(&"ab".repeat(32)),
+            Some(gold()),
+            "a declared key carries the labels held for its site"
+        );
+        assert_eq!(
+            identities.resolve_by_key(&"cd".repeat(32)),
+            None,
+            "a key nobody declared names nobody"
+        );
+    }
+
+    #[test]
+    fn site_b_is_refused_while_site_c_is_served() {
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            (
+                "site-c".to_owned(),
+                PeerRecord {
+                    labels: gold(),
+                    pins: vec!["cc".repeat(32)],
+                },
+            ),
+            (
+                "site-b".to_owned(),
+                PeerRecord {
+                    labels: BTreeMap::from([("tier".to_owned(), "silver".to_owned())]),
+                    pins: vec!["bb".repeat(32)],
+                },
+            ),
+        ]));
+        let store = restricted_store();
+
+        let silver = identities.resolve_by_key(&"bb".repeat(32)).expect("site-b is declared");
+        let denied = store.render(None, &[], Some(&silver)).0;
+        assert!(
+            !denied.contains("secret-pool"),
+            "site-b is denied the restricted pool: {denied}"
+        );
+
+        let matching = identities.resolve_by_key(&"cc".repeat(32)).expect("site-c is declared");
+        let served = store.render(None, &[], Some(&matching)).0;
+        assert!(served.contains("secret-pool"), "site-c is served it: {served}");
+    }
+
+    #[test]
+    fn rotating_a_key_needs_the_record_updated() {
+        // The cost of the declared key being the identity, written down so it is
+        // a decision rather than a surprise. canonicalFingerprints takes two
+        // entries so an overlap can be declared before the switch.
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([(
+            "site-c".to_owned(),
+            PeerRecord {
+                labels: gold(),
+                pins: vec!["ab".repeat(32), "cd".repeat(32)],
+            },
+        )]));
+        assert_eq!(identities.resolve_by_key(&"ab".repeat(32)), Some(gold()), "the old key");
+        assert_eq!(
+            identities.resolve_by_key(&"cd".repeat(32)),
+            Some(gold()),
+            "and the new one"
+        );
+        assert_eq!(
+            identities.resolve_by_key(&"ef".repeat(32)),
+            None,
+            "an undeclared third is nobody"
+        );
+    }
+
+    #[test]
+    fn a_refusal_stops_traffic_in_both_directions() {
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            (
+                "site-b".to_owned(),
+                PeerRecord {
+                    labels: gold(),
+                    pins: Vec::new(),
+                },
+            ),
+            (
+                "site-c".to_owned(),
+                PeerRecord {
+                    labels: gold(),
+                    pins: vec!["cd".repeat(32)],
+                },
+            ),
+        ]));
+
+        assert!(identities.refuses("site-b"), "site-b is not polled");
+        assert_eq!(
+            identities.resolve_by_key(&"ab".repeat(32)),
+            None,
+            "and no key reaches it"
+        );
+
+        assert!(!identities.refuses("site-c"), "site-c is still polled");
+        assert_eq!(
+            identities.resolve_by_key(&"cd".repeat(32)),
+            Some(gold()),
+            "and its declared key is served"
+        );
+    }
+
+
+    #[test]
+    fn a_fingerprint_is_stable_and_distinguishing() {
+        assert_eq!(leaf_fingerprint(b"a").len(), 64, "sha256 as lowercase hex");
+        assert_eq!(leaf_fingerprint(b"a"), leaf_fingerprint(b"a"), "stable");
+        assert_ne!(leaf_fingerprint(b"a"), leaf_fingerprint(b"b"), "distinguishing");
+    }
+
+    #[test]
+    fn a_denied_target_is_never_rendered() {
+        let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
+        let body = restricted_store().render(None, &[], Some(&silver)).0;
+        assert!(
+            !body.contains("secret-pool"),
+            "a reader the policy denies is served nothing for that target: {body}"
+        );
+        assert!(
+            body.contains("open-pool"),
+            "and still receives what it may read: {body}"
+        );
+    }
+
+    #[test]
+    fn a_matching_reader_is_served_the_restricted_target() {
+        let body = restricted_store().render(None, &[], Some(&gold())).0;
+        assert!(body.contains("secret-pool"), "labels satisfy the selector: {body}");
+    }
+
+    #[test]
+    fn an_unnamed_reader_is_denied_a_restricted_target() {
+        let body = restricted_store().render(None, &[], None).0;
+        assert!(
+            !body.contains("secret-pool"),
+            "identity unknown fails closed rather than open: {body}"
+        );
+        assert!(
+            body.contains("open-pool"),
+            "an unrestricted target still serves: {body}"
+        );
+    }
+
+    #[test]
+    fn naming_a_denied_target_does_not_reach_it() {
+        let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
+        let body = restricted_store().render(Some("secret-pool"), &[], Some(&silver)).0;
+        assert_eq!(body, "", "a parameter cannot widen what the connection decided");
+    }
+
+    #[test]
+    fn two_callers_see_different_scrapes() {
+        // Six pools. site-a may read one, site-b may read all. One endpoint,
+        // one store, two responses.
+        let store = SignalStore::new();
+        let mut held = BTreeMap::new();
+        let mut access = BTreeMap::new();
+        for n in 1..=6 {
+            let pool = format!("pool{n}");
+            held.insert(pool.clone(), attribute(scraped(), "east", &pool));
+            if n > 1 {
+                access.insert(pool, vec![gold()]);
+            }
+        }
+        store.refresh(held, Duration::from_secs(60));
+        store.set_access(access);
+
+        let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
+        let restricted = store.render(None, &[], Some(&silver)).0;
+        let full = store.render(None, &[], Some(&gold())).0;
+
+        assert!(
+            restricted.contains("pool1"),
+            "site-a reads the one it may: {restricted}"
+        );
+        for n in 2..=6 {
+            assert!(
+                !restricted.contains(&format!("pool{n}")),
+                "and none of the other five: {restricted}"
+            );
+        }
+        for n in 1..=6 {
+            assert!(full.contains(&format!("pool{n}")), "site-b reads all six: {full}");
+        }
+        assert_eq!(restricted.lines().filter(|l| !l.is_empty()).count(), 1);
+        assert_eq!(full.lines().filter(|l| !l.is_empty()).count(), 6);
+    }
+
+    #[test]
+    fn collect_cannot_reach_a_denied_target() {
+        // `collect[]` is chosen by the caller, so it narrows within what the
+        // caller may see and can never name past the policy.
+        let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
+        let body = restricted_store().render(None, &[QUEUE.to_owned()], Some(&silver)).0;
+        assert!(
+            !body.contains("secret-pool"),
+            "asking for the metric by name does not reach a denied provider: {body}"
+        );
+        assert!(
+            body.contains("open-pool"),
+            "and the same request still returns what the caller may read: {body}"
+        );
+    }
+
+    #[test]
+    fn a_denied_provider_leaves_no_trace_in_the_response() {
+        // Absent, not zeroed and not redacted. A reader cannot tell a denied
+        // provider from one that does not exist or is not reporting.
+        let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
+        let denied = restricted_store().render(None, &[], Some(&silver)).0;
+        let served = restricted_store().render(None, &[], Some(&gold())).0;
+        let lines = |body: &str| body.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            lines(&denied),
+            lines(&served) - 1,
+            "exactly the denied provider's series are missing, nothing else changes"
+        );
+        assert!(!denied.contains("secret-pool"), "no label, no name, no line: {denied}");
+    }
+
+    #[test]
+    fn every_selector_has_to_be_satisfied() {
+        let store = SignalStore::new();
+        store.refresh(
+            BTreeMap::from([("pool-a".to_owned(), attribute(scraped(), "east", "pool-a"))]),
+            Duration::from_secs(60),
+        );
+        // Routing allows the reader, a metrics-specific selector does not.
+        store.set_access(BTreeMap::from([(
+            "pool-a".to_owned(),
+            vec![gold(), BTreeMap::from([("audit".to_owned(), "yes".to_owned())])],
+        )]));
+        assert_eq!(
+            store.render(None, &[], Some(&gold())).0,
+            "",
+            "satisfying one selector is not satisfying both"
+        );
+    }
+
     #[test]
     fn target_selects_one_provider() {
         let store = SignalStore::new();
@@ -1024,11 +1485,11 @@ mod tests {
             ]),
             Duration::from_secs(60),
         );
-        let (one, _) = store.render(Some("pool-a"), &[]);
+        let (one, _) = store.render(Some("pool-a"), &[], None);
         assert!(one.contains(r#"grid_provider="pool-a""#), "the asked-for target: {one}");
         assert!(!one.contains(r#"grid_provider="pool-b""#), "and only that one: {one}");
         assert_eq!(
-            store.render(None, &[]).0.lines().count(),
+            store.render(None, &[], None).0.lines().count(),
             2,
             "no target returns every target"
         );
@@ -1042,12 +1503,12 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(
-            store.render(None, &[QUEUE.to_owned()]).0.lines().count(),
+            store.render(None, &[QUEUE.to_owned()], None).0.lines().count(),
             1,
             "the named signal"
         );
         assert_eq!(
-            store.render(None, &["absent".to_owned()]).0.lines().count(),
+            store.render(None, &["absent".to_owned()], None).0.lines().count(),
             0,
             "and nothing else"
         );
@@ -1060,7 +1521,7 @@ mod tests {
             BTreeMap::from([("pool-a".to_owned(), scraped())]),
             Duration::from_secs(60),
         );
-        let (_, age) = store.render(None, &[]);
+        let (_, age) = store.render(None, &[], None);
         assert!(
             age < Duration::from_secs(1),
             "a value just collected is reported as new: {age:?}"
@@ -1071,7 +1532,7 @@ mod tests {
     fn a_target_nothing_refreshes_stops_being_served() {
         let store = SignalStore::new();
         store.refresh(BTreeMap::from([("pool-a".to_owned(), scraped())]), Duration::ZERO);
-        assert_eq!(store.render(None, &[]).0, "", "absence is what says it is stale");
+        assert_eq!(store.render(None, &[], None).0, "", "absence is what says it is stale");
     }
 
     #[test]
