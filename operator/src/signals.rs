@@ -259,13 +259,47 @@ impl PeerIdentities {
         }
     }
 
+    /// The record key for a SWIM site id.
+    ///
+    /// A discovered peer's `GridSite` is named `{network}-{site}`, so the id
+    /// gossip carries is not the object name. Falls back to a unique suffix
+    /// match, and refuses an ambiguous one rather than guessing.
+    fn key_for(held: &BTreeMap<String, PeerRecord>, site: &str) -> Option<String> {
+        if held.contains_key(site) {
+            return Some(site.to_owned());
+        }
+        let sanitised: String = site
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let suffix = format!("-{}", sanitised.trim_matches('-'));
+        let mut found = None;
+        for name in held.keys() {
+            if name.ends_with(&suffix) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(name.clone());
+            }
+        }
+        found
+    }
+
     /// Fingerprints declared for `site`, empty when none are.
     #[must_use]
     pub fn pins_for(&self, site: &str) -> Vec<String> {
         let Ok(held) = self.inner.read() else {
             return Vec::new();
         };
-        held.get(site).map(|record| record.pins.clone()).unwrap_or_default()
+        Self::key_for(&held, site)
+            .and_then(|key| held.get(&key).map(|record| record.pins.clone()))
+            .unwrap_or_default()
     }
 
     /// Whether this site refuses `site` outright.
@@ -278,7 +312,9 @@ impl PeerIdentities {
         let Ok(held) = self.inner.read() else {
             return true;
         };
-        held.get(site).is_none_or(|record| record.pins.is_empty())
+        Self::key_for(&held, site)
+            .and_then(|key| held.get(&key))
+            .is_none_or(|record| record.pins.is_empty())
     }
 
     /// Labels for a caller presenting `leaf_sha256`.
@@ -1651,5 +1687,58 @@ q{pool=\"d\"} 0.35
             kept.iter().all(|o| o.value.is_finite()),
             "a non-finite score outranks every finite one at the consumer"
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod peer_key_tests {
+    use super::*;
+
+    fn identities(names: &[&str]) -> PeerIdentities {
+        let held = names
+            .iter()
+            .map(|n| {
+                (
+                    (*n).to_owned(),
+                    PeerRecord {
+                        labels: BTreeMap::new(),
+                        pins: vec!["ab".repeat(32)],
+                    },
+                )
+            })
+            .collect();
+        let ids = PeerIdentities::new();
+        ids.set(held);
+        ids
+    }
+
+    #[test]
+    fn a_gossiped_site_id_finds_its_prefixed_object() {
+        // The peer announces "pool-b"; its GridSite is "{network}-pool-b".
+        let held = identities(&["grid-llmd-pool-metrics-pool-b", "pool-a"]);
+        assert!(!held.refuses("pool-b"), "a declared peer must be polled");
+        assert_eq!(held.pins_for("pool-b").len(), 1);
+    }
+
+    #[test]
+    fn an_exact_name_still_wins() {
+        let held = identities(&["pool-b"]);
+        assert!(!held.refuses("pool-b"));
+    }
+
+    #[test]
+    fn an_ambiguous_suffix_refuses() {
+        // Two networks holding the same site name must not be guessed between.
+        let held = identities(&["net-one-pool-b", "net-two-pool-b"]);
+        assert!(held.refuses("pool-b"), "ambiguity must fail closed");
+        assert!(held.pins_for("pool-b").is_empty());
+    }
+
+    #[test]
+    fn an_unknown_site_still_refuses() {
+        let held = identities(&["grid-pool-b"]);
+        assert!(held.refuses("pool-z"));
     }
 }
