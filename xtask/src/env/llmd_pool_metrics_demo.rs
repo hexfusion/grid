@@ -923,8 +923,8 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
                     if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
                         let epp_b =
                             scrape_epp_metrics("pool-b", context.metrics_transport == MetricsTransport::MtlsProxy);
-                        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
-                        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
+                        let row_a = build_scorecard_row(&site_label("pool-a"), &candidates, "pool-a", &epp_a);
+                        let row_b = build_scorecard_row(&site_label("pool-b"), &candidates, "pool-b", &epp_b);
                         eprintln!("  [BASELINE] Request attributed to pool-a -- baseline confirmed");
                         print_scorecard_with_cause(
                             "BASELINE",
@@ -1038,8 +1038,8 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         let epp_a = scrape_epp_metrics("pool-a", mtls);
         let epp_b = scrape_epp_metrics("pool-b", mtls);
         let updated_candidates = read_overlay_candidates("pool-a");
-        let row_a = build_scorecard_row("Cluster A", &updated_candidates, "pool-a", &epp_a);
-        let row_b = build_scorecard_row("Cluster B", &updated_candidates, "pool-b", &epp_b);
+        let row_a = build_scorecard_row(&site_label("pool-a"), &updated_candidates, "pool-a", &epp_a);
+        let row_b = build_scorecard_row(&site_label("pool-b"), &updated_candidates, "pool-b", &epp_b);
         let stats = read_pressure_stats("pool-a");
         let score_gap = row_b.score - row_a.score;
 
@@ -1185,8 +1185,8 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
         let epp_a = scrape_epp_metrics("pool-a", mtls);
         let epp_b = scrape_epp_metrics("pool-b", mtls);
         let candidates = read_overlay_candidates("pool-a");
-        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
-        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
+        let row_a = build_scorecard_row(&site_label("pool-a"), &candidates, "pool-a", &epp_a);
+        let row_b = build_scorecard_row(&site_label("pool-b"), &candidates, "pool-b", &epp_b);
 
         print_live_table_row(&LiveTableRow {
             elapsed: table_start.elapsed(),
@@ -1448,13 +1448,19 @@ fn parse_epp_metrics(text: &str) -> EppMetrics {
 /// Derived from the site in the name rather than branching on pool-a, which
 /// printed every other site as Cluster B and hid pool-c entirely.
 fn cluster_label(cluster: &str) -> String {
-    CLUSTERS.iter().find(|site| cluster.contains(*site)).map_or_else(
-        || cluster.to_owned(),
-        |site| {
-            let suffix = site.rsplit('-').next().unwrap_or(site).to_uppercase();
-            format!("Cluster {suffix}")
-        },
-    )
+    CLUSTERS
+        .iter()
+        .find(|site| cluster.contains(*site))
+        .map_or_else(|| cluster.to_owned(), |site| site_label(site))
+}
+
+/// `Site A pool-a`, for a site named `pool-a`.
+///
+/// A site holds pools and a pool serves models, so one name for both hides a
+/// layer that the rest of the output depends on.
+fn site_label(site: &str) -> String {
+    let letter = site.rsplit('-').next().unwrap_or(site).to_uppercase();
+    format!("Site {letter} {site}")
 }
 
 /// Whether the pressure phase should be announced/entered for the given
