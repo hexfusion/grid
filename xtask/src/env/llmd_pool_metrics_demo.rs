@@ -105,10 +105,14 @@ const PRESSURE_GENERATOR_DEPLOYMENT: &str = "pressure-generator";
 
 /// Number of pressure generator replicas during the pressure phase.
 ///
-/// With 4 workers per pod, 6 replicas = 24 concurrent requests. This
-/// reliably pushes pool-a queue past 3.5/4, triggering the rank flip
-/// even when pool-b's SWIM-propagated overlay scores are stale.
-const PRESSURE_REPLICAS: u32 = 6;
+/// With 4 workers per pod this is that many times four concurrent requests,
+/// enough to push the queue past its configured capacity and move the score.
+///
+/// Six was calibrated against a pool that refused requests once it passed
+/// capacity, where the refusals did half the work of holding the queue up.
+/// The gateway serves under saturation now, so the same load is absorbed and
+/// the queue no longer backs up far enough for the rank to change.
+const PRESSURE_REPLICAS: u32 = 12;
 
 /// GridNetwork resource name.
 const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
