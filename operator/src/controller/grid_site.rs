@@ -567,7 +567,24 @@ fn truncate_event_note(message: &str) -> String {
 
 /// Return whether the status subresource differs from the desired status.
 fn grid_site_status_needs_update(current: Option<&GridSiteStatus>, desired: &GridSiteStatus) -> bool {
-    current != Some(desired)
+    let Some(current) = current else {
+        return true;
+    };
+    // Every field but the probe timestamp. That one is `now` on each probe, so
+    // comparing it made this always true: the write bumped the resource
+    // version, the watch fired, the reconcile probed, and it wrote again.
+    // Roughly ninety writes a second per remote site to record that a probe
+    // had just happened.
+    //
+    // It still rides along on writes that happen for a reason, so it stays as
+    // fresh as anything anyone would act on. It is simply never the reason.
+    current.phase != desired.phase
+        || current.observed_generation != desired.observed_generation
+        || current.reason != desired.reason
+        || current.message != desired.message
+        || current.last_transition_time != desired.last_transition_time
+        || current.capabilities != desired.capabilities
+        || current.public_cert_pem != desired.public_cert_pem
 }
 
 /// Build a merge patch containing only fields owned by the `GridSite`
@@ -1526,6 +1543,55 @@ mod tests {
         assert!(
             result.chars().count() <= crate::resources::gateway_probe::MAX_STATUS_MESSAGE_LEN,
             "truncated message must not exceed MAX_STATUS_MESSAGE_LEN"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_write_tests {
+    use super::{GridSiteStatus, grid_site_status_needs_update};
+    use crate::crd::grid_site::{GridSitePhase, SiteCapabilities};
+
+    fn status(phase: GridSitePhase, probed_at: &str) -> GridSiteStatus {
+        GridSiteStatus {
+            phase,
+            observed_generation: 1,
+            reason: "Reachable".to_owned(),
+            message: "peer answered".to_owned(),
+            capabilities: SiteCapabilities::default(),
+            last_probe_time: Some(probed_at.to_owned()),
+            last_transition_time: Some("2026-08-27T00:00:00Z".to_owned()),
+            public_cert_pem: None,
+        }
+    }
+
+    #[test]
+    fn a_probe_that_changed_nothing_is_not_worth_a_write() {
+        let before = status(GridSitePhase::Active, "2026-08-27T21:15:17Z");
+        let after = status(GridSitePhase::Active, "2026-08-27T21:15:20Z");
+        assert!(
+            !grid_site_status_needs_update(Some(&before), &after),
+            "a fresh probe timestamp alone must not wake every watcher"
+        );
+    }
+
+    #[test]
+    fn a_phase_change_still_writes() {
+        let before = status(GridSitePhase::Active, "2026-08-27T21:15:17Z");
+        let mut after = status(GridSitePhase::Unreachable, "2026-08-27T21:15:17Z");
+        after.reason = "Unreachable".to_owned();
+        assert!(
+            grid_site_status_needs_update(Some(&before), &after),
+            "a site that changed phase must be published"
+        );
+    }
+
+    #[test]
+    fn a_site_with_no_status_yet_writes() {
+        let first = status(GridSitePhase::Active, "2026-08-27T21:15:17Z");
+        assert!(
+            grid_site_status_needs_update(None, &first),
+            "the first status must be written"
         );
     }
 }
