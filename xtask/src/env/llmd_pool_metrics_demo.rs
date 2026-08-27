@@ -5049,20 +5049,40 @@ const ATTRIBUTION_PRESSURE_REPLICAS: u32 = 4;
 /// away, and the window would compare against a signal that is still working.
 const LOAD_STALENESS_WAIT: Duration = Duration::from_secs(25);
 
+/// Pressure is topped up before the second window rather than left to decay.
+///
+/// The generator drives through the gateway, so the load it creates drains
+/// while the stage waits for samples to age out. A second window opening on an
+/// idle grid measures nothing, whatever the first one saw.
+fn hold_pressure(cluster: &str, observations: &mut Vec<String>) {
+    if let Err(error) = scale_pressure_generator(cluster, 0) {
+        observations.push(format!("{cluster}: could not cycle pressure: {error}"));
+        return;
+    }
+    if let Err(error) = scale_pressure_generator(cluster, ATTRIBUTION_PRESSURE_REPLICAS) {
+        observations.push(format!("{cluster}: could not reapply pressure: {error}"));
+        return;
+    }
+    let settled = await_pressure(cluster);
+    if settled <= 0.0 {
+        observations.push(format!("{cluster}: pressure did not return before the second window"));
+    }
+}
+
 /// Where a run of requests landed, and what the signals said at the time.
 struct RoutingWindow {
-    /// Site with the highest queue when the window opened.
-    busiest: String,
-    /// Queue depth for that site.
-    busiest_queue: f64,
+    /// The site being watched, fixed before the first window opens.
+    subject: String,
+    /// Queue depth that site was carrying when the window opened.
+    subject_queue: f64,
     /// Destination site per request.
     destinations: Vec<String>,
 }
 
 impl RoutingWindow {
-    /// How many requests went to the site that was carrying the most work.
-    fn hits_on_busiest(&self) -> usize {
-        self.destinations.iter().filter(|d| **d == self.busiest).count()
+    /// How many requests went to the site being watched.
+    fn hits(&self) -> usize {
+        self.destinations.iter().filter(|d| **d == self.subject).count()
     }
 }
 
@@ -5085,12 +5105,24 @@ fn queue_by_site(cluster: &str) -> Vec<(String, f64)> {
 }
 
 /// Send a run of requests and record where each one landed.
-fn observe_routing(cluster: &str) -> RoutingWindow {
-    let queues = queue_by_site(cluster);
-    let (busiest, busiest_queue) = queues
+/// The site carrying the most work right now.
+fn busiest_site(cluster: &str) -> (String, f64) {
+    queue_by_site(cluster)
         .iter()
         .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map_or_else(|| (String::new(), 0.0), |(s, v)| (s.clone(), *v));
+        .map_or_else(|| (String::new(), 0.0), |(s, v)| (s.clone(), *v))
+}
+
+/// Send a run of requests and count how many reached `subject`.
+///
+/// The site is fixed by the caller rather than recomputed here. Watching
+/// whichever site is busiest at the moment each window opens compares two
+/// different sites and reports the difference as though it meant something.
+fn observe_routing(cluster: &str, subject: &str) -> RoutingWindow {
+    let subject_queue = queue_by_site(cluster)
+        .iter()
+        .find(|(s, _)| s == subject)
+        .map_or(0.0, |(_, v)| *v);
     let ctx = kind_context(cluster);
     let destinations = (0..ROUTING_SAMPLE_REQUESTS)
         .filter_map(|_| send_inference_request(&ctx, VCR_MODEL).ok())
@@ -5098,8 +5130,8 @@ fn observe_routing(cluster: &str) -> RoutingWindow {
         .filter(|d| !d.is_empty())
         .collect();
     RoutingWindow {
-        busiest,
-        busiest_queue,
+        subject: subject.to_owned(),
+        subject_queue,
         destinations,
     }
 }
@@ -5217,22 +5249,30 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         observations.push(format!(
             "{cluster}: no site reported a queue under pressure, so there is nothing to attribute"
         ));
+        success = false;
     }
-    let with_load = observe_routing(cluster);
+
+    // Fixed once. Whichever site is carrying the work when the comparison
+    // starts is the site both windows are about, because a busiest site
+    // recomputed per window compares two different sites.
+    let (subject, _) = busiest_site(cluster);
+    let with_load = observe_routing(cluster, &subject);
+    observations.push(format!(
+        "{cluster}: watching {subject}, queue {:.1} when the comparison began",
+        with_load.subject_queue
+    ));
+    observations.push(format!(
+        "{cluster}: with the load source, {} of {} requests went to {subject}",
+        with_load.hits(),
+        with_load.destinations.len(),
+    ));
     if with_load.destinations.len() < ROUTING_SAMPLE_REQUESTS {
         observations.push(format!(
-            "{cluster}: only {} of {ROUTING_SAMPLE_REQUESTS} requests completed with the load source, so the comparison is thin",
+            "{cluster}: only {} of {ROUTING_SAMPLE_REQUESTS} requests completed with the load source",
             with_load.destinations.len()
         ));
         success = false;
     }
-    observations.push(format!(
-        "{cluster}: with the load source, {} of {} requests went to {} (queue {:.1}, the busiest)",
-        with_load.hits_on_busiest(),
-        with_load.destinations.len(),
-        with_load.busiest,
-        with_load.busiest_queue,
-    ));
 
     let withdrawn = set_load_source_reachable(cluster, false);
     if let Err(error) = &withdrawn {
@@ -5243,29 +5283,36 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
     if withdrawn.is_ok() {
         // Every held sample has to age out before the store is empty.
         std::thread::sleep(LOAD_STALENESS_WAIT);
-        let without_load = observe_routing(cluster);
+        hold_pressure(cluster, &mut observations);
+        let without_load = observe_routing(cluster, &subject);
         observations.push(format!(
-            "{cluster}: without it, {} of {} requests went to {} (queue {:.1}, the busiest)",
-            without_load.hits_on_busiest(),
+            "{cluster}: without it, {} of {} requests went to {subject}, queue {:.1}",
+            without_load.hits(),
             without_load.destinations.len(),
-            without_load.busiest,
-            without_load.busiest_queue,
+            without_load.subject_queue,
         ));
-        if without_load.destinations.is_empty() {
-            observations.push(format!("{cluster}: no request completed without the load source"));
-            success = false;
-        } else if without_load.hits_on_busiest() > with_load.hits_on_busiest() {
+        if without_load.subject_queue <= 0.0 {
             observations.push(format!(
-                "{cluster}: the busiest site gained traffic once the signal was gone, so the signal is what kept it away"
+                "{cluster}: {subject} was idle by the second window, so the two are not comparable"
+            ));
+            success = false;
+        } else if without_load.destinations.len() < ROUTING_SAMPLE_REQUESTS {
+            observations.push(format!(
+                "{cluster}: only {} of {ROUTING_SAMPLE_REQUESTS} requests completed without the load source",
+                without_load.destinations.len()
+            ));
+            success = false;
+        } else if without_load.hits() > with_load.hits() {
+            observations.push(format!(
+                "{cluster}: {subject} took {} requests without the signal against {} with it, so the signal is what kept traffic away",
+                without_load.hits(),
+                with_load.hits()
             ));
         } else {
-            // Equal counts are equal counts, including zero against zero.
-            // Reading a verdict into them is how a stage reports proving
-            // something while showing no difference at all.
             observations.push(format!(
-                "{cluster}: the busiest site saw {} requests with the signal and {} without, which shows nothing either way",
-                with_load.hits_on_busiest(),
-                without_load.hits_on_busiest()
+                "{cluster}: {subject} took {} requests with the signal and {} without, which shows nothing either way",
+                with_load.hits(),
+                without_load.hits()
             ));
             success = false;
         }
