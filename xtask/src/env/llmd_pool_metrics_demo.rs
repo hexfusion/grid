@@ -5112,15 +5112,20 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         if without_load.destinations.is_empty() {
             observations.push(format!("{cluster}: no request completed without the load source"));
             success = false;
-        } else if with_load.hits_on_busiest() >= without_load.hits_on_busiest() && without_load.hits_on_busiest() > 0 {
-            observations.push(format!(
-                "{cluster}: withdrawing the signal did not change where requests went, so nothing here shows it decided"
-            ));
-            success = false;
-        } else {
+        } else if without_load.hits_on_busiest() > with_load.hits_on_busiest() {
             observations.push(format!(
                 "{cluster}: the busiest site gained traffic once the signal was gone, so the signal is what kept it away"
             ));
+        } else {
+            // Equal counts are equal counts, including zero against zero.
+            // Reading a verdict into them is how a stage reports proving
+            // something while showing no difference at all.
+            observations.push(format!(
+                "{cluster}: the busiest site saw {} requests with the signal and {} without, which shows nothing either way",
+                with_load.hits_on_busiest(),
+                without_load.hits_on_busiest()
+            ));
+            success = false;
         }
     }
 
