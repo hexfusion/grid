@@ -109,3 +109,11 @@ admin:
   address: "127.0.0.1:9901"
 
 shutdown_timeout_secs: 5
+
+# Every provider is reached at a MetalLB address on the cluster network, and
+# the issuer the policy filter fetches keys from is one too. The gateway treats
+# those as sensitive addresses and refuses to reach them unless told otherwise,
+# which is right facing the internet and wrong for a gateway whose peers all
+# live on the same private network.
+insecure_options:
+  allow_private_endpoints: true
