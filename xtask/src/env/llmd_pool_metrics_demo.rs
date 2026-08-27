@@ -6042,14 +6042,19 @@ const BASIS_LIVE_LOAD: &str = "live_load";
 /// Basis label the gateway records when it had no load source to consult.
 const BASIS_NO_LOAD_SOURCE: &str = "no_load_source";
 
+/// Local port the gateway's admin endpoint is forwarded to while reading it.
+const ADMIN_FORWARD_PORT: u16 = 19901;
+
 /// Route decisions the consumer gateway has recorded, by basis.
 ///
-/// Read from the gateway's own admin endpoint at its pod address, so this is
-/// the gateway's account of what it routed on rather than an inference from
-/// where the requests ended up.
+/// This is the gateway's own account of what it routed on, rather than an
+/// inference from where the requests ended up.
+///
+/// The admin endpoint stays on loopback, as it should, so this forwards into
+/// the pod for the read instead of asking for it to be opened up.
 fn route_decisions(cluster: &str) -> BTreeMap<String, u64> {
     let ctx = kind_context(cluster);
-    let ip = Command::new("kubectl")
+    let pod = Command::new("kubectl")
         .args([
             "--context",
             &ctx,
@@ -6060,18 +6065,57 @@ fn route_decisions(cluster: &str) -> BTreeMap<String, u64> {
             "-l",
             "app.kubernetes.io/instance=consumer-gateway",
             "-o",
-            "jsonpath={.items[0].status.podIP}",
+            "jsonpath={.items[0].metadata.name}",
         ])
         .output()
         .ok();
-    let Some(ip) = ip else { return BTreeMap::new() };
-    let ip = String::from_utf8_lossy(&ip.stdout).trim().to_owned();
-    if ip.is_empty() {
+    let Some(pod) = pod else { return BTreeMap::new() };
+    let pod = String::from_utf8_lossy(&pod.stdout).trim().to_owned();
+    if pod.is_empty() {
         return BTreeMap::new();
     }
-    let raw =
-        exec_in_load_probe(cluster, &format!("curl -s --max-time 10 http://{ip}:9901/metrics")).unwrap_or_default();
-    parse_route_decisions(&raw)
+
+    let Ok(mut forward) = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "port-forward",
+            &format!("pod/{pod}"),
+            &format!("{ADMIN_FORWARD_PORT}:9901"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return BTreeMap::new();
+    };
+
+    // Read once the forward answers, and take the tunnel down either way.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut parsed = BTreeMap::new();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "5",
+                &format!("http://127.0.0.1:{ADMIN_FORWARD_PORT}/metrics"),
+            ])
+            .output();
+        if let Ok(out) = out {
+            let raw = String::from_utf8_lossy(&out.stdout);
+            if raw.contains("praxis_ai_route_decisions_total") {
+                parsed = parse_route_decisions(&raw);
+                break;
+            }
+        }
+    }
+    drop(forward.kill());
+    drop(forward.wait());
+    parsed
 }
 
 /// Sum `praxis_ai_route_decisions_total` per basis from Prometheus text.
