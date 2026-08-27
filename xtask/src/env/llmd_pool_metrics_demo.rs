@@ -286,8 +286,41 @@ struct Evidence {
     setup: SetupEvidence,
     /// Proof scenario results.
     proofs: BTreeMap<String, ProofResult>,
+    /// Per-site scores and queues over the run, for drawing it afterwards.
+    timeline: Vec<TimelineTick>,
+    /// What each tenant offered, was served, and was refused.
+    quotas: Vec<QuotaOutcome>,
     /// Lifecycle metadata.
     lifecycle: LifecycleRecord,
+}
+
+/// One tenant's offered load measured against the limit its issuer signed.
+#[derive(Serialize, Clone)]
+struct QuotaOutcome {
+    /// Tenant the token identified.
+    tenant: String,
+    /// Requests per second the token carried.
+    rate: u32,
+    /// Bucket capacity the token carried.
+    burst: u32,
+    /// Requests offered at once.
+    offered: u32,
+    /// Requests served.
+    served: u32,
+    /// Requests refused by the limiter.
+    throttled: u32,
+    /// Anything else, keyed by status.
+    other: BTreeMap<String, u32>,
+}
+
+/// Quota outcomes recorded by the rate limit proof.
+static QUOTAS: std::sync::Mutex<Vec<QuotaOutcome>> = std::sync::Mutex::new(Vec::new());
+
+/// Take what the run recorded, leaving the stores empty.
+fn drain_recorded() -> (Vec<TimelineTick>, Vec<QuotaOutcome>) {
+    let timeline = TIMELINE.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+    let quotas = QUOTAS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+    (timeline, quotas)
 }
 
 /// Setup phase evidence.
@@ -478,6 +511,8 @@ pub(crate) fn run(
     let images = collect_image_evidence(&context.images)?;
     let success = run_error.is_none();
 
+    let (timeline, quotas) = drain_recorded();
+
     let evidence = Evidence {
         schema_version: EVIDENCE_SCHEMA_VERSION.to_owned(),
         mode: format!("{mode:?}").to_lowercase(),
@@ -492,6 +527,8 @@ pub(crate) fn run(
             images,
         },
         proofs: proof_results,
+        timeline,
+        quotas,
         lifecycle: LifecycleRecord {
             teardown_requested: options.teardown,
             teardown_performed: teardown_success,
@@ -1726,8 +1763,61 @@ struct LiveTableRow<'row> {
     published: &'row [SiteSignals],
 }
 
+/// One tick of the live table, kept so a run can be drawn afterwards.
+///
+/// The terminal table is the whole story of a flip and it scrolls away. These
+/// are the same numbers, retained.
+#[derive(Serialize, Clone)]
+struct TimelineTick {
+    /// Seconds since the table started.
+    at_secs: u64,
+    /// Phase label the row was rendered under.
+    phase: String,
+    /// Site name, one tick per site.
+    site: String,
+    /// Queue depth the scorer saw.
+    queue: f64,
+    /// KV cache utilisation the scorer saw.
+    kv_cache: f64,
+    /// Score the site held at this tick.
+    score: f64,
+    /// Rank the site held at this tick, 0 being preferred.
+    rank: i64,
+    /// Queue this site published over signals, when it published one.
+    published_queue: Option<f64>,
+    /// Requests attributed to this site so far.
+    requests: u64,
+}
+
+/// Ticks recorded across the run, in order.
+static TIMELINE: std::sync::Mutex<Vec<TimelineTick>> = std::sync::Mutex::new(Vec::new());
+
+/// Record one tick per site, for the report drawn after the run.
+fn record_timeline(row: &LiveTableRow<'_>) {
+    let (a, b) = row.rows;
+    let published_for = |site: &str| row.published.iter().find(|s| s.site == site).map(|s| s.queue);
+    let ticks = [(a, "pool-a", row.stats.a_reqs), (b, "pool-b", row.stats.b_reqs)];
+    let Ok(mut timeline) = TIMELINE.lock() else {
+        return;
+    };
+    for (card, site, requests) in ticks {
+        timeline.push(TimelineTick {
+            at_secs: row.elapsed.as_secs(),
+            phase: row.phase.to_owned(),
+            site: site.to_owned(),
+            queue: card.queue,
+            kv_cache: card.kv_cache,
+            score: card.score,
+            rank: card.rank,
+            published_queue: published_for(site),
+            requests,
+        });
+    }
+}
+
 /// Print one row of the live metrics table.
 fn print_live_table_row(row: &LiveTableRow<'_>) {
+    record_timeline(row);
     let secs = row.elapsed.as_secs();
     let time_str = format!("{:02}:{:02}", secs / 60, secs % 60);
     let (a, b) = row.rows;
@@ -3977,6 +4067,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn evidence_serializes_to_json() {
+        let (timeline, quotas) = drain_recorded();
         let evidence = Evidence {
             schema_version: "1".to_owned(),
             mode: "quick".to_owned(),
@@ -3991,6 +4082,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
                 images: BTreeMap::new(),
             },
             proofs: BTreeMap::new(),
+            timeline,
+            quotas,
             lifecycle: LifecycleRecord {
                 teardown_requested: false,
                 teardown_performed: false,
@@ -4168,6 +4261,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn evidence_records_direct_http_transport() {
+        let (timeline, quotas) = drain_recorded();
         let evidence = Evidence {
             schema_version: "1".to_owned(),
             mode: "quick".to_owned(),
@@ -4182,6 +4276,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
                 images: BTreeMap::new(),
             },
             proofs: BTreeMap::new(),
+            timeline,
+            quotas,
             lifecycle: LifecycleRecord {
                 teardown_requested: false,
                 teardown_performed: false,
@@ -4195,6 +4291,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn evidence_records_mtls_proxy_transport() {
+        let (timeline, quotas) = drain_recorded();
         let evidence = Evidence {
             schema_version: "1".to_owned(),
             mode: "quick".to_owned(),
@@ -4209,6 +4306,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
                 images: BTreeMap::new(),
             },
             proofs: BTreeMap::new(),
+            timeline,
+            quotas,
             lifecycle: LifecycleRecord {
                 teardown_requested: false,
                 teardown_performed: false,
@@ -5608,6 +5707,7 @@ fn proof_per_identity_rate_limit(_context: &DemoContext) -> ProofResult {
             "{tenant}: {RATE_LIMIT_BURST_REQUESTS} at once -> {}",
             describe_statuses(&seen)
         ));
+        record_quota(tenant, &seen);
         Ok(seen)
     };
 
@@ -5881,4 +5981,37 @@ fn await_routable(kube_context: &str) -> Result<(), Box<dyn std::error::Error>> 
         std::thread::sleep(Duration::from_secs(3));
     }
     Err(format!("last saw {last}").into())
+}
+
+
+/// The limits the realm signs into each tenant's token.
+///
+/// Named here only so a report can draw the line a tally was measured
+/// against; the gateway reads them from the token, never from this.
+fn signed_limits(tenant: &str) -> (u32, u32) {
+    match tenant {
+        THROTTLED_TENANT => (2, 5),
+        DEFAULT_TENANT => (60, 120),
+        _ => (0, 0),
+    }
+}
+
+/// Record one tenant's offered load against its signed limit.
+fn record_quota(tenant: &str, seen: &BTreeMap<String, u32>) {
+    let (rate, burst) = signed_limits(tenant);
+    let mut other = seen.clone();
+    other.remove("200");
+    other.remove("429");
+    let outcome = QuotaOutcome {
+        tenant: tenant.to_owned(),
+        rate,
+        burst,
+        offered: RATE_LIMIT_BURST_REQUESTS,
+        served: status_count(seen, "200"),
+        throttled: status_count(seen, "429"),
+        other,
+    };
+    if let Ok(mut quotas) = QUOTAS.lock() {
+        quotas.push(outcome);
+    }
 }
