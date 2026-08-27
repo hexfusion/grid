@@ -1021,7 +1021,9 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
 
     eprintln!();
     eprintln!("  Live Metrics Table");
-    eprintln!("    Queue/KV/Score/Rank: derived from the Grid overlay (production scoring engine)");
+    eprintln!("    Queue/KV/Score/Rank: from the Grid overlay, rendered on reconcile from");
+    eprintln!("                        gossiped state. Ages are not available on that path;");
+    eprintln!("                        the published signals above carry them.");
     eprintln!("    A_REQ/B_REQ:        cumulative gateway attribution counts from pressure pods");
     eprintln!("    LAST_ROUTE:         most recent confirmed request destination");
     print_live_table_header();
@@ -1602,6 +1604,9 @@ fn print_scorecard_with_cause(
     eprintln!();
     eprintln!("  LLM-D POOL ROUTING DECISION");
     eprintln!("  State: {state}");
+    print_signals_table(CLUSTERS.first().copied().unwrap_or("pool-a"));
+    eprintln!();
+    eprintln!("  OVERLAY VIEW  (rendered on reconcile from gossiped state)");
     eprintln!();
     eprintln!(
         "  {:>14} {:>7} {:>9} {:>9} {:>9} {:>7} {:>5}",
@@ -5144,4 +5149,88 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         description: "Withdrawing the polled load source changes where requests go".to_owned(),
         observations,
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the signals endpoint publishes
+// ---------------------------------------------------------------------------
+
+/// One site's published signals, as a reader receives them.
+struct SiteSignals {
+    /// Site the samples describe.
+    site: String,
+    /// Provider within that site.
+    provider: String,
+    /// Queue depth, as the provider reported it.
+    queue: f64,
+    /// KV cache utilisation.
+    kv_cache: f64,
+    /// How old the newest sample is, in milliseconds.
+    age_ms: i64,
+}
+
+/// Read what a site publishes, newest sample per site.
+///
+/// Every column here comes off the signals endpoint. Nothing is taken from the
+/// overlay, which is rendered on reconcile from gossiped state and carries no
+/// age, so a reader cannot tell a value observed a moment ago from one that
+/// has not moved in minutes.
+fn signals_view(cluster: &str) -> Vec<SiteSignals> {
+    let Ok(body) = read_signals_authenticated(cluster) else {
+        return Vec::new();
+    };
+    let now = now_ms();
+    let samples = parse_signals(&body);
+    let mut by_site: BTreeMap<String, SiteSignals> = BTreeMap::new();
+    for sample in samples {
+        let entry = by_site.entry(sample.site.clone()).or_insert_with(|| SiteSignals {
+            site: sample.site.clone(),
+            provider: sample.provider.clone(),
+            queue: 0.0,
+            kv_cache: 0.0,
+            age_ms: i64::MAX,
+        });
+        if sample.metric == GATEWAY_QUEUE_METRIC {
+            entry.queue = sample.value;
+        }
+        if EPP_KV_METRICS.iter().any(|m| sample.metric.contains(m)) {
+            entry.kv_cache = sample.value;
+        }
+        entry.age_ms = entry.age_ms.min(now.saturating_sub(sample.at_ms));
+    }
+    by_site.into_values().collect()
+}
+
+/// Print the routing inputs as the signals endpoint published them.
+fn print_signals_table(cluster: &str) {
+    let view = signals_view(cluster);
+    eprintln!();
+    eprintln!("  PUBLISHED SIGNALS  (read from {cluster}'s endpoint, per site)");
+    eprintln!();
+    eprintln!(
+        "  {:>16} {:>22} {:>7} {:>9} {:>8}",
+        "Site", "Provider", "Queue", "KV Cache", "Age"
+    );
+    if view.is_empty() {
+        eprintln!("  {:>16}  nothing published, so nothing to route on", "-");
+        return;
+    }
+    for s in &view {
+        let age = if s.age_ms == i64::MAX {
+            "-".to_owned()
+        } else {
+            format!("{}.{}s", s.age_ms / 1000, (s.age_ms % 1000) / 100)
+        };
+        eprintln!(
+            "  {:>16} {:>22} {:>7.1} {:>9.2} {:>8}",
+            site_label(&s.site),
+            s.provider,
+            s.queue,
+            s.kv_cache,
+            age
+        );
+    }
+    eprintln!();
+    eprintln!("    Age is what the overlay cannot report: a gossiped value carries no");
+    eprintln!("    collection time, so a reader cannot tell fresh from unmoved.");
 }
