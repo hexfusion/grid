@@ -2218,13 +2218,27 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
         return Ok(());
     }
 
+    // Both the demo tags forge renders against and the pins the charts deploy.
+    //
+    // The topology is rewritten to whatever image the run was given, so the
+    // name a pod pulls is the fully qualified one. Loading only the demo tags
+    // leaves that name absent from the node, and the pod sits in
+    // ImagePullBackOff against a registry these clusters cannot resolve, which
+    // reads as a missing build rather than an image that was never copied in.
     let mut tags: Vec<&str> = vec![
         "grid-operator:llmd-pool-metrics-demo",
         "grid-overlay-sync:llmd-pool-metrics-demo",
         "praxis-ai:llmd-pool-metrics-demo",
         "llm-d-epp:llmd-pool-metrics-demo",
         "vllm-vcr:llmd-pool-metrics-demo",
+        &context.images.operator,
+        &context.images.gateway,
+        &context.images.epp,
+        &context.images.vcr,
+        &context.images.overlay_sync,
     ];
+    tags.sort_unstable();
+    tags.dedup();
     if let Some(nginx) = &context.images.nginx {
         tags.push(nginx);
     }
