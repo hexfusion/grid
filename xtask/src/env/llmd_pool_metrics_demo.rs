@@ -76,11 +76,6 @@ const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
 
-/// Minimum score gap required before capturing the pressure scorecard.
-///
-/// With real VCR backends, pressure creates modest score differences
-/// (queue=2 → gap ≈ 0.03) from live VCR/EPP pressure.
-const MIN_PRESSURE_SCORE_GAP: f64 = 0.01;
 
 /// Queue-depth pressure-phase threshold (raw queue size, out of `QUEUE_CAPACITY`).
 const QUEUE_PRESSURE_THRESHOLD: f64 = 1.0;
@@ -1105,11 +1100,8 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         let row_a = build_scorecard_row(&site_label("pool-a"), &updated_candidates, "pool-a", &epp_a);
         let row_b = build_scorecard_row(&site_label("pool-b"), &updated_candidates, "pool-b", &epp_b);
         let stats = read_pressure_stats("pool-a");
-        let score_gap = row_b.score - row_a.score;
 
-        let phase = if row_b.rank == 0 && row_a.rank > 0 {
-            "FAILOVER"
-        } else if pressure_phase_active(context.scoring_flavor, &epp_a) {
+        let phase = if pressure_phase_active(context.scoring_flavor, &epp_a) {
             "PRESSURE"
         } else {
             "BASELINE"
@@ -1133,12 +1125,15 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             published: &published,
         });
 
-        if row_b.rank == 0 && row_a.rank > 0 && score_gap >= MIN_PRESSURE_SCORE_GAP {
+        // The flip is a data-plane fact, so it is read there. The overlay rank
+        // beside it is a property of topology and does not move with load;
+        // waiting on it waited forever while traffic had already shifted.
+        if pressure_phase_active(context.scoring_flavor, &epp_a) {
             eprintln!(
-                "  [SCORING] Pool A score={:.2} rank={}; Pool B score={:.2} rank={} (gap={:.2})",
-                row_a.score, row_a.rank, row_b.score, row_b.rank, score_gap
+                "  [PRESSURE] Pool A queue={:.1}/{:.0} kv={:.2}; Pool B queue={:.1} kv={:.2}",
+                row_a.queue, row_a.capacity, row_a.kv_cache, row_b.queue, row_b.kv_cache
             );
-            eprintln!("  [FAILOVER] Pool B is now preferred; sending verification request");
+            eprintln!("  [FAILOVER] Checking where the gateway is sending work");
             let probe_ctx = kind_context("pool-a");
             if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
                 last_route = if resp.provider_gateway.contains("pool-b") {
@@ -1157,11 +1152,11 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                         &[&row_a, &row_b],
                         "CLUSTER B",
                         &updated_candidates,
-                        "Pool A pressure lowered its queue/KV scores, so Pool B became rank 0.",
+                        "Pool A is over its queue capacity, so the gateway scored Pool B higher for this request.",
                     );
                     observations.push(format!(
-                        "flip: pool-b rank=0 score={:.2}, pool-a rank={} score={:.2} (gap={:.2})",
-                        row_b.score, row_a.rank, row_a.score, score_gap
+                        "flip: pool-a queue={:.1}/{:.0} against pool-b queue={:.1}, and the request went to pool-b",
+                        row_a.queue, row_a.capacity, row_b.queue
                     ));
                     observations.push(format!(
                         "pool-a: queue={:.1}/{:.0} kv={:.2}",
@@ -5990,18 +5985,25 @@ fn demo_token(kube_context: &str) -> Result<&'static str, Box<dyn std::error::Er
 /// Wait until the gateway serves a request, so a measurement starts against a
 /// gateway that can route rather than one still coming back.
 fn await_routable(kube_context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let token = mint_tenant_token(kube_context, DEFAULT_TENANT)?;
-    let deadline = Instant::now() + Duration::from_secs(120);
+    // The proof before this one restarts the gateway as its last act, and a
+    // gateway that has not yet loaded an overlay routes nowhere. Two minutes
+    // was not enough twice, so this waits as long as the data-plane proofs do
+    // rather than guessing again.
+    let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last = String::from("nothing yet");
     while Instant::now() < deadline {
-        match drive_concurrent_requests("pool-a", &token, 1) {
+        // Minted inside the loop: the issuer may be no readier than the
+        // gateway, and a mint that failed once should not end the wait.
+        match mint_tenant_token(kube_context, DEFAULT_TENANT)
+            .and_then(|token| drive_concurrent_requests("pool-a", &token, 1))
+        {
             Ok(seen) if status_count(&seen, "200") == 1 => return Ok(()),
             Ok(seen) => last = describe_statuses(&seen),
             Err(e) => last = e.to_string(),
         }
         std::thread::sleep(Duration::from_secs(3));
     }
-    Err(format!("last saw {last}").into())
+    Err(format!("waited {}s, last saw {last}", DATA_PLANE_WAIT.as_secs()).into())
 }
 
 
