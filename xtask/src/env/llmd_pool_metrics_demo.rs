@@ -5391,7 +5391,9 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
     // The site being loaded, not whichever happens to be busiest: the point is
     // that this one is both preferred by locality and carrying the work.
     let subject = cluster.to_owned();
+    let before = route_decisions(cluster);
     let with_load = observe_routing(cluster, &subject);
+    let with_basis = delta_since(&before, &route_decisions(cluster));
     observations.push(format!(
         "{cluster}: watching {subject}, queue {:.1} when the comparison began",
         with_load.subject_queue
@@ -5419,7 +5421,9 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         // Every held sample has to age out before the store is empty.
         std::thread::sleep(LOAD_STALENESS_WAIT);
         hold_pressure(cluster, &mut observations);
+        let mid = route_decisions(cluster);
         let without_load = observe_routing(cluster, &subject);
+        let without_basis = delta_since(&mid, &route_decisions(cluster));
         observations.push(format!(
             "{cluster}: without it, {} of {} requests went to {subject}, queue {:.1}",
             without_load.hits(),
@@ -5437,19 +5441,34 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
                 without_load.destinations.len()
             ));
             success = false;
-        } else if without_load.hits() > with_load.hits() {
-            observations.push(format!(
-                "{cluster}: {subject} is local and loaded, and took {} requests without the signal against {} with it, so the signal is what sent work elsewhere",
-                without_load.hits(),
-                with_load.hits()
-            ));
-        } else {
-            observations.push(format!(
-                "{cluster}: {subject} took {} requests with the signal and {} without, which shows nothing either way",
-                with_load.hits(),
-                without_load.hits()
-            ));
-            success = false;
+        }
+
+        // What the gateway says it routed on, rather than what we infer from
+        // where requests landed. The operator's overlay is load-aware too, so
+        // a destination cannot separate the two; the basis label names which
+        // one the gateway used and nothing else can move it.
+        match (
+            basis_after(&with_basis, BASIS_LIVE_LOAD),
+            basis_after(&without_basis, BASIS_NO_LOAD_SOURCE),
+        ) {
+            (live, none) if live > 0 && none > 0 => {
+                observations.push(format!(
+                    "{cluster}: the gateway routed on the live signal {live} times while it had one, \
+                     and reported having none {none} times once it was withdrawn"
+                ));
+            },
+            (0, _) => {
+                observations.push(format!(
+                    "{cluster}: the gateway never named the live signal as its basis while it had one"
+                ));
+                success = false;
+            },
+            (..) => {
+                observations.push(format!(
+                    "{cluster}: withdrawing the load source did not change what the gateway routed on"
+                ));
+                success = false;
+            },
         }
     }
 
@@ -6013,5 +6032,132 @@ fn record_quota(tenant: &str, seen: &BTreeMap<String, u32>) {
     };
     if let Ok(mut quotas) = QUOTAS.lock() {
         quotas.push(outcome);
+    }
+}
+
+
+/// Basis label the gateway records when the polled signal decided.
+const BASIS_LIVE_LOAD: &str = "live_load";
+
+/// Basis label the gateway records when it had no load source to consult.
+const BASIS_NO_LOAD_SOURCE: &str = "no_load_source";
+
+/// Route decisions the consumer gateway has recorded, by basis.
+///
+/// Read from the gateway's own admin endpoint at its pod address, so this is
+/// the gateway's account of what it routed on rather than an inference from
+/// where the requests ended up.
+fn route_decisions(cluster: &str) -> BTreeMap<String, u64> {
+    let ctx = kind_context(cluster);
+    let ip = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pod",
+            "-l",
+            "app.kubernetes.io/instance=consumer-gateway",
+            "-o",
+            "jsonpath={.items[0].status.podIP}",
+        ])
+        .output()
+        .ok();
+    let Some(ip) = ip else { return BTreeMap::new() };
+    let ip = String::from_utf8_lossy(&ip.stdout).trim().to_owned();
+    if ip.is_empty() {
+        return BTreeMap::new();
+    }
+    let raw =
+        exec_in_load_probe(cluster, &format!("curl -s --max-time 10 http://{ip}:9901/metrics")).unwrap_or_default();
+    parse_route_decisions(&raw)
+}
+
+/// Sum `praxis_ai_route_decisions_total` per basis from Prometheus text.
+fn parse_route_decisions(raw: &str) -> BTreeMap<String, u64> {
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.starts_with("praxis_ai_route_decisions_total") {
+            continue;
+        }
+        let Some(basis) = line
+            .split_once("basis=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(b, _)| b.to_owned())
+        else {
+            continue;
+        };
+        // Counters are whole numbers written as floats, so take the integer
+        // part as text rather than round-tripping through f64.
+        let value: u64 = line
+            .rsplit_once(' ')
+            .map(|(_, v)| v.trim())
+            .map(|v| v.split_once('.').map_or(v, |(whole, _)| whole))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default();
+        *out.entry(basis).or_default() += value;
+    }
+    out
+}
+
+/// How much one basis moved between two readings.
+fn delta_since(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    after
+        .iter()
+        .map(|(basis, now)| {
+            let then = before.get(basis).copied().unwrap_or_default();
+            (basis.clone(), now.saturating_sub(then))
+        })
+        .collect()
+}
+
+/// Count recorded for one basis in a delta.
+fn basis_after(delta: &BTreeMap<String, u64>, basis: &str) -> u64 {
+    delta.get(basis).copied().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod route_decision_tests {
+    use super::{basis_after, delta_since, parse_route_decisions};
+
+    #[test]
+    fn sums_a_basis_across_every_site_it_was_recorded_for() {
+        let raw = "\
+# HELP praxis_ai_route_decisions_total decisions
+praxis_ai_route_decisions_total{basis=\"live_load\",site=\"pool-a\"} 4
+praxis_ai_route_decisions_total{basis=\"live_load\",site=\"pool-b\"} 2
+praxis_ai_route_decisions_total{basis=\"no_load_source\",site=\"pool-a\"} 1
+other_metric{basis=\"live_load\"} 99";
+        let parsed = parse_route_decisions(raw);
+        assert_eq!(basis_after(&parsed, "live_load"), 6);
+        assert_eq!(basis_after(&parsed, "no_load_source"), 1);
+        assert_eq!(basis_after(&parsed, "saturated"), 0);
+    }
+
+    #[test]
+    fn a_counter_that_did_not_move_reports_no_decisions() {
+        let before = parse_route_decisions("praxis_ai_route_decisions_total{basis=\"live_load\"} 7");
+        let after = parse_route_decisions("praxis_ai_route_decisions_total{basis=\"live_load\"} 7");
+        assert_eq!(basis_after(&delta_since(&before, &after), "live_load"), 0);
+    }
+
+    #[test]
+    fn a_counter_written_as_a_float_keeps_its_whole_value() {
+        let parsed = parse_route_decisions("praxis_ai_route_decisions_total{basis=\"live_load\"} 12.0");
+        assert_eq!(basis_after(&parsed, "live_load"), 12);
+    }
+
+    #[test]
+    fn a_basis_first_seen_after_the_reading_counts_from_zero() {
+        let before = parse_route_decisions("praxis_ai_route_decisions_total{basis=\"live_load\"} 3");
+        let after = parse_route_decisions(
+            "praxis_ai_route_decisions_total{basis=\"live_load\"} 3\n\
+             praxis_ai_route_decisions_total{basis=\"no_load_source\"} 5",
+        );
+        let delta = delta_since(&before, &after);
+        assert_eq!(basis_after(&delta, "no_load_source"), 5);
+        assert_eq!(basis_after(&delta, "live_load"), 0);
     }
 }

@@ -100,7 +100,9 @@ filter_chains:
               - "{{ captures.pool-c.provider-gateway-ip }}:8443"
 
 admin:
-  address: "127.0.0.1:9901"
+  # Reachable from the pod network, so a probe can read /metrics and ask the
+  # gateway what it routed on. No Service fronts it; the pod IP is enough.
+  address: "0.0.0.0:9901"
 
 shutdown_timeout_secs: 5
 
