@@ -134,6 +134,9 @@ const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.1
 /// Default vllm-vcr image reference required by this demo.
 const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 
+/// Default identity provider image.
+const DEFAULT_KEYCLOAK_IMAGE: &str = "quay.io/keycloak/keycloak:26.0";
+
 /// Default overlay-sync sidecar image tag.
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.3";
 
@@ -250,6 +253,8 @@ struct ResolvedImages {
     vcr: String,
     /// Grid overlay-sync sidecar image.
     overlay_sync: String,
+    /// Identity provider the consumer gateway validates tokens against.
+    keycloak: String,
     /// nginx image for metrics TLS reverse proxy sidecar (mTLS mode only).
     nginx: Option<String>,
 }
@@ -554,6 +559,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
     let vcr = std::env::var("GRID_XTASK_VCR_IMAGE").unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned());
     let overlay_sync =
         std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned());
+    let keycloak = std::env::var("GRID_XTASK_KEYCLOAK_IMAGE").unwrap_or_else(|_| DEFAULT_KEYCLOAK_IMAGE.to_owned());
     let nginx = (metrics_transport == MetricsTransport::MtlsProxy)
         .then(|| std::env::var("GRID_XTASK_NGINX_IMAGE").unwrap_or_else(|_| DEFAULT_NGINX_IMAGE.to_owned()));
 
@@ -563,6 +569,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
     eprintln!("    epp:          {epp}");
     eprintln!("    vcr:          {vcr}");
     eprintln!("    overlay-sync: {overlay_sync}");
+    eprintln!("    keycloak:     {keycloak}");
     if let Some(n) = &nginx {
         eprintln!("    nginx:        {n}");
     }
@@ -573,6 +580,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
         epp,
         vcr,
         overlay_sync,
+        keycloak,
         nginx,
     })
 }
@@ -598,6 +606,7 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
         ("epp", &images.epp, "EPP"),
         ("vcr", &images.vcr, "VCR"),
         ("overlay-sync", &images.overlay_sync, "OVERLAY_SYNC"),
+        ("keycloak", &images.keycloak, "KEYCLOAK"),
     ];
     if let Some(nginx) = &images.nginx {
         checks.push(("nginx", nginx, "NGINX"));
@@ -2274,6 +2283,7 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
         &context.images.epp,
         &context.images.vcr,
         &context.images.overlay_sync,
+        &context.images.keycloak,
     ];
     tags.sort_unstable();
     tags.dedup();

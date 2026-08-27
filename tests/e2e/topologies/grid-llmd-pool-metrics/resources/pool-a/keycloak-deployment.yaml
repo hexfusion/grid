@@ -1,0 +1,62 @@
+# Keycloak, as the demo's identity provider.
+#
+# Development mode on purpose: no TLS on the Keycloak listener, an in-memory
+# database, and the realm imported from a ConfigMap at startup. None of that is
+# how it would be deployed for real, and all of it keeps a demo from spending
+# minutes on a database it discards.
+#
+# What is real is the part the gateway depends on. Keycloak signs RS256 and
+# publishes JWKS, and the gateway fetches keys from that endpoint rather than
+# holding a shared secret, which is the arrangement a production deployment
+# uses too.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: grid-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: keycloak}
+  template:
+    metadata:
+      labels: {app: keycloak}
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.0
+          args: ["start-dev", "--import-realm", "--http-port=8180"]
+          env:
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              value: admin
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+          ports:
+            - {name: http, containerPort: 8180}
+          volumeMounts:
+            - name: realm
+              mountPath: /opt/keycloak/data/import
+              readOnly: true
+          readinessProbe:
+            httpGet: {path: /realms/grid, port: 8180}
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: {cpu: "200m", memory: "512Mi"}
+      volumes:
+        - name: realm
+          configMap:
+            name: keycloak-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: grid-system
+spec:
+  selector: {app: keycloak}
+  ports:
+    - {name: http, port: 8180, targetPort: http}

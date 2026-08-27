@@ -1,0 +1,113 @@
+# The realm the demo's tenants live in, imported at startup.
+#
+# Declared rather than created through the admin API afterwards, so a run
+# either comes up with the tenants it needs or fails while starting, instead
+# of failing later as an unexplained 401 at the gateway.
+#
+# Two tenants, deliberately unequal. gold is allowed ten requests a second and
+# platinum sixty, and those numbers travel in the token as grid_rate and
+# grid_burst rather than living in gateway config. That is the property worth
+# demonstrating: the gateway holds no table of callers, and changing a tenant's
+# limit is an issuer decision.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+  namespace: grid-system
+data:
+  grid-realm.json: |
+    {
+      "realm": "grid",
+      "enabled": true,
+      "accessTokenLifespan": 1800,
+      "clients": [
+        {
+          "clientId": "tenant-gold",
+          "enabled": true,
+          "publicClient": false,
+          "serviceAccountsEnabled": true,
+          "standardFlowEnabled": false,
+          "secret": "gold-secret",
+          "attributes": { "access.token.signed.response.alg": "RS256" },
+          "protocolMappers": [
+            {
+              "name": "grid-site",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_site",
+                "claim.value": "tenant-gold",
+                "access.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "grid-rate",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_rate",
+                "claim.value": "10",
+                "access.token.claim": "true",
+                "jsonType.label": "int"
+              }
+            },
+            {
+              "name": "grid-burst",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_burst",
+                "claim.value": "20",
+                "access.token.claim": "true",
+                "jsonType.label": "int"
+              }
+            }
+          ]
+        },
+        {
+          "clientId": "tenant-platinum",
+          "enabled": true,
+          "publicClient": false,
+          "serviceAccountsEnabled": true,
+          "standardFlowEnabled": false,
+          "secret": "platinum-secret",
+          "attributes": { "access.token.signed.response.alg": "RS256" },
+          "protocolMappers": [
+            {
+              "name": "grid-site",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_site",
+                "claim.value": "tenant-platinum",
+                "access.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "grid-rate",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_rate",
+                "claim.value": "60",
+                "access.token.claim": "true",
+                "jsonType.label": "int"
+              }
+            },
+            {
+              "name": "grid-burst",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_burst",
+                "claim.value": "120",
+                "access.token.claim": "true",
+                "jsonType.label": "int"
+              }
+            }
+          ]
+        }
+      ]
+    }

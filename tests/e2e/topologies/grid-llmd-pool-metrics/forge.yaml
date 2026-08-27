@@ -225,6 +225,18 @@ spec:
           path: resources/pool-a/epp-deployment.yaml
         - type: manifest
           path: resources/pool-a/pressure-generator.yaml
+        # The identity provider the consumer gateway validates tokens against.
+        # Waited on separately so a realm that failed to import is reported
+        # here rather than as an unexplained 401 once traffic starts.
+        - type: manifest
+          path: resources/pool-a/keycloak-realm.yaml
+        - type: manifest
+          path: resources/pool-a/keycloak-deployment.yaml
+        - type: wait
+          resource: deployment/keycloak
+          namespace: grid-system
+          condition: available
+          timeout: "300s"
         - type: wait
           resource: deployment/vcr-1
           namespace: grid-system
