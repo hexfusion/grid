@@ -1898,7 +1898,6 @@ mod tests {
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
             phase: crdt::ProviderPhase::Available,
-            metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-x".to_owned(),
@@ -2067,7 +2066,7 @@ mod tests {
         );
     }
 
-    fn provider_broadcast(queue_depth: f64) -> swim::StateBroadcast {
+    fn provider_broadcast(phase: crdt::ProviderPhase) -> swim::StateBroadcast {
         let mut snapshot = GridStateSnapshot::new("site-a".to_owned());
         snapshot.add_capability(crdt::Capability::Model("model-x".to_owned()));
         snapshot.upsert_provider(crdt::ProviderState {
@@ -2077,11 +2076,7 @@ mod tests {
             routing_cluster: "site-a".to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
-            phase: crdt::ProviderPhase::Available,
-            metrics: crdt::ProviderMetricsSnapshot {
-                queue_depth: Some(queue_depth),
-                ..crdt::ProviderMetricsSnapshot::default()
-            },
+            phase,
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 7,
             writer_id: "site-a".to_owned(),
@@ -2095,7 +2090,7 @@ mod tests {
         reason = "ordered state-machine proof covers initial, duplicate, changed, and repair publications"
     )]
     fn retained_state_deduplicates_updates_and_republishes_with_new_revision() {
-        let original = provider_broadcast(0.1);
+        let original = provider_broadcast(crdt::ProviderPhase::Available);
         let (retained, first) =
             RetainedStateBroadcast::update(None, original.clone(), 100).unwrap_or_else(|_| std::process::abort());
         let first = first.unwrap_or_else(|| std::process::abort());
@@ -2111,7 +2106,7 @@ mod tests {
             "an identical controller reconcile must not reset the foca transmission budget"
         );
 
-        let changed = provider_broadcast(0.8);
+        let changed = provider_broadcast(crdt::ProviderPhase::Degraded);
         let (mut retained, changed_outbound) =
             RetainedStateBroadcast::update(Some(retained), changed, 102).unwrap_or_else(|_| std::process::abort());
         let changed_outbound = changed_outbound.unwrap_or_else(|| std::process::abort());
@@ -2123,8 +2118,8 @@ mod tests {
             changed_outbound
                 .snapshot
                 .provider("net", "site-a", "provider-a")
-                .and_then(|provider| provider.metrics.queue_depth),
-            Some(0.8),
+                .map(|provider| provider.phase.clone()),
+            Some(crdt::ProviderPhase::Degraded),
             "changed provider state must publish immediately"
         );
 
@@ -2190,7 +2185,6 @@ mod tests {
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
             phase: crdt::ProviderPhase::Available,
-            metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),

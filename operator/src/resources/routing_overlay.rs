@@ -194,48 +194,6 @@ pub(crate) fn crdt_phase_to_fresh(phase: &crdt::ProviderPhase) -> Option<bool> {
     }
 }
 
-/// Convert a [`crdt::ProviderMetricsSnapshot`] to [`scoring::BackendMetrics`].
-///
-/// # Defaults for absent fields
-///
-/// | Field | Missing default | Rationale |
-/// |---|---|---|
-/// | `error_rate` | `0.0` | No evidence of errors → do not penalise |
-/// | `healthy` | `true` | Assume reachable until evidence of failure |
-/// | `kv_cache_utilization` | `0.5` | Neutral (no signal) |
-/// | `latency_p99_ms` | `2500.0` | Neutral: `1.0 - 2500/5000 = 0.5` latency score |
-/// | `prefix_cache_hit_ratio` | `0.5` | Neutral (no signal) |
-/// | `queue_depth` | `0.5` | Neutral (no signal) |
-///
-/// Using `2500.0` for missing latency (rather than `0.0` or `0.5`) matches the
-/// local Prometheus scrape path (`PartialMetrics::into_backend_metrics`) and
-/// avoids inflating the latency score of remote providers whose latency has not
-/// yet been observed.
-///
-/// # Sanitize remote signals
-///
-/// CRDT values are produced by remote operators which may run a different
-/// software version.  Non-finite values fall back to the same defaults as
-/// absent values, ratio signals are clamped to `[0.0, 1.0]`, and latency is
-/// clamped to `≥ 0.0` so that a misbehaving or outdated remote site cannot
-/// corrupt overlay scoring through invalid or out-of-range values.
-pub(crate) fn crdt_metrics_to_backend(m: &crdt::ProviderMetricsSnapshot) -> scoring::BackendMetrics {
-    scoring::BackendMetrics {
-        error_rate: finite_or(m.error_rate, 0.0).clamp(0.0, 1.0),
-        healthy: m.healthy.unwrap_or(true),
-        kv_cache_utilization: finite_or(m.kv_cache_utilization, UNMAPPED_NEUTRAL_SIGNAL).clamp(0.0, 1.0),
-        latency_p99_ms: finite_or(m.latency_p99_ms, NEUTRAL_LATENCY_MS).max(0.0),
-        prefix_cache_hit_ratio: finite_or(m.prefix_cache_hit_ratio, UNMAPPED_NEUTRAL_SIGNAL).clamp(0.0, 1.0),
-        queue_depth: finite_or(m.queue_depth, UNMAPPED_NEUTRAL_SIGNAL).clamp(0.0, 1.0),
-    }
-}
-
-/// Return `value` if it is `Some` and finite, otherwise return `default`.
-///
-/// Drops NaN and ±Inf so they cannot corrupt downstream scoring.
-fn finite_or(value: Option<f64>, default: f64) -> f64 {
-    value.filter(|v| v.is_finite()).unwrap_or(default)
-}
 
 /// Convert one remote CRDT provider record to [`RoutingCandidate`]s, one per model.
 ///
@@ -345,16 +303,6 @@ pub(crate) fn remote_crdt_provider_to_backend_config(provider: &crdt::ProviderSt
 /// the same as providers with no observed metrics.
 const UNMAPPED_NEUTRAL_SIGNAL: f64 = 0.5;
 
-/// Neutral latency value (ms) applied when no latency observation is available.
-///
-/// Chosen so that the scoring formula produces a neutral latency score of 0.5:
-/// `1.0 - NEUTRAL_LATENCY_MS / MAX_LATENCY_MS = 1.0 - 2500 / 5000 = 0.5`.
-///
-/// Both the local Prometheus scrape path (`PartialMetrics::into_backend_metrics`)
-/// and the CRDT remote path (`crdt_metrics_to_backend`) use this constant so that
-/// providers with no latency observation score neutrally on the latency signal in
-/// both paths.
-const NEUTRAL_LATENCY_MS: f64 = 2500.0;
 
 // ---------------------------------------------------------------------------
 // Stale candidate expiry policy
@@ -565,19 +513,17 @@ fn unmapped_provider_breakdown(backend_kind: &str, weights: &scoring::ScoringWei
 /// by [`is_candidate_fresh`] (local) or [`crdt_phase_to_fresh`] (remote).
 ///
 /// Returns a map from routing cluster name to score.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
-)]
 fn provider_ordering_scores(
     network_name: &str,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     local_region: Option<&str>,
-    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     weights: &scoring::ScoringWeights,
 ) -> HashMap<String, scoring::ScoreBreakdown> {
-    let state = build_grid_state_with_metrics(network_name, providers, remote_crdt_providers, metrics);
+    // No metrics. The overlay says who exists and where, and that changes when
+    // a site or a model does. Feeding live load in here rewrote the document
+    // on every sample, and the gateway scores the same load itself anyway.
+    let state = build_grid_state_with_metrics(network_name, providers, remote_crdt_providers, None);
     let scored = scoring::score_backends(&state, weights, local_region);
     let from_engine: HashMap<String, scoring::ScoreBreakdown> =
         scored.into_iter().map(|sb| (sb.name, sb.breakdown)).collect();
@@ -643,9 +589,7 @@ pub(crate) fn build_grid_state_with_metrics(
     }
     for provider in remote_crdt_providers {
         if let Some(config) = remote_crdt_provider_to_backend_config(provider) {
-            let name = config.name.clone();
             drop(state.add_backend(config));
-            state.set_metrics(name, crdt_metrics_to_backend(&provider.metrics));
         }
     }
     state
@@ -917,14 +861,16 @@ pub struct RoutingOverlay {
 
 /// Build admission state for all providers keyed by routing identity.
 ///
-/// Local providers are looked up in `metrics` by [`routing_identity`].
-/// Remote CRDT providers use their replicated metrics snapshot.
-/// Providers without metrics default to [`AdmissionState::NewAndExisting`].
+/// A provider that exists and is not explicitly unavailable is offered.
+/// Load does not decide it here: admission by queue depth reordered the
+/// overlay every time a pool got busy, and the gateway is already asking the
+/// same question per request against a fresher signal.
+///
+/// `precomputed` still wins where the controller has decided deliberately.
 fn build_admission_map(
     network_name: &str,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
-    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     precomputed: Option<&HashMap<String, AdmissionState>>,
 ) -> HashMap<String, AdmissionState> {
     let mut map = HashMap::new();
@@ -933,12 +879,11 @@ fn build_admission_map(
             continue;
         }
         if let Some(key) = routing_identity(provider) {
-            let m = metrics.and_then(|mmap| mmap.get(key));
             map.insert(
                 key.to_owned(),
                 precomputed
                     .and_then(|states| states.get(key).copied())
-                    .unwrap_or_else(|| super::geography::derive_admission_state(m)),
+                    .unwrap_or_else(|| super::geography::derive_admission_state(None)),
             );
         }
     }
@@ -946,10 +891,12 @@ fn build_admission_map(
         if provider.phase == crdt::ProviderPhase::Unavailable {
             continue;
         }
-        let m = crdt_metrics_to_backend(&provider.metrics);
+        // A remote provider that is present and not Unavailable is offered.
+        // Whether it should take this request is a live question, and the
+        // gateway answers it from the signal it polls.
         map.insert(
             provider.routing_cluster.clone(),
-            super::geography::derive_admission_state(Some(&m)),
+            super::geography::derive_admission_state(None),
         );
     }
     map
@@ -1100,7 +1047,6 @@ pub fn render_routing_overlay(
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     local_site: &str,
-    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
 ) -> Result<RoutingOverlay, String> {
@@ -1110,7 +1056,6 @@ pub fn render_routing_overlay(
         providers,
         remote_crdt_providers,
         local_site,
-        metrics,
         generated_at,
         weights,
         None,
@@ -1139,7 +1084,6 @@ pub fn render_routing_overlay_with_admission(
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     local_site: &str,
-    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
     precomputed_admission: Option<&HashMap<String, AdmissionState>>,
@@ -1155,17 +1099,10 @@ pub fn render_routing_overlay_with_admission(
         providers,
         remote_crdt_providers,
         network.spec.region.as_deref(),
-        metrics,
         weights,
     );
 
-    let admission_map = build_admission_map(
-        network_name,
-        providers,
-        remote_crdt_providers,
-        metrics,
-        precomputed_admission,
-    );
+    let admission_map = build_admission_map(network_name, providers, remote_crdt_providers, precomputed_admission);
 
     // Find the consumer site to get its labels for access policy evaluation
     let consumer_site_labels = sites
@@ -2049,7 +1986,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2075,7 +2011,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2098,7 +2033,6 @@ mod tests {
             &[p_z, p_a],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2127,7 +2061,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2151,7 +2084,6 @@ mod tests {
             &[api, self_hosted],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2177,7 +2109,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2187,7 +2118,6 @@ mod tests {
             &[api, local],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2214,7 +2144,6 @@ mod tests {
             &[remote, local],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2288,7 +2217,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2331,7 +2259,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2372,7 +2299,6 @@ mod tests {
             &[api_ok, local_degraded],
             &[],
             "site-a",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2419,7 +2345,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2457,7 +2382,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2480,7 +2404,6 @@ mod tests {
             &[local_up, api_always_available],
             &[],
             "site-a",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2514,7 +2437,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2542,7 +2464,6 @@ mod tests {
             &[local_prov, api_prov],
             &[],
             "site-a",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2666,7 +2587,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2692,7 +2612,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2717,7 +2636,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2740,7 +2658,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2750,7 +2667,6 @@ mod tests {
             &[api, local],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2777,7 +2693,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2802,7 +2717,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2819,7 +2733,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2841,7 +2754,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2859,7 +2771,6 @@ mod tests {
             &[p1, p2],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2886,7 +2797,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2910,7 +2820,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -2920,7 +2829,6 @@ mod tests {
             &[p2, p1],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2944,7 +2852,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         );
         assert!(result.is_err(), "blank model name must return an error");
@@ -2966,7 +2873,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -2994,7 +2900,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3020,7 +2925,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3052,7 +2956,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3076,7 +2979,6 @@ mod tests {
             &[p1, p2],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3102,7 +3004,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3166,7 +3067,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3183,7 +3083,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3205,7 +3104,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3232,7 +3130,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3257,7 +3154,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3285,7 +3181,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3309,7 +3204,6 @@ mod tests {
             &[available, degraded],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3342,7 +3236,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3372,7 +3265,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3404,7 +3296,6 @@ mod tests {
             &[stale, healthy],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3439,7 +3330,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3470,7 +3360,6 @@ mod tests {
             &[remote_stale],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3497,7 +3386,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3508,7 +3396,6 @@ mod tests {
             &[healthy, stale],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3546,7 +3433,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3567,7 +3453,6 @@ mod tests {
             &[],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3598,7 +3483,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3621,7 +3505,6 @@ mod tests {
             &[],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3685,7 +3568,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3708,7 +3590,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3730,7 +3611,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -3740,7 +3620,6 @@ mod tests {
             &[],
             &[],
             "site-b",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3763,7 +3642,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -3808,7 +3686,6 @@ mod tests {
             &[],
             "local",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         );
         assert!(result.is_err(), "network without metadata.name must return an error");
@@ -3838,7 +3715,6 @@ mod tests {
             &[],
             "local",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         );
         assert!(
@@ -3848,74 +3724,43 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_grid_state_with_metrics — integration seam for live metrics
+    // Ordering is a property of topology, not of load
     // -----------------------------------------------------------------------
 
     #[test]
-    fn live_metrics_queue_depth_affects_ordering() {
-        // Two local providers with equal locality and no cost difference.
-        // Without metrics they are tied and fall back to alphabetical order.
-        // With metrics the high-queue provider scores lower and yields the lead.
-        let provider_busy = test_provider_with_backend_kind("provider-busy", "net", "local");
-        let provider_idle = test_provider_with_backend_kind("provider-idle", "net", "local");
+    fn the_overlay_has_no_way_to_see_load() {
+        // The overlay carries a score and a rank per candidate, so anything
+        // load-shaped reaching this render rewrote the document on every
+        // scrape and every gateway reloaded against it. Two renders of the
+        // same topology must be byte-identical: whether a provider should take
+        // *this* request is live, and the gateway answers it from the signal
+        // it polls.
+        let network = test_network("net");
+        let busy = test_provider_with_backend_kind("provider-busy", "net", "local");
+        let idle = test_provider_with_backend_kind("provider-idle", "net", "local");
+        let providers = [busy, idle];
+        let weights = scoring::ScoringWeights::default();
 
-        let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
-        metrics.insert(
-            "provider-busy",
-            scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.9),
-        );
-        metrics.insert(
-            "provider-idle",
-            scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1),
-        );
+        let render = || {
+            render_routing_overlay(&network, &[], &providers, &[], "test-site", None, &weights)
+                .unwrap_or_else(|_| std::process::abort())
+        };
+        let first = render();
+        let second = render();
 
-        let providers_for_ordering = [provider_busy, provider_idle];
-        let ordering = provider_ordering_scores(
-            "net",
-            &providers_for_ordering,
-            &[],
-            None,
-            Some(&metrics),
-            &scoring::ScoringWeights::default(),
-        );
-
-        let busy_score = ordering["provider-busy"].total;
-        let idle_score = ordering["provider-idle"].total;
-        assert!(
-            idle_score > busy_score,
-            "idle provider (queue 0.1) must score higher than busy provider (queue 0.9), \
-             got idle={idle_score}, busy={busy_score}"
+        let shape = |o: &RoutingOverlay| {
+            o.candidates
+                .iter()
+                .map(|c| (c.cluster.clone(), c.rank, c.score, c.admission_state))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shape(&first),
+            shape(&second),
+            "rank, score and admission must be a property of topology alone"
         );
     }
 
-    #[test]
-    #[expect(clippy::float_cmp, reason = "exact equality for deterministic scoring")]
-    fn no_metrics_map_preserves_static_ordering() {
-        // Passing None for metrics must produce the same result as the current
-        // static-only path (locality and cost only).
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
-        let ps_static = [local.clone(), api.clone()];
-        let ordering_static =
-            provider_ordering_scores("net", &ps_static, &[], None, None, &scoring::ScoringWeights::default());
-        let ps_empty = [local, api];
-        let ordering_no_metrics = provider_ordering_scores(
-            "net",
-            &ps_empty,
-            &[],
-            None,
-            Some(&HashMap::new()),
-            &scoring::ScoringWeights::default(),
-        );
-        assert_eq!(
-            ordering_static["prov-local"].total, ordering_no_metrics["prov-local"].total,
-            "empty metrics map must yield same score as None"
-        );
-        assert_eq!(
-            ordering_static["prov-api"].total, ordering_no_metrics["prov-api"].total,
-            "empty metrics map must yield same score as None"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // noMetrics strategy — overlay rendering with production default weights
@@ -3943,27 +3788,9 @@ mod tests {
         let b = test_provider_with_backend_kind("prov-b", "net", "local");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-a",
-            scoring::BackendMetrics::new(0.0, true, 0.80, 100.0, 0.0, 0.10),
-        );
-        metrics.insert(
-            "prov-b",
-            scoring::BackendMetrics::new(0.0, true, 0.20, 100.0, 0.0, 0.90),
-        );
 
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[a, b],
-            &[],
-            "gw",
-            Some(&metrics),
-            None,
-            &no_metrics_weights(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[a, b], &[], "gw", None, &no_metrics_weights())
+            .unwrap_or_else(|_| std::process::abort());
 
         for c in &overlay.candidates {
             let bd = c.score_breakdown.as_ref().unwrap_or_else(|| std::process::abort());
@@ -3983,27 +3810,9 @@ mod tests {
         let b = test_provider_with_backend_kind("prov-b", "net", "local");
         let network = test_network_score_first("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-a",
-            scoring::BackendMetrics::new(0.0, true, 0.80, 100.0, 0.0, 0.10),
-        );
-        metrics.insert(
-            "prov-b",
-            scoring::BackendMetrics::new(0.0, true, 0.20, 100.0, 0.0, 0.90),
-        );
 
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[a, b],
-            &[],
-            "gw",
-            Some(&metrics),
-            None,
-            &no_metrics_weights(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[a, b], &[], "gw", None, &no_metrics_weights())
+            .unwrap_or_else(|_| std::process::abort());
 
         let scores: Vec<f64> = overlay.candidates.iter().map(|c| c.score.unwrap_or(f64::NAN)).collect();
         assert_eq!(scores.len(), 2);
@@ -4020,15 +3829,6 @@ mod tests {
         let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-local",
-            scoring::BackendMetrics::new(0.0, true, 0.80, 0.0, 0.0, 0.80),
-        );
-        metrics.insert(
-            "prov-remote",
-            scoring::BackendMetrics::new(0.0, true, 0.01, 0.0, 0.0, 0.01),
-        );
 
         let overlay = render_routing_overlay(
             &network,
@@ -4036,7 +3836,6 @@ mod tests {
             &[remote, local],
             &[],
             "prov-local",
-            Some(&metrics),
             None,
             &no_metrics_weights(),
         )
@@ -4055,15 +3854,6 @@ mod tests {
         let saturated = test_provider_with_backend_kind("prov-saturated", "net", "local");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-saturated",
-            scoring::BackendMetrics::new(0.0, true, 0.95, 0.0, 0.0, 0.95),
-        );
-        metrics.insert(
-            "prov-healthy",
-            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
-        );
 
         let overlay = render_routing_overlay(
             &network,
@@ -4071,7 +3861,6 @@ mod tests {
             &[saturated, healthy],
             &[],
             "gw",
-            Some(&metrics),
             None,
             &no_metrics_weights(),
         )
@@ -4102,7 +3891,6 @@ mod tests {
             &[],
             "gw",
             None,
-            None,
             &no_metrics_weights(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -4121,27 +3909,9 @@ mod tests {
         let b = test_provider_with_backend_kind("prov-b", "net", "local");
         let network = test_network_score_first("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-a",
-            scoring::BackendMetrics::new(0.0, true, 0.90, 100.0, 0.0, 0.99),
-        );
-        metrics.insert(
-            "prov-b",
-            scoring::BackendMetrics::new(0.0, true, 0.01, 100.0, 0.0, 0.01),
-        );
 
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[a, b],
-            &[],
-            "gw",
-            Some(&metrics),
-            None,
-            &no_metrics_weights(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[a, b], &[], "gw", None, &no_metrics_weights())
+            .unwrap_or_else(|_| std::process::abort());
 
         let scores: Vec<f64> = overlay.candidates.iter().map(|c| c.score.unwrap_or(f64::NAN)).collect();
         assert_weight(
@@ -4155,47 +3925,6 @@ mod tests {
     // render_routing_overlay metrics path — end-to-end ordering proofs
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn render_with_metrics_reorders_equal_locality_providers() {
-        // Two local providers with equal locality and no cost difference.
-        // Without metrics they are tied and fall back to alphabetical order;
-        // provider-busy < provider-idle alphabetically, so busy comes first.
-        // With metrics the high-queue provider scores lower and yields the lead.
-        let busy = test_provider_with_backend_kind("provider-busy", "net", "local");
-        let idle = test_provider_with_backend_kind("provider-idle", "net", "local");
-        let network = test_network("net");
-
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "provider-busy",
-            scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.9),
-        );
-        metrics.insert(
-            "provider-idle",
-            scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1),
-        );
-
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[busy, idle],
-            &[],
-            "local-gw",
-            Some(&metrics),
-            None,
-            &scoring::ScoringWeights::default(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-
-        // idle (queue_depth=0.1) must rank before busy (queue_depth=0.9).
-        let first = overlay.candidates.first().map(|c| c.cluster.as_str());
-        assert_eq!(
-            first,
-            Some("provider-idle"),
-            "idle provider must rank first when busy has high queue depth; \
-             got first={first:?}"
-        );
-    }
 
     #[test]
     fn render_without_metrics_preserves_static_locality_ordering() {
@@ -4212,7 +3941,6 @@ mod tests {
             &[],
             "gw",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -4223,7 +3951,6 @@ mod tests {
             &[api, local],
             &[],
             "gw",
-            Some(&HashMap::new()),
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4249,11 +3976,6 @@ mod tests {
         let unmapped = test_provider_with_backend_kind("unmapped-prov", "net", "local");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "known-prov",
-            scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1),
-        );
         // "unmapped-prov" intentionally absent from the metrics map.
 
         let overlay = render_routing_overlay(
@@ -4262,7 +3984,6 @@ mod tests {
             &[known, unmapped],
             &[],
             "gw",
-            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4320,40 +4041,6 @@ mod tests {
     // Score-driven routing algorithm — sort order proofs
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn metrics_pressure_outranks_locality() {
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
-        let network = test_network_score_first("net");
-
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-local",
-            scoring::BackendMetrics::new(0.0, true, 0.85, 0.0, 0.0, 0.9),
-        );
-        metrics.insert(
-            "prov-remote",
-            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
-        );
-
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[local, remote],
-            &[],
-            "gw",
-            Some(&metrics),
-            None,
-            &scoring::ScoringWeights::default(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-
-        assert_eq!(
-            overlay.candidates.first().map(|c| c.cluster.as_str()),
-            Some("prov-remote"),
-            "remote provider with low pressure must outrank local provider with high pressure"
-        );
-    }
 
     #[test]
     fn equal_metrics_prefers_local() {
@@ -4361,15 +4048,6 @@ mod tests {
         let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-local",
-            scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.3),
-        );
-        metrics.insert(
-            "prov-remote",
-            scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.3),
-        );
 
         let overlay = render_routing_overlay(
             &network,
@@ -4377,7 +4055,6 @@ mod tests {
             &[local, remote],
             &[],
             "gw",
-            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4403,7 +4080,6 @@ mod tests {
             &[],
             "gw",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -4423,25 +4099,21 @@ mod tests {
         let saturated = test_provider_with_backend_kind("prov-saturated", "net", "local");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-saturated",
-            scoring::BackendMetrics::new(0.0, true, 0.95, 0.0, 0.0, 0.95),
-        );
-        metrics.insert(
-            "prov-healthy",
-            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
-        );
+        // Admission is the controller's own decision now, held down over time,
+        // rather than something re-derived from a metric on every render.
+        let mut admission = HashMap::new();
+        admission.insert("prov-saturated".to_owned(), AdmissionState::ExistingOnly);
+        admission.insert("prov-healthy".to_owned(), AdmissionState::NewAndExisting);
 
-        let overlay = render_routing_overlay(
+        let overlay = render_routing_overlay_with_admission(
             &network,
             &[],
             &[saturated, healthy],
             &[],
             "gw",
-            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
+            Some(&admission),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -4467,11 +4139,6 @@ mod tests {
         let local = test_provider_with_backend_kind("prov-local", "net", "local");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "prov-local",
-            scoring::BackendMetrics::new(0.0, true, 0.3, 500.0, 0.4, 0.2),
-        );
 
         let overlay = render_routing_overlay(
             &network,
@@ -4479,7 +4146,6 @@ mod tests {
             &[local],
             &[],
             "gw",
-            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4524,7 +4190,6 @@ mod tests {
             &[],
             "gw",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -4534,7 +4199,6 @@ mod tests {
             &providers,
             &[],
             "gw",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4554,15 +4218,6 @@ mod tests {
         let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
         let network = test_network("net");
 
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "local-site",
-            scoring::BackendMetrics::new(0.0, true, 0.70, 0.0, 0.0, 0.80),
-        );
-        metrics.insert(
-            "prov-remote",
-            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
-        );
 
         let overlay = render_routing_overlay(
             &network,
@@ -4570,7 +4225,6 @@ mod tests {
             &[local, remote],
             &[],
             "local-site",
-            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4652,7 +4306,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -4675,7 +4328,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4711,7 +4363,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -4736,7 +4387,6 @@ mod tests {
             &[p1, p2],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4773,7 +4423,6 @@ mod tests {
             &[],
             "test-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -4807,7 +4456,6 @@ mod tests {
             &[provider],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4848,7 +4496,6 @@ mod tests {
             &[api_provider, local_with_ref],
             &[],
             "test-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -4936,7 +4583,6 @@ mod tests {
             models: models.iter().map(|m| (*m).to_owned()).collect(),
             backend_kind: "local".to_owned(),
             phase,
-            metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
@@ -5035,128 +4681,6 @@ mod tests {
     // crdt_metrics_to_backend — metrics mapping
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn crdt_metrics_all_some_maps_correctly() {
-        let m = crdt::ProviderMetricsSnapshot {
-            queue_depth: Some(0.3),
-            kv_cache_utilization: Some(0.4),
-            latency_p99_ms: Some(120.0),
-            prefix_cache_hit_ratio: Some(0.7),
-            error_rate: Some(0.1),
-            healthy: Some(true),
-        };
-        let bm = crdt_metrics_to_backend(&m);
-        assert!((bm.queue_depth - 0.3).abs() < f64::EPSILON, "queue_depth must map");
-        assert!(
-            (bm.kv_cache_utilization - 0.4).abs() < f64::EPSILON,
-            "kv_cache must map"
-        );
-        assert!((bm.latency_p99_ms - 120.0).abs() < f64::EPSILON, "latency must map");
-        assert!(
-            (bm.prefix_cache_hit_ratio - 0.7).abs() < f64::EPSILON,
-            "prefix_cache must map"
-        );
-        assert!((bm.error_rate - 0.1).abs() < f64::EPSILON, "error_rate must map");
-        assert!(bm.healthy, "healthy must map");
-    }
-
-    #[test]
-    fn crdt_metrics_all_none_uses_neutral_defaults() {
-        let m = crdt::ProviderMetricsSnapshot::default();
-        let bm = crdt_metrics_to_backend(&m);
-        assert!(
-            (bm.queue_depth - UNMAPPED_NEUTRAL_SIGNAL).abs() < f64::EPSILON,
-            "queue_depth must default to neutral 0.5"
-        );
-        assert!(
-            (bm.kv_cache_utilization - UNMAPPED_NEUTRAL_SIGNAL).abs() < f64::EPSILON,
-            "kv_cache must default to neutral 0.5"
-        );
-        assert!(bm.error_rate.abs() < f64::EPSILON, "error_rate must default to 0.0");
-        assert!(bm.healthy, "healthy must default to true");
-    }
-
-    #[test]
-    fn crdt_metrics_absent_latency_defaults_to_neutral_ms() {
-        // Missing latency must use NEUTRAL_LATENCY_MS (2500.0) so that a remote
-        // provider with no latency observation scores neutrally (0.5) on the latency
-        // signal, not optimally (≈1.0 if 0.5ms were used).
-        let m = crdt::ProviderMetricsSnapshot::default(); // all None
-        let bm = crdt_metrics_to_backend(&m);
-        assert!(
-            (bm.latency_p99_ms - NEUTRAL_LATENCY_MS).abs() < f64::EPSILON,
-            "absent latency_p99_ms must default to {NEUTRAL_LATENCY_MS}ms (neutral), got {}",
-            bm.latency_p99_ms
-        );
-    }
-
-    #[test]
-    #[expect(clippy::float_cmp, reason = "exact boundary comparison for clamped signals")]
-    fn crdt_metrics_ratio_signals_clamped_above_one() {
-        // Out-of-range ratio values from a remote site with different schema must not
-        // corrupt scoring; they must be clamped to [0.0, 1.0].
-        let m = crdt::ProviderMetricsSnapshot {
-            queue_depth: Some(1.5),
-            kv_cache_utilization: Some(2.0),
-            latency_p99_ms: Some(-100.0), // negative latency → clamp to 0.0
-            prefix_cache_hit_ratio: Some(1.1),
-            error_rate: Some(1.3),
-            healthy: Some(false),
-        };
-        let bm = crdt_metrics_to_backend(&m);
-        assert_eq!(bm.queue_depth, 1.0, "queue_depth > 1.0 must be clamped to 1.0");
-        assert_eq!(bm.kv_cache_utilization, 1.0, "kv_cache > 1.0 must be clamped to 1.0");
-        assert_eq!(bm.latency_p99_ms, 0.0, "negative latency must be clamped to 0.0");
-        assert_eq!(
-            bm.prefix_cache_hit_ratio, 1.0,
-            "prefix_cache_hit_ratio > 1.0 must be clamped to 1.0"
-        );
-        assert_eq!(bm.error_rate, 1.0, "error_rate > 1.0 must be clamped to 1.0");
-        assert!(!bm.healthy, "healthy=false must propagate");
-    }
-
-    #[test]
-    #[expect(clippy::float_cmp, reason = "exact boundary comparison for clamped signals")]
-    fn crdt_metrics_ratio_signals_clamped_below_zero() {
-        // Negative ratio values must be clamped to 0.0.
-        let m = crdt::ProviderMetricsSnapshot {
-            queue_depth: Some(-0.1),
-            kv_cache_utilization: Some(-0.5),
-            latency_p99_ms: None,
-            prefix_cache_hit_ratio: Some(-1.0),
-            error_rate: Some(-0.2),
-            healthy: Some(true),
-        };
-        let bm = crdt_metrics_to_backend(&m);
-        assert_eq!(bm.queue_depth, 0.0, "negative queue_depth must be clamped to 0.0");
-        assert_eq!(bm.kv_cache_utilization, 0.0, "negative kv_cache must be clamped to 0.0");
-        assert_eq!(
-            bm.prefix_cache_hit_ratio, 0.0,
-            "negative prefix_cache_hit_ratio must be clamped to 0.0"
-        );
-        assert_eq!(bm.error_rate, 0.0, "negative error_rate must be clamped to 0.0");
-    }
-
-    #[test]
-    #[expect(clippy::float_cmp, reason = "exact equality for deterministic neutral defaults")]
-    fn crdt_metrics_non_finite_values_default_before_scoring() {
-        // f64::clamp does not sanitize NaN, so CRDT values must be filtered before
-        // clamping. Treat non-finite values like absent fields.
-        let m = crdt::ProviderMetricsSnapshot {
-            queue_depth: Some(f64::NAN),
-            kv_cache_utilization: Some(f64::INFINITY),
-            latency_p99_ms: Some(f64::NEG_INFINITY),
-            prefix_cache_hit_ratio: Some(f64::NAN),
-            error_rate: Some(f64::INFINITY),
-            healthy: Some(true),
-        };
-        let bm = crdt_metrics_to_backend(&m);
-        assert_eq!(bm.queue_depth, UNMAPPED_NEUTRAL_SIGNAL);
-        assert_eq!(bm.kv_cache_utilization, UNMAPPED_NEUTRAL_SIGNAL);
-        assert_eq!(bm.latency_p99_ms, NEUTRAL_LATENCY_MS);
-        assert_eq!(bm.prefix_cache_hit_ratio, UNMAPPED_NEUTRAL_SIGNAL);
-        assert_eq!(bm.error_rate, 0.0);
-    }
 
     // -----------------------------------------------------------------------
     // render_routing_overlay integration — remote CRDT providers
@@ -5177,7 +4701,6 @@ mod tests {
             &[],
             &[remote],
             "local-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -5212,7 +4735,6 @@ mod tests {
             &[],
             &[unavailable],
             "local-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -5330,7 +4852,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -5355,7 +4876,6 @@ mod tests {
             &[provider],
             &[],
             "site-a",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -5395,7 +4915,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -5422,7 +4941,6 @@ mod tests {
             &[provider],
             &[],
             "site-a",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -5575,7 +5093,6 @@ mod tests {
             models: vec!["model".to_owned()],
             backend_kind: "remote".to_owned(),
             phase: crdt::ProviderPhase::Available,
-            metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "w".to_owned(),
@@ -5780,7 +5297,6 @@ mod tests {
             &[],
             "local-site",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -5834,7 +5350,6 @@ mod tests {
             models: vec!["model-remote".to_owned()],
             backend_kind: "remote".to_owned(),
             phase: crdt::ProviderPhase::Available,
-            metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy,
             revision: 1,
             writer_id: site_id.to_owned(),
@@ -5997,7 +5512,6 @@ mod tests {
             &[],
             "site-prod",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6017,7 +5531,6 @@ mod tests {
             &[provider],
             &[],
             "site-staging",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6047,7 +5560,6 @@ mod tests {
             &[],
             "site-prod",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6068,7 +5580,6 @@ mod tests {
             &[provider],
             &[],
             "site-staging",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6102,7 +5613,6 @@ mod tests {
             &[],
             "site-prod",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6120,7 +5630,6 @@ mod tests {
             &[],
             "site-staging",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6137,7 +5646,6 @@ mod tests {
             &[provider],
             &[],
             "site-other",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6165,7 +5673,6 @@ mod tests {
             &[provider_restricted, provider_unrestricted],
             &[],
             "unknown-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6213,7 +5720,6 @@ mod tests {
             &[],
             "site-prod",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6241,7 +5747,6 @@ mod tests {
             &[provider_unrestricted, provider_prod_only, provider_platform_only],
             &[],
             "site-staging",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6285,7 +5790,6 @@ mod tests {
             &[],
             "site-prod",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6314,7 +5818,6 @@ mod tests {
             &[],
             "site-prod",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6331,7 +5834,6 @@ mod tests {
             std::slice::from_ref(&provider),
             &[],
             "site-staging",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6362,7 +5864,6 @@ mod tests {
             &[],
             "site-wrong",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6389,7 +5890,6 @@ mod tests {
             &[provider_restricted, provider_unrestricted],
             &[],
             "unknown-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6421,7 +5921,6 @@ mod tests {
             &[],
             std::slice::from_ref(&remote_provider),
             "site-prod",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6455,7 +5954,6 @@ mod tests {
             std::slice::from_ref(&remote_provider),
             "site-prod",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6472,7 +5970,6 @@ mod tests {
             &[],
             std::slice::from_ref(&remote_provider),
             "site-staging",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6502,7 +5999,6 @@ mod tests {
             std::slice::from_ref(&remote_provider),
             "site-wrong",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6529,7 +6025,6 @@ mod tests {
             &[],
             &[remote_restricted, remote_unrestricted],
             "unknown-site",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6608,25 +6103,20 @@ mod tests {
         let prov_local = test_provider_on_site("prov-local", "net", "site-b", "local", &["llm"]);
         let prov_remote = test_provider_on_site("prov-remote", "net", "site-c", "remote", &["llm"]);
 
-        let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
-        metrics.insert(
-            "prov-local",
-            scoring::BackendMetrics::new(0.0, true, 0.5, 100.0, 0.5, 0.90),
-        );
-        metrics.insert(
-            "prov-remote",
-            scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.2),
-        );
 
-        let overlay = render_routing_overlay(
+        let mut admission = HashMap::new();
+        admission.insert("prov-local".to_owned(), AdmissionState::ExistingOnly);
+        admission.insert("prov-remote".to_owned(), AdmissionState::NewAndExisting);
+
+        let overlay = render_routing_overlay_with_admission(
             &network,
             &[site_a, site_b, site_c],
             &[prov_local, prov_remote],
             &[],
             "site-a",
-            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
+            Some(&admission),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -6647,50 +6137,6 @@ mod tests {
         assert_eq!(second.cluster, "prov-local", "same-region saturated must rank second");
     }
 
-    #[test]
-    fn all_local_saturated_falls_through_to_remote() {
-        let network = test_network("net");
-        let site_a = test_site_with_geography_and_label("site-a", "net", Some("us-east"), Some("az-1"));
-        let site_b = test_site_with_geography_and_label("site-b", "net", Some("us-east"), Some("az-2"));
-        let site_c = test_site_with_geography_and_label("site-c", "net", Some("eu-west"), Some("az-1"));
-
-        let prov_a = test_provider_on_site("prov-a", "net", "site-a", "local", &["llm"]);
-        let prov_b = test_provider_on_site("prov-b", "net", "site-b", "local", &["llm"]);
-        let prov_c = test_provider_on_site("prov-c", "net", "site-c", "remote", &["llm"]);
-
-        let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
-        metrics.insert("prov-a", scoring::BackendMetrics::new(0.0, true, 0.5, 100.0, 0.5, 0.95));
-        metrics.insert("prov-b", scoring::BackendMetrics::new(0.0, true, 0.92, 100.0, 0.5, 0.5));
-        metrics.insert("prov-c", scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.2));
-
-        let overlay = render_routing_overlay(
-            &network,
-            &[site_a, site_b, site_c],
-            &[prov_a, prov_b, prov_c],
-            &[],
-            "site-a",
-            Some(&metrics),
-            None,
-            &scoring::ScoringWeights::default(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-
-        assert_eq!(overlay.candidates.len(), 3, "all three candidates must be present");
-        assert_eq!(
-            overlay.candidates[0].admission_state,
-            Some(AdmissionState::NewAndExisting),
-            "remote healthy must be first (NewAndExisting)"
-        );
-        assert_eq!(
-            overlay.candidates[0].cluster, "prov-c",
-            "cross-region healthy must rank first when all local are saturated"
-        );
-        assert!(
-            overlay.candidates[1].admission_state == Some(AdmissionState::ExistingOnly)
-                && overlay.candidates[2].admission_state == Some(AdmissionState::ExistingOnly),
-            "saturated local providers must both be ExistingOnly"
-        );
-    }
 
     #[test]
     fn excluded_candidate_removed_from_output() {
@@ -6701,25 +6147,22 @@ mod tests {
         let prov_healthy = test_provider_on_site("prov-healthy", "net", "site-a", "local", &["llm"]);
         let prov_dead = test_provider_on_site("prov-dead", "net", "site-b", "local", &["llm"]);
 
-        let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
-        metrics.insert(
-            "prov-healthy",
-            scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.2),
-        );
-        metrics.insert(
-            "prov-dead",
-            scoring::BackendMetrics::new(0.5, false, 0.3, 100.0, 0.5, 0.2),
-        );
 
-        let overlay = render_routing_overlay(
+        // Excluded is a controller decision, held down over time. The overlay
+        // still drops what is excluded; it just no longer decides it.
+        let mut admission = HashMap::new();
+        admission.insert("prov-dead".to_owned(), AdmissionState::Excluded);
+        admission.insert("prov-healthy".to_owned(), AdmissionState::NewAndExisting);
+
+        let overlay = render_routing_overlay_with_admission(
             &network,
             &[site_a, site_b],
             &[prov_healthy, prov_dead],
             &[],
             "site-a",
-            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
+            Some(&admission),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -6742,7 +6185,6 @@ mod tests {
             &[prov_local, prov_api],
             &[],
             "local-gw",
-            None,
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -6783,7 +6225,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6814,7 +6255,6 @@ mod tests {
             &[prov],
             &[],
             "site-a",
-            None,
             Some("2026-07-24T12:00:00Z"),
             &scoring::ScoringWeights::default(),
         )
@@ -6881,7 +6321,6 @@ mod tests {
             &[prov],
             &[],
             "net",
-            None,
             Some(ts),
             &scoring::ScoringWeights::default(),
         )
@@ -6914,7 +6353,6 @@ mod tests {
             &[],
             "site-a",
             None,
-            None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
@@ -6930,41 +6368,6 @@ mod tests {
             json["candidates"][0]["selection_tier"].as_str(),
             Some("same_region"),
             "SameRegion must serialize as same_region"
-        );
-    }
-
-    #[test]
-    fn admission_state_from_saturated_metrics() {
-        let network = test_network("net");
-        let site_a = test_site_with_geography_and_label("site-a", "net", Some("us-east"), Some("az-1"));
-        let prov = test_provider_on_site("prov-a", "net", "site-a", "local", &["llm"]);
-
-        let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
-        metrics.insert("prov-a", scoring::BackendMetrics::new(0.0, true, 0.5, 100.0, 0.5, 0.90));
-
-        let overlay = render_routing_overlay(
-            &network,
-            &[site_a],
-            &[prov],
-            &[],
-            "site-a",
-            Some(&metrics),
-            None,
-            &scoring::ScoringWeights::default(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-
-        assert_eq!(overlay.candidates.len(), 1, "one candidate");
-        assert_eq!(
-            overlay.candidates[0].admission_state,
-            Some(AdmissionState::ExistingOnly),
-            "saturated queue must produce ExistingOnly"
-        );
-        let json: serde_json::Value = serde_json::to_value(&overlay).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(
-            json["candidates"][0]["admission_state"].as_str(),
-            Some("existing_only"),
-            "ExistingOnly must serialize as existing_only"
         );
     }
 }

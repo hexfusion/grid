@@ -967,12 +967,12 @@ mod tests {
         let ok = labels(&[("topology/region", "us-east"), ("topology/zone", "us-east-1a")]);
         assert_eq!(accept_site_labels(ok, "east").unwrap_or_default().len(), 2);
     }
-    use crdt::{Capability, GCounter, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
+    use crdt::{Capability, GCounter, ProviderPhase, ProviderState};
     use foca::{BroadcastHandler as _, Invalidates as _};
 
     use super::*;
 
-    fn snapshot(site: &str, revision: u64, queue_depth: f64) -> GridStateSnapshot {
+    fn snapshot(site: &str, revision: u64) -> GridStateSnapshot {
         let mut snap = GridStateSnapshot::new(site.to_owned());
         snap.add_capability(Capability::Model("model-x".to_owned()));
         snap.upsert_provider(ProviderState {
@@ -983,10 +983,6 @@ mod tests {
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
             phase: ProviderPhase::Available,
-            metrics: ProviderMetricsSnapshot {
-                queue_depth: Some(queue_depth),
-                ..ProviderMetricsSnapshot::default()
-            },
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision,
             writer_id: site.to_owned(),
@@ -1003,7 +999,7 @@ mod tests {
 
     #[test]
     fn new_sets_version_origin_and_revision() {
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7, 0.1), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7), None);
         assert_eq!(broadcast.version, STATE_BROADCAST_VERSION_V1, "version without gateway");
         assert_eq!(broadcast.origin_site, "site-p", "origin");
         assert_eq!(broadcast.revision, 7, "revision");
@@ -1011,7 +1007,7 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip_preserves_snapshot() {
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7, 0.1), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7), None);
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
         let provider = decoded
@@ -1019,12 +1015,16 @@ mod tests {
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(decoded.version, STATE_BROADCAST_VERSION_V1, "version without gateway");
-        assert_eq!(provider.metrics.queue_depth, Some(0.1), "metric value");
+        assert_eq!(
+            provider.phase,
+            ProviderPhase::Available,
+            "provider record survives the round trip"
+        );
     }
 
     #[test]
     fn grid_state_and_metadata_broadcasts_are_distinguished() {
-        let state = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7, 0.1), None);
+        let state = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7), None);
         let metadata = StateBroadcast::new(
             "site-p".to_owned(),
             8,
@@ -1087,7 +1087,7 @@ mod tests {
         // actually carries provider/capability data, not merely because
         // `carries_grid_state()` is true (which tenant_spend alone satisfies).
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let full = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.2), None);
+        let full = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         receive(&mut handler, &full);
         assert!(
             handler.snapshot().provider("net", "site-p", "provider").is_some(),
@@ -1228,24 +1228,24 @@ mod tests {
 
     #[test]
     fn decoded_broadcast_merges_with_local_snapshot() {
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 2, snapshot("site-p", 2, 0.1), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 2, snapshot("site-p", 2), None);
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
 
-        let mut local = snapshot("site-p", 1, 0.9);
+        let mut local = snapshot("site-p", 1);
         local.merge(&decoded.snapshot);
 
         let provider = local
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(provider.revision, 2, "newer broadcast snapshot must win");
-        assert_eq!(provider.metrics.queue_depth, Some(0.1), "newer metric must win");
+        assert_eq!(provider.phase, ProviderPhase::Available, "newer metric must win");
     }
 
     #[test]
     fn handler_accepts_new_broadcast_and_merges_snapshot() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.2), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
 
         let key = handler
@@ -1257,14 +1257,14 @@ mod tests {
         let provider = snap
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
-        assert_eq!(provider.metrics.queue_depth, Some(0.2), "snapshot must merge");
+        assert_eq!(provider.phase, ProviderPhase::Available, "snapshot must merge");
     }
 
     #[test]
-    fn newer_transport_revision_replaces_equal_revision_provider_metrics() {
+    fn newer_transport_revision_replaces_an_equal_revision_record() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let initial = StateBroadcast::new("site-p".to_owned(), 10, snapshot("site-p", 1, 0.9), None);
-        let changed = StateBroadcast::new("site-p".to_owned(), 11, snapshot("site-p", 1, 0.1), None);
+        let initial = StateBroadcast::new("site-p".to_owned(), 10, snapshot("site-p", 1), None);
+        let changed = StateBroadcast::new("site-p".to_owned(), 11, snapshot("site-p", 1), None);
 
         assert!(receive(&mut handler, &initial).is_some());
         assert!(receive(&mut handler, &changed).is_some());
@@ -1277,17 +1277,12 @@ mod tests {
             provider.revision, 11,
             "transport revision must become the provider LWW revision"
         );
-        assert_eq!(
-            provider.metrics.queue_depth,
-            Some(0.1),
-            "newer origin snapshot must replace metric-only state"
-        );
     }
 
     #[test]
     fn handler_rejects_duplicate_broadcast() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.2), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
 
         assert!(
@@ -1312,7 +1307,7 @@ mod tests {
         // a provider broadcast takes this one. Storing labels on only the other
         // left every site advertising a region and no site keeping one.
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.5), None)
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None)
             .with_labels(Some(labels(&[(SITE_REGION_LABEL, "us-east")])));
         assert!(
             !broadcast.is_metadata_only(),
@@ -1336,8 +1331,8 @@ mod tests {
     #[test]
     fn handler_rejects_older_broadcast_after_newer_one() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let newer = StateBroadcast::new("site-p".to_owned(), 2, snapshot("site-p", 2, 0.1), None);
-        let older = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.9), None);
+        let newer = StateBroadcast::new("site-p".to_owned(), 2, snapshot("site-p", 2), None);
+        let older = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         let newer_bytes = newer.encode().unwrap_or_else(|_| std::process::abort());
         let older_bytes = older.encode().unwrap_or_else(|_| std::process::abort());
 
@@ -1359,7 +1354,7 @@ mod tests {
         let provider = snap
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
-        assert_eq!(provider.metrics.queue_depth, Some(0.1), "newer state must remain");
+        assert_eq!(provider.phase, ProviderPhase::Available, "newer state must remain");
     }
 
     // -----------------------------------------------------------------------
@@ -1368,7 +1363,7 @@ mod tests {
 
     #[test]
     fn v1_broadcast_decoded_has_no_gateway_address() {
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.5), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         assert_eq!(broadcast.version, STATE_BROADCAST_VERSION_V1, "v1 version");
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
@@ -1384,7 +1379,7 @@ mod tests {
         let broadcast = StateBroadcast::new(
             "site-p".to_owned(),
             3,
-            snapshot("site-p", 3, 0.7),
+            snapshot("site-p", 3),
             Some("10.0.0.1:19080".to_owned()),
         );
         assert_eq!(
@@ -1403,7 +1398,7 @@ mod tests {
 
     #[test]
     fn broadcast_without_gateway_address_encodes_base_payload_only() {
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 5, snapshot("site-p", 5, 0.3), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 5, snapshot("site-p", 5), None);
         assert_eq!(
             broadcast.version, STATE_BROADCAST_VERSION_V1,
             "version must be v1 when no gateway"
@@ -1426,7 +1421,7 @@ mod tests {
         let broadcast = StateBroadcast::new(
             "site-p".to_owned(),
             3,
-            snapshot("site-p", 3, 0.7),
+            snapshot("site-p", 3),
             Some("10.0.0.1:19080".to_owned()),
         );
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
@@ -1449,7 +1444,7 @@ mod tests {
         let broadcast = StateBroadcast::new(
             "site-p".to_owned(),
             1,
-            snapshot("site-p", 1, 0.4),
+            snapshot("site-p", 1),
             Some("10.0.0.2:19080".to_owned()),
         );
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
@@ -1468,11 +1463,11 @@ mod tests {
     #[test]
     fn handler_accepts_gateway_address_update_at_equal_revision() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let without_gateway = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7, 0.4), None);
+        let without_gateway = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7), None);
         let with_gateway = StateBroadcast::new(
             "site-p".to_owned(),
             7,
-            snapshot("site-p", 7, 0.4),
+            snapshot("site-p", 7),
             Some("10.0.0.2:19080".to_owned()),
         );
 
@@ -1511,7 +1506,7 @@ mod tests {
         );
         assert!(receive(&mut handler, &gateway_only).is_some());
 
-        let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.8), None);
+        let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         assert!(
             receive(&mut handler, &state).is_some(),
             "state broadcast must not be blocked by higher gateway-only revision"
@@ -1522,8 +1517,8 @@ mod tests {
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(
-            provider.metrics.queue_depth,
-            Some(0.8),
+            provider.phase,
+            ProviderPhase::Available,
             "provider state must merge after gateway-only update"
         );
         assert_eq!(
@@ -1536,7 +1531,7 @@ mod tests {
     #[test]
     fn handler_state_revision_does_not_block_gateway_only_update() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let state = StateBroadcast::new("site-p".to_owned(), 99, snapshot("site-p", 99, 0.8), None);
+        let state = StateBroadcast::new("site-p".to_owned(), 99, snapshot("site-p", 99), None);
         assert!(receive(&mut handler, &state).is_some());
 
         let gateway_only = StateBroadcast::new(
@@ -1583,8 +1578,8 @@ mod tests {
     #[test]
     fn cert_extension_round_trips() {
         let cert = "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n";
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 4, snapshot("site-p", 4, 0.6), None)
-            .with_cert(Some(cert.to_owned()));
+        let broadcast =
+            StateBroadcast::new("site-p".to_owned(), 4, snapshot("site-p", 4), None).with_cert(Some(cert.to_owned()));
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
 
@@ -1596,8 +1591,8 @@ mod tests {
     fn handler_stores_public_cert_from_extension() {
         let cert = "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n";
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.4), None)
-            .with_cert(Some(cert.to_owned()));
+        let broadcast =
+            StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None).with_cert(Some(cert.to_owned()));
 
         assert!(receive(&mut handler, &broadcast).is_some());
         assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
@@ -1662,7 +1657,7 @@ mod tests {
         .with_cert(Some(cert.to_owned()));
         assert!(receive(&mut handler, &cert_only).is_some());
 
-        let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.8), None);
+        let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         assert!(
             receive(&mut handler, &state).is_some(),
             "state broadcast must not be blocked by higher cert-only revision"
@@ -1685,7 +1680,7 @@ mod tests {
         .with_cert(Some(cert.to_owned()));
         assert!(receive(&mut handler, &metadata_only).is_some());
 
-        let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.8), None);
+        let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         assert!(
             receive(&mut handler, &state).is_some(),
             "state broadcast must not be blocked by higher combined metadata revision"
@@ -1706,7 +1701,7 @@ mod tests {
     #[test]
     fn receive_item_merges_tenant_spend_from_broadcast() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let mut snap = snapshot("site-p", 1, 0.2);
+        let mut snap = snapshot("site-p", 1);
         snap.increment_tenant_spend("tenant-x", 500);
         let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
 
@@ -1728,11 +1723,11 @@ mod tests {
     fn receive_item_sums_tenant_spend_across_origin_sites() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
 
-        let mut snap_a = snapshot("site-a", 1, 0.2);
+        let mut snap_a = snapshot("site-a", 1);
         snap_a.increment_tenant_spend("tenant-x", 300);
         receive(&mut handler, &StateBroadcast::new("site-a".to_owned(), 1, snap_a, None));
 
-        let mut snap_b = snapshot("site-b", 1, 0.2);
+        let mut snap_b = snapshot("site-b", 1);
         snap_b.increment_tenant_spend("tenant-x", 700);
         receive(&mut handler, &StateBroadcast::new("site-b".to_owned(), 1, snap_b, None));
 
@@ -1825,7 +1820,7 @@ mod tests {
     #[test]
     fn handler_accepts_v1_broadcast_without_gateway_address() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.4), None);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1), None);
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
 
         let key = handler
@@ -1845,7 +1840,7 @@ mod tests {
         let original = StateBroadcast::new(
             "site-a".to_owned(),
             10,
-            snapshot("site-a", 10, 0.4),
+            snapshot("site-a", 10),
             Some("10.0.0.1:8443".to_owned()),
         )
         .with_cert(Some(cert.to_owned()));
@@ -1859,7 +1854,7 @@ mod tests {
         let restarted = StateBroadcast::new(
             "site-a".to_owned(),
             1,
-            snapshot("site-a", 1, 0.8),
+            snapshot("site-a", 1),
             Some("10.0.0.9:8443".to_owned()),
         );
         assert!(
@@ -1879,7 +1874,7 @@ mod tests {
             let broadcast = StateBroadcast::new(
                 origin.to_owned(),
                 revision,
-                snapshot(origin, revision, 0.3),
+                snapshot(origin, revision),
                 Some(format!("10.0.0.{revision}:8443")),
             )
             .with_cert(Some(format!("cert-{origin}")));

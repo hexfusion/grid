@@ -150,9 +150,6 @@ pub struct ProviderState {
     /// Lifecycle phase observed by the advertising site.
     pub phase: ProviderPhase,
 
-    /// Optional normalized metrics.
-    pub metrics: ProviderMetricsSnapshot,
-
     /// Access policy for consumer authorization.
     ///
     /// When empty `match_labels`, the provider allows all consumers (preserving
@@ -376,7 +373,7 @@ fn provider_key(network_id: &str, site_id: &str, provider_id: &str) -> String {
 mod tests {
     use super::*;
 
-    fn provider(site: &str, provider_id: &str, revision: u64, queue_depth: f64) -> ProviderState {
+    fn provider(site: &str, provider_id: &str, revision: u64, phase: ProviderPhase) -> ProviderState {
         ProviderState {
             network_id: "net".to_owned(),
             site_id: site.to_owned(),
@@ -384,11 +381,7 @@ mod tests {
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
-            phase: ProviderPhase::Available,
-            metrics: ProviderMetricsSnapshot {
-                queue_depth: Some(queue_depth),
-                ..ProviderMetricsSnapshot::default()
-            },
+            phase,
             access_policy: ProviderAccessPolicy::default(), // Empty policy = allow all
             revision,
             writer_id: site.to_owned(),
@@ -398,32 +391,32 @@ mod tests {
     #[test]
     fn upsert_keeps_newer_provider_revision() {
         let mut snap = GridStateSnapshot::new("site-p".to_owned());
-        snap.upsert_provider(provider("site-p", "provider", 1, 0.9));
-        snap.upsert_provider(provider("site-p", "provider", 2, 0.1));
+        snap.upsert_provider(provider("site-p", "provider", 1, ProviderPhase::Degraded));
+        snap.upsert_provider(provider("site-p", "provider", 2, ProviderPhase::Available));
         let got = snap
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(got.revision, 2, "newer revision must win");
-        assert_eq!(got.metrics.queue_depth, Some(0.1), "newer metrics must win");
+        assert_eq!(got.phase, ProviderPhase::Available, "newer record must win");
     }
 
     #[test]
     fn upsert_ignores_older_provider_revision() {
         let mut snap = GridStateSnapshot::new("site-p".to_owned());
-        snap.upsert_provider(provider("site-p", "provider", 2, 0.1));
-        snap.upsert_provider(provider("site-p", "provider", 1, 0.9));
+        snap.upsert_provider(provider("site-p", "provider", 2, ProviderPhase::Available));
+        snap.upsert_provider(provider("site-p", "provider", 1, ProviderPhase::Degraded));
         let got = snap
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(got.revision, 2, "older revision must not replace newer state");
-        assert_eq!(got.metrics.queue_depth, Some(0.1), "newer metrics must remain");
+        assert_eq!(got.phase, ProviderPhase::Available, "newer record must remain");
     }
 
     #[test]
     fn equal_revision_tie_breaks_by_writer_id() {
-        let mut left = provider("site-p", "provider", 1, 0.9);
+        let mut left = provider("site-p", "provider", 1, ProviderPhase::Degraded);
         left.writer_id = "writer-a".to_owned();
-        let mut right = provider("site-p", "provider", 1, 0.1);
+        let mut right = provider("site-p", "provider", 1, ProviderPhase::Available);
         right.writer_id = "writer-b".to_owned();
 
         let mut snap = GridStateSnapshot::new("site-p".to_owned());
@@ -440,7 +433,7 @@ mod tests {
     fn merge_is_idempotent_for_duplicate_snapshot() {
         let mut snap = GridStateSnapshot::new("site-p".to_owned());
         snap.add_capability(Capability::Model("model-x".to_owned()));
-        snap.upsert_provider(provider("site-p", "provider", 1, 0.2));
+        snap.upsert_provider(provider("site-p", "provider", 1, ProviderPhase::Available));
 
         let duplicate = snap.clone();
         snap.merge(&duplicate);
@@ -452,13 +445,13 @@ mod tests {
     #[test]
     fn authoritative_origin_replacement_updates_and_removes_provider_records() {
         let mut current = GridStateSnapshot::new("consumer".to_owned());
-        current.upsert_provider(provider("site-p", "stale", 9, 0.9));
-        current.upsert_provider(provider("site-p", "current", 9, 0.9));
-        current.upsert_provider(provider("site-q", "preserved", 9, 0.4));
+        current.upsert_provider(provider("site-p", "stale", 9, ProviderPhase::Degraded));
+        current.upsert_provider(provider("site-p", "current", 9, ProviderPhase::Degraded));
+        current.upsert_provider(provider("site-q", "preserved", 9, ProviderPhase::Available));
 
         let mut authoritative = GridStateSnapshot::new("site-p".to_owned());
-        authoritative.upsert_provider(provider("site-p", "current", 1, 0.1));
-        authoritative.upsert_provider(provider("site-q", "foreign", 20, 0.2));
+        authoritative.upsert_provider(provider("site-p", "current", 1, ProviderPhase::Available));
+        authoritative.upsert_provider(provider("site-q", "foreign", 20, ProviderPhase::Available));
 
         current.replace_origin_providers("site-p", 10, &authoritative);
 
@@ -470,7 +463,11 @@ mod tests {
             .provider("net", "site-p", "current")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(updated.revision, 10, "transport revision must govern the origin record");
-        assert_eq!(updated.metrics.queue_depth, Some(0.1), "metric-only change must apply");
+        assert_eq!(
+            updated.phase,
+            ProviderPhase::Available,
+            "a phase-only change must apply"
+        );
         assert!(
             current.provider("net", "site-q", "preserved").is_some(),
             "records owned by other origins must remain"
@@ -485,11 +482,11 @@ mod tests {
     fn merge_order_does_not_change_result() {
         let mut snap_a = GridStateSnapshot::new("site-p".to_owned());
         snap_a.add_capability(Capability::Model("model-p".to_owned()));
-        snap_a.upsert_provider(provider("site-p", "provider", 1, 0.8));
+        snap_a.upsert_provider(provider("site-p", "provider", 1, ProviderPhase::Available));
 
         let mut snap_b = GridStateSnapshot::new("site-q".to_owned());
         snap_b.add_capability(Capability::Model("model-q".to_owned()));
-        snap_b.upsert_provider(provider("site-p", "provider", 2, 0.2));
+        snap_b.upsert_provider(provider("site-p", "provider", 2, ProviderPhase::Available));
 
         let mut ab = snap_a.clone();
         ab.merge(&snap_b);
@@ -511,20 +508,17 @@ mod tests {
             ab_provider.revision, ba_provider.revision,
             "provider revision must converge"
         );
-        assert_eq!(
-            ab_provider.metrics.queue_depth, ba_provider.metrics.queue_depth,
-            "provider metrics must converge"
-        );
+        assert_eq!(ab_provider.phase, ba_provider.phase, "provider metrics must converge");
     }
 
     #[test]
     fn merge_is_associative_for_provider_records() {
         let mut snap_a = GridStateSnapshot::new("site-p".to_owned());
-        snap_a.upsert_provider(provider("site-p", "provider", 1, 0.8));
+        snap_a.upsert_provider(provider("site-p", "provider", 1, ProviderPhase::Available));
         let mut snap_b = GridStateSnapshot::new("site-q".to_owned());
-        snap_b.upsert_provider(provider("site-p", "provider", 2, 0.4));
+        snap_b.upsert_provider(provider("site-p", "provider", 2, ProviderPhase::Available));
         let mut snap_c = GridStateSnapshot::new("site-r".to_owned());
-        snap_c.upsert_provider(provider("site-p", "provider", 3, 0.1));
+        snap_c.upsert_provider(provider("site-p", "provider", 3, ProviderPhase::Available));
 
         let mut ab_then_c = snap_a.clone();
         ab_then_c.merge(&snap_b);
@@ -545,17 +539,14 @@ mod tests {
             left.revision, right.revision,
             "associative merge must choose same revision"
         );
-        assert_eq!(
-            left.metrics.queue_depth, right.metrics.queue_depth,
-            "associative merge must choose same metrics"
-        );
+        assert_eq!(left.phase, right.phase, "associative merge must choose same metrics");
     }
 
     #[test]
     fn snapshot_serde_round_trip() {
         let mut snap = GridStateSnapshot::new("site-p".to_owned());
         snap.add_capability(Capability::Model("model-x".to_owned()));
-        snap.upsert_provider(provider("site-p", "provider", 1, 0.3));
+        snap.upsert_provider(provider("site-p", "provider", 1, ProviderPhase::Available));
 
         let bytes =
             bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
@@ -574,7 +565,7 @@ mod tests {
     fn snapshot_bincode_round_trip_with_default_access_policy() {
         // Test bincode round-trip with default (empty) access policy
         let mut snap = GridStateSnapshot::new("site-a".to_owned());
-        let mut provider_state = provider("site-a", "provider-default", 1, 0.5);
+        let mut provider_state = provider("site-a", "provider-default", 1, ProviderPhase::Available);
         provider_state.access_policy = ProviderAccessPolicy::default(); // Empty policy
         snap.upsert_provider(provider_state);
 
@@ -598,7 +589,7 @@ mod tests {
     fn snapshot_bincode_round_trip_with_restricted_access_policy() {
         // Test bincode round-trip with restricted access policy
         let mut snap = GridStateSnapshot::new("site-b".to_owned());
-        let mut provider_state = provider("site-b", "provider-restricted", 2, 0.8);
+        let mut provider_state = provider("site-b", "provider-restricted", 2, ProviderPhase::Available);
         provider_state.access_policy = ProviderAccessPolicy {
             match_labels: [
                 ("env".to_owned(), "prod".to_owned()),
@@ -664,9 +655,9 @@ mod tests {
     #[test]
     fn remove_origin_providers_clears_only_matching_site() {
         let mut snap = GridStateSnapshot::new("consumer".to_owned());
-        snap.upsert_provider(provider("site-a", "p1", 1, 0.5));
-        snap.upsert_provider(provider("site-a", "p2", 1, 0.6));
-        snap.upsert_provider(provider("site-b", "p1", 1, 0.4));
+        snap.upsert_provider(provider("site-a", "p1", 1, ProviderPhase::Available));
+        snap.upsert_provider(provider("site-a", "p2", 1, ProviderPhase::Available));
+        snap.upsert_provider(provider("site-b", "p1", 1, ProviderPhase::Available));
 
         snap.remove_origin_providers("site-a");
 

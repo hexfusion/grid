@@ -278,7 +278,7 @@ fn grid_config() -> foca::Config {
 
 #[cfg(test)]
 mod tests {
-    use crdt::{Capability, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
+    use crdt::{Capability, ProviderPhase, ProviderState};
 
     use super::*;
     use crate::state_broadcast::StateBroadcastError;
@@ -300,7 +300,7 @@ mod tests {
         (SwimNode::new(local_id(site, port)), ())
     }
 
-    fn provider_snap(site: &str, queue: f64) -> GridStateSnapshot {
+    fn provider_snap(site: &str, phase: ProviderPhase) -> GridStateSnapshot {
         let mut snap = GridStateSnapshot::new(site.to_owned());
         snap.add_capability(Capability::Model("model-x".to_owned()));
         snap.upsert_provider(ProviderState {
@@ -310,11 +310,7 @@ mod tests {
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
-            phase: ProviderPhase::Available,
-            metrics: ProviderMetricsSnapshot {
-                queue_depth: Some(queue),
-                ..Default::default()
-            },
+            phase,
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site.to_owned(),
@@ -381,7 +377,7 @@ mod tests {
     #[test]
     fn publish_state_broadcast_does_not_error() {
         let (mut node, _) = make_node("site-a", 19_105);
-        let snap = provider_snap("site-a", 0.2);
+        let snap = provider_snap("site-a", ProviderPhase::Degraded);
         let bc = StateBroadcast::new("site-a".to_owned(), 1, snap, None);
         node.publish_state_broadcast(&bc)
             .unwrap_or_else(|_| std::process::abort());
@@ -449,7 +445,12 @@ mod tests {
         establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
 
         // Step 2: queue a CRDT broadcast on A.
-        let bc = StateBroadcast::new("site-a".to_owned(), 1, provider_snap("site-a", 0.2), None);
+        let bc = StateBroadcast::new(
+            "site-a".to_owned(),
+            1,
+            provider_snap("site-a", ProviderPhase::Degraded),
+            None,
+        );
         node_a
             .publish_state_broadcast(&bc)
             .unwrap_or_else(|_| std::process::abort());
@@ -478,9 +479,9 @@ mod tests {
             .provider("net", "site-a", "provider-1")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(
-            received.metrics.queue_depth,
-            Some(0.2),
-            "B must receive the correct queue depth from A's CRDT state"
+            received.phase,
+            ProviderPhase::Degraded,
+            "B must receive the provider record A published"
         );
         assert!(
             !b_snap.capabilities.is_empty(),
@@ -508,7 +509,7 @@ mod tests {
             .publish_state_broadcast(&StateBroadcast::new(
                 "site-a".to_owned(),
                 1,
-                provider_snap("site-a", 0.2),
+                provider_snap("site-a", ProviderPhase::Degraded),
                 None,
             ))
             .unwrap_or_else(|_| std::process::abort());
@@ -558,7 +559,7 @@ mod tests {
             .publish_state_broadcast(&StateBroadcast::new(
                 "site-a".to_owned(),
                 2,
-                provider_snap("site-a", 0.1),
+                provider_snap("site-a", ProviderPhase::Degraded),
                 None,
             ))
             .unwrap_or_else(|_| std::process::abort());
@@ -571,9 +572,9 @@ mod tests {
             node_b
                 .state_snapshot()
                 .provider("net", "site-a", "provider-1")
-                .map(|prov| prov.metrics.queue_depth),
-            Some(Some(0.1)),
-            "B should have queue_depth=0.1 from rev=2"
+                .map(|prov| prov.phase.clone()),
+            Some(ProviderPhase::Degraded),
+            "B should hold the record from rev=2"
         );
 
         // Send rev=1 (stale) — B must reject it.
@@ -581,7 +582,7 @@ mod tests {
             .publish_state_broadcast(&StateBroadcast::new(
                 "site-a".to_owned(),
                 1,
-                provider_snap("site-a", 0.9),
+                provider_snap("site-a", ProviderPhase::Available),
                 None,
             ))
             .unwrap_or_else(|_| std::process::abort());
@@ -594,8 +595,8 @@ mod tests {
             node_b
                 .state_snapshot()
                 .provider("net", "site-a", "provider-1")
-                .map(|prov| prov.metrics.queue_depth),
-            Some(Some(0.1)),
+                .map(|prov| prov.phase.clone()),
+            Some(ProviderPhase::Degraded),
             "stale rev=1 must not overwrite newer rev=2 state"
         );
     }
@@ -613,7 +614,7 @@ mod tests {
             .publish_state_broadcast(&StateBroadcast::new(
                 "site-a".to_owned(),
                 1,
-                provider_snap("site-a", 0.3),
+                provider_snap("site-a", ProviderPhase::Available),
                 None,
             ))
             .unwrap_or_else(|_| std::process::abort());
@@ -687,7 +688,7 @@ mod tests {
             .publish_state_broadcast(&StateBroadcast::new(
                 "site-a".to_owned(),
                 1,
-                provider_snap("site-a", 0.2),
+                provider_snap("site-a", ProviderPhase::Degraded),
                 None,
             ))
             .unwrap_or_else(|_| std::process::abort());
@@ -702,7 +703,7 @@ mod tests {
             .publish_state_broadcast(&StateBroadcast::new(
                 "site-b".to_owned(),
                 1,
-                provider_snap("site-b", 0.8),
+                provider_snap("site-b", ProviderPhase::Available),
                 None,
             ))
             .unwrap_or_else(|_| std::process::abort());
