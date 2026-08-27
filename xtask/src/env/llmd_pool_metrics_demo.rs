@@ -5449,12 +5449,12 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         // one the gateway used and nothing else can move it.
         match (
             basis_after(&with_basis, BASIS_LIVE_LOAD),
-            basis_after(&without_basis, BASIS_NO_LOAD_SOURCE),
+            basis_after(&without_basis, BASIS_NO_FRESH_SIGNAL),
         ) {
             (live, none) if live > 0 && none > 0 => {
                 observations.push(format!(
-                    "{cluster}: the gateway routed on the live signal {live} times while it had one, \
-                     and reported having none {none} times once it was withdrawn"
+                    "{cluster}: the gateway routed on the live signal {live} times while it could \
+                     reach one, and reported no usable sample {none} times once it could not"
                 ));
             },
             (0, _) => {
@@ -5463,9 +5463,11 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
                 ));
                 success = false;
             },
-            (..) => {
+            _ => {
                 observations.push(format!(
-                    "{cluster}: withdrawing the load source did not change what the gateway routed on"
+                    "{cluster}: withdrawing the load source did not change what the gateway routed \
+                     on; it recorded {}",
+                    describe_counts(&without_basis)
                 ));
                 success = false;
             },
@@ -6039,8 +6041,13 @@ fn record_quota(tenant: &str, seen: &BTreeMap<String, u32>) {
 /// Basis label the gateway records when the polled signal decided.
 const BASIS_LIVE_LOAD: &str = "live_load";
 
-/// Basis label the gateway records when it had no load source to consult.
-const BASIS_NO_LOAD_SOURCE: &str = "no_load_source";
+/// Basis label the gateway records when a load source is configured and no
+/// candidate had a usable sample.
+///
+/// Not `no_load_source`, which means none is configured at all. This proof
+/// withdraws the source by pointing it somewhere that does not answer, so the
+/// gateway still has one and simply cannot reach it.
+const BASIS_NO_FRESH_SIGNAL: &str = "no_fresh_signal";
 
 /// Local port the gateway's admin endpoint is forwarded to while reading it.
 const ADMIN_FORWARD_PORT: u16 = 19901;
@@ -6204,4 +6211,17 @@ other_metric{basis=\"live_load\"} 99";
         assert_eq!(basis_after(&delta, "no_load_source"), 5);
         assert_eq!(basis_after(&delta, "live_load"), 0);
     }
+}
+
+
+/// Render a basis tally the way a failure needs to read.
+fn describe_counts(counts: &BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "no decisions at all".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(basis, n)| format!("{n}x{basis}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
