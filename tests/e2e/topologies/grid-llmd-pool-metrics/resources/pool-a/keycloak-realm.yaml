@@ -49,7 +49,7 @@ data:
               "protocolMapper": "oidc-hardcoded-claim-mapper",
               "config": {
                 "claim.name": "grid_rate",
-                "claim.value": "10",
+                "claim.value": "2",
                 "access.token.claim": "true",
                 "jsonType.label": "int"
               }
@@ -60,7 +60,7 @@ data:
               "protocolMapper": "oidc-hardcoded-claim-mapper",
               "config": {
                 "claim.name": "grid_burst",
-                "claim.value": "20",
+                "claim.value": "5",
                 "access.token.claim": "true",
                 "jsonType.label": "int"
               }

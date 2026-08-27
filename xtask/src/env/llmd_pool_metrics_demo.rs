@@ -5527,9 +5527,13 @@ const DEFAULT_TENANT: &str = "tenant-platinum";
 /// Tenant whose issuer-signed limit is low enough to reach under burst.
 const THROTTLED_TENANT: &str = "tenant-gold";
 
-/// Requests each tenant sends at once. Above gold's signed burst of 20 and
-/// below platinum's 120, so one offered load lands either side of both limits.
-const RATE_LIMIT_BURST_REQUESTS: u32 = 60;
+/// Requests each tenant sends at once. Above gold's signed burst of 5 and below
+/// platinum's 120, so one offered load lands either side of both limits.
+///
+/// Sized to what these pools serve, not to what makes a tidy number: at 60 the
+/// backends stopped answering and the proof measured the environment giving
+/// out rather than the limiter working.
+const RATE_LIMIT_BURST_REQUESTS: u32 = 20;
 
 /// Address of the grid's issuer, as every site reaches it.
 fn keycloak_endpoint() -> Result<String, Box<dyn std::error::Error>> {
@@ -5589,6 +5593,13 @@ fn proof_per_identity_rate_limit(_context: &DemoContext) -> ProofResult {
     let ctx = kind_context("pool-a");
     let mut observations = Vec::new();
 
+    // The proof before this one restarts the gateway, and a gateway that has
+    // not yet loaded its overlay routes nowhere and answers 500. Wait for one
+    // request to be served before measuring, or the tally reads as the limiter
+    // refusing traffic it never saw.
+    if let Err(e) = await_routable(&ctx) {
+        return failed_proof(format!("the gateway never became routable: {e}"), observations);
+    }
 
     let mut burst = |tenant: &str| -> Result<BTreeMap<String, u32>, Box<dyn std::error::Error>> {
         let token = mint_tenant_token(&ctx, tenant)?;
@@ -5634,7 +5645,7 @@ fn proof_per_identity_rate_limit(_context: &DemoContext) -> ProofResult {
     }
     if gold_throttled == 0 {
         return failed_proof(
-            format!("{THROTTLED_TENANT} was never throttled, though its signed burst is 20"),
+            format!("{THROTTLED_TENANT} was never throttled, though its signed burst is 5"),
             observations,
         );
     }
@@ -5691,7 +5702,9 @@ fn drive_concurrent_requests(
     } else {
         format!("-H 'Authorization: Bearer {token}' ")
     };
-    let body = format!(r#"{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"test"}}]}}"#);
+    // One token out: the limiter decides before any of this is generated, so a
+    // long completion would only spend the backend the other proofs need.
+    let body = format!(r#"{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"hi"}}],"max_tokens":1}}"#);
     let cmd = format!(
         "seq 1 {count} | xargs -P {count} -I{{}} sh -c \"curl -s -o /dev/null -w '%{{http_code}}\\n' \
          --max-time 60 -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
@@ -5851,4 +5864,21 @@ fn demo_token(kube_context: &str) -> Result<&'static str, Box<dyn std::error::Er
     }
     let minted = mint_tenant_token(kube_context, DEFAULT_TENANT)?;
     Ok(TOKEN.get_or_init(|| minted))
+}
+
+/// Wait until the gateway serves a request, so a measurement starts against a
+/// gateway that can route rather than one still coming back.
+fn await_routable(kube_context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let token = mint_tenant_token(kube_context, DEFAULT_TENANT)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut last = String::from("nothing yet");
+    while Instant::now() < deadline {
+        match drive_concurrent_requests("pool-a", &token, 1) {
+            Ok(seen) if status_count(&seen, "200") == 1 => return Ok(()),
+            Ok(seen) => last = describe_statuses(&seen),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    Err(format!("last saw {last}").into())
 }
