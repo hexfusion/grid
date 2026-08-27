@@ -15,7 +15,7 @@ spec:
 
   clusters:
     - name: pool-a
-      stacks: [metallb, pool-a-operator-base, llmd-pool-a, pool-a-site, provider-gateway, consumer-gateway]
+      stacks: [metallb, pool-a-operator-base, llmd-pool-a, identity, pool-a-site, provider-gateway, consumer-gateway]
       properties:
         region: us-east
         zone: us-east-1a
@@ -225,18 +225,6 @@ spec:
           path: resources/pool-a/epp-deployment.yaml
         - type: manifest
           path: resources/pool-a/pressure-generator.yaml
-        # The identity provider the consumer gateway validates tokens against.
-        # Waited on separately so a realm that failed to import is reported
-        # here rather than as an unexplained 401 once traffic starts.
-        - type: manifest
-          path: resources/pool-a/keycloak-realm.yaml
-        - type: manifest
-          path: resources/pool-a/keycloak-deployment.yaml
-        - type: wait
-          resource: deployment/keycloak
-          namespace: grid-system
-          condition: available
-          timeout: "300s"
         - type: wait
           resource: deployment/vcr-1
           namespace: grid-system
@@ -637,12 +625,49 @@ spec:
           timeout: "60s"
           interval: "2s"
 
+    identity:
+      description: Keycloak, the grid's issuer; one for the network, not one per site
+      steps:
+        - type: manifest
+          path: resources/pool-a/keycloak-realm.yaml
+        - type: manifest
+          path: resources/pool-a/keycloak-deployment.yaml
+        # Waited on separately so a realm that failed to import is reported
+        # here rather than as an unexplained 401 once traffic starts.
+        - type: wait
+          resource: deployment/keycloak
+          namespace: grid-system
+          condition: available
+          timeout: "300s"
+        - type: capture
+          resource: svc/keycloak
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: keycloak-ip
+          timeout: "60s"
+          interval: "2s"
+
     consumer-gateway:
       description: Praxis consumer gateway with operator-managed overlay
       steps:
         - type: template-file
           source: configs/consumer/praxis.yaml
           target: .forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
+        - type: template-file
+          source: configs/consumer/policy.yaml
+          target: .forge/runtime/{{ cluster.name }}/consumer/policy.yaml
+        # A Secret rather than a ConfigMap because the chart projects a
+        # single named key from its config map and mounts nothing else.
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              kubectl --context kind-grid-llmd-pm-{{ cluster.name }} -n grid-system
+              create secret generic consumer-gateway-policy
+              --from-file=policy.yaml=.forge/runtime/{{ cluster.name }}/consumer/policy.yaml
+              --dry-run=client -o yaml |
+              kubectl --context kind-grid-llmd-pm-{{ cluster.name }} apply -f -
         - type: exec
           command:
             - bash
@@ -676,6 +701,9 @@ spec:
                 memory: 256Mi
             config:
               existingConfigMap: "consumer-gateway-config"
+            credentials:
+              - name: consumer-gateway-policy
+                mountPath: /etc/praxis/policy
             service:
               type: "LoadBalancer"
             overlay:

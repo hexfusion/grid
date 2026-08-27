@@ -57,6 +57,9 @@ metadata:
   name: keycloak
   namespace: grid-system
 spec:
+  # Reachable from every site: one issuer serves the grid, so peers
+  # outside this cluster resolve tokens against the same keys.
+  type: LoadBalancer
   selector: {app: keycloak}
   ports:
     - {name: http, port: 8180, targetPort: http}

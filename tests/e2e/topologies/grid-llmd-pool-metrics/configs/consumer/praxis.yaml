@@ -7,6 +7,25 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      # Identity first: an unauthenticated caller is refused before the
+      # gateway spends anything parsing its body or scoring a route.
+      - filter: policy
+        config_path: /etc/praxis/policy/policy.yaml
+        # No protocol classifier in this chain; the filter fail-closes on
+        # missing classification unless told this is identity-only.
+        require_protocol_metadata: false
+      # Buckets by the authenticated principal, never by a header the
+      # caller controls. Rate and burst come from claims the issuer
+      # signed, so one filter instance holds every tenant's limit and
+      # the gateway carries no table of callers. The values below apply
+      # only to a token that carries neither claim.
+      - filter: rate_limit
+        mode: per_identity
+        key_claim: grid_tenant
+        rate_claim: grid_rate
+        burst_claim: grid_burst
+        rate: 5
+        burst: 10
       - filter: json_body_field
         field: model
         header: X-Model

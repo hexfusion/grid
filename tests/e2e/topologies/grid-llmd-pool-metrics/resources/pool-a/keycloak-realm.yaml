@@ -35,7 +35,7 @@ data:
               "protocol": "openid-connect",
               "protocolMapper": "oidc-hardcoded-claim-mapper",
               "config": {
-                "claim.name": "grid_site",
+                "claim.name": "grid_tenant",
                 "claim.value": "tenant-gold",
                 "access.token.claim": "true",
                 "jsonType.label": "String"
@@ -79,7 +79,7 @@ data:
               "protocol": "openid-connect",
               "protocolMapper": "oidc-hardcoded-claim-mapper",
               "config": {
-                "claim.name": "grid_site",
+                "claim.name": "grid_tenant",
                 "claim.value": "tenant-platinum",
                 "access.token.claim": "true",
                 "jsonType.label": "String"

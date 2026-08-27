@@ -1,0 +1,48 @@
+# Identity for tenant traffic entering the grid.
+#
+# One issuer serves the whole network, so a token minted at pool-a is
+# accepted by every site's consumer gateway. The address is captured at
+# deploy time because MetalLB assigns it, and it has to match the `iss`
+# Keycloak stamps on the token it issues.
+#
+# Authorization here is deliberately trivial. The question this demo
+# answers is what happens *after* identity is established: `rate_limit`
+# buckets by the authenticated principal and honours the limits the
+# issuer signed into the token.
+
+plugin_settings:
+  routing_enabled: true
+
+plugins:
+  - name: tenant-jwt
+    kind: identity/jwt
+    hooks: [identity.resolve]
+    on_error: fail
+    config:
+      header: Authorization
+      # `user`, so the resolved subject lands in the slot the policy
+      # filter publishes `AuthenticatedIdentity` from. A workload role
+      # resolves no subject and the limiter would see no identity.
+      role: user
+      trusted_issuers:
+        - issuer: "http://{{ captures.pool-a.keycloak-ip }}:8180/realms/grid"
+          # Empty disables `aud` validation; the tenant is identified by
+          # its claims, not by which service it addressed.
+          audiences: []
+          algorithms: ["RS256"]
+          decoding_key:
+            kind: jwks_url
+            url: "http://{{ captures.pool-a.keycloak-ip }}:8180/realms/grid/protocol/openid-connect/certs"
+            # Plaintext to the issuer, which is a demo-only allowance.
+            insecure_http: true
+      claim_mapper: standard
+
+global:
+  authentication:
+    - tenant-jwt
+  authorization:
+    pre_invocation:
+      - "require(authenticated)"
+  response:
+    status: 401
+    body: "{\"error\":\"authentication required\"}"

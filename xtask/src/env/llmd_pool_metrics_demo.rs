@@ -771,6 +771,10 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         next(),
         total
     );
+    // One issuer for the network, stood up before any gateway that has to
+    // fetch its keys at startup.
+    run_forge_stack(&context.forge_bin, &context.resolved_config, "pool-a", "identity")?;
+    eprintln!("  [OK] pool-a: identity provider deployed");
     for cluster in CLUSTERS {
         let site_stack = format!("{cluster}-site");
         run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, &site_stack)?;
