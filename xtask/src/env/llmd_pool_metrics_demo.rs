@@ -1064,12 +1064,14 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             );
         }
 
+        let published = signals_view("pool-a");
         print_live_table_row(&LiveTableRow {
             elapsed: table_start.elapsed(),
             phase,
             rows: (&row_a, &row_b),
             stats: &stats,
             last_route: &last_route,
+            published: &published,
         });
 
         if row_b.rank == 0 && row_a.rank > 0 && score_gap >= MIN_PRESSURE_SCORE_GAP {
@@ -1193,12 +1195,14 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
         let row_a = build_scorecard_row(&site_label("pool-a"), &candidates, "pool-a", &epp_a);
         let row_b = build_scorecard_row(&site_label("pool-b"), &candidates, "pool-b", &epp_b);
 
+        let published = signals_view("pool-a");
         print_live_table_row(&LiveTableRow {
             elapsed: table_start.elapsed(),
             phase: "RECOVERY",
             rows: (&row_a, &row_b),
             stats: &final_stats,
             last_route: &last_route,
+            published: &published,
         });
 
         if row_a.rank == 0 && recovery_condition_met(context.scoring_flavor, &epp_a) {
@@ -1646,7 +1650,7 @@ fn print_scorecard_with_cause(
 fn print_live_table_header() {
     eprintln!();
     eprintln!(
-        "  {:<6} {:<11} {:>7} {:>5} {:>7} {:>6}  {:>7} {:>5} {:>7} {:>6}  {:>5} {:>5} {:>10}",
+        "  {:<6} {:<11} {:>7} {:>5} {:>7} {:>6}  {:>7} {:>5} {:>7} {:>6}  {:>5} {:>5} {:>10}  {:>7} {:>7} {:>6}",
         "TIME",
         "PHASE",
         "A_QUEUE",
@@ -1659,7 +1663,10 @@ fn print_live_table_header() {
         "B_RANK",
         "A_REQ",
         "B_REQ",
-        "LAST_ROUTE"
+        "LAST_ROUTE",
+        "SIG_A_Q",
+        "SIG_B_Q",
+        "SIG_AGE"
     );
 }
 
@@ -1675,6 +1682,12 @@ struct LiveTableRow<'row> {
     stats: &'row PressureStats,
     /// Last probe request attribution.
     last_route: &'row str,
+
+    /// Queue each site published, and how old that reading is.
+    ///
+    /// The overlay columns beside these are rendered from gossiped state and
+    /// carry no age, so watching the two move apart is the point.
+    published: &'row [SiteSignals],
 }
 
 /// Print one row of the live metrics table.
@@ -1682,8 +1695,21 @@ fn print_live_table_row(row: &LiveTableRow<'_>) {
     let secs = row.elapsed.as_secs();
     let time_str = format!("{:02}:{:02}", secs / 60, secs % 60);
     let (a, b) = row.rows;
+    let published_for = |site: &str| {
+        row.published
+            .iter()
+            .find(|s| s.site == site)
+            .map_or_else(|| "-".to_owned(), |s| format!("{:.1}", s.queue))
+    };
+    let age = row
+        .published
+        .iter()
+        .map(|s| s.age_ms)
+        .min()
+        .filter(|ms| *ms != i64::MAX)
+        .map_or_else(|| "-".to_owned(), |ms| format!("{}.{}s", ms / 1000, (ms % 1000) / 100));
     eprintln!(
-        "  {:<6} {:<11} {:>7.1} {:>.2} {:>7.2} {:>6}  {:>7.1} {:>.2} {:>7.2} {:>6}  {:>5} {:>5} {:>10}",
+        "  {:<6} {:<11} {:>7.1} {:>.2} {:>7.2} {:>6}  {:>7.1} {:>.2} {:>7.2} {:>6}  {:>5} {:>5} {:>10}  {:>7} {:>7} {:>6}",
         time_str,
         row.phase,
         a.queue,
@@ -1697,6 +1723,9 @@ fn print_live_table_row(row: &LiveTableRow<'_>) {
         row.stats.a_reqs,
         row.stats.b_reqs,
         row.last_route,
+        published_for("pool-a"),
+        published_for("pool-b"),
+        age,
     );
 }
 
@@ -4658,6 +4687,87 @@ fn a_peer_reaches_the_other_site(observations: &mut Vec<String>) -> bool {
 /// Secret holding the client identity a reader presents to the signals endpoint.
 const SIGNALS_READER_SECRET: &str = "consumer-gateway-tls";
 
+/// Long-lived pod that reads the signals endpoint on demand.
+const SIGNALS_PROBE_POD: &str = "signals-reader";
+
+/// Make sure a site has a reader pod carrying its certificate.
+///
+/// Reading through a throwaway pod costs seconds, which is fine for a snapshot
+/// and useless for a table that ticks while load moves. One pod that stays up
+/// turns each read into an exec.
+fn ensure_signals_probe(cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let running = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pod",
+            SIGNALS_PROBE_POD,
+            "-o",
+            "jsonpath={.status.phase}",
+        ])
+        .output()?;
+    if String::from_utf8_lossy(&running.stdout).trim() == "Running" {
+        return Ok(());
+    }
+    let overrides = format!(
+        r#"{{"spec":{{"containers":[{{"name":"{SIGNALS_PROBE_POD}","image":"curlimages/curl:8.5.0","command":["sh","-c","sleep 86400"],"volumeMounts":[{{"name":"tls","mountPath":"/tls","readOnly":true}}]}}],"volumes":[{{"name":"tls","secret":{{"secretName":"{SIGNALS_READER_SECRET}"}}}}]}}}}"#
+    );
+    let _ = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "delete",
+            "pod",
+            SIGNALS_PROBE_POD,
+            "--ignore-not-found",
+        ])
+        .status()?;
+    let created = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "run",
+            SIGNALS_PROBE_POD,
+            "--image=curlimages/curl:8.5.0",
+            "--restart=Never",
+            "-n",
+            GRID_SYSTEM_NS,
+            "--overrides",
+            &overrides,
+        ])
+        .status()?;
+    if !created.success() {
+        return Err(format!("{cluster}: could not start the signals reader").into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        let phase = Command::new("kubectl")
+            .args([
+                "--context",
+                &ctx,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "pod",
+                SIGNALS_PROBE_POD,
+                "-o",
+                "jsonpath={.status.phase}",
+            ])
+            .output()?;
+        if String::from_utf8_lossy(&phase.stdout).trim() == "Running" {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err(format!("{cluster}: signals reader never became ready").into())
+}
+
 /// Read a site's signals endpoint the way a reader does.
 ///
 /// The endpoint terminates TLS and names its caller by the key it presents, so
@@ -4665,7 +4775,33 @@ const SIGNALS_READER_SECRET: &str = "consumer-gateway-tls";
 /// A short-lived pod carries the site's own certificate, which is the identity
 /// the gateway beside the operator uses for the same read.
 fn read_signals_authenticated(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    ensure_signals_probe(cluster)?;
     let ctx = kind_context(cluster);
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            SIGNALS_PROBE_POD,
+            "--",
+            "curl",
+            "-sS",
+            "--cacert",
+            "/tls/ca.crt",
+            "--cert",
+            "/tls/tls.crt",
+            "--key",
+            "/tls/tls.key",
+            &format!("https://{SIGNALS_SERVICE}:{SIGNALS_PORT}/metrics"),
+        ])
+        .output()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+    // Fall back to a fresh pod, which also covers the reader having been
+    // evicted between reads.
     let pod_name = format!("signals-probe-{}", &format_utc_timestamp()[9..15]);
     let cmd = format!(
         "curl -sS --cacert /tls/ca.crt --cert /tls/tls.crt --key /tls/tls.key \
