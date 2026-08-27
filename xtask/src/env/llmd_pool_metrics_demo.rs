@@ -5055,12 +5055,8 @@ const LOAD_STALENESS_WAIT: Duration = Duration::from_secs(25);
 /// while the stage waits for samples to age out. A second window opening on an
 /// idle grid measures nothing, whatever the first one saw.
 fn hold_pressure(cluster: &str, observations: &mut Vec<String>) {
-    if let Err(error) = scale_pressure_generator(cluster, 0) {
-        observations.push(format!("{cluster}: could not cycle pressure: {error}"));
-        return;
-    }
-    if let Err(error) = scale_pressure_generator(cluster, ATTRIBUTION_PRESSURE_REPLICAS) {
-        observations.push(format!("{cluster}: could not reapply pressure: {error}"));
+    if let Err(error) = scale_local_load(cluster, ATTRIBUTION_PRESSURE_REPLICAS) {
+        observations.push(format!("{cluster}: could not keep the local pool loaded: {error}"));
         return;
     }
     let settled = await_pressure(cluster);
@@ -5105,14 +5101,6 @@ fn queue_by_site(cluster: &str) -> Vec<(String, f64)> {
 }
 
 /// Send a run of requests and record where each one landed.
-/// The site carrying the most work right now.
-fn busiest_site(cluster: &str) -> (String, f64) {
-    queue_by_site(cluster)
-        .iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map_or_else(|| (String::new(), 0.0), |(s, v)| (s.clone(), *v))
-}
-
 /// Send a run of requests and count how many reached `subject`.
 ///
 /// The site is fixed by the caller rather than recomputed here. Watching
@@ -5241,8 +5229,12 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         };
     };
 
-    if let Err(error) = scale_pressure_generator(cluster, ATTRIBUTION_PRESSURE_REPLICAS) {
-        observations.push(format!("{cluster}: could not apply pressure: {error}"));
+    // The local site is the subject, because that is the only place the two
+    // paths disagree. Locality prefers it and live load says to leave it, so
+    // where the request goes says which one decided.
+    if let Err(error) = scale_local_load(cluster, ATTRIBUTION_PRESSURE_REPLICAS) {
+        observations.push(format!("{cluster}: could not load the local pool: {error}"));
+        success = false;
     }
     let settled = await_pressure(cluster);
     if settled <= 0.0 {
@@ -5252,10 +5244,9 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         success = false;
     }
 
-    // Fixed once. Whichever site is carrying the work when the comparison
-    // starts is the site both windows are about, because a busiest site
-    // recomputed per window compares two different sites.
-    let (subject, _) = busiest_site(cluster);
+    // The site being loaded, not whichever happens to be busiest: the point is
+    // that this one is both preferred by locality and carrying the work.
+    let subject = cluster.to_owned();
     let with_load = observe_routing(cluster, &subject);
     observations.push(format!(
         "{cluster}: watching {subject}, queue {:.1} when the comparison began",
@@ -5304,7 +5295,7 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
             success = false;
         } else if without_load.hits() > with_load.hits() {
             observations.push(format!(
-                "{cluster}: {subject} took {} requests without the signal against {} with it, so the signal is what kept traffic away",
+                "{cluster}: {subject} is local and loaded, and took {} requests without the signal against {} with it, so the signal is what sent work elsewhere",
                 without_load.hits(),
                 with_load.hits()
             ));
@@ -5322,8 +5313,8 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         observations.push(format!("{cluster}: could not restore the load source: {error}"));
         success = false;
     }
-    if let Err(error) = scale_pressure_generator(cluster, 0) {
-        observations.push(format!("{cluster}: could not stop pressure: {error}"));
+    if let Err(error) = scale_local_load(cluster, 0) {
+        observations.push(format!("{cluster}: could not stop the local load: {error}"));
     }
 
     let _ = context;
@@ -5416,4 +5407,66 @@ fn print_signals_table(cluster: &str) {
     eprintln!();
     eprintln!("    Age is what the overlay cannot report: a gossiped value carries no");
     eprintln!("    collection time, so a reader cannot tell fresh from unmoved.");
+}
+
+/// Load applied to one site's own model servers, bypassing routing.
+const LOCAL_LOAD_DEPLOYMENT: &str = "local-load";
+
+/// Put load on a site's pool without routing deciding where it lands.
+///
+/// The pressure generator drives through the consumer gateway, so the routing
+/// decision spreads its load and the local site cannot be made busy on
+/// purpose. That is fatal for attribution: while the local site is idle,
+/// locality and live load agree on it, the signal has nothing to change, and
+/// withdrawing the signal changes nothing either.
+///
+/// This talks to the model servers directly. Nothing here is a routing
+/// decision, so the site under test can be made busy while the grid still has
+/// idle peers to prefer.
+fn scale_local_load(cluster: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let manifest = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {LOCAL_LOAD_DEPLOYMENT}
+  namespace: {GRID_SYSTEM_NS}
+spec:
+  replicas: {replicas}
+  selector:
+    matchLabels: {{app: {LOCAL_LOAD_DEPLOYMENT}}}
+  template:
+    metadata:
+      labels: {{app: {LOCAL_LOAD_DEPLOYMENT}}}
+    spec:
+      containers:
+        - name: load
+          image: curlimages/curl:8.5.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              while true; do
+                for i in 1 2 3 4; do
+                  curl -s -o /dev/null --max-time 30 \
+                    -X POST http://vcr-service.{GRID_SYSTEM_NS}.svc.cluster.local:8000/v1/chat/completions \
+                    -H 'Content-Type: application/json' \
+                    -d '{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"load"}}],"max_tokens":64}}' &
+                done
+                wait
+              done
+"#
+    );
+    let mut apply = Command::new("kubectl")
+        .args(["--context", &ctx, "apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = apply.stdin.as_mut() {
+        use std::io::Write as _;
+        stdin.write_all(manifest.as_bytes())?;
+    }
+    if !apply.wait()?.success() {
+        return Err(format!("{cluster}: could not apply {LOCAL_LOAD_DEPLOYMENT}").into());
+    }
+    Ok(())
 }
