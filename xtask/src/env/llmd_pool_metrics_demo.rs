@@ -4894,11 +4894,12 @@ const ROUTING_SAMPLE_REQUESTS: usize = 6;
 
 /// Pressure applied while attributing a routing decision.
 ///
-/// Deliberately far below what the flip proof uses. Enough load to tell the
-/// sites apart is all this needs, and more than the pool can absorb takes the
-/// pool past its configured capacity, at which point admission refuses new
-/// requests and the stage cannot send the ones it is trying to observe.
-const ATTRIBUTION_PRESSURE_REPLICAS: u32 = 1;
+/// This was one replica while a saturated pool refused new requests, which
+/// meant the stage could not send the requests it was trying to observe. That
+/// is no longer true, and one replica is too light to hold a queue across the
+/// wait for held samples to age out, so the second window compared against a
+/// grid that had gone idle and could conclude nothing.
+const ATTRIBUTION_PRESSURE_REPLICAS: u32 = 4;
 
 /// Long enough for every held sample to pass the reader's freshness bound.
 ///
