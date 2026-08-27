@@ -30,13 +30,31 @@ spec:
             - |
               GW="http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions"
               BODY='{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"Explain distributed systems architecture patterns including consensus algorithms, replication strategies, partitioning schemes, and consistency models in detail."}],"max_tokens":64}'
+              KC="http://keycloak.grid-system:8180/realms/grid/protocol/openid-connect/token"
+
+              # This load is a tenant like any other, so it carries a token.
+              # Its own tenant, and a large one: it stands in for the aggregate
+              # traffic the two demo tenants are measured against, and sharing
+              # either of their buckets would move the limit under the proof.
+              TOKEN=""
+              mint() {
+                TOKEN=$(curl -s --max-time 10 -X POST "$KC" \
+                  -H 'Content-Type: application/x-www-form-urlencoded' \
+                  -d 'grant_type=client_credentials&client_id=tenant-bulk&client_secret=bulk-secret' \
+                  | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+              }
+              until [ -n "$TOKEN" ]; do mint; [ -n "$TOKEN" ] || sleep 2; done
+              # Re-minted well inside the realm's token lifespan.
+              ( while true; do sleep 900; mint; done ) &
+
               worker() {
                 local ID=$1 T=0 O=0 F=0 A=0 B=0
                 echo "0 0 0 0 0" > "/tmp/w${ID}"
                 while true; do
                   STATUS=$(curl -s -o /dev/null -w '%{http_code}' -D "/tmp/hdr${ID}" \
                     --max-time 30 -X POST "$GW" \
-                    -H 'Content-Type: application/json' -d "$BODY" 2>/dev/null || echo "000")
+                    -H 'Content-Type: application/json' \
+                    -H "Authorization: Bearer ${TOKEN}" -d "$BODY" 2>/dev/null || echo "000")
                   T=$((T + 1))
                   if [ "$STATUS" = "200" ]; then
                     O=$((O + 1))

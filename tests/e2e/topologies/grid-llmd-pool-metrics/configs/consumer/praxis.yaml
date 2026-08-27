@@ -7,18 +7,12 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      # Identity first: an unauthenticated caller is refused before the
-      # gateway spends anything parsing its body or scoring a route.
+      # First, so an unauthenticated caller is refused before any work.
       - filter: policy
         config_path: /etc/praxis/policy/policy.yaml
-        # No protocol classifier in this chain; the filter fail-closes on
-        # missing classification unless told this is identity-only.
+        # Identity-only: no protocol classifier in this chain to fail closed on.
         require_protocol_metadata: false
-      # Buckets by the authenticated principal, never by a header the
-      # caller controls. Rate and burst come from claims the issuer
-      # signed, so one filter instance holds every tenant's limit and
-      # the gateway carries no table of callers. The values below apply
-      # only to a token that carries neither claim.
+      # Keys on the authenticated principal; these apply only without claims.
       - filter: rate_limit
         mode: per_identity
         key_claim: grid_tenant
@@ -110,10 +104,6 @@ admin:
 
 shutdown_timeout_secs: 5
 
-# Every provider is reached at a MetalLB address on the cluster network, and
-# the issuer the policy filter fetches keys from is one too. The gateway treats
-# those as sensitive addresses and refuses to reach them unless told otherwise,
-# which is right facing the internet and wrong for a gateway whose peers all
-# live on the same private network.
+# The providers and the issuer are all private addresses, refused by default.
 insecure_options:
   allow_private_endpoints: true

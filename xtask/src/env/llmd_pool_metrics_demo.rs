@@ -771,8 +771,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         next(),
         total
     );
-    // One issuer for the network, stood up before any gateway that has to
-    // fetch its keys at startup.
+    // One issuer for the network, up before any gateway that fetches its keys.
     run_forge_stack(&context.forge_bin, &context.resolved_config, "pool-a", "identity")?;
     eprintln!("  [OK] pool-a: identity provider deployed");
     for cluster in CLUSTERS {
@@ -1193,6 +1192,20 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
         "final load stats: total={} ok={} fail={} a={} b={}",
         final_stats.total, final_stats.ok, final_stats.fail, final_stats.a_reqs, final_stats.b_reqs
     ));
+
+    // A queue nothing filled drains on its own, so recovery would pass without
+    // the load ever arriving. It did once, on a run where every request was
+    // refused at the gateway and the drain proved only that idle pools idle.
+    if final_stats.ok == 0 {
+        return ProofResult {
+            success: false,
+            description: format!(
+                "Recovery: nothing to recover from, {} requests and none served",
+                final_stats.total
+            ),
+            observations,
+        };
+    }
 
     eprintln!("  [RECOVERY] Pressure stopped; waiting for Pool A to drain and regain rank 0");
 
@@ -5507,16 +5520,15 @@ spec:
 // Tenant identity
 // ---------------------------------------------------------------------------
 
-/// Tenant the demo drives ordinary traffic as. Its limit is high enough
-/// that the other proofs never collide with the limiter.
+/// Tenant the demo drives ordinary traffic as, limited high enough that no
+/// other proof collides with the limiter.
 const DEFAULT_TENANT: &str = "tenant-platinum";
 
 /// Tenant whose issuer-signed limit is low enough to reach under burst.
 const THROTTLED_TENANT: &str = "tenant-gold";
 
-/// Concurrent requests each tenant sends in the rate limit proof. Above
-/// gold's signed burst of 20 and below platinum's 120, so the same
-/// offered load lands on opposite sides of the two limits.
+/// Requests each tenant sends at once. Above gold's signed burst of 20 and
+/// below platinum's 120, so one offered load lands either side of both limits.
 const RATE_LIMIT_BURST_REQUESTS: u32 = 60;
 
 /// Address of the grid's issuer, as every site reaches it.
@@ -5543,8 +5555,7 @@ fn keycloak_endpoint() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Mint an access token for one tenant.
 ///
-/// Minted through the same address the gateway validates against, so the
-/// `iss` the issuer stamps matches the issuer the gateway trusts.
+/// Through the address the gateway validates against, so `iss` matches.
 fn mint_tenant_token(kube_context: &str, tenant: &str) -> Result<String, Box<dyn std::error::Error>> {
     let idp = keycloak_endpoint()?;
     let cmd = format!(
@@ -5572,77 +5583,109 @@ fn tenant_secret(tenant: &str) -> &'static str {
 
 /// Proof: two tenants, one offered load, two outcomes.
 ///
-/// Both tenants fire the same number of concurrent requests at the same
-/// gateway. Nothing about them differs except the limits their issuer
-/// signed, so a throttled tenant and an unaffected one is the limiter
-/// keying on identity rather than on traffic.
+/// Nothing separates them but the limits their issuer signed, so one throttled
+/// and one not is the limiter keying on identity rather than on traffic.
 fn proof_per_identity_rate_limit(_context: &DemoContext) -> ProofResult {
     let ctx = kind_context("pool-a");
     let mut observations = Vec::new();
 
-    let mut burst = |tenant: &str| -> Result<(u32, u32), Box<dyn std::error::Error>> {
+
+    let mut burst = |tenant: &str| -> Result<BTreeMap<String, u32>, Box<dyn std::error::Error>> {
         let token = mint_tenant_token(&ctx, tenant)?;
-        let counts = drive_concurrent_requests(&ctx, &token, RATE_LIMIT_BURST_REQUESTS)?;
+        let seen = drive_concurrent_requests("pool-a", &token, RATE_LIMIT_BURST_REQUESTS)?;
         observations.push(format!(
-            "{tenant}: {} of {RATE_LIMIT_BURST_REQUESTS} served, {} throttled",
-            counts.0, counts.1
+            "{tenant}: {RATE_LIMIT_BURST_REQUESTS} at once -> {}",
+            describe_statuses(&seen)
         ));
-        Ok(counts)
+        Ok(seen)
     };
 
-    let (gold_ok, gold_throttled) = match burst(THROTTLED_TENANT) {
-        Ok(counts) => counts,
+    let gold = match burst(THROTTLED_TENANT) {
+        Ok(seen) => seen,
         Err(e) => return failed_proof(format!("{THROTTLED_TENANT} burst failed: {e}"), observations),
     };
-    let (plat_ok, plat_throttled) = match burst(DEFAULT_TENANT) {
-        Ok(counts) => counts,
+    let platinum = match burst(DEFAULT_TENANT) {
+        Ok(seen) => seen,
         Err(e) => return failed_proof(format!("{DEFAULT_TENANT} burst failed: {e}"), observations),
     };
 
-    // An unauthenticated caller is refused before the limiter is consulted,
-    // so the bucket is not something a request can reach without identity.
-    let anon = drive_concurrent_requests(&ctx, "", 1).map_or(0, |c| c.0);
-    observations.push(format!("no token: {anon} of 1 served"));
+    // Refused before the limiter: no identity, no bucket to reach.
+    let anon = match drive_concurrent_requests("pool-a", "", 1) {
+        Ok(seen) => seen,
+        Err(e) => return failed_proof(format!("the unauthenticated request failed: {e}"), observations),
+    };
+    observations.push(format!("no token: {}", describe_statuses(&anon)));
 
-    let throttled = gold_throttled > 0;
-    let unaffected = plat_throttled == 0;
-    let refused = anon == 0;
-    if !throttled {
+    let gold_throttled = status_count(&gold, "429");
+    let gold_served = status_count(&gold, "200");
+    let plat_throttled = status_count(&platinum, "429");
+    let plat_served = status_count(&platinum, "200");
+
+    // Both tenants have to be served as well as limited. A tenant refused for
+    // some other reason is throttled by accident, and that proves nothing.
+    if gold_served + gold_throttled < RATE_LIMIT_BURST_REQUESTS {
         return failed_proof(
-            format!("{THROTTLED_TENANT} was never throttled ({gold_ok} served, its signed burst is 20)"),
+            format!(
+                "{THROTTLED_TENANT} saw statuses this proof cannot read: {}",
+                describe_statuses(&gold)
+            ),
             observations,
         );
     }
-    if !unaffected {
+    if gold_throttled == 0 {
+        return failed_proof(
+            format!("{THROTTLED_TENANT} was never throttled, though its signed burst is 20"),
+            observations,
+        );
+    }
+    if plat_served != RATE_LIMIT_BURST_REQUESTS {
+        return failed_proof(
+            format!(
+                "{DEFAULT_TENANT} was not served the same load: {}",
+                describe_statuses(&platinum)
+            ),
+            observations,
+        );
+    }
+    if plat_throttled != 0 {
         return failed_proof(
             format!("{DEFAULT_TENANT} was throttled {plat_throttled} times on the same offered load"),
             observations,
         );
     }
-    if !refused {
-        return failed_proof("an unauthenticated request was served".to_owned(), observations);
+    if status_count(&anon, "401") != 1 {
+        return failed_proof(
+            format!(
+                "an unauthenticated request was not refused: {}",
+                describe_statuses(&anon)
+            ),
+            observations,
+        );
     }
 
     ProofResult {
         success: true,
         description: format!(
-            "same offered load, opposite outcomes: {THROTTLED_TENANT} throttled {gold_throttled} times, \
-             {DEFAULT_TENANT} served all {plat_ok}"
+            "same offered load, opposite outcomes: {THROTTLED_TENANT} served {gold_served} and throttled \
+             {gold_throttled}, {DEFAULT_TENANT} served all {plat_served}"
         ),
         observations,
     }
 }
 
-/// Fire `count` requests at the consumer gateway at once and tally the
-/// served against the throttled.
+/// Fire `count` requests at once and tally what came back, by status.
 ///
-/// Concurrent rather than sequential: a token bucket refills, so requests
-/// spread over time measure the refill rate instead of the burst.
+/// At once because a bucket refills: spread out, this measures the refill rate.
+///
+/// Every status is counted, including ones this proof has no opinion on. A
+/// tally that keeps only 200 and 429 reports "0 served" for a run where
+/// nothing was served *and* for one where everything failed upstream, and
+/// those want different fixes.
 fn drive_concurrent_requests(
-    kube_context: &str,
+    cluster: &str,
     token: &str,
     count: u32,
-) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+) -> Result<BTreeMap<String, u32>, Box<dyn std::error::Error>> {
     let auth = if token.is_empty() {
         String::new()
     } else {
@@ -5651,23 +5694,142 @@ fn drive_concurrent_requests(
     let body = format!(r#"{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"test"}}]}}"#);
     let cmd = format!(
         "seq 1 {count} | xargs -P {count} -I{{}} sh -c \"curl -s -o /dev/null -w '%{{http_code}}\\n' \
-         -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
+         --max-time 60 -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
          -H 'Content-Type: application/json' {auth}-d '{body}'\""
     );
-    let raw = kubectl_exec_curl_raw(kube_context, &cmd)?;
-    let mut served = 0_u32;
-    let mut throttled = 0_u32;
+    let raw = exec_in_load_probe(cluster, &cmd)?;
+    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
     for line in raw.lines() {
-        match line.trim() {
-            "200" => served += 1,
-            "429" => throttled += 1,
-            _ => {},
+        let code = line.trim();
+        if code.len() == 3 && code.chars().all(|c| c.is_ascii_digit()) {
+            *seen.entry(code.to_owned()).or_default() += 1;
         }
     }
-    if served + throttled == 0 {
-        return Err(format!("no request produced a usable status: {}", raw.trim()).into());
+    if seen.is_empty() {
+        return Err(format!("no request produced a status: {}", raw.trim()).into());
     }
-    Ok((served, throttled))
+    Ok(seen)
+}
+
+/// Count of one status, or zero.
+fn status_count(seen: &BTreeMap<String, u32>, code: &str) -> u32 {
+    seen.get(code).copied().unwrap_or_default()
+}
+
+/// Render a status tally the way a failure needs to read.
+fn describe_statuses(seen: &BTreeMap<String, u32>) -> String {
+    seen.iter()
+        .map(|(code, n)| format!("{n}x{code}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Pod the rate limit proof drives its load from.
+const LOAD_PROBE_POD: &str = "rate-limit-driver";
+
+/// Run a command in a long-lived pod, starting it if it is not up.
+///
+/// Long-lived and exec'd rather than a pod per call: a pod per call raced its
+/// own deletion and returned the deletion notice instead of the output, which
+/// reads as a gateway that answered nothing.
+fn exec_in_load_probe(cluster: &str, cmd: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    ensure_load_probe(&ctx)?;
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            LOAD_PROBE_POD,
+            "--",
+            "sh",
+            "-c",
+            cmd,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "exec in {LOAD_PROBE_POD} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Start the load probe pod unless it is already running.
+fn ensure_load_probe(ctx: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let phase = Command::new("kubectl")
+        .args([
+            "--context",
+            ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pod",
+            LOAD_PROBE_POD,
+            "-o",
+            "jsonpath={.status.phase}",
+        ])
+        .output()?;
+    if String::from_utf8_lossy(&phase.stdout).trim() == "Running" {
+        return Ok(());
+    }
+    let _ = Command::new("kubectl")
+        .args([
+            "--context",
+            ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "delete",
+            "pod",
+            LOAD_PROBE_POD,
+            "--ignore-not-found",
+        ])
+        .status()?;
+    let created = Command::new("kubectl")
+        .args([
+            "--context",
+            ctx,
+            "run",
+            LOAD_PROBE_POD,
+            "--image=curlimages/curl:8.5.0",
+            "--restart=Never",
+            "-n",
+            GRID_SYSTEM_NS,
+            "--command",
+            "--",
+            "sh",
+            "-c",
+            "sleep 86400",
+        ])
+        .status()?;
+    if !created.success() {
+        return Err("could not start the load probe".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        let settled = Command::new("kubectl")
+            .args([
+                "--context",
+                ctx,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "pod",
+                LOAD_PROBE_POD,
+                "-o",
+                "jsonpath={.status.phase}",
+            ])
+            .output()?;
+        if String::from_utf8_lossy(&settled.stdout).trim() == "Running" {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err("the load probe never became ready".into())
 }
 
 /// A proof that did not hold, with what was seen before it gave out.
@@ -5681,9 +5843,7 @@ fn failed_proof(description: String, observations: Vec<String>) -> ProofResult {
 
 /// The token the demo's own traffic carries.
 ///
-/// Minted once and reused: every proof that drives the gateway is a
-/// tenant now, and the one it presents as is the high-limit tenant so
-/// the limiter never colours another proof's result.
+/// The high-limit tenant, so the limiter never colours another proof's result.
 fn demo_token(kube_context: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(token) = TOKEN.get() {

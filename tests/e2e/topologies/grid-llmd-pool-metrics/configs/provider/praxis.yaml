@@ -63,9 +63,6 @@ admin:
   address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5
 
-# The backend is a cluster-local Service, which the gateway treats as a
-# sensitive address and refuses to proxy to unless told otherwise. That default
-# is right for a gateway facing the internet and wrong for one whose job is
-# reaching a service beside it.
+# The backend is a cluster-local Service, refused by default.
 insecure_options:
   allow_private_endpoints: true

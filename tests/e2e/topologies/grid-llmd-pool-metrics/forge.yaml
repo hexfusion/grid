@@ -632,8 +632,7 @@ spec:
           path: resources/pool-a/keycloak-realm.yaml
         - type: manifest
           path: resources/pool-a/keycloak-deployment.yaml
-        # Waited on separately so a realm that failed to import is reported
-        # here rather than as an unexplained 401 once traffic starts.
+        # Waited on separately: a failed realm import reports here, not as a 401.
         - type: wait
           resource: deployment/keycloak
           namespace: grid-system
@@ -656,8 +655,7 @@ spec:
         - type: template-file
           source: configs/consumer/policy.yaml
           target: .forge/runtime/{{ cluster.name }}/consumer/policy.yaml
-        # A Secret rather than a ConfigMap because the chart projects a
-        # single named key from its config map and mounts nothing else.
+        # A Secret because the chart projects one named key from its config map.
         - type: exec
           command:
             - bash

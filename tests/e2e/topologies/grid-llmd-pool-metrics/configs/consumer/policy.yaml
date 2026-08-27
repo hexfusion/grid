@@ -1,14 +1,11 @@
 # Identity for tenant traffic entering the grid.
 #
-# One issuer serves the whole network, so a token minted at pool-a is
-# accepted by every site's consumer gateway. The address is captured at
-# deploy time because MetalLB assigns it, and it has to match the `iss`
-# Keycloak stamps on the token it issues.
+# One issuer serves the network. Its name is fixed and its address is captured
+# at deploy time, because MetalLB assigns the latter and only sites off-cluster
+# need it: the name is compared, the address is dialled.
 #
-# Authorization here is deliberately trivial. The question this demo
-# answers is what happens *after* identity is established: `rate_limit`
-# buckets by the authenticated principal and honours the limits the
-# issuer signed into the token.
+# Authorization is deliberately trivial: what this demo asks is what happens
+# after identity is established, not who is allowed through.
 
 plugin_settings:
   routing_enabled: true
@@ -20,14 +17,12 @@ plugins:
     on_error: fail
     config:
       header: Authorization
-      # `user`, so the resolved subject lands in the slot the policy
-      # filter publishes `AuthenticatedIdentity` from. A workload role
-      # resolves no subject and the limiter would see no identity.
+      # A workload role resolves no subject, and the limiter would see no identity.
       role: user
       trusted_issuers:
-        - issuer: "http://{{ captures.pool-a.keycloak-ip }}:8180/realms/grid"
-          # Empty disables `aud` validation; the tenant is identified by
-          # its claims, not by which service it addressed.
+          # Compared as a string, never dialled, so it holds for every site.
+        - issuer: "http://keycloak.grid-system:8180/realms/grid"
+          # Empty disables `aud`; the tenant is identified by its claims.
           audiences: []
           algorithms: ["RS256"]
           decoding_key:

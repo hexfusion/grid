@@ -112,6 +112,52 @@ data:
               }
             }
           ]
+        },
+        {
+          "clientId": "tenant-bulk",
+          "enabled": true,
+          "publicClient": false,
+          "serviceAccountsEnabled": true,
+          "standardFlowEnabled": false,
+          "secret": "bulk-secret",
+          "attributes": {
+            "access.token.signed.response.alg": "RS256"
+          },
+          "protocolMappers": [
+            {
+              "name": "grid-tenant",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_tenant",
+                "claim.value": "tenant-bulk",
+                "access.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "grid-rate",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_rate",
+                "claim.value": "100000",
+                "access.token.claim": "true",
+                "jsonType.label": "int"
+              }
+            },
+            {
+              "name": "grid-burst",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "grid_burst",
+                "claim.value": "200000",
+                "access.token.claim": "true",
+                "jsonType.label": "int"
+              }
+            }
+          ]
         }
       ]
     }
