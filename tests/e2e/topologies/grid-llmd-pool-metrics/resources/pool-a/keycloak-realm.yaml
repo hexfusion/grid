@@ -19,7 +19,7 @@ data:
     {
       "realm": "grid",
       "enabled": true,
-      "accessTokenLifespan": 1800,
+      "accessTokenLifespan": 3600,
       "clients": [
         {
           "clientId": "tenant-gold",
@@ -28,7 +28,9 @@ data:
           "serviceAccountsEnabled": true,
           "standardFlowEnabled": false,
           "secret": "gold-secret",
-          "attributes": { "access.token.signed.response.alg": "RS256" },
+          "attributes": {
+            "access.token.signed.response.alg": "RS256"
+          },
           "protocolMappers": [
             {
               "name": "grid-site",
@@ -72,7 +74,9 @@ data:
           "serviceAccountsEnabled": true,
           "standardFlowEnabled": false,
           "secret": "platinum-secret",
-          "attributes": { "access.token.signed.response.alg": "RS256" },
+          "attributes": {
+            "access.token.signed.response.alg": "RS256"
+          },
           "protocolMappers": [
             {
               "name": "grid-site",

@@ -841,6 +841,12 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     // Proof 6: the polled signal is what decides, shown by taking it away
     results.insert("load_drives_routing".to_owned(), proof_load_drives_routing(context));
 
+    // Proof 7: identity decides the limit, not the traffic
+    results.insert(
+        "per_identity_rate_limit".to_owned(),
+        proof_per_identity_rate_limit(context),
+    );
+
     // TLS proof stages — only in mTLS mode
     if mtls {
         let tls_results = run_tls_proof_stages();
@@ -1754,11 +1760,13 @@ fn print_live_table_row(row: &LiveTableRow<'_>) {
 fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"test"}}]}}"#,);
     let session_id = format!("probe-{}", format_utc_timestamp());
+    let token = demo_token(kube_context)?;
     let curl_cmd = format!(
         "curl -s -o /dev/null \
          -w 'STATUS:%{{http_code}}\\nPROVIDER_GW:%header{{X-Grid-LlmD-Provider-Gateway}}\\nDEMO_ATTRIB:%header{{x-ai-demo-provider-gateway}}\\n' \
          -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
          -H 'Content-Type: application/json' \
+         -H 'Authorization: Bearer {token}' \
          -H 'X-Session-Id: {session_id}' \
          -d '{body}'",
     );
@@ -5493,4 +5501,194 @@ spec:
         return Err(format!("{cluster}: could not apply {LOCAL_LOAD_DEPLOYMENT}").into());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tenant identity
+// ---------------------------------------------------------------------------
+
+/// Tenant the demo drives ordinary traffic as. Its limit is high enough
+/// that the other proofs never collide with the limiter.
+const DEFAULT_TENANT: &str = "tenant-platinum";
+
+/// Tenant whose issuer-signed limit is low enough to reach under burst.
+const THROTTLED_TENANT: &str = "tenant-gold";
+
+/// Concurrent requests each tenant sends in the rate limit proof. Above
+/// gold's signed burst of 20 and below platinum's 120, so the same
+/// offered load lands on opposite sides of the two limits.
+const RATE_LIMIT_BURST_REQUESTS: u32 = 60;
+
+/// Address of the grid's issuer, as every site reaches it.
+fn keycloak_endpoint() -> Result<String, Box<dyn std::error::Error>> {
+    let ctx = kind_context("pool-a");
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "svc/keycloak",
+            "-o",
+            "jsonpath={.status.loadBalancer.ingress[0].ip}",
+        ])
+        .output()?;
+    let ip = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if ip.is_empty() {
+        return Err("keycloak has no load balancer address".into());
+    }
+    Ok(format!("http://{ip}:8180"))
+}
+
+/// Mint an access token for one tenant.
+///
+/// Minted through the same address the gateway validates against, so the
+/// `iss` the issuer stamps matches the issuer the gateway trusts.
+fn mint_tenant_token(kube_context: &str, tenant: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let idp = keycloak_endpoint()?;
+    let cmd = format!(
+        "curl -s -X POST {idp}/realms/grid/protocol/openid-connect/token \
+         -H 'Content-Type: application/x-www-form-urlencoded' \
+         -d 'grant_type=client_credentials&client_id={tenant}&client_secret={secret}'",
+        secret = tenant_secret(tenant),
+    );
+    let raw = kubectl_exec_curl_raw(kube_context, &cmd)?;
+    let token = raw
+        .split("\"access_token\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .ok_or_else(|| format!("no access_token in issuer response for {tenant}"))?;
+    Ok(token.to_owned())
+}
+
+/// The demo's client secrets, as imported with the realm.
+fn tenant_secret(tenant: &str) -> &'static str {
+    match tenant {
+        THROTTLED_TENANT => "gold-secret",
+        _ => "platinum-secret",
+    }
+}
+
+/// Proof: two tenants, one offered load, two outcomes.
+///
+/// Both tenants fire the same number of concurrent requests at the same
+/// gateway. Nothing about them differs except the limits their issuer
+/// signed, so a throttled tenant and an unaffected one is the limiter
+/// keying on identity rather than on traffic.
+fn proof_per_identity_rate_limit(_context: &DemoContext) -> ProofResult {
+    let ctx = kind_context("pool-a");
+    let mut observations = Vec::new();
+
+    let mut burst = |tenant: &str| -> Result<(u32, u32), Box<dyn std::error::Error>> {
+        let token = mint_tenant_token(&ctx, tenant)?;
+        let counts = drive_concurrent_requests(&ctx, &token, RATE_LIMIT_BURST_REQUESTS)?;
+        observations.push(format!(
+            "{tenant}: {} of {RATE_LIMIT_BURST_REQUESTS} served, {} throttled",
+            counts.0, counts.1
+        ));
+        Ok(counts)
+    };
+
+    let (gold_ok, gold_throttled) = match burst(THROTTLED_TENANT) {
+        Ok(counts) => counts,
+        Err(e) => return failed_proof(format!("{THROTTLED_TENANT} burst failed: {e}"), observations),
+    };
+    let (plat_ok, plat_throttled) = match burst(DEFAULT_TENANT) {
+        Ok(counts) => counts,
+        Err(e) => return failed_proof(format!("{DEFAULT_TENANT} burst failed: {e}"), observations),
+    };
+
+    // An unauthenticated caller is refused before the limiter is consulted,
+    // so the bucket is not something a request can reach without identity.
+    let anon = drive_concurrent_requests(&ctx, "", 1).map_or(0, |c| c.0);
+    observations.push(format!("no token: {anon} of 1 served"));
+
+    let throttled = gold_throttled > 0;
+    let unaffected = plat_throttled == 0;
+    let refused = anon == 0;
+    if !throttled {
+        return failed_proof(
+            format!("{THROTTLED_TENANT} was never throttled ({gold_ok} served, its signed burst is 20)"),
+            observations,
+        );
+    }
+    if !unaffected {
+        return failed_proof(
+            format!("{DEFAULT_TENANT} was throttled {plat_throttled} times on the same offered load"),
+            observations,
+        );
+    }
+    if !refused {
+        return failed_proof("an unauthenticated request was served".to_owned(), observations);
+    }
+
+    ProofResult {
+        success: true,
+        description: format!(
+            "same offered load, opposite outcomes: {THROTTLED_TENANT} throttled {gold_throttled} times, \
+             {DEFAULT_TENANT} served all {plat_ok}"
+        ),
+        observations,
+    }
+}
+
+/// Fire `count` requests at the consumer gateway at once and tally the
+/// served against the throttled.
+///
+/// Concurrent rather than sequential: a token bucket refills, so requests
+/// spread over time measure the refill rate instead of the burst.
+fn drive_concurrent_requests(
+    kube_context: &str,
+    token: &str,
+    count: u32,
+) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    let auth = if token.is_empty() {
+        String::new()
+    } else {
+        format!("-H 'Authorization: Bearer {token}' ")
+    };
+    let body = format!(r#"{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"test"}}]}}"#);
+    let cmd = format!(
+        "seq 1 {count} | xargs -P {count} -I{{}} sh -c \"curl -s -o /dev/null -w '%{{http_code}}\\n' \
+         -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
+         -H 'Content-Type: application/json' {auth}-d '{body}'\""
+    );
+    let raw = kubectl_exec_curl_raw(kube_context, &cmd)?;
+    let mut served = 0_u32;
+    let mut throttled = 0_u32;
+    for line in raw.lines() {
+        match line.trim() {
+            "200" => served += 1,
+            "429" => throttled += 1,
+            _ => {},
+        }
+    }
+    if served + throttled == 0 {
+        return Err(format!("no request produced a usable status: {}", raw.trim()).into());
+    }
+    Ok((served, throttled))
+}
+
+/// A proof that did not hold, with what was seen before it gave out.
+fn failed_proof(description: String, observations: Vec<String>) -> ProofResult {
+    ProofResult {
+        success: false,
+        description,
+        observations,
+    }
+}
+
+/// The token the demo's own traffic carries.
+///
+/// Minted once and reused: every proof that drives the gateway is a
+/// tenant now, and the one it presents as is the high-limit tenant so
+/// the limiter never colours another proof's result.
+fn demo_token(kube_context: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(token) = TOKEN.get() {
+        return Ok(token);
+    }
+    let minted = mint_tenant_token(kube_context, DEFAULT_TENANT)?;
+    Ok(TOKEN.get_or_init(|| minted))
 }
