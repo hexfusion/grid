@@ -5059,7 +5059,7 @@ fn hold_pressure(cluster: &str, observations: &mut Vec<String>) {
         observations.push(format!("{cluster}: could not keep the local pool loaded: {error}"));
         return;
     }
-    let settled = await_pressure(cluster);
+    let settled = await_pressure(cluster, cluster);
     if settled <= 0.0 {
         observations.push(format!("{cluster}: pressure did not return before the second window"));
     }
@@ -5199,17 +5199,23 @@ fn set_load_source_reachable(cluster: &str, reachable: bool) -> Result<(), Box<d
 /// Scaling the generator returns before any request has been served, so
 /// observing straight afterwards compares two idle windows and concludes
 /// nothing. Returns the queue depth it settled on.
-fn await_pressure(cluster: &str) -> f64 {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut best = 0.0_f64;
+fn await_pressure(cluster: &str, subject: &str) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut seen = 0.0_f64;
     while Instant::now() < deadline {
-        best = queue_by_site(cluster).iter().map(|(_, v)| *v).fold(0.0, f64::max);
-        if best > 0.0 {
-            return best;
+        // The subject's own queue, not the highest anywhere. Waiting on any
+        // site opened the first window while the site under test was still
+        // idle, so the comparison ran unloaded first and loaded second.
+        seen = queue_by_site(cluster)
+            .iter()
+            .find(|(s, _)| s == subject)
+            .map_or(0.0, |(_, v)| *v);
+        if seen > 0.0 {
+            return seen;
         }
         std::thread::sleep(Duration::from_secs(3));
     }
-    best
+    seen
 }
 
 /// Prove the polled signal is what decides, by taking it away.
@@ -5236,10 +5242,10 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         observations.push(format!("{cluster}: could not load the local pool: {error}"));
         success = false;
     }
-    let settled = await_pressure(cluster);
+    let settled = await_pressure(cluster, cluster);
     if settled <= 0.0 {
         observations.push(format!(
-            "{cluster}: no site reported a queue under pressure, so there is nothing to attribute"
+            "{cluster}: its own queue never rose under direct load, so there is nothing to attribute"
         ));
         success = false;
     }
