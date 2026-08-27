@@ -5010,6 +5010,24 @@ fn set_load_source_reachable(cluster: &str, reachable: bool) -> Result<(), Box<d
     Ok(())
 }
 
+/// Wait until some site is actually carrying work.
+///
+/// Scaling the generator returns before any request has been served, so
+/// observing straight afterwards compares two idle windows and concludes
+/// nothing. Returns the queue depth it settled on.
+fn await_pressure(cluster: &str) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut best = 0.0_f64;
+    while Instant::now() < deadline {
+        best = queue_by_site(cluster).iter().map(|(_, v)| *v).fold(0.0, f64::max);
+        if best > 0.0 {
+            return best;
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    best
+}
+
 /// Prove the polled signal is what decides, by taking it away.
 ///
 /// A routing decision that matches the signal is not evidence on its own: the
@@ -5030,7 +5048,20 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
     if let Err(error) = scale_pressure_generator(cluster, PRESSURE_REPLICAS) {
         observations.push(format!("{cluster}: could not apply pressure: {error}"));
     }
+    let settled = await_pressure(cluster);
+    if settled <= 0.0 {
+        observations.push(format!(
+            "{cluster}: no site reported a queue under pressure, so there is nothing to attribute"
+        ));
+    }
     let with_load = observe_routing(cluster);
+    if with_load.destinations.len() < ROUTING_SAMPLE_REQUESTS {
+        observations.push(format!(
+            "{cluster}: only {} of {ROUTING_SAMPLE_REQUESTS} requests completed with the load source, so the comparison is thin",
+            with_load.destinations.len()
+        ));
+        success = false;
+    }
     observations.push(format!(
         "{cluster}: with the load source, {} of {} requests went to {} (queue {:.1}, the busiest)",
         with_load.hits_on_busiest(),
