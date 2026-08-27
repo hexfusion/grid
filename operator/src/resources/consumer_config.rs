@@ -245,11 +245,11 @@ pub(crate) fn build_consumer_config_map(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LoadSource {
     /// Signals endpoint the gateway polls.
+    ///
+    /// Only the address. Which signals to score on, how to weigh them and
+    /// which to request are the gateway's to decide, and it asks for exactly
+    /// the ones it scores.
     pub endpoint: String,
-    /// Metric name carrying queue depth.
-    pub queue_metric: String,
-    /// Metric names sent as `collect[]`, narrowing what the operator returns.
-    pub collect: Vec<String>,
 }
 
 /// Render the `intelligent_route` load block, or nothing when unconfigured.
@@ -259,25 +259,13 @@ pub(crate) struct LoadSource {
 /// rollback.
 fn render_load(load: Option<&LoadSource>) -> String {
     load.map_or_else(String::new, |l| {
-        // Every value originates in an InferenceProvider, which a tenant may
-        // write, so quote them the way every other renderer here does.
+        // The endpoint originates in operator configuration, so quote it the
+        // way every other renderer here does.
         let endpoint = yaml_scalar(&l.endpoint).unwrap_or_else(|_| "\"\"".to_owned());
-        let queue_metric = yaml_scalar(&l.queue_metric).unwrap_or_else(|_| "\"\"".to_owned());
-        let mut out = format!(
+        format!(
             "\x20       load:\n\
-             \x20         endpoint: {endpoint}\n\
-             \x20         queue_metric: {queue_metric}\n",
-        );
-        if !l.collect.is_empty() {
-            out.push_str("\x20         collect:\n");
-            for name in &l.collect {
-                let quoted = yaml_scalar(name).unwrap_or_else(|_| "\"\"".to_owned());
-                out.push_str("\x20           - ");
-                out.push_str(&quoted);
-                out.push('\n');
-            }
-        }
-        out
+             \x20         endpoint: {endpoint}\n",
+        )
     })
 }
 
@@ -659,8 +647,6 @@ mod tests {
     fn a_load_block() -> LoadSource {
         LoadSource {
             endpoint: "http://grid-operator-signals:9091/metrics".to_owned(),
-            queue_metric: "vllm:num_requests_waiting".to_owned(),
-            collect: vec!["vllm:num_requests_waiting".to_owned()],
         }
     }
 
@@ -687,9 +673,10 @@ mod tests {
             yaml.contains(r#"endpoint: "http://grid-operator-signals:9091/metrics""#),
             "endpoint rendered:\n{yaml}"
         );
+        // The hostname contains "signals", so match the key at its indent.
         assert!(
-            yaml.contains(r#"queue_metric: "vllm:num_requests_waiting""#),
-            "metric rendered:\n{yaml}"
+            !yaml.contains("queue_metric") && !yaml.contains("\n          signals:"),
+            "which signals to score on is the gateway's, not rendered here:\n{yaml}"
         );
         assert!(
             yaml.find("load:") < yaml.find("candidates:"),
@@ -1729,25 +1716,5 @@ mod tests {
                 "load block emits {key:?}, which the gateway rejects: {rendered}"
             );
         }
-    }
-
-    #[test]
-    fn a_crafted_queue_metric_cannot_inject_config_keys() {
-        // signalNames.queueDepth is tenant-writable on the InferenceProvider.
-        let payload = "q\"\n         transport:\n           mode: plaintext\n         x: \"".to_owned();
-        let hostile = LoadSource {
-            endpoint: "http://operator:9091/metrics".to_owned(),
-            queue_metric: payload.clone(),
-            // Tenant-writable too, so it carries the same payload.
-            collect: vec![payload],
-        };
-        let rendered = render_load(Some(&hostile));
-        // The payload may appear inside the quoted scalar; what must not happen
-        // is a real newline turning it into a key the gateway would honour.
-        assert_eq!(rendered.lines().count(), 5, "one block, five lines: {rendered}");
-        assert!(
-            !rendered.lines().any(|l| l.trim_start().starts_with("transport:")),
-            "injected key reached the gateway config: {rendered}"
-        );
     }
 }

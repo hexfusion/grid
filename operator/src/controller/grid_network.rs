@@ -1075,7 +1075,7 @@ async fn reconcile_routing_overlay_inner(
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
-    let load = load_source(providers);
+    let load = load_source();
 
     let sites = list_all_grid_sites(client).await?;
 
@@ -1392,42 +1392,14 @@ async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorE
 /// The metric name comes from the providers themselves. Returns `None` when they
 /// do not agree on one, because the gateway can name a single queue metric and
 /// guessing which to use would silently score some providers and not others.
-fn load_source(providers: &[InferenceProvider]) -> Option<consumer_config::LoadSource> {
+fn load_source() -> Option<consumer_config::LoadSource> {
+    // Just the address. The gateway declares which signals it scores on and
+    // asks the endpoint for those, so a change of scoring policy is a gateway
+    // change and does not wait on the operator to name a metric.
     let endpoint = std::env::var("GRID_SIGNALS_CONSUMER_URL").ok()?;
-    let queue_metric = agreed_signal_name(providers, |sn| sn.queue_depth.as_deref()).or_else(|| {
-        tracing::warn!("providers disagree on the queue-depth metric; omitting live load from consumer config");
-        None
-    })?;
-    // Narrowing the response to what the gateway scores on. Only queue depth
-    // today, because that is the only signal it reads; naming more would grow
-    // the payload without changing a decision.
-    let collect = vec![queue_metric.clone()];
-    Some(consumer_config::LoadSource {
-        endpoint,
-        queue_metric,
-        collect,
-    })
+    Some(consumer_config::LoadSource { endpoint })
 }
 
-/// The one name every provider that declares this signal uses for it.
-///
-/// `None` when nobody declares it, or when two providers declare different
-/// names. Disagreement is not resolvable here: the gateway can name one metric
-/// per signal, and picking a side would score some providers on live data and
-/// leave the rest on whatever the absent series defaults to.
-fn agreed_signal_name(
-    providers: &[InferenceProvider],
-    pick: impl Fn(&crate::crd::inference_provider::MetricSignalNames) -> Option<&str>,
-) -> Option<String> {
-    let mut names = providers
-        .iter()
-        .filter_map(|p| p.spec.metrics_config.as_ref())
-        .filter_map(|mc| pick(&mc.signal_names))
-        .map(str::trim)
-        .filter(|n| !n.is_empty());
-    let first = names.next()?;
-    names.all(|n| n == first).then(|| first.to_owned())
-}
 
 /// Server-side apply the operator-generated consumer Praxis config `ConfigMap`.
 ///
@@ -2811,78 +2783,11 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
-    fn provider_with_signals(name: &str, queue: Option<&str>, kv: Option<&str>) -> InferenceProvider {
-        let mut signal_names = serde_json::Map::new();
-        if let Some(q) = queue {
-            signal_names.insert("queueDepth".to_owned(), serde_json::Value::String(q.to_owned()));
-        }
-        if let Some(k) = kv {
-            signal_names.insert("kvCacheUtilization".to_owned(), serde_json::Value::String(k.to_owned()));
-        }
-        serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-            "kind": "InferenceProvider",
-            "metadata": { "name": name },
-            "spec": {
-                "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
-                "backendKind": "local",
-                "endpoint": "http://localhost:8000",
-                "models": [],
-                "metricsConfig": { "signalNames": signal_names }
-            }
-        }))
-        .unwrap_or_else(|_| std::process::abort())
-    }
 
     // -----------------------------------------------------------------------
     // Signal names offered to the gateway
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn one_signal_disagreeing_does_not_withhold_the_others() {
-        // The whole point of naming signals separately. Under the earlier
-        // all-or-nothing rule this left the gateway with nothing to route on
-        // but the order the operator had already chosen.
-        let providers = [
-            provider_with_signals("a", Some("q_one"), Some("kv")),
-            provider_with_signals("b", Some("q_two"), Some("kv")),
-        ];
-        assert_eq!(
-            agreed_signal_name(&providers, |sn| sn.queue_depth.as_deref()),
-            None,
-            "two names for one signal is not resolvable here"
-        );
-        assert_eq!(
-            agreed_signal_name(&providers, |sn| sn.kv_cache_utilization.as_deref()),
-            Some("kv".to_owned()),
-            "the signal they do agree on still reaches the gateway"
-        );
-    }
-
-    #[test]
-    fn a_signal_nobody_declares_has_no_name() {
-        let providers = [provider_with_signals("a", Some("q"), None)];
-        assert_eq!(
-            agreed_signal_name(&providers, |sn| sn.kv_cache_utilization.as_deref()),
-            None
-        );
-    }
-
-    #[test]
-    fn a_blank_signal_name_is_not_a_name() {
-        // An empty string renders as a real key with an empty value, which the
-        // gateway would read as a metric that never matches anything.
-        let providers = [
-            provider_with_signals("a", Some("   "), None),
-            provider_with_signals("b", Some("q"), None),
-        ];
-        assert_eq!(
-            agreed_signal_name(&providers, |sn| sn.queue_depth.as_deref()),
-            Some("q".to_owned()),
-            "blank is skipped, not treated as a competing name"
-        );
-    }
 
     fn make_grid_site(name: &str, network_ref: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({

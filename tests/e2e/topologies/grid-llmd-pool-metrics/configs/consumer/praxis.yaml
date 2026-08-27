@@ -35,9 +35,6 @@ filter_chains:
         # to one site and leave the remote candidates unscored.
         load:
           endpoint: "https://grid-operator-signals:9091/metrics"
-          queue_metric: "llm_d_epp_average_queue_size"
-          collect:
-            - "llm_d_epp_average_queue_size"
           interval_ms: 2000
           max_age_ms: 15000
           # The same Secret the operator serves this listener with, so the
@@ -47,6 +44,16 @@ filter_chains:
             ca_path: /etc/praxis/tls/ca.crt
             cert_path: /etc/praxis/tls/tls.crt
             key_path: /etc/praxis/tls/tls.key
+        # Scored on the default pair, queue depth and KV cache utilisation at
+        # equal weight, which is what the endpoint picker scores a pool on.
+        # Declaring this list is how a grid scores on something else, and what
+        # it asks the endpoint for is whatever it names:
+        #
+        #   signals:
+        #     - metric: "llm_d_epp_average_queue_size"
+        #       weight: 2.0
+        #     - metric: "llm_d_epp_average_kv_cache_utilization"
+        #       scale: ratio
         provider_hop_clusters:
           - llmd-pool-a-provider
           - llmd-pool-b-provider
