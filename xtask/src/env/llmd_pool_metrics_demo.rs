@@ -4878,6 +4878,14 @@ const GATEWAY_QUEUE_METRIC: &str = "llm_d_epp_average_queue_size";
 /// Requests sent per observation window.
 const ROUTING_SAMPLE_REQUESTS: usize = 6;
 
+/// Pressure applied while attributing a routing decision.
+///
+/// Deliberately far below what the flip proof uses. Enough load to tell the
+/// sites apart is all this needs, and more than the pool can absorb takes the
+/// pool past its configured capacity, at which point admission refuses new
+/// requests and the stage cannot send the ones it is trying to observe.
+const ATTRIBUTION_PRESSURE_REPLICAS: u32 = 1;
+
 /// Long enough for every held sample to pass the reader's freshness bound.
 ///
 /// The gateway config sets max_age_ms to 15s, so anything shorter leaves the
@@ -5045,7 +5053,7 @@ fn proof_load_drives_routing(context: &DemoContext) -> ProofResult {
         };
     };
 
-    if let Err(error) = scale_pressure_generator(cluster, PRESSURE_REPLICAS) {
+    if let Err(error) = scale_pressure_generator(cluster, ATTRIBUTION_PRESSURE_REPLICAS) {
         observations.push(format!("{cluster}: could not apply pressure: {error}"));
     }
     let settled = await_pressure(cluster);
