@@ -224,8 +224,6 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             stable_id: None,
             admission_state: None,
             selection_tier: None,
-            score: None,
-            score_breakdown: None,
             rank: None,
         })
         .collect()
@@ -807,14 +805,6 @@ pub struct RoutingCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_tier: Option<LocalityTier>,
 
-    /// Weighted score from the production scoring engine.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f64>,
-
-    /// Per-signal weighted contributions from the scoring engine.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score_breakdown: Option<scoring::ScoreBreakdown>,
-
     /// Zero-based position in the final sorted overlay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
@@ -1184,10 +1174,6 @@ pub fn render_routing_overlay_with_admission(
         )]
         let rank = i as u32;
         candidate.rank = Some(rank);
-        if let Some(bd) = ordering.get(candidate.cluster.as_str()) {
-            candidate.score = Some(bd.total);
-            candidate.score_breakdown = Some(bd.clone());
-        }
     }
 
     Ok(RoutingOverlay {
@@ -1386,8 +1372,6 @@ fn candidates_from_provider(
                 stable_id: None,
                 admission_state: None,
                 selection_tier: None,
-                score: None,
-                score_breakdown: None,
                 rank: None,
             });
         }
@@ -3751,13 +3735,13 @@ mod tests {
         let shape = |o: &RoutingOverlay| {
             o.candidates
                 .iter()
-                .map(|c| (c.cluster.clone(), c.rank, c.score, c.admission_state))
+                .map(|c| (c.cluster.clone(), c.rank, c.admission_state))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
             shape(&first),
             shape(&second),
-            "rank, score and admission must be a property of topology alone"
+            "rank and admission must be a property of topology alone"
         );
     }
 
@@ -3775,53 +3759,6 @@ mod tests {
         crate::crd::grid_network::resolve_scoring_weights(None)
     }
 
-    fn assert_weight(actual: f64, expected: f64, label: &str) {
-        assert!(
-            (actual - expected).abs() < f64::EPSILON,
-            "{label}: expected {expected}, got {actual}"
-        );
-    }
-
-    #[test]
-    fn no_metrics_all_score_contributions_are_zero() {
-        let a = test_provider_with_backend_kind("prov-a", "net", "local");
-        let b = test_provider_with_backend_kind("prov-b", "net", "local");
-        let network = test_network("net");
-
-
-        let overlay = render_routing_overlay(&network, &[], &[a, b], &[], "gw", None, &no_metrics_weights())
-            .unwrap_or_else(|_| std::process::abort());
-
-        for c in &overlay.candidates {
-            let bd = c.score_breakdown.as_ref().unwrap_or_else(|| std::process::abort());
-            assert_weight(bd.queue_depth, 0.0, &format!("{}: queue_depth", c.cluster));
-            assert_weight(bd.kv_cache, 0.0, &format!("{}: kv_cache", c.cluster));
-            assert_weight(bd.locality, 0.0, &format!("{}: locality", c.cluster));
-            assert_weight(bd.prefix_cache, 0.0, &format!("{}: prefix_cache", c.cluster));
-            assert_weight(bd.latency, 0.0, &format!("{}: latency", c.cluster));
-            assert_weight(bd.cost, 0.0, &format!("{}: cost", c.cluster));
-            assert_weight(bd.total, 0.0, &format!("{}: total", c.cluster));
-        }
-    }
-
-    #[test]
-    fn no_metrics_opposing_metrics_produce_equal_dynamic_scores() {
-        let a = test_provider_with_backend_kind("prov-a", "net", "local");
-        let b = test_provider_with_backend_kind("prov-b", "net", "local");
-        let network = test_network_score_first("net");
-
-
-        let overlay = render_routing_overlay(&network, &[], &[a, b], &[], "gw", None, &no_metrics_weights())
-            .unwrap_or_else(|_| std::process::abort());
-
-        let scores: Vec<f64> = overlay.candidates.iter().map(|c| c.score.unwrap_or(f64::NAN)).collect();
-        assert_eq!(scores.len(), 2);
-        assert_weight(
-            scores[0],
-            scores[1],
-            "both providers must have equal dynamic scores under noMetrics",
-        );
-    }
 
     #[test]
     fn no_metrics_geography_first_still_prefers_local() {
@@ -3903,23 +3840,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_metrics_score_first_does_not_manufacture_preference() {
-        let a = test_provider_with_backend_kind("prov-a", "net", "local");
-        let b = test_provider_with_backend_kind("prov-b", "net", "local");
-        let network = test_network_score_first("net");
-
-
-        let overlay = render_routing_overlay(&network, &[], &[a, b], &[], "gw", None, &no_metrics_weights())
-            .unwrap_or_else(|_| std::process::abort());
-
-        let scores: Vec<f64> = overlay.candidates.iter().map(|c| c.score.unwrap_or(f64::NAN)).collect();
-        assert_weight(
-            scores[0],
-            scores[1],
-            "scoreFirst with noMetrics: extreme metric differences must not create score preference",
-        );
-    }
 
     // -----------------------------------------------------------------------
     // render_routing_overlay metrics path — end-to-end ordering proofs
@@ -4134,34 +4054,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn score_breakdown_populates_on_candidates() {
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let network = test_network("net");
-
-
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[local],
-            &[],
-            "gw",
-            None,
-            &scoring::ScoringWeights::default(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-
-        let c = &overlay.candidates[0];
-        assert!(c.score.is_some(), "candidate must have a score");
-        let bd = c.score_breakdown.as_ref().unwrap_or_else(|| std::process::abort());
-        assert!(bd.locality > 0.0, "locality must be positive for local provider");
-        assert!(bd.queue_depth > 0.0, "queue_depth must be positive");
-        assert!(bd.kv_cache > 0.0, "kv_cache must be positive");
-        assert!(
-            (bd.total - c.score.unwrap_or(0.0)).abs() < 1e-10,
-            "breakdown.total must equal candidate.score"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // Routing policy — backward compatibility and serialization
