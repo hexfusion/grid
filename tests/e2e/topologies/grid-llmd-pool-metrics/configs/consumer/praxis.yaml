@@ -47,9 +47,9 @@ filter_chains:
         # it asks the endpoint for is whatever it names:
         #
         #   signals:
-        #     - metric: "llm_d_epp_average_queue_size"
+        #     - key: "llm_d_epp_average_queue_size"
         #       weight: 2.0
-        #     - metric: "llm_d_epp_average_kv_cache_utilization"
+        #     - key: "llm_d_epp_average_kv_cache_utilization"
         #       scale: ratio
         provider_hop_clusters:
           - llmd-pool-a-provider
