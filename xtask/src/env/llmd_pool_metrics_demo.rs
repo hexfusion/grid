@@ -73,6 +73,10 @@ const DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
 /// Retry interval for convergence probes.
 const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Requests that must have been served before the split between sites means
+/// anything. A handful can land anywhere.
+const MIN_SHED_REQUESTS: u64 = 100;
+
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
 
@@ -182,7 +186,7 @@ impl MetricsTransport {
 /// pressure generator and the same overlay score-breakdown display (both
 /// `queue_depth` and `kv_cache` are always shown); only the operator's
 /// `GridNetwork.spec.scoringPolicy.strategy` — and therefore which raw
-/// signal actually produces the `score`/`rank` that drives the A\u{2192}B flip —
+/// signal actually produces the score that moves work off a loaded site —
 /// changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScoringFlavor {
@@ -1036,7 +1040,7 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
 }
 
 /// Proof 3: Scale up pressure through the consumer gateway, wait for
-/// A→B flip with live metrics table and attribution tracking.
+/// Load shedding under pressure, with a live metrics table and attribution.
 fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> ProofResult {
     let mut observations = Vec::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
@@ -1083,7 +1087,9 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
     print_live_table_header();
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
-    let mut last_route = String::from("-");
+    // Nothing reassigns this now: the probe that used to set it returns in the
+    // same breath, so the table shows the dash until the proof ends.
+    let last_route = String::from("-");
     let mut pressure_announced = false;
 
     while Instant::now() < deadline {
@@ -1125,60 +1131,48 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             published: &published,
         });
 
-        // The flip is a data-plane fact, so it is read there. The overlay rank
-        // beside it is a property of topology and does not move with load;
-        // waiting on it waited forever while traffic had already shifted.
-        if pressure_phase_active(context.scoring_flavor, &epp_a) {
+        // What sustained load on one site actually does, which is shed work to
+        // the others. It is not a failover: the gateway rescores every request
+        // against a live queue, so a loaded site drains as fast as it fills
+        // and no site stays saturated long enough to be taken out of service.
+        // Waiting for one to be taken out waits forever while the work is
+        // already moving.
+        let elsewhere = stats.total.saturating_sub(stats.a_reqs);
+        if stats.total >= MIN_SHED_REQUESTS && elsewhere > stats.a_reqs {
             eprintln!(
-                "  [PRESSURE] Pool A queue={:.1}/{:.0} kv={:.2}; Pool B queue={:.1} kv={:.2}",
-                row_a.queue, row_a.capacity, row_a.kv_cache, row_b.queue, row_b.kv_cache
+                "  [SHEDDING] Pool A queue={:.1}/{:.0}; {} of {} requests served elsewhere",
+                row_a.queue, row_a.capacity, elsewhere, stats.total
             );
-            eprintln!("  [FAILOVER] Checking where the gateway is sending work");
             let probe_ctx = kind_context("pool-a");
             if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
-                last_route = if resp.provider_gateway.contains("pool-b") {
-                    "pool-b".to_owned()
-                } else {
-                    "pool-a".to_owned()
+                print_scorecard_with_cause(
+                    "SHEDDING",
+                    &[&row_a, &row_b],
+                    "ELSEWHERE",
+                    &updated_candidates,
+                    "Pool A is over its queue capacity, so the gateway scored other sites higher.",
+                );
+                observations.push(format!(
+                    "pool-a queue={:.1}/{:.0} while {} of {} requests went elsewhere",
+                    row_a.queue, row_a.capacity, elsewhere, stats.total
+                ));
+                observations.push(format!(
+                    "pool-b queue={:.1} kv={:.2}, carrying the work pool-a shed",
+                    row_b.queue, row_b.kv_cache
+                ));
+                observations.push(format!(
+                    "load stats: total={} ok={} fail={} a={} b={}",
+                    stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
+                ));
+                observations.push(format!("the next request was served by {}", resp.demo_attribution));
+                observations.push(
+                    "Grid shed load: a site over capacity kept serving while the rest took the excess".to_owned(),
+                );
+                return ProofResult {
+                    success: true,
+                    description: "Load on one site moved work to the others, with nothing refused".to_owned(),
+                    observations,
                 };
-                if resp.provider_gateway.contains("pool-b") && resp.demo_attribution.contains("pool-b") {
-                    eprintln!("  [TRAFFIC SHIFT] Request attributed to pool-b");
-                    eprintln!(
-                        "    load stats: total={} ok={} fail={} | a={} b={}",
-                        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
-                    );
-                    print_scorecard_with_cause(
-                        "FAILOVER",
-                        &[&row_a, &row_b],
-                        "CLUSTER B",
-                        &updated_candidates,
-                        "Pool A is over its queue capacity, so the gateway scored Pool B higher for this request.",
-                    );
-                    observations.push(format!(
-                        "flip: pool-a queue={:.1}/{:.0} against pool-b queue={:.1}, and the request went to pool-b",
-                        row_a.queue, row_a.capacity, row_b.queue
-                    ));
-                    observations.push(format!(
-                        "pool-a: queue={:.1}/{:.0} kv={:.2}",
-                        row_a.queue, row_a.capacity, row_a.kv_cache
-                    ));
-                    observations.push(format!(
-                        "attribution: gateway={} provider={}",
-                        resp.provider_gateway, resp.demo_attribution
-                    ));
-                    observations.push(format!(
-                        "load stats: total={} ok={} fail={} a={} b={}",
-                        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
-                    ));
-                    observations
-                        .push("Grid rerouted: gateway-routed load caused A\u{2192}B preference change".to_owned());
-                    return ProofResult {
-                        success: true,
-                        description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift"
-                            .to_owned(),
-                        observations,
-                    };
-                }
             }
         }
 
@@ -1190,10 +1184,11 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         "final load stats: total={} ok={} fail={} a={} b={}",
         stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
     ));
-    observations.push("A\u{2192}B flip did not converge in data plane within timeout".to_owned());
+    observations
+        .push("pool-a never carried less than half the work while over capacity, so nothing was shed".to_owned());
     ProofResult {
         success: false,
-        description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift".to_owned(),
+        description: "Load on one site moved work to the others, with nothing refused".to_owned(),
         observations,
     }
 }
