@@ -1075,7 +1075,6 @@ async fn reconcile_routing_overlay_inner(
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
-    let load = load_source();
 
     let sites = list_all_grid_sites(client).await?;
 
@@ -1230,7 +1229,7 @@ async fn reconcile_routing_overlay_inner(
         // Gateways with consumerConfig.enabled=false get a Disabled entry.
         // Gateways without a consumerConfig block are omitted from status.
         if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
-            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client, load.as_ref()).await {
+            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await {
                 Ok(()) => {
                     consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
                 },
@@ -1382,41 +1381,18 @@ async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorE
     Ok(list.items)
 }
 
-/// Where the gateway should read live load, if it can be stated unambiguously.
-///
-/// The endpoint comes from `GRID_SIGNALS_CONSUMER_URL`; unset means this
-/// operator does not offer live load, and the rendered config omits the block.
-/// Making it opt-in this way keeps generated config unchanged for anyone who has
-/// not deployed the signals endpoint.
-///
-/// The metric name comes from the providers themselves. Returns `None` when they
-/// do not agree on one, because the gateway can name a single queue metric and
-/// guessing which to use would silently score some providers and not others.
-fn load_source() -> Option<consumer_config::LoadSource> {
-    // Just the address. The gateway declares which signals it scores on and
-    // asks the endpoint for those, so a change of scoring policy is a gateway
-    // change and does not wait on the operator to name a metric.
-    let endpoint = std::env::var("GRID_SIGNALS_CONSUMER_URL").ok()?;
-    Some(consumer_config::LoadSource { endpoint })
-}
-
 
 /// Server-side apply the operator-generated consumer Praxis config `ConfigMap`.
 ///
 /// Only called when `gw_ref.consumer_config.enabled` is `true`.  Renders the
 /// consumer Praxis YAML from the routing overlay and applies it to the gateway
 /// namespace.  The generated config never contains credential token bytes.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "rendering inputs; a struct to carry them would exist only to satisfy the lint"
-)]
 async fn apply_consumer_config_for_gateway(
     overlay: &routing_overlay::RoutingOverlay,
     network_name: &str,
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
     client: &Client,
-    load: Option<&consumer_config::LoadSource>,
 ) -> Result<(), OperatorError> {
     let config_yaml = consumer_config::generate_consumer_praxis_config(
         overlay,
@@ -1424,7 +1400,6 @@ async fn apply_consumer_config_for_gateway(
         &cc.cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
-        load,
     )?;
     let cm = consumer_config::build_consumer_config_map(
         &config_yaml,

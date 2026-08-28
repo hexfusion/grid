@@ -30,20 +30,17 @@ filter_chains:
       - filter: intelligent_route
         overlay_file: /etc/praxis/routing/routing-overlay.json
         model_header: X-Model
-        # Live load from the local operator. Unqualified, so it carries this
-        # site and every peer the operator collected; ?target= would narrow it
-        # to one site and leave the remote candidates unscored.
-        load:
-          endpoint: "https://grid-operator-signals:9091/metrics"
-          interval_ms: 2000
-          max_age_ms: 15000
-          # The same Secret the operator serves this listener with, so the
-          # gateway presents the site's own key and is recognised as this
-          # site rather than refused as an unnamed caller.
-          tls:
-            ca_path: /etc/praxis/tls/ca.crt
-            cert_path: /etc/praxis/tls/tls.crt
-            key_path: /etc/praxis/tls/tls.key
+        # Live signals from the local operator. Unqualified, so it carries
+        # this site and every peer the operator collected; ?target= would
+        # narrow it to one site and leave the remote candidates unscored.
+        signals_endpoint: "https://grid-operator-signals:9091/metrics"
+        # The same Secret the operator serves this listener with, so the
+        # gateway presents the site's own key and is recognised as this site
+        # rather than refused as an unnamed caller.
+        signals_tls:
+          ca_path: /etc/praxis/tls/ca.crt
+          cert_path: /etc/praxis/tls/tls.crt
+          key_path: /etc/praxis/tls/tls.key
         # Scored on the default pair, queue depth and KV cache utilisation at
         # equal weight, which is what the endpoint picker scores a pool on.
         # Declaring this list is how a grid scores on something else, and what
