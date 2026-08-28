@@ -5813,20 +5813,42 @@ fn drive_concurrent_requests(
     token: &str,
     count: u32,
 ) -> Result<BTreeMap<String, u32>, Box<dyn std::error::Error>> {
-    let auth = if token.is_empty() {
+    // Everything the request needs goes in the environment, not into the
+    // command text. Interpolating a JSON body into a nested `sh -c "..."`
+    // splits it on its own quotes: curl sends something that is not the body,
+    // no model is found, and the gateway answers 500 for a reason that looks
+    // like the grid rather than like this line.
+    let body = format!(r#"{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"hi"}}],"max_tokens":1}}"#);
+    let auth_header = if token.is_empty() {
         String::new()
     } else {
-        format!("-H 'Authorization: Bearer {token}' ")
+        format!("Authorization: Bearer {token}")
     };
-    // One token out: the limiter decides before any of this is generated, so a
-    // long completion would only spend the backend the other proofs need.
-    let body = format!(r#"{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"hi"}}],"max_tokens":1}}"#);
+    // No -I replacement: xargs substitutes it everywhere, and every spelling
+    // of a placeholder that reads well also appears inside `%{http_code}`.
+    // The command ignores its argument, so nothing needs replacing.
     let cmd = format!(
-        "seq 1 {count} | xargs -P {count} -I{{}} sh -c \"curl -s -o /dev/null -w '%{{http_code}}\\n' \
-         --max-time 60 -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
-         -H 'Content-Type: application/json' {auth}-d '{body}'\""
+        "seq 1 {count} | xargs -P {count} -n 1 sh -c '\
+         if [ -n \"$REQ_AUTH\" ]; then \
+           curl -s -o /dev/null -w \"%{{http_code}}\\n\" --max-time 60 -X POST \"$URL\" \
+             -H \"Content-Type: application/json\" -H \"$REQ_AUTH\" -d \"$REQ_BODY\"; \
+         else \
+           curl -s -o /dev/null -w \"%{{http_code}}\\n\" --max-time 60 -X POST \"$URL\" \
+             -H \"Content-Type: application/json\" -d \"$REQ_BODY\"; \
+         fi' _"
     );
-    let raw = exec_in_load_probe(cluster, &cmd)?;
+    let raw = exec_in_load_probe_with_env(
+        cluster,
+        &cmd,
+        &[
+            ("REQ_BODY", body.as_str()),
+            ("REQ_AUTH", auth_header.as_str()),
+            (
+                "URL",
+                "http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+            ),
+        ],
+    )?;
     let mut seen: BTreeMap<String, u32> = BTreeMap::new();
     for line in raw.lines() {
         let code = line.trim();
@@ -5856,28 +5878,33 @@ fn describe_statuses(seen: &BTreeMap<String, u32>) -> String {
 /// Pod the rate limit proof drives its load from.
 const LOAD_PROBE_POD: &str = "rate-limit-driver";
 
-/// Run a command in a long-lived pod, starting it if it is not up.
+/// Run a command in the load probe with values supplied as environment.
 ///
-/// Long-lived and exec'd rather than a pod per call: a pod per call raced its
-/// own deletion and returned the deletion notice instead of the output, which
-/// reads as a gateway that answered nothing.
-fn exec_in_load_probe(cluster: &str, cmd: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Anything a request carries goes here rather than into the command text.
+/// A JSON body interpolated into a nested `sh -c` is split on its own quotes,
+/// and what arrives is not what was meant to be sent.
+fn exec_in_load_probe_with_env(
+    cluster: &str,
+    cmd: &str,
+    env: &[(&str, &str)],
+) -> Result<String, Box<dyn std::error::Error>> {
     let ctx = kind_context(cluster);
     ensure_load_probe(&ctx)?;
-    let out = Command::new("kubectl")
-        .args([
-            "--context",
-            &ctx,
-            "-n",
-            GRID_SYSTEM_NS,
-            "exec",
-            LOAD_PROBE_POD,
-            "--",
-            "sh",
-            "-c",
-            cmd,
-        ])
-        .output()?;
+    let mut args: Vec<String> = vec![
+        "--context".to_owned(),
+        ctx,
+        "-n".to_owned(),
+        GRID_SYSTEM_NS.to_owned(),
+        "exec".to_owned(),
+        LOAD_PROBE_POD.to_owned(),
+        "--".to_owned(),
+        "env".to_owned(),
+    ];
+    for (key, value) in env {
+        args.push(format!("{key}={value}"));
+    }
+    args.extend(["sh".to_owned(), "-c".to_owned(), cmd.to_owned()]);
+    let out = Command::new("kubectl").args(&args).output()?;
     if !out.status.success() {
         return Err(format!(
             "exec in {LOAD_PROBE_POD} failed: {}",
@@ -5887,6 +5914,7 @@ fn exec_in_load_probe(cluster: &str, cmd: &str) -> Result<String, Box<dyn std::e
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
+
 
 /// Start the load probe pod unless it is already running.
 fn ensure_load_probe(ctx: &str) -> Result<(), Box<dyn std::error::Error>> {
