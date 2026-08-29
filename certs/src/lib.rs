@@ -5,9 +5,11 @@
 //! (certs from disk); production will use a `SpiffeProvider`
 //! (SPIRE workload API) without changing the mTLS plumbing.
 
+mod enroll;
 mod generate;
 mod provider;
 
+pub use enroll::{EnrollError, EnrolledCert, MAX_CSR_PEM_BYTES, sign_csr};
 pub use generate::{
     CaCert, DEFAULT_ORGANIZATION, GenerateError, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
     generate_cert_with_org, generate_dns_cert, generate_expired_dns_cert, generate_not_yet_valid_dns_cert,

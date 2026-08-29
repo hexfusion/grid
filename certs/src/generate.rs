@@ -346,7 +346,7 @@ pub fn load_ca(common_name: &str, ca_key_pem: &str, ca_cert_pem: &str) -> Result
 /// Separated from [`generate_site_cert`] so tests can verify
 /// the distinguished name entries without generating a full
 /// signed certificate.
-fn build_site_params(site_name: &str, dns_san: &str) -> Result<CertificateParams, GenerateError> {
+pub(crate) fn build_site_params(site_name: &str, dns_san: &str) -> Result<CertificateParams, GenerateError> {
     build_site_params_with_org(site_name, dns_san, DEFAULT_ORGANIZATION)
 }
 
