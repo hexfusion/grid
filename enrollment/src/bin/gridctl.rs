@@ -49,9 +49,12 @@ enum Command {
     /// Ask to join a grid, and collect the certificate once approved.
     Enroll(EnrollArgs),
 
-    /// Inspect and decide on requests. Requires an operator token.
-    #[command(subcommand)]
-    Requests(RequestsCommand),
+    /// Inspect and decide on enrollments. Requires an operator token.
+    ///
+    /// Aliased to `csr` for anyone reaching for `kubectl get csr`, though an
+    /// enrollment carries more than the request it was asked with.
+    #[command(subcommand, alias = "csr", alias = "enrollments")]
+    Enrollment(EnrollmentCommand),
 }
 
 /// How to ask for membership.
@@ -90,25 +93,25 @@ struct EnrollArgs {
     timeout_secs: u64,
 }
 
-/// Operator actions on requests.
+/// Operator actions on enrollments.
 #[derive(Debug, Subcommand)]
-enum RequestsCommand {
-    /// List requests, newest first.
+enum EnrollmentCommand {
+    /// List enrollments, newest first.
     List {
         /// Show only requests in this phase.
         #[arg(long)]
         phase: Option<String>,
     },
 
-    /// Approve a request and issue its certificate.
+    /// Approve an enrollment and issue its certificate.
     Approve {
-        /// The request to approve.
+        /// The enrollment to approve.
         request_id: String,
     },
 
-    /// Deny a request.
+    /// Deny an enrollment.
     Deny {
-        /// The request to deny.
+        /// The enrollment to deny.
         request_id: String,
 
         /// Recorded as the reason.
@@ -136,9 +139,9 @@ async fn main() -> Result<(), Failure> {
 
     match cli.command {
         Command::Enroll(args) => enroll(&client, &args).await,
-        Command::Requests(RequestsCommand::List { phase }) => list(&client, phase.as_deref()).await,
-        Command::Requests(RequestsCommand::Approve { request_id }) => approve(&client, &request_id).await,
-        Command::Requests(RequestsCommand::Deny { request_id, reason }) => {
+        Command::Enrollment(EnrollmentCommand::List { phase }) => list(&client, phase.as_deref()).await,
+        Command::Enrollment(EnrollmentCommand::Approve { request_id }) => approve(&client, &request_id).await,
+        Command::Enrollment(EnrollmentCommand::Deny { request_id, reason }) => {
             deny(&client, &request_id, reason.as_deref()).await
         },
     }
@@ -157,7 +160,7 @@ async fn enroll(client: &Client, args: &EnrollArgs) -> Result<(), Failure> {
     println!("submitted request {request_id} for site {}", args.site);
 
     if !args.wait {
-        println!("an operator must approve it: gridctl requests approve {request_id}");
+        println!("an operator must approve it: gridctl enrollment approve {request_id}");
         return Ok(());
     }
 
@@ -240,7 +243,7 @@ async fn list(client: &Client, phase: Option<&str>) -> Result<(), Failure> {
         return Err("the service did not return a list".into());
     };
     if rows.is_empty() {
-        println!("no enrollment requests");
+        println!("no enrollments");
         return Ok(());
     }
 
