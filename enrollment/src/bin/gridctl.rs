@@ -110,6 +110,24 @@ enum EnrollmentCommand {
         request_id: String,
     },
 
+    /// Print the resources that make an approved member visible to a cluster.
+    ///
+    /// Apply them with kubectl. Emitting rather than creating keeps the
+    /// enrollment service free of a Kubernetes dependency, which is what lets a
+    /// provider with no cluster of its own use it.
+    Export {
+        /// The enrollment to export.
+        request_id: String,
+
+        /// Namespace the resources go in.
+        #[arg(long, default_value = "models-as-a-service")]
+        namespace: String,
+
+        /// Also emit the MaaS resources that surface the member's models.
+        #[arg(long)]
+        with_models: bool,
+    },
+
     /// Deny an enrollment.
     Deny {
         /// The enrollment to deny.
@@ -145,6 +163,11 @@ async fn main() -> Result<(), Failure> {
         Command::Enrollment(EnrollmentCommand::Deny { request_id, reason }) => {
             deny(&client, &request_id, reason.as_deref()).await
         },
+        Command::Enrollment(EnrollmentCommand::Export {
+            request_id,
+            namespace,
+            with_models,
+        }) => export(&client, &request_id, &namespace, with_models).await,
     }
 }
 
@@ -326,6 +349,143 @@ async fn deny(client: &Client, request_id: &str, reason: Option<&str>) -> Result
 fn pem_to_der(pem_text: &str) -> Result<Vec<u8>, Failure> {
     Ok(pem::parse(pem_text)?.contents().to_vec())
 }
+
+/// Print the resources that make an approved member visible to a cluster.
+async fn export(client: &Client, request_id: &str, namespace: &str, with_models: bool) -> Result<(), Failure> {
+    let record = client
+        .send(Method::GET, &format!("/v1/requests/{request_id}"), None, false)
+        .await?;
+
+    if record.get("phase").and_then(Value::as_str) != Some("issued") {
+        return Err(format!(
+            "{} is {}, and only an issued enrollment has anything to export",
+            field(&record, "siteName"),
+            field(&record, "phase")
+        )
+        .into());
+    }
+
+    let site = field(&record, "siteName");
+    let address = record
+        .get("egress")
+        .and_then(|egress| egress.get("address"))
+        .and_then(Value::as_str)
+        .ok_or("the enrollment recorded no egress address")?;
+
+    // The pin is derived from the certificate the grid just issued, so an
+    // operator no longer copies a fingerprint between machines by hand.
+    let fingerprint = certs::canonical_fingerprint(field(&record, "certificate"))?;
+
+    print!("{}", grid_site_yaml(site, namespace, &record, address, &fingerprint));
+    if with_models {
+        print!("{}", maas_yaml(site, namespace, &record, address));
+    }
+    Ok(())
+}
+
+/// The `GridSite` that tells this cluster a member exists.
+fn grid_site_yaml(site: &str, namespace: &str, record: &Value, address: &str, fingerprint: &str) -> String {
+    format!(
+        "---\n\
+         apiVersion: grid.praxis-proxy.io/v1alpha1\n\
+         kind: GridSite\n\
+         metadata:\n\
+        \x20 name: {site}\n\
+        \x20 namespace: {namespace}\n\
+        \x20 annotations:\n\
+        \x20   grid.praxis-proxy.io/enrolled-as: {spiffe}\n\
+        \x20   grid.praxis-proxy.io/enrollment-request: {request}\n\
+         spec:\n\
+        \x20 gridNetworkRef: {grid}\n\
+        \x20 egress:\n\
+        \x20   address: {address}\n\
+        \x20   tls:\n\
+        \x20     mode: mutual\n\
+        \x20     serverName: {site}.grid.internal\n\
+        \x20 trust:\n\
+        \x20   canonicalFingerprints:\n\
+        \x20     - {fingerprint}\n",
+        spiffe = field(record, "spiffeId"),
+        request = field(record, "requestId"),
+        grid = field(record, "gridNetworkRef"),
+    )
+}
+
+/// The MaaS resources that surface a member's models in the dashboard.
+///
+/// `auth.type` is `mtls` because an enrolled peer authenticates with the certificate
+/// the grid issued it, not an API key. That value is not yet in the upstream
+/// enum, which is the change this asks for.
+fn maas_yaml(site: &str, namespace: &str, record: &Value, address: &str) -> String {
+    let models = record
+        .get("capabilities")
+        .and_then(|caps| caps.get("inference"))
+        .and_then(|inference| inference.get("models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = external_provider_yaml(site, namespace, address);
+    for model in &models {
+        out.push_str(&external_model_yaml(site, namespace, model));
+    }
+    out
+}
+
+/// The provider entry for one enrolled member.
+fn external_provider_yaml(site: &str, namespace: &str, address: &str) -> String {
+    format!(
+        "---\n\
+         apiVersion: inference.opendatahub.io/v1alpha1\n\
+         kind: ExternalProvider\n\
+         metadata:\n\
+        \x20 name: {site}\n\
+        \x20 namespace: {namespace}\n\
+         spec:\n\
+        \x20 provider: {site}\n\
+        \x20 endpoint: {address}\n\
+        \x20 auth:\n\
+        \x20   type: mtls\n\
+        \x20   secretRef:\n\
+        \x20     name: {site}-grid-identity\n"
+    )
+}
+
+/// One model the member serves, pointed at its provider entry.
+fn external_model_yaml(site: &str, namespace: &str, model: &Value) -> String {
+    let name = field(model, "name");
+    let slug: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    format!(
+        "---\n\
+         apiVersion: inference.opendatahub.io/v1alpha1\n\
+         kind: ExternalModel\n\
+         metadata:\n\
+        \x20 name: {slug}-{site}\n\
+        \x20 namespace: {namespace}\n\
+         spec:\n\
+        \x20 modelName: {slug}\n\
+        \x20 externalProviderRefs:\n\
+        \x20   - ref:\n\
+        \x20       name: {site}\n\
+        \x20     targetModel: {name}\n\
+        \x20     path: {path}\n\
+        \x20     apiFormat: {api_format}\n\
+        \x20     weight: 100\n",
+        path = field(model, "path"),
+        api_format = field(model, "apiFormat"),
+    )
+}
+
 
 /// Write a file only the owner can read.
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {

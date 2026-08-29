@@ -102,6 +102,29 @@ pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -
     Ok(leaf.public_key().subject_public_key.data.to_vec())
 }
 
+/// The canonical fingerprint of a certificate: lowercase hex SHA-256 over its
+/// DER form.
+///
+/// Taken over DER rather than PEM, so line wrapping and trailing newlines cannot
+/// change it. This is the form a peer pins.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn canonical_fingerprint(cert_pem: &str) -> Result<String, VerifyError> {
+    use sha2::{Digest as _, Sha256};
+
+    if cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
+
+    Ok(Sha256::digest(der.contents())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 /// The public key a certificate request carries, as a key point.
 ///
 /// An enrollee proves it is the one that made a request by signing with the key
@@ -236,6 +259,46 @@ mod tests {
         let local = generate_site_cert(&ca, "site-a").expect("local");
 
         verify_site_cert(&ca.cert_pem, &local.cert_pem, "site-a").expect("a grid-minted cert should verify");
+    }
+
+    /// The pin a peer configures has to be the one this computes.
+    #[test]
+    fn a_fingerprint_is_sixty_four_lowercase_hex_characters() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let issued = sign_csr(&ca, "site-d", &csr_for("site-d"), crate::Validity::default()).expect("sign");
+
+        let fingerprint = canonical_fingerprint(&issued.cert_pem).expect("fingerprint");
+        assert_eq!(fingerprint.len(), 64, "a SHA-256 in hex is 64 characters");
+        assert!(
+            fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "the operator accepts only lowercase hex, got {fingerprint}"
+        );
+    }
+
+    /// Whitespace around the PEM must not change the pin.
+    #[test]
+    fn a_fingerprint_is_taken_over_der_not_the_pem_text() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let issued = sign_csr(&ca, "site-d", &csr_for("site-d"), crate::Validity::default()).expect("sign");
+
+        let plain = canonical_fingerprint(&issued.cert_pem).expect("fingerprint");
+        let padded = canonical_fingerprint(&format!("\n{}\n\n", issued.cert_pem.trim())).expect("fingerprint");
+        assert_eq!(plain, padded, "trailing newlines must not change the pin");
+    }
+
+    #[test]
+    fn two_certificates_have_different_fingerprints() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let first = sign_csr(&ca, "site-d", &csr_for("site-d"), crate::Validity::default()).expect("sign");
+        let second = sign_csr(&ca, "site-e", &csr_for("site-e"), crate::Validity::default()).expect("sign");
+
+        assert_ne!(
+            canonical_fingerprint(&first.cert_pem).expect("first"),
+            canonical_fingerprint(&second.cert_pem).expect("second"),
+            "different certificates must pin differently"
+        );
     }
 
     #[test]
