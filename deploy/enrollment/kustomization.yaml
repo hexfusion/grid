@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The enrollment service, deployed beside MaaS so it can use the Postgres that
+# is already there. It holds no Kubernetes permissions: it issues certificates
+# and records decisions, and gridctl emits the resources a cluster acts on.
+
+resources:
+  - service-account.yaml
+  - deployment.yaml
+  - service.yaml

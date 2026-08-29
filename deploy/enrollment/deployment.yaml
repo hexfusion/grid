@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grid-enrollment
+  namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/name: grid-enrollment
+    app.kubernetes.io/part-of: grid
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grid-enrollment
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grid-enrollment
+    spec:
+      serviceAccountName: grid-enrollment
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: enrollment
+          image: ghcr.io/praxis-proxy/grid-enrollment:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          env:
+            - name: ENROLLMENT_LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: ENROLLMENT_CA_CERT
+              value: /etc/grid/ca/ca.crt
+            - name: ENROLLMENT_CA_KEY
+              value: /etc/grid/ca/tls.key
+            - name: ENROLLMENT_CA_COMMON_NAME
+              value: grid-ca
+            - name: ENROLLMENT_OPERATOR_TOKENS
+              value: /etc/grid/operators/operators.txt
+            # Thirty days. Shorten once renewal exists: expiry is the only thing
+            # that removes a member, since a grid has no revocation list.
+            - name: ENROLLMENT_CERT_LIFETIME_SECS
+              value: "2592000"
+            # The transport key a member needs to join the mesh, handed over with
+            # its certificate so it does not travel out of band.
+            - name: ENROLLMENT_GOSSIP_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: grid-swim-key
+                  key: key
+                  optional: true
+            - name: ENROLLMENT_GOSSIP_SEEDS
+              value: ""
+            # The database MaaS already runs. Same secret, same key.
+            - name: DB_CONNECTION_URL
+              valueFrom:
+                secretKeyRef:
+                  name: maas-db-config
+                  key: DB_CONNECTION_URL
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: grid-ca
+              mountPath: /etc/grid/ca
+              readOnly: true
+            - name: operators
+              mountPath: /etc/grid/operators
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              # Unauthenticated, so a probe needs no credential. It answers 401
+              # rather than 200, which still proves the process is serving.
+              path: /v1/requests
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: grid-ca
+          secret:
+            secretName: grid-ca
+            defaultMode: 0440
+        - name: operators
+          secret:
+            secretName: grid-enrollment-operators
+            defaultMode: 0440
