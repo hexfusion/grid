@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "certs",
     "crdt",
+    "enrollment",
     "forge",
     "mock-providers",
     "operator",

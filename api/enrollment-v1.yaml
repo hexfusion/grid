@@ -1,0 +1,400 @@
+openapi: 3.1.0
+info:
+  title: Grid Enrollment API
+  version: 1.0.0
+  description: |
+    Lets an inference provider join a grid.
+
+    A provider arrives holding no credential. It generates a key pair,
+    keeps the private half, and submits a certificate signing request. A
+    person approves or denies it. On approval the grid signs the request
+    and assigns a name, and the provider collects a certificate it can
+    use to prove that name to any peer trusting the grid.
+
+    The grid assigns the name. A request only asks for one. Accepting a
+    certificate a provider had already signed for itself would let it
+    choose its own name, including another provider's.
+
+    Enrollment grants membership and nothing else. What a member may
+    consume, and what may be sent to it, is decided per site.
+  contact:
+    name: AI Grid
+    url: https://github.com/praxis-proxy/grid
+servers:
+  - url: https://grid.example/enrollment/v1
+    description: A grid's enrollment endpoint.
+
+tags:
+  - name: enrollment
+    description: Requesting and collecting a grid identity.
+  - name: administration
+    description: Deciding on requests. Requires an authenticated operator.
+
+paths:
+  /requests:
+    post:
+      operationId: createEnrollmentRequest
+      tags: [enrollment]
+      summary: Ask to join the grid
+      description: |
+        Submits a certificate signing request. The response carries the
+        request identifier to poll, and nothing is trusted yet.
+
+        Unauthenticated by design: a provider has no credential until it
+        completes this exchange. A grid limits abuse by rate and by
+        requiring approval, not by requiring a credential here.
+
+        This endpoint does not consult a subscription and ignores the
+        X-MaaS-Subscription header.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentRequestInput'
+      responses:
+        '202':
+          description: Recorded and awaiting a decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollmentRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: A request for this name is already pending, or the name is taken.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many requests from this source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      operationId: listEnrollmentRequests
+      tags: [administration]
+      summary: List requests
+      description: |
+        Returns requests, most recent first. Intended for an operator
+        deciding on them.
+
+        This endpoint does not consult a subscription and ignores the
+        X-MaaS-Subscription header.
+      security:
+        - operatorAuth: []
+      parameters:
+        - name: phase
+          in: query
+          description: Return only requests in this phase.
+          required: false
+          schema:
+            $ref: '#/components/schemas/EnrollmentPhase'
+      responses:
+        '200':
+          description: The requests matching the query.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    description: The matching requests.
+                    items:
+                      $ref: '#/components/schemas/EnrollmentRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /requests/{requestId}:
+    get:
+      operationId: getEnrollmentRequest
+      tags: [enrollment]
+      summary: Check a request and collect its certificate
+      description: |
+        Returns the request. Once approved it carries the issued
+        certificate, so a provider that lost the approval response can
+        collect it again. The certificate is public material.
+
+        This endpoint does not consult a subscription and ignores the
+        X-MaaS-Subscription header.
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The request in its current phase.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollmentRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /requests/{requestId}/approve:
+    post:
+      operationId: approveEnrollmentRequest
+      tags: [administration]
+      summary: Approve a request and issue a certificate
+      description: |
+        Signs the request, assigns a name, and records who approved it.
+        Idempotent: approving an already issued request returns it
+        unchanged rather than signing a second certificate.
+
+        This endpoint does not consult a subscription and ignores the
+        X-MaaS-Subscription header.
+      security:
+        - operatorAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Approved, with the issued certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollmentRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The request was already denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /requests/{requestId}/deny:
+    post:
+      operationId: denyEnrollmentRequest
+      tags: [administration]
+      summary: Deny a request
+      description: |
+        Refuses the request. No certificate is issued. Recorded so a grid
+        can answer why a provider is not a member.
+
+        This endpoint does not consult a subscription and ignores the
+        X-MaaS-Subscription header.
+      security:
+        - operatorAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Why the request was refused.
+                  maxLength: 256
+      responses:
+        '200':
+          description: Denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollmentRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The request was already issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    operatorAuth:
+      type: http
+      scheme: bearer
+      description: An operator credential. Deciding on requests is not self-service.
+
+  parameters:
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      description: Identifier returned when the request was created.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: The request was malformed or the signing request unusable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: No operator credential, or one that is not accepted.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: No such request.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    EnrollmentRequestInput:
+      type: object
+      description: What a provider submits to ask for membership.
+      required: [siteName, gridNetworkRef, csr]
+      properties:
+        siteName:
+          type: string
+          description: |
+            The name being asked for. The grid grants this name or
+            refuses; it does not grant a different one.
+          pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+        gridNetworkRef:
+          type: string
+          description: The grid being joined.
+          minLength: 1
+          maxLength: 253
+        csr:
+          type: string
+          description: |
+            PKCS#10 certificate signing request, PEM encoded. The private
+            key stays with the requester and is never sent.
+          maxLength: 16384
+        egress:
+          $ref: '#/components/schemas/Egress'
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    EnrollmentRequest:
+      type: object
+      description: A request and whatever has been decided about it.
+      required: [requestId, siteName, gridNetworkRef, phase, createdAt]
+      properties:
+        requestId:
+          type: string
+          format: uuid
+          description: Identifier for polling and for deciding.
+        siteName:
+          type: string
+          description: The name asked for.
+        gridNetworkRef:
+          type: string
+          description: The grid being joined.
+        phase:
+          $ref: '#/components/schemas/EnrollmentPhase'
+        createdAt:
+          type: string
+          format: date-time
+          description: When the request arrived.
+        decidedAt:
+          type: string
+          format: date-time
+          description: When it was approved or denied.
+        decidedBy:
+          type: string
+          description: |
+            Who decided. Recorded so a grid can answer why a provider is
+            trusted, which a hand-edited allow list cannot.
+        reason:
+          type: string
+          description: Why it was refused, when it was.
+        certificate:
+          type: string
+          description: |
+            The issued certificate, PEM encoded. Present once issued.
+            Public material.
+        spiffeId:
+          type: string
+          description: |
+            The name the grid assigned, carried as a URI SAN on the
+            certificate.
+          examples: ['spiffe://grid.internal/site/site-d']
+        fingerprint:
+          type: string
+          description: |
+            Lowercase hex SHA-256 of the issued leaf in DER form. Peers
+            pin this.
+          pattern: '^[0-9a-f]{64}$'
+        egress:
+          $ref: '#/components/schemas/Egress'
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    EnrollmentPhase:
+      type: string
+      description: |
+        Where a request has got to. Nothing is trusted before `issued`.
+      enum: [pending, issued, denied, failed]
+
+    Egress:
+      type: object
+      description: Where peers reach this provider once it is a member.
+      required: [address]
+      properties:
+        address:
+          type: string
+          description: Host and port of the provider's gateway.
+          examples: ['site-d.example:8443']
+        serverName:
+          type: string
+          description: Name peers present in SNI, when it differs from the address.
+
+    Capabilities:
+      type: object
+      description: |
+        What the provider serves. An advertisement grants nothing: a site
+        decides for itself whether to believe it and whether to route
+        there, so a false claim costs the believer one failed request.
+      properties:
+        inference:
+          type: object
+          description: Inference the provider offers.
+          properties:
+            models:
+              type: array
+              description: The models served.
+              items:
+                $ref: '#/components/schemas/ModelCapability'
+
+    ModelCapability:
+      type: object
+      description: One model a provider serves, and how to call it.
+      required: [name, path, apiFormat]
+      properties:
+        name:
+          type: string
+          description: Model identifier as the provider knows it.
+          examples: ['Qwen/Qwen3-0.6B']
+        path:
+          type: string
+          description: Absolute request path for this model.
+          examples: ['/v1/chat/completions']
+        apiFormat:
+          type: string
+          description: Request and response shape the provider speaks.
+          examples: ['openai-chat']
+
+    Error:
+      type: object
+      description: A failure, described so a caller can act on it.
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Machine-readable code.
+          examples: ['name_taken']
+        message:
+          type: string
+          description: What went wrong, and what would fix it.
