@@ -206,14 +206,17 @@ async fn create(
     // fingerprint. The certificate is thrown away; only approval issues one.
     let checked = issue_for(&state, &input.site_name, &input.csr)?;
 
-    let created = state.store.create(NewRequest {
-        site_name: input.site_name,
-        grid_network_ref: input.grid_network_ref,
-        csr_pem: input.csr,
-        public_key_sha256: checked.public_key_sha256,
-        egress: input.egress,
-        capabilities: input.capabilities,
-    })?;
+    let created = state
+        .store
+        .create(NewRequest {
+            site_name: input.site_name,
+            grid_network_ref: input.grid_network_ref,
+            csr_pem: input.csr,
+            public_key_sha256: checked.public_key_sha256,
+            egress: input.egress,
+            capabilities: input.capabilities,
+        })
+        .await?;
 
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -227,7 +230,7 @@ async fn list(
     _operator: Operator,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<EnrollmentRequest>>, ApiError> {
-    let mut rows = state.store.list()?;
+    let mut rows = state.store.list().await?;
     if let Some(phase) = query.phase {
         rows.retain(|row| row.phase == phase);
     }
@@ -239,7 +242,7 @@ async fn fetch(
     State(state): State<Arc<AppState>>,
     Path(request_id): Path<Uuid>,
 ) -> Result<Json<EnrollmentRequest>, ApiError> {
-    Ok(Json(state.store.get(request_id)?.public))
+    Ok(Json(state.store.get(request_id).await?.public))
 }
 
 /// Approve a request and issue the certificate.
@@ -251,24 +254,28 @@ async fn approve(
     Operator(operator): Operator,
     Path(request_id): Path<Uuid>,
 ) -> Result<Json<EnrollmentRequest>, ApiError> {
-    let stored = state.store.get(request_id)?;
+    let stored = state.store.get(request_id).await?;
     if let Some(settled) = settled_outcome(&stored.public)? {
         return Ok(Json(settled));
     }
 
     let issued = issue_for(&state, &stored.public.site_name, &stored.csr_pem)?;
 
-    let updated = match state.store.mark_issued(
-        request_id,
-        Issued {
-            certificate: issued.cert_pem,
-            spiffe_id: issued.spiffe_id,
-            decided_by: operator.clone(),
-        },
-    ) {
+    let updated = match state
+        .store
+        .mark_issued(
+            request_id,
+            Issued {
+                certificate: issued.cert_pem,
+                spiffe_id: issued.spiffe_id,
+                decided_by: operator.clone(),
+            },
+        )
+        .await
+    {
         Ok(updated) => updated,
         // Another approval won the race. Its certificate is the one that counts.
-        Err(StoreError::AlreadyDecided) => state.store.get(request_id)?.public,
+        Err(StoreError::AlreadyDecided) => state.store.get(request_id).await?.public,
         Err(err) => return Err(err.into()),
     };
 
@@ -319,7 +326,7 @@ async fn deny(
     body: Option<Json<DenyInput>>,
 ) -> Result<Json<EnrollmentRequest>, ApiError> {
     let reason = body.and_then(|Json(input)| input.reason);
-    let updated = state.store.mark_denied(request_id, operator.clone(), reason)?;
+    let updated = state.store.mark_denied(request_id, operator.clone(), reason).await?;
     tracing::info!(site = %updated.site_name, %operator, "enrollment denied");
     Ok(Json(updated))
 }

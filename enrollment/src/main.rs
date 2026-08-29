@@ -16,6 +16,11 @@ const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 const OPERATOR_TOKENS: &str = "ENROLLMENT_OPERATOR_TOKENS";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
+/// Postgres connection URL.
+///
+/// Named to match MaaS, which carries it under this key in the `maas-db-config`
+/// secret, so a deployment beside MaaS points at the database already there.
+const DB_CONNECTION_URL: &str = "DB_CONNECTION_URL";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let state = Arc::new(AppState {
-        store: Store::memory(),
+        store: open_store().await?,
         ca,
         operators: load_operators()?,
         cert_lifetime: load_cert_lifetime(),
@@ -45,6 +50,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+/// Open the store the enrollment record lives in.
+///
+/// Falls back to keeping requests in this process, which loses them on restart
+/// and shares nothing between replicas. That suits a local trial and nothing
+/// else, so it says so.
+async fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
+    match std::env::var(DB_CONNECTION_URL) {
+        Ok(url) => {
+            let store = Store::postgres(&url).await?;
+            tracing::info!("enrollment records are kept in Postgres");
+            Ok(store)
+        },
+        Err(_unset) => {
+            tracing::warn!(
+                "{DB_CONNECTION_URL} is not set, so enrollment records are kept in memory and lost on restart"
+            );
+            Ok(Store::memory())
+        },
+    }
 }
 
 /// Read how long issued certificates should last.

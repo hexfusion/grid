@@ -15,4 +15,4 @@ pub mod store;
 
 pub use api::{AppState, router};
 pub use auth::Operators;
-pub use store::Store;
+pub use store::{Issued, NewRequest, Store, StoreError};

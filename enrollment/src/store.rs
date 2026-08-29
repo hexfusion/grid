@@ -9,6 +9,10 @@ use std::{collections::HashMap, sync::Mutex};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod postgres;
+
+pub use postgres::PgStore;
+
 use crate::model::{Capabilities, Egress, EnrollmentPhase, EnrollmentRequest};
 
 /// Reasons a store operation could not be carried out.
@@ -83,7 +87,13 @@ pub struct StoredRequest {
 #[derive(Debug)]
 pub enum Store {
     /// Held in this process. Suits a standalone grid and the tests.
+    ///
+    /// Everything is lost on restart, and two replicas share nothing, so this
+    /// is not a deployment a grid should depend on.
     Memory(MemoryStore),
+
+    /// Held in Postgres. A MaaS deployment already runs one.
+    Postgres(PgStore),
 }
 
 impl Store {
@@ -93,15 +103,26 @@ impl Store {
         Self::Memory(MemoryStore::default())
     }
 
+    /// A store backed by Postgres, with the schema applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] if the database is unreachable or the
+    /// schema cannot be applied.
+    pub async fn postgres(url: &str) -> Result<Self, StoreError> {
+        Ok(Self::Postgres(PgStore::connect(url).await?))
+    }
+
     /// Record a new request in [`EnrollmentPhase::Pending`].
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::NameTaken`] if an issued member already holds the
     /// name, so two providers cannot end up with the same identity.
-    pub fn create(&self, new: NewRequest) -> Result<EnrollmentRequest, StoreError> {
+    pub async fn create(&self, new: NewRequest) -> Result<EnrollmentRequest, StoreError> {
         match self {
             Self::Memory(store) => store.create(new),
+            Self::Postgres(store) => store.create(new).await,
         }
     }
 
@@ -110,9 +131,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::Backend`] if the backend failed.
-    pub fn list(&self) -> Result<Vec<EnrollmentRequest>, StoreError> {
+    pub async fn list(&self) -> Result<Vec<EnrollmentRequest>, StoreError> {
         match self {
             Self::Memory(store) => store.list(),
+            Self::Postgres(store) => store.list().await,
         }
     }
 
@@ -121,9 +143,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::NotFound`] if no request has that identifier.
-    pub fn get(&self, request_id: Uuid) -> Result<StoredRequest, StoreError> {
+    pub async fn get(&self, request_id: Uuid) -> Result<StoredRequest, StoreError> {
         match self {
             Self::Memory(store) => store.get(request_id),
+            Self::Postgres(store) => store.get(request_id).await,
         }
     }
 
@@ -134,9 +157,10 @@ impl Store {
     /// Returns [`StoreError::AlreadyDecided`] if the request was already
     /// decided, and [`StoreError::NameTaken`] if the name was granted to
     /// someone else while this request waited.
-    pub fn mark_issued(&self, request_id: Uuid, issued: Issued) -> Result<EnrollmentRequest, StoreError> {
+    pub async fn mark_issued(&self, request_id: Uuid, issued: Issued) -> Result<EnrollmentRequest, StoreError> {
         match self {
             Self::Memory(store) => store.mark_issued(request_id, issued),
+            Self::Postgres(store) => store.mark_issued(request_id, issued).await,
         }
     }
 
@@ -145,7 +169,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::AlreadyDecided`] if the request was already decided.
-    pub fn mark_denied(
+    pub async fn mark_denied(
         &self,
         request_id: Uuid,
         decided_by: String,
@@ -153,6 +177,7 @@ impl Store {
     ) -> Result<EnrollmentRequest, StoreError> {
         match self {
             Self::Memory(store) => store.mark_denied(request_id, decided_by, reason),
+            Self::Postgres(store) => store.mark_denied(request_id, decided_by, reason).await,
         }
     }
 }

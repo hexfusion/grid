@@ -25,6 +25,7 @@ hyper-util = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+sqlx = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["parsing", "serde-well-known"] }
