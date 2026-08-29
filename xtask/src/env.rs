@@ -224,6 +224,17 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
+    /// Mint a site certificate from the environment's existing CA.
+    ///
+    /// Reuses the CA already in the certificate directory, so a site
+    /// enrolled this way is trusted by the clusters already running.
+    /// Sites that already hold a certificate are left alone.
+    MintSiteCert {
+        /// Site name to mint for, used as the certificate's common name.
+        #[arg(long)]
+        site: String,
+    },
+
     /// Build gateway images from the AI repository.
     BuildGatewayImages {
         /// Path to the AI repository. Can also be provided via `AI_REPO_PATH`.
@@ -1017,6 +1028,25 @@ mod llmd_pool_metrics_demo_cli_tests {
 // Execution
 // ---------------------------------------------------------------------------
 
+/// Mint a site certificate from the environment's existing CA.
+///
+/// The certificate carries the site's SPIFFE ID as a URI SAN, so a peer
+/// can match on the name rather than on the organization every site
+/// shares.
+///
+/// # Errors
+///
+/// Returns an error when no CA is present, or when generation or the
+/// file writes fail.
+fn env_mint_site_cert(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !certs::certs_exist() {
+        return Err("no certificate directory yet; run `env up` first so a CA exists".into());
+    }
+    let dir = certs::generate_all(std::slice::from_ref(&site.to_owned()))?;
+    println!("certificate for {site} is in {}", dir.display());
+    Ok(())
+}
+
 /// Run the requested environment action.
 ///
 /// # Errors
@@ -1033,6 +1063,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::Down { config } => env_down(config),
         Action::Status { config } => env_status(config),
         Action::VerifyProviders { config } => env_verify_providers(config),
+        Action::MintSiteCert { site } => env_mint_site_cert(site),
         Action::BuildGatewayImages { ai_repo } => env_build_gateway_images(ai_repo.as_deref()),
         Action::LoadGatewayImages { config } => env_load_gateway_images(config),
         Action::DeployProviderGateways { config } => env_deploy_provider_gateways(config),
