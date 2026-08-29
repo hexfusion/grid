@@ -14,6 +14,8 @@ const LISTEN_ADDR: &str = "ENROLLMENT_LISTEN_ADDR";
 const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 /// Table of operators allowed to decide on requests.
 const OPERATOR_TOKENS: &str = "ENROLLMENT_OPERATOR_TOKENS";
+/// How many seconds an issued certificate lasts.
+const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store: Store::memory(),
         ca,
         operators: load_operators()?,
+        cert_lifetime: load_cert_lifetime(),
     });
 
     let addr: SocketAddr = listen.parse()?;
@@ -42,6 +45,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+/// Read how long issued certificates should last.
+///
+/// Expiry is the only thing that removes a member, so this is what bounds how
+/// long a decision to admit someone stays in force.
+fn load_cert_lifetime() -> time::Duration {
+    let configured = std::env::var(CERT_LIFETIME_SECS)
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(time::Duration::seconds);
+
+    let lifetime = configured.unwrap_or(certs::DEFAULT_SITE_CERT_LIFETIME);
+    tracing::info!(
+        seconds = lifetime.whole_seconds(),
+        "issued certificates expire after this"
+    );
+    lifetime
 }
 
 /// Read the operator token table.

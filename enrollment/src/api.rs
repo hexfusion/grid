@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, sign_csr};
+use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, Validity, sign_csr};
 use uuid::Uuid;
 
 use crate::{
@@ -33,6 +33,12 @@ pub struct AppState {
 
     /// Who may decide on requests.
     pub operators: Operators,
+
+    /// How long an issued certificate lasts.
+    ///
+    /// Held here rather than taken per call, so every certificate this grid
+    /// issues has the same bound and no route can quietly issue a longer one.
+    pub cert_lifetime: time::Duration,
 }
 
 /// Failures the interface can report.
@@ -198,7 +204,7 @@ async fn create(
 
     // Signing here proves the submission is usable and yields the key
     // fingerprint. The certificate is thrown away; only approval issues one.
-    let checked = sign_csr(&state.ca, &input.site_name, &input.csr).map_err(signing_error)?;
+    let checked = issue_for(&state, &input.site_name, &input.csr)?;
 
     let created = state.store.create(NewRequest {
         site_name: input.site_name,
@@ -250,7 +256,7 @@ async fn approve(
         return Ok(Json(settled));
     }
 
-    let issued = sign_csr(&state.ca, &stored.public.site_name, &stored.csr_pem).map_err(signing_error)?;
+    let issued = issue_for(&state, &stored.public.site_name, &stored.csr_pem)?;
 
     let updated = match state.store.mark_issued(
         request_id,
@@ -273,6 +279,20 @@ async fn approve(
         "enrollment approved"
     );
     Ok(Json(updated))
+}
+
+/// Sign a request under this grid's CA and lifetime.
+///
+/// One place decides how long an issued certificate lasts, so no route can
+/// quietly issue a longer one than the grid was configured for.
+fn issue_for(state: &AppState, site_name: &str, csr_pem: &str) -> Result<certs::EnrolledCert, ApiError> {
+    sign_csr(
+        &state.ca,
+        site_name,
+        csr_pem,
+        Validity::starting_now(state.cert_lifetime),
+    )
+    .map_err(signing_error)
 }
 
 /// The record to return for a request that has already been decided.

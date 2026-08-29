@@ -11,11 +11,58 @@
 
 use rcgen::{CertificateSigningRequestParams, Issuer};
 use sha2::{Digest as _, Sha256};
+use time::{Duration, OffsetDateTime};
 
 use crate::generate::{CaCert, GenerateError, build_site_params, spiffe_id};
 
 /// Longest accepted site name, matching the DNS label limit.
 const MAX_SITE_NAME_LEN: usize = 63;
+
+/// Backdating applied to `not_before`, so a peer whose clock runs slightly slow
+/// does not reject a certificate issued moments ago.
+const CLOCK_SKEW_ALLOWANCE: Duration = Duration::minutes(5);
+
+/// How long an issued certificate lasts when a caller does not say.
+///
+/// Finite, because expiry is the only thing that removes a member: a grid has no
+/// revocation list, so a certificate is trusted until it lapses.
+///
+/// Deliberately not the hours-long lifetime this should eventually have. Nothing
+/// renews yet, so a short lifetime would strand every site the first time one
+/// lapsed. Shorten this once renewal exists.
+pub const DEFAULT_SITE_CERT_LIFETIME: Duration = Duration::days(30);
+
+/// When a certificate is valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Validity {
+    /// Not valid before this instant.
+    pub not_before: OffsetDateTime,
+
+    /// Not valid after this instant.
+    pub not_after: OffsetDateTime,
+}
+
+impl Validity {
+    /// Valid from a little before now, for `lifetime`.
+    ///
+    /// The start is backdated by [`CLOCK_SKEW_ALLOWANCE`], since a verifier whose
+    /// clock is a minute behind would otherwise refuse a certificate that was
+    /// just issued to it.
+    #[must_use]
+    pub fn starting_now(lifetime: Duration) -> Self {
+        let now = OffsetDateTime::now_utc();
+        Self {
+            not_before: now.saturating_sub(CLOCK_SKEW_ALLOWANCE),
+            not_after: now.saturating_add(lifetime),
+        }
+    }
+}
+
+impl Default for Validity {
+    fn default() -> Self {
+        Self::starting_now(DEFAULT_SITE_CERT_LIFETIME)
+    }
+}
 
 /// Largest accepted request, before parsing.
 ///
@@ -103,11 +150,15 @@ fn validate_site_name(site_name: &str) -> Result<(), EnrollError> {
 /// so an enrollee asking to be `site-a` receives whatever the approver assigned
 /// instead.
 ///
+/// `validity` is explicit rather than defaulted, because the alternative is
+/// rcgen's own default, which runs to the year 4096. A certificate that never
+/// expires cannot be taken away from a member.
+///
 /// # Errors
 ///
 /// Returns [`EnrollError`] if the request is oversized, unparseable, signed by a
 /// key it does not carry, or if `site_name` is not a DNS label.
-pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str) -> Result<EnrolledCert, EnrollError> {
+pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str, validity: Validity) -> Result<EnrolledCert, EnrollError> {
     validate_site_name(site_name)?;
 
     if csr_pem.len() > MAX_CSR_PEM_BYTES {
@@ -126,15 +177,15 @@ pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str) -> Result<EnrolledC
         }
     })?;
 
-    let public_key_sha256 = {
-        use rcgen::PublicKeyData as _;
-        hex(&Sha256::digest(csr.public_key.der_bytes()))
-    };
+    let public_key_sha256 = key_fingerprint(&csr.public_key);
 
     // Everything the request asked for is dropped here. The public key is the
     // only field carried forward, and the names below are the grid's own.
     let primary = format!("{site_name}.{}", crate::SPIFFE_TRUST_DOMAIN);
-    csr.params = build_site_params(site_name, &primary).map_err(|err| signing_failed(&err))?;
+    let mut params = build_site_params(site_name, &primary).map_err(|err| signing_failed(&err))?;
+    params.not_before = validity.not_before;
+    params.not_after = validity.not_after;
+    csr.params = params;
 
     let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
     let cert = csr
@@ -147,6 +198,12 @@ pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str) -> Result<EnrolledC
         sans: vec![primary],
         public_key_sha256,
     })
+}
+
+/// Lowercase hex SHA-256 over a request's `SubjectPublicKeyInfo`.
+fn key_fingerprint(public_key: &rcgen::PublicKey) -> String {
+    use rcgen::PublicKeyData as _;
+    hex(&Sha256::digest(public_key.der_bytes()))
 }
 
 /// Wrap a generation failure, which is a grid-side fault rather than a bad request.
@@ -237,7 +294,7 @@ mod tests {
         let ca = generate_ca("test-ca").expect("ca");
         let (csr, _key) = plain_csr();
 
-        let issued = sign_csr(&ca, "site-d", &csr).expect("sign");
+        let issued = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
 
         assert_eq!(issued.spiffe_id, "spiffe://grid.internal/site/site-d");
         assert_eq!(
@@ -254,7 +311,7 @@ mod tests {
             "spiffe://grid.internal/site/site-a".to_owned().try_into().expect("ia5"),
         )]);
 
-        let issued = sign_csr(&ca, "site-d", &csr).expect("sign");
+        let issued = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
 
         assert_eq!(
             uri_sans_of(&issued.cert_pem),
@@ -270,7 +327,7 @@ mod tests {
             "site-a.grid.internal".to_owned().try_into().expect("ia5"),
         )]);
 
-        let issued = sign_csr(&ca, "site-d", &csr).expect("sign");
+        let issued = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
 
         assert_eq!(dns_sans_of(&issued.cert_pem), vec!["site-d.grid.internal"]);
     }
@@ -288,7 +345,10 @@ mod tests {
         let tampered = pem::encode(&pem::Pem::new("CERTIFICATE REQUEST", bytes));
 
         assert!(
-            matches!(sign_csr(&ca, "site-d", &tampered), Err(EnrollError::BadSignature)),
+            matches!(
+                sign_csr(&ca, "site-d", &tampered, Validity::default()),
+                Err(EnrollError::BadSignature)
+            ),
             "a request whose signature does not match its key must be refused"
         );
     }
@@ -297,7 +357,10 @@ mod tests {
     fn bytes_that_are_not_a_request_are_refused() {
         let ca = generate_ca("test-ca").expect("ca");
         assert!(
-            matches!(sign_csr(&ca, "site-d", "not a pem file"), Err(EnrollError::Malformed)),
+            matches!(
+                sign_csr(&ca, "site-d", "not a pem file", Validity::default()),
+                Err(EnrollError::Malformed)
+            ),
             "bytes that are not a request must be refused"
         );
     }
@@ -307,7 +370,10 @@ mod tests {
         let ca = generate_ca("test-ca").expect("ca");
         let padded = "-".repeat(MAX_CSR_PEM_BYTES + 1);
         assert!(
-            matches!(sign_csr(&ca, "site-d", &padded), Err(EnrollError::TooLarge)),
+            matches!(
+                sign_csr(&ca, "site-d", &padded, Validity::default()),
+                Err(EnrollError::TooLarge)
+            ),
             "an oversized request must be refused before parsing"
         );
     }
@@ -320,7 +386,10 @@ mod tests {
 
         for name in ["site-d/../site-a", "site-d/admin", "Site-D", "", "site_d", "-site-d"] {
             assert!(
-                matches!(sign_csr(&ca, name, &csr), Err(EnrollError::InvalidSiteName)),
+                matches!(
+                    sign_csr(&ca, name, &csr, Validity::default()),
+                    Err(EnrollError::InvalidSiteName)
+                ),
                 "{name} should be refused"
             );
         }
@@ -331,8 +400,8 @@ mod tests {
         let ca = generate_ca("test-ca").expect("ca");
         let (csr, _key) = plain_csr();
 
-        let first = sign_csr(&ca, "site-d", &csr).expect("sign");
-        let second = sign_csr(&ca, "site-e", &csr).expect("sign again");
+        let first = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
+        let second = sign_csr(&ca, "site-e", &csr, Validity::default()).expect("sign again");
 
         assert_eq!(
             first.public_key_sha256, second.public_key_sha256,
@@ -341,7 +410,7 @@ mod tests {
         assert_ne!(first.cert_pem, second.cert_pem);
 
         let (other_csr, _other) = plain_csr();
-        let other = sign_csr(&ca, "site-d", &other_csr).expect("sign other");
+        let other = sign_csr(&ca, "site-d", &other_csr, Validity::default()).expect("sign other");
         assert_ne!(first.public_key_sha256, other.public_key_sha256);
     }
 
@@ -351,12 +420,88 @@ mod tests {
         let ca = generate_ca("test-ca").expect("ca");
         let (csr, _key) = plain_csr();
 
-        let enrolled = sign_csr(&ca, "site-d", &csr).expect("sign");
+        let enrolled = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
         let local = crate::generate_site_cert(&ca, "site-d").expect("local");
 
         assert_eq!(uri_sans_of(&enrolled.cert_pem), uri_sans_of(&local.cert_pem));
         assert_eq!(dns_sans_of(&enrolled.cert_pem), dns_sans_of(&local.cert_pem));
         assert_eq!(enrolled.sans, local.sans);
+    }
+
+    /// A declared lifetime has to reach the certificate, or nothing bounds it.
+    #[test]
+    fn the_declared_lifetime_is_what_the_certificate_carries() {
+        use x509_parser::prelude::{FromDer as _, X509Certificate};
+
+        let ca = generate_ca("test-ca").expect("ca");
+        let (csr, _key) = plain_csr();
+
+        let lifetime = Duration::days(7);
+        let validity = Validity::starting_now(lifetime);
+        let issued = sign_csr(&ca, "site-d", &csr, validity).expect("sign");
+
+        let der = pem::parse(&issued.cert_pem).expect("pem");
+        let (_rest, cert) = X509Certificate::from_der(der.contents()).expect("parse");
+
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+        assert_eq!(
+            not_before,
+            validity.not_before.unix_timestamp(),
+            "the declared start must reach the certificate"
+        );
+        assert_eq!(
+            not_after,
+            validity.not_after.unix_timestamp(),
+            "the declared end must reach the certificate"
+        );
+
+        let carried = not_after.saturating_sub(not_before);
+        let expected = (lifetime + CLOCK_SKEW_ALLOWANCE).whole_seconds();
+        assert_eq!(carried, expected, "the span is the lifetime plus the skew allowance");
+    }
+
+    /// Backdating exists so a verifier a minute behind does not refuse a fresh
+    /// certificate.
+    #[test]
+    fn a_fresh_certificate_is_already_valid() {
+        let ca = generate_ca("test-ca").expect("ca");
+        let (csr, _key) = plain_csr();
+        let issued = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
+
+        crate::verify_site_cert(&ca.cert_pem, &issued.cert_pem, "site-d")
+            .expect("a certificate issued moments ago must verify now");
+    }
+
+    /// The point of a finite lifetime: an expired certificate stops working.
+    #[test]
+    fn an_expired_lifetime_is_refused_by_verification() {
+        let ca = generate_ca("test-ca").expect("ca");
+        let (csr, _key) = plain_csr();
+
+        let past = OffsetDateTime::now_utc() - Duration::days(2);
+        let expired = Validity {
+            not_before: past,
+            not_after: past + Duration::days(1),
+        };
+        let issued = sign_csr(&ca, "site-d", &csr, expired).expect("sign");
+
+        assert_eq!(
+            crate::verify_site_cert(&ca.cert_pem, &issued.cert_pem, "site-d"),
+            Err(crate::VerifyError::NotCurrentlyValid),
+            "an expired certificate must stop establishing membership"
+        );
+    }
+
+    /// The default has to be finite, or expiry can never remove anyone.
+    #[test]
+    fn the_default_lifetime_is_finite() {
+        let validity = Validity::default();
+        let span = validity.not_after - validity.not_before;
+        assert!(
+            span < Duration::days(366),
+            "the default lifetime must be finite and short enough to matter, got {span}"
+        );
     }
 
     #[test]
@@ -365,7 +510,7 @@ mod tests {
 
         let ca = generate_ca("test-ca").expect("ca");
         let (csr, _key) = plain_csr();
-        let issued = sign_csr(&ca, "site-d", &csr).expect("sign");
+        let issued = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
 
         let ca_der = pem::parse(&ca.cert_pem).expect("ca pem");
         let (_r, ca_cert) = X509Certificate::from_der(ca_der.contents()).expect("ca parse");

@@ -25,7 +25,7 @@ fn enrolled(ca: &certs::CaCert, site: &str) -> Site {
     let key = rcgen::KeyPair::generate().expect("key");
     let params = rcgen::CertificateParams::default();
     let csr = params.serialize_request(&key).expect("csr").pem().expect("pem");
-    let issued = certs::sign_csr(ca, site, &csr).expect("sign");
+    let issued = certs::sign_csr(ca, site, &csr, certs::Validity::default()).expect("sign");
 
     let key_pem = key.serialize_pem();
     let key_der = pem::parse(&key_pem).expect("key pem").contents().to_vec();

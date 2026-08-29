@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn a_certificate_this_grid_issued_verifies() {
         let ca = generate_ca("grid-ca").expect("ca");
-        let issued = sign_csr(&ca, "site-d", &csr_for("site-d")).expect("sign");
+        let issued = sign_csr(&ca, "site-d", &csr_for("site-d"), crate::Validity::default()).expect("sign");
 
         let spki = verify_site_cert(&ca.cert_pem, &issued.cert_pem, "site-d").expect("should verify");
         assert!(!spki.is_empty(), "the public key should come back for signature checks");
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn a_certificate_cannot_vouch_for_another_site() {
         let ca = generate_ca("grid-ca").expect("ca");
-        let issued = sign_csr(&ca, "site-d", &csr_for("site-d")).expect("sign");
+        let issued = sign_csr(&ca, "site-d", &csr_for("site-d"), crate::Validity::default()).expect("sign");
 
         let result = verify_site_cert(&ca.cert_pem, &issued.cert_pem, "site-a");
         assert_eq!(
@@ -165,7 +165,7 @@ mod tests {
     fn a_certificate_from_another_ca_is_refused() {
         let ours = generate_ca("grid-ca").expect("ca");
         let theirs = generate_ca("someone-elses-ca").expect("other ca");
-        let issued = sign_csr(&theirs, "site-d", &csr_for("site-d")).expect("sign");
+        let issued = sign_csr(&theirs, "site-d", &csr_for("site-d"), crate::Validity::default()).expect("sign");
 
         assert_eq!(
             verify_site_cert(&ours.cert_pem, &issued.cert_pem, "site-d"),
@@ -179,7 +179,7 @@ mod tests {
     fn a_forged_issuer_name_does_not_pass() {
         let ours = generate_ca("grid-ca").expect("ca");
         let impostor = generate_ca("grid-ca").expect("impostor with the same name");
-        let issued = sign_csr(&impostor, "site-d", &csr_for("site-d")).expect("sign");
+        let issued = sign_csr(&impostor, "site-d", &csr_for("site-d"), crate::Validity::default()).expect("sign");
 
         assert_eq!(
             verify_site_cert(&ours.cert_pem, &issued.cert_pem, "site-d"),

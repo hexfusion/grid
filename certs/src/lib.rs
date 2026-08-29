@@ -10,7 +10,7 @@ mod generate;
 mod provider;
 mod verify;
 
-pub use enroll::{EnrollError, EnrolledCert, MAX_CSR_PEM_BYTES, sign_csr};
+pub use enroll::{DEFAULT_SITE_CERT_LIFETIME, EnrollError, EnrolledCert, MAX_CSR_PEM_BYTES, Validity, sign_csr};
 pub use generate::{
     CaCert, DEFAULT_ORGANIZATION, GenerateError, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
     generate_cert_with_org, generate_dns_cert, generate_expired_dns_cert, generate_not_yet_valid_dns_cert,

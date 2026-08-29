@@ -29,6 +29,7 @@ fn service() -> axum::Router {
         store: Store::memory(),
         ca,
         operators: Operators::from_table("tester: t0ken\n"),
+        cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
     }))
 }
 
