@@ -13,9 +13,9 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use enrollment::{AppState, Operators, Store, router};
+use enrollment::{AppState, JoiningConfig, Operators, Store, router};
 use http_body_util::BodyExt as _;
-use rcgen::{CertificateParams, KeyPair, SanType};
+use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -30,6 +30,10 @@ fn service() -> axum::Router {
         ca,
         operators: Operators::from_table("tester: t0ken\n"),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
+        joining: JoiningConfig {
+            gossip_key: Some("dGVzdC1nb3NzaXAta2V5LTMyLWJ5dGVzLWxvbmchIQ==".to_owned()),
+            seeds: vec!["site-a.grid.internal:7946".to_owned()],
+        },
     }))
 }
 
@@ -37,7 +41,7 @@ fn service() -> axum::Router {
 fn csr_asking_for(requested: &[SanType]) -> String {
     let key = KeyPair::generate().expect("key");
     let mut params = CertificateParams::default();
-    params.distinguished_name.push(rcgen::DnType::CommonName, "whatever");
+    params.distinguished_name.push(DnType::CommonName, "whatever");
     params.subject_alt_names = requested.to_vec();
     params.serialize_request(&key).expect("csr").pem().expect("pem")
 }
@@ -364,4 +368,125 @@ async fn requests_are_listed_newest_first() {
         .filter_map(|row| row["siteName"].as_str())
         .collect();
     assert_eq!(names, vec!["site-f", "site-e", "site-d"], "newest first");
+}
+
+
+/// A certificate alone does not let a provider join: it also has to verify peers
+/// and reach the mesh.
+#[tokio::test]
+async fn an_approved_provider_collects_what_it_needs_to_join() {
+    let app = service();
+    let (id, key) = approved_site(&app, "site-join").await;
+
+    let (status, kit) = call(
+        &app,
+        "POST",
+        &format!("/v1/requests/{id}/join"),
+        Some(proof_for(&id, &key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an approved provider can collect its kit");
+    assert!(
+        kit["certificate"]
+            .as_str()
+            .is_some_and(|pem| pem.contains("BEGIN CERTIFICATE")),
+        "the kit carries the certificate"
+    );
+    assert!(
+        kit["caBundle"]
+            .as_str()
+            .is_some_and(|pem| pem.contains("BEGIN CERTIFICATE")),
+        "the kit carries the CA, without which a member cannot verify anyone else"
+    );
+    assert!(kit["gossipKey"].is_string(), "the kit carries the gossip key");
+    assert_eq!(
+        kit["seeds"][0], "site-a.grid.internal:7946",
+        "the kit says who to announce to"
+    );
+}
+
+/// The kit carries a secret, so it is not handed to whoever asks.
+#[tokio::test]
+async fn the_joining_kit_is_refused_without_proof_of_the_key() {
+    let app = service();
+    let (id, _key) = approved_site(&app, "site-proof").await;
+
+    // Somebody else's key, which is what an interloper would have.
+    let other = KeyPair::generate().expect("other key");
+    let (wrong_status, _body) = call(
+        &app,
+        "POST",
+        &format!("/v1/requests/{id}/join"),
+        Some(proof_for(&id, &other)),
+    )
+    .await;
+    assert_eq!(
+        wrong_status,
+        StatusCode::UNAUTHORIZED,
+        "a signature from another key must not collect the kit"
+    );
+
+    let (garbage_status, _garbage_body) = call(
+        &app,
+        "POST",
+        &format!("/v1/requests/{id}/join"),
+        Some(json!({"signature": "bm90LWEtc2lnbmF0dXJl"})),
+    )
+    .await;
+    assert_eq!(garbage_status, StatusCode::UNAUTHORIZED, "rubbish must not collect it");
+}
+
+/// Nothing to join with before a decision.
+#[tokio::test]
+async fn a_pending_request_has_no_joining_kit() {
+    let app = service();
+    let key = KeyPair::generate().expect("key");
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, "site-early");
+    let csr = params.serialize_request(&key).expect("csr").pem().expect("pem");
+
+    let (_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-early", &csr))).await;
+    let id = created["requestId"].as_str().expect("id").to_owned();
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/v1/requests/{id}/join"),
+        Some(proof_for(&id, &key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "there is nothing to collect yet");
+    assert_eq!(body["error"], "not_issued");
+}
+
+/// Submit for `site`, approve it, and hand back the request id and the key.
+async fn approved_site(app: &axum::Router, site: &str) -> (String, KeyPair) {
+    let key = KeyPair::generate().expect("key");
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, site);
+    let csr = params.serialize_request(&key).expect("csr").pem().expect("pem");
+
+    let (_status, created) = call(app, "POST", "/v1/requests", Some(submit(site, &csr))).await;
+    let id = created["requestId"].as_str().expect("id").to_owned();
+    call_as_operator(app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
+    (id, key)
+}
+
+/// Sign the request identifier the way the provider does.
+fn proof_for(request_id: &str, key: &KeyPair) -> Value {
+    use base64::Engine as _;
+
+    let id = uuid::Uuid::parse_str(request_id).expect("uuid");
+    let der = pem::parse(key.serialize_pem()).expect("key pem").contents().to_vec();
+    let signing = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &der,
+        &ring::rand::SystemRandom::new(),
+    )
+    .expect("signing key");
+    let signature = signing
+        .sign(&ring::rand::SystemRandom::new(), id.as_bytes())
+        .expect("sign");
+
+    json!({ "signature": base64::engine::general_purpose::STANDARD.encode(signature.as_ref()) })
 }

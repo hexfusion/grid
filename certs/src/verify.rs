@@ -102,6 +102,33 @@ pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -
     Ok(leaf.public_key().subject_public_key.data.to_vec())
 }
 
+/// The public key a certificate request carries, as a key point.
+///
+/// An enrollee proves it is the one that made a request by signing with the key
+/// half it kept. This returns the half the request published, so a caller can
+/// check that signature.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the request is oversized or unparseable.
+pub fn csr_public_key(csr_pem: &str) -> Result<Vec<u8>, VerifyError> {
+    use x509_parser::certification_request::X509CertificationRequest;
+
+    if csr_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+
+    let der = pem::parse(csr_pem).map_err(|_bad| VerifyError::Malformed)?;
+    let (_rest, csr) = X509CertificationRequest::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
+
+    Ok(csr
+        .certification_request_info
+        .subject_pki
+        .subject_public_key
+        .data
+        .to_vec())
+}
+
 /// The one SPIFFE URI name on a certificate, when there is exactly one.
 fn single_spiffe_name(leaf: &X509Certificate<'_>) -> Option<String> {
     let san = leaf.subject_alternative_name().ok().flatten()?;

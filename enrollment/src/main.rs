@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use enrollment::{AppState, Operators, Store, router};
+use enrollment::{AppState, JoiningConfig, Operators, Store, router};
 
 /// Where the CA that signs approved requests is read from.
 const CA_CERT_PATH: &str = "ENROLLMENT_CA_CERT";
@@ -16,6 +16,10 @@ const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 const OPERATOR_TOKENS: &str = "ENROLLMENT_OPERATOR_TOKENS";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
+/// Shared gossip transport key, base64, handed to a member on joining.
+const GOSSIP_KEY: &str = "ENROLLMENT_GOSSIP_KEY";
+/// Comma-separated peers a joining member announces to.
+const GOSSIP_SEEDS: &str = "ENROLLMENT_GOSSIP_SEEDS";
 /// Postgres connection URL.
 ///
 /// Named to match MaaS, which carries it under this key in the `maas-db-config`
@@ -42,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ca,
         operators: load_operators()?,
         cert_lifetime: load_cert_lifetime(),
+        joining: load_joining_config(),
     });
 
     let addr: SocketAddr = listen.parse()?;
@@ -50,6 +55,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+/// Read what every joining member is handed besides its certificate.
+///
+/// Without a gossip key a member holds a valid identity and still cannot reach
+/// the mesh, which looks like enrollment working and nothing happening, so this
+/// says which case the deployment is in.
+fn load_joining_config() -> JoiningConfig {
+    let gossip_key = std::env::var(GOSSIP_KEY).ok().filter(|key| !key.is_empty());
+    let seeds: Vec<String> = std::env::var(GOSSIP_SEEDS)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|seed| !seed.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if gossip_key.is_none() {
+        tracing::warn!(
+            "{GOSSIP_KEY} is not set, so an admitted member receives no gossip key and cannot join the mesh"
+        );
+    }
+    if seeds.is_empty() {
+        tracing::warn!("{GOSSIP_SEEDS} is not set, so an admitted member is told of no peers to announce to");
+    }
+
+    JoiningConfig { gossip_key, seeds }
 }
 
 /// Open the store the enrollment record lives in.

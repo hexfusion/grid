@@ -13,12 +13,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, Validity, sign_csr};
+use base64::Engine as _;
+use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, Validity, csr_public_key, sign_csr};
 use uuid::Uuid;
 
 use crate::{
     auth::Operators,
-    model::{DenyInput, EnrollmentPhase, EnrollmentRequest, EnrollmentRequestInput, ErrorBody, ListQuery},
+    model::{
+        DenyInput, EnrollmentPhase, EnrollmentRequest, EnrollmentRequestInput, ErrorBody, JoinProof, JoiningKit,
+        ListQuery,
+    },
     store::{Issued, NewRequest, Store, StoreError},
 };
 
@@ -39,6 +43,20 @@ pub struct AppState {
     /// Held here rather than taken per call, so every certificate this grid
     /// issues has the same bound and no route can quietly issue a longer one.
     pub cert_lifetime: time::Duration,
+
+    /// What a newly admitted provider is handed besides its certificate.
+    pub joining: JoiningConfig,
+}
+
+/// The parts of a joining kit that are the same for every member.
+#[derive(Debug, Clone, Default)]
+pub struct JoiningConfig {
+    /// Shared gossip transport key, base64. `None` leaves a member unable to
+    /// join the mesh, so the service says so at startup.
+    pub gossip_key: Option<String>,
+
+    /// Peers a joining member announces to.
+    pub seeds: Vec<String>,
 }
 
 /// Failures the interface can report.
@@ -182,6 +200,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/requests/{request_id}", get(fetch))
         .route("/v1/requests/{request_id}/approve", post(approve))
         .route("/v1/requests/{request_id}/deny", post(deny))
+        .route("/v1/requests/{request_id}/join", post(join))
         .layer(DefaultBodyLimit::max(MAX_CSR_PEM_BYTES.saturating_mul(2)))
         .with_state(state)
 }
@@ -286,6 +305,55 @@ async fn approve(
         "enrollment approved"
     );
     Ok(Json(updated))
+}
+
+/// Collect what is needed to start participating.
+///
+/// Not open the way reading a certificate is: the kit carries the gossip key,
+/// which is a secret. The caller proves it is the provider that made the request
+/// by signing the request identifier with the key half it kept, which the grid
+/// checks against the public half the request published.
+async fn join(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<Uuid>,
+    Json(proof): Json<JoinProof>,
+) -> Result<Json<JoiningKit>, ApiError> {
+    let stored = state.store.get(request_id).await?;
+
+    let (Some(certificate), Some(spiffe_id)) = (stored.public.certificate, stored.public.spiffe_id) else {
+        return Err(ApiError::Conflict {
+            code: "not_issued",
+            message: "this request has no certificate yet, so there is nothing to join with".to_owned(),
+        });
+    };
+
+    proves_possession(&stored.csr_pem, request_id, &proof.signature)?;
+
+    tracing::info!(site = %stored.public.site_name, "joining kit collected");
+    Ok(Json(JoiningKit {
+        certificate,
+        spiffe_id,
+        ca_bundle: state.ca.cert_pem.clone(),
+        gossip_key: state.joining.gossip_key.clone(),
+        seeds: state.joining.seeds.clone(),
+    }))
+}
+
+/// Check that the caller holds the key the request was made with.
+///
+/// The request identifier is what gets signed. It is unguessable and specific to
+/// one request, so a signature over it cannot be replayed onto another.
+fn proves_possession(csr_pem: &str, request_id: Uuid, signature: &str) -> Result<(), ApiError> {
+    let refused = || ApiError::Unauthorized;
+
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .map_err(|_bad| refused())?;
+    let public_key = csr_public_key(csr_pem).map_err(|_bad| refused())?;
+
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &public_key)
+        .verify(request_id.as_bytes(), &signature)
+        .map_err(|_bad| refused())
 }
 
 /// Sign a request under this grid's CA and lifetime.

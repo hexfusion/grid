@@ -146,6 +146,50 @@ pub struct EnrollmentRequest {
     pub capabilities: Option<Capabilities>,
 }
 
+/// Everything a newly admitted provider needs to start participating.
+///
+/// The certificate on its own is not enough to join. A member has to verify its
+/// peers, which needs the grid CA, and has to reach the gossip mesh, which needs
+/// the transport key and somewhere to announce itself. Handing these over
+/// together is what turns an issued certificate into membership.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoiningKit {
+    /// The certificate the grid issued, PEM encoded.
+    pub certificate: String,
+
+    /// The name bound into that certificate.
+    pub spiffe_id: String,
+
+    /// The grid CA, for verifying peers.
+    ///
+    /// Without this a member can prove who it is and still not know who anyone
+    /// else is.
+    pub ca_bundle: String,
+
+    /// Shared key for the gossip transport, base64.
+    ///
+    /// A secret, and the reason collecting this is not open the way reading a
+    /// certificate is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gossip_key: Option<String>,
+
+    /// Peers to announce to when joining the mesh.
+    #[serde(default)]
+    pub seeds: Vec<String>,
+}
+
+/// Proof that the caller is the provider that made the request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinProof {
+    /// Signature over the request identifier, base64.
+    ///
+    /// Made with the private key whose public half the request carried, which
+    /// only the provider that made it holds.
+    pub signature: String,
+}
+
 /// Narrowing applied when listing.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -17,4 +17,4 @@ pub use generate::{
     generate_site_cert, generate_site_cert_with_names, load_ca, spiffe_id,
 };
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
-pub use verify::{MAX_CERT_PEM_BYTES, VerifyError, verify_site_cert};
+pub use verify::{MAX_CERT_PEM_BYTES, VerifyError, csr_public_key, verify_site_cert};

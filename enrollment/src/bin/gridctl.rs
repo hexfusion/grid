@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use http_body_util::{BodyExt as _, Full};
 use hyper::{Method, Request, body::Bytes};
@@ -166,7 +167,7 @@ async fn enroll(client: &Client, args: &EnrollArgs) -> Result<(), Failure> {
 
     let timeout = Duration::from_secs(args.timeout_secs);
     let record = poll_until_decided(client, &request_id, timeout).await?;
-    collect(&record, args)
+    collect(client, &record, args, &key).await
 }
 
 /// Build the submission body.
@@ -198,19 +199,59 @@ fn submission(args: &EnrollArgs, key: &rcgen::KeyPair) -> Result<Value, Failure>
     Ok(Value::Object(body))
 }
 
-/// Write out the certificate, or explain why there is none.
-fn collect(record: &Value, args: &EnrollArgs) -> Result<(), Failure> {
+/// Collect the joining kit, or explain why there is none.
+async fn collect(client: &Client, record: &Value, args: &EnrollArgs, key: &rcgen::KeyPair) -> Result<(), Failure> {
     match record.get("phase").and_then(Value::as_str) {
-        Some("issued") => {
-            let cert_path = args.out.join(format!("{}-cert.pem", args.site));
-            std::fs::write(&cert_path, field(record, "certificate"))?;
-            println!("approved as {}", field(record, "spiffeId"));
-            println!("wrote {}", cert_path.display());
-            Ok(())
-        },
-        Some("denied") => Err(format!("denied: {}", field(record, "reason")).into()),
-        other => Err(format!("request ended in phase {}", other.unwrap_or("unknown")).into()),
+        Some("issued") => {},
+        Some("denied") => return Err(format!("denied: {}", field(record, "reason")).into()),
+        other => return Err(format!("request ended in phase {}", other.unwrap_or("unknown")).into()),
     }
+
+    println!("approved as {}", field(record, "spiffeId"));
+
+    let request_id = field(record, "requestId");
+    let kit = client.collect_kit(request_id, key).await?;
+    write_kit(&kit, args)
+}
+
+/// Write the joining kit where a proxy can be pointed at it.
+///
+/// A certificate on its own is not enough to join: a member also has to verify
+/// its peers and reach the mesh. All of it lands in one directory so the next
+/// step is configuration rather than assembly.
+fn write_kit(kit: &Value, args: &EnrollArgs) -> Result<(), Failure> {
+    let dir = args.out.join(format!("{}-grid", args.site));
+    std::fs::create_dir_all(&dir)?;
+
+    std::fs::write(dir.join("tls.crt"), field(kit, "certificate"))?;
+    std::fs::write(dir.join("ca.crt"), field(kit, "caBundle"))?;
+
+    let seeds: Vec<&str> = kit
+        .get("seeds")
+        .and_then(Value::as_array)
+        .map(|seeds| seeds.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    std::fs::write(dir.join("seeds"), format!("{}\n", seeds.join("\n")))?;
+
+    match kit.get("gossipKey").and_then(Value::as_str) {
+        Some(gossip_key) => write_private(&dir.join("gossip.key"), gossip_key)?,
+        None => println!("warning: the grid returned no gossip key, so this site cannot join the mesh"),
+    }
+
+    println!("wrote {}/", dir.display());
+    println!("  tls.crt     this site's certificate");
+    println!("  ca.crt      the grid CA, for verifying peers");
+    println!("  gossip.key  shared transport key");
+    println!("  seeds       peers to announce to");
+    println!();
+    println!("point the grid operator at it:");
+    println!("  GRID_SITE_CERT_PATH={}/tls.crt", dir.display());
+    println!("  GRID_CA_CERT_PATH={}/ca.crt", dir.display());
+    println!(
+        "  GRID_SITE_KEY_PATH={}",
+        args.out.join(format!("{}-key.pem", args.site)).display()
+    );
+    Ok(())
 }
 
 /// Poll one request until it leaves the pending phase.
@@ -281,6 +322,11 @@ async fn deny(client: &Client, request_id: &str, reason: Option<&str>) -> Result
     Ok(())
 }
 
+/// The DER body of a PEM document.
+fn pem_to_der(pem_text: &str) -> Result<Vec<u8>, Failure> {
+    Ok(pem::parse(pem_text)?.contents().to_vec())
+}
+
 /// Write a file only the owner can read.
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)?;
@@ -308,6 +354,38 @@ impl Client {
             server: server.trim_end_matches('/').to_owned(),
             token,
         }
+    }
+
+    /// Collect the joining kit for one request.
+    ///
+    /// The kit carries the gossip key, so the grid will not hand it over without
+    /// proof that the caller is the provider that asked. The proof is a signature
+    /// over the request identifier, made with the key this process generated and
+    /// never sent.
+    async fn collect_kit(&self, request_id: &str, key: &rcgen::KeyPair) -> Result<Value, Failure> {
+        let id = uuid::Uuid::parse_str(request_id)?;
+        let signing = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &pem_to_der(&key.serialize_pem())?,
+            &ring::rand::SystemRandom::new(),
+        )
+        .map_err(|_bad| "the generated key cannot sign")?;
+
+        let rng = ring::rand::SystemRandom::new();
+        let signature = signing
+            .sign(&rng, id.as_bytes())
+            .map_err(|_bad| "could not sign the request identifier")?;
+
+        let proof = json!({
+            "signature": base64::engine::general_purpose::STANDARD.encode(signature.as_ref())
+        });
+        self.send(
+            Method::POST,
+            &format!("/v1/requests/{request_id}/join"),
+            Some(proof),
+            false,
+        )
+        .await
     }
 
     /// Make one request and return the decoded body.

@@ -13,6 +13,6 @@ pub mod auth;
 pub mod model;
 pub mod store;
 
-pub use api::{AppState, router};
+pub use api::{AppState, JoiningConfig, router};
 pub use auth::Operators;
 pub use store::{Issued, NewRequest, Store, StoreError};
