@@ -71,6 +71,16 @@ pub struct StateBroadcast {
     /// [`accept_site_labels`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_labels: Option<BTreeMap<String, String>>,
+
+    /// Signature made by the originating site's enrolled key.
+    ///
+    /// The transport key is shared by the whole grid, so a valid packet proves
+    /// only that some member sent it. This binds the payload to one member:
+    /// a receiver checks it against the certificate in `site_cert_pem`, which
+    /// chains to the grid CA and names the site. Without it `origin_site` is an
+    /// unsigned claim any member could make about any other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Vec<u8>>,
 }
 
 /// Base wire-format struct.
@@ -103,6 +113,8 @@ struct BroadcastExtension {
     /// Optional site labels, carrying geography among anything else a
     /// deployment weights on.
     site_labels: Option<BTreeMap<String, String>>,
+    /// Signature over the rest of the broadcast.
+    signature: Option<Vec<u8>>,
 }
 
 /// The extension shape before site labels.
@@ -182,6 +194,7 @@ impl StateBroadcast {
             snapshot,
             gateway_address,
             site_cert_pem: None,
+            signature: None,
             site_labels: None,
         }
     }
@@ -287,16 +300,81 @@ impl StateBroadcast {
             snapshot: self.snapshot.clone(),
         };
         let mut bytes = bincode::serde::encode_to_vec(&v1, bincode::config::standard())?;
-        if self.gateway_address.is_some() || self.site_cert_pem.is_some() || self.site_labels.is_some() {
+        if self.gateway_address.is_some()
+            || self.site_cert_pem.is_some()
+            || self.site_labels.is_some()
+            || self.signature.is_some()
+        {
             let ext = BroadcastExtension {
                 gateway_address: self.gateway_address.clone(),
                 site_cert_pem: self.site_cert_pem.clone(),
                 site_labels: self.site_labels.clone(),
+                signature: self.signature.clone(),
             };
             let ext_bytes = bincode::serde::encode_to_vec(&ext, bincode::config::standard())?;
             bytes.extend_from_slice(&ext_bytes);
         }
         Ok(bytes)
+    }
+
+    /// The bytes a signature covers.
+    ///
+    /// Everything a receiver acts on is included: the origin, the revision, the
+    /// snapshot, the gateway address, the certificate, and the labels. The
+    /// signature field itself is cleared first, so signing and verifying agree
+    /// on the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bincode encode error if the snapshot cannot be serialized.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
+        let mut unsigned = self.clone();
+        unsigned.signature = None;
+        let mut bytes = SIGNING_DOMAIN.to_vec();
+        bytes.extend_from_slice(&unsigned.encode()?);
+        Ok(bytes)
+    }
+
+    /// Sign this broadcast with the site's enrolled private key.
+    ///
+    /// `pkcs8_der` is the site's private key, the one whose public half the grid
+    /// signed at enrollment. It never leaves the site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignError`] if the key is not a usable P-256 key or the payload
+    /// cannot be encoded.
+    pub fn sign(&mut self, pkcs8_der: &[u8]) -> Result<(), SignError> {
+        let message = self.signing_bytes().map_err(|_bad| SignError::Encode)?;
+        let rng = ring::rand::SystemRandom::new();
+        let key = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8_der,
+            &rng,
+        )
+        .map_err(|_bad| SignError::UnusableKey)?;
+
+        let signature = key.sign(&rng, &message).map_err(|_bad| SignError::UnusableKey)?;
+        self.signature = Some(signature.as_ref().to_vec());
+        Ok(())
+    }
+
+    /// Whether this broadcast was signed by the holder of `public_key`.
+    ///
+    /// `public_key` is the point from the sender's certificate, which the caller
+    /// has already checked chains to the grid CA and names `origin_site`.
+    /// An unsigned broadcast never verifies.
+    #[must_use]
+    pub fn verify(&self, public_key: &[u8]) -> bool {
+        let Some(signature) = self.signature.as_deref() else {
+            return false;
+        };
+        let Ok(message) = self.signing_bytes() else {
+            return false;
+        };
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, public_key)
+            .verify(&message, signature)
+            .is_ok()
     }
 
     /// Decode this broadcast from bincode bytes.
@@ -318,7 +396,7 @@ impl StateBroadcast {
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (gateway_address, site_cert_pem, site_labels) = decode_extension(remaining, &v1.origin_site);
+        let (gateway_address, site_cert_pem, site_labels, signature) = decode_extension(remaining, &v1.origin_site);
 
         Ok(Self {
             version: v1.version,
@@ -328,12 +406,18 @@ impl StateBroadcast {
             gateway_address,
             site_cert_pem,
             site_labels,
+            signature,
         })
     }
 }
 
 /// Gateway address, certificate, and labels carried by an extension.
-type DecodedExtension = (Option<String>, Option<String>, Option<BTreeMap<String, String>>);
+type DecodedExtension = (
+    Option<String>,
+    Option<String>,
+    Option<BTreeMap<String, String>>,
+    Option<Vec<u8>>,
+);
 
 /// Decode the trailing extension, newest shape first.
 ///
@@ -341,21 +425,37 @@ type DecodedExtension = (Option<String>, Option<String>, Option<BTreeMap<String,
 /// short rather than wrong, and each older shape is tried in turn.
 fn decode_extension(remaining: &[u8], origin: &str) -> DecodedExtension {
     if remaining.is_empty() {
-        return (None, None, None);
+        return (None, None, None, None);
     }
     let config = bincode::config::standard();
     if let Ok((ext, _)) = bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, config) {
         let labels = ext.site_labels.and_then(|labels| accept_site_labels(labels, origin));
-        return (ext.gateway_address, ext.site_cert_pem, labels);
+        return (ext.gateway_address, ext.site_cert_pem, labels, ext.signature);
     }
     if let Ok((ext, _)) = bincode::serde::decode_from_slice::<BroadcastExtensionV2, _>(remaining, config) {
-        return (ext.gateway_address, ext.site_cert_pem, None);
+        return (ext.gateway_address, ext.site_cert_pem, None, None);
     }
     // Compatibility fallback: bare String encoding for gateway_address only.
     match bincode::serde::decode_from_slice::<String, _>(remaining, config) {
-        Ok((gateway, _)) => (Some(gateway), None, None),
-        Err(_) => (None, None, None),
+        Ok((gateway, _)) => (Some(gateway), None, None, None),
+        Err(_) => (None, None, None, None),
     }
+}
+
+/// Domain separator, so a signature made for a broadcast cannot be replayed as
+/// a signature over anything else this grid signs.
+const SIGNING_DOMAIN: &[u8] = b"ai-grid:state-broadcast:v1\0";
+
+/// Reasons a broadcast could not be signed.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SignError {
+    /// The key is not a usable P-256 signing key.
+    #[error("signing key is not a usable P-256 key")]
+    UnusableKey,
+
+    /// The payload could not be encoded for signing.
+    #[error("broadcast could not be encoded for signing")]
+    Encode,
 }
 
 /// Key used to replace stale queued broadcasts in foca.

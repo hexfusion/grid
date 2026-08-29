@@ -8,6 +8,7 @@
 mod enroll;
 mod generate;
 mod provider;
+mod verify;
 
 pub use enroll::{EnrollError, EnrolledCert, MAX_CSR_PEM_BYTES, sign_csr};
 pub use generate::{
@@ -16,3 +17,4 @@ pub use generate::{
     generate_site_cert, generate_site_cert_with_names, load_ca, spiffe_id,
 };
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
+pub use verify::{MAX_CERT_PEM_BYTES, VerifyError, verify_site_cert};
