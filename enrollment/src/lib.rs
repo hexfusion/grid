@@ -9,8 +9,10 @@
 //! Postgres it already runs while a standalone grid brings its own.
 
 pub mod api;
+pub mod auth;
 pub mod model;
 pub mod store;
 
 pub use api::{AppState, router};
+pub use auth::Operators;
 pub use store::Store;

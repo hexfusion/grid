@@ -6,10 +6,25 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "enrollment"
+path = "src/main.rs"
+
+[[bin]]
+name = "gridctl"
+path = "src/bin/gridctl.rs"
+
 [dependencies]
 axum = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 certs = { path = "../certs" }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
+rcgen = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["parsing", "serde-well-known"] }

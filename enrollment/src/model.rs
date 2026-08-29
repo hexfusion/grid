@@ -146,6 +146,15 @@ pub struct EnrollmentRequest {
     pub capabilities: Option<Capabilities>,
 }
 
+/// Narrowing applied when listing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListQuery {
+    /// Return only requests in this phase.
+    #[serde(default)]
+    pub phase: Option<EnrollmentPhase>,
+}
+
 /// Why a request was refused.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

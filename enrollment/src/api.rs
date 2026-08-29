@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State},
+    http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -17,7 +17,8 @@ use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, sign_csr};
 use uuid::Uuid;
 
 use crate::{
-    model::{DenyInput, EnrollmentRequest, EnrollmentRequestInput, ErrorBody},
+    auth::Operators,
+    model::{DenyInput, EnrollmentPhase, EnrollmentRequest, EnrollmentRequestInput, ErrorBody, ListQuery},
     store::{Issued, NewRequest, Store, StoreError},
 };
 
@@ -29,6 +30,9 @@ pub struct AppState {
 
     /// The CA that signs approved requests.
     pub ca: CaCert,
+
+    /// Who may decide on requests.
+    pub operators: Operators,
 }
 
 /// Failures the interface can report.
@@ -56,9 +60,42 @@ pub enum ApiError {
         message: String,
     },
 
+    /// The caller presented no operator credential, or one that is not known.
+    #[error("an operator credential is required")]
+    Unauthorized,
+
     /// The service itself failed.
     #[error("{0}")]
     Internal(String),
+}
+
+/// An authenticated operator.
+///
+/// Extracting this is what gates a decision, so a handler that takes it cannot
+/// be reached without a credential.
+#[derive(Debug, Clone)]
+pub struct Operator(pub String);
+
+impl FromRequestParts<Arc<AppState>> for Operator {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+        let presented = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+            .ok_or(ApiError::Unauthorized)?;
+
+        // An unknown token and a missing one are reported the same way, so the
+        // interface cannot be used to test whether a token exists.
+        state
+            .operators
+            .resolve(presented)
+            .map(|name| Self(name.to_owned()))
+            .ok_or(ApiError::Unauthorized)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -71,6 +108,11 @@ impl IntoResponse for ApiError {
                 "no enrollment request has that identifier".to_owned(),
             ),
             Self::Conflict { code, message } => (StatusCode::CONFLICT, code, message),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "deciding on enrollment requests requires an operator credential".to_owned(),
+            ),
             Self::Internal(message) => {
                 tracing::error!(error = %message, "enrollment request could not be served");
                 (
@@ -171,8 +213,19 @@ async fn create(
 }
 
 /// Every request, newest first.
-async fn list(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EnrollmentRequest>>, ApiError> {
-    Ok(Json(state.store.list()?))
+///
+/// Operator-only: a pending request names a provider that asked to join, which
+/// is not public.
+async fn list(
+    State(state): State<Arc<AppState>>,
+    _operator: Operator,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Vec<EnrollmentRequest>>, ApiError> {
+    let mut rows = state.store.list()?;
+    if let Some(phase) = query.phase {
+        rows.retain(|row| row.phase == phase);
+    }
+    Ok(Json(rows))
 }
 
 /// One request, including the certificate once it has been issued.
@@ -189,43 +242,64 @@ async fn fetch(
 /// denies rather than renaming, so what they saw is what gets signed.
 async fn approve(
     State(state): State<Arc<AppState>>,
+    Operator(operator): Operator,
     Path(request_id): Path<Uuid>,
 ) -> Result<Json<EnrollmentRequest>, ApiError> {
     let stored = state.store.get(request_id)?;
+    if let Some(settled) = settled_outcome(&stored.public)? {
+        return Ok(Json(settled));
+    }
+
     let issued = sign_csr(&state.ca, &stored.public.site_name, &stored.csr_pem).map_err(signing_error)?;
 
-    let updated = state.store.mark_issued(
+    let updated = match state.store.mark_issued(
         request_id,
         Issued {
             certificate: issued.cert_pem,
             spiffe_id: issued.spiffe_id,
-            decided_by: OPERATOR.to_owned(),
+            decided_by: operator.clone(),
         },
-    )?;
+    ) {
+        Ok(updated) => updated,
+        // Another approval won the race. Its certificate is the one that counts.
+        Err(StoreError::AlreadyDecided) => state.store.get(request_id)?.public,
+        Err(err) => return Err(err.into()),
+    };
 
     tracing::info!(
         site = %updated.site_name,
         spiffe_id = ?updated.spiffe_id,
+        %operator,
         "enrollment approved"
     );
     Ok(Json(updated))
 }
 
+/// The record to return for a request that has already been decided.
+///
+/// Retrying an approval must not sign a second certificate over the same key, so
+/// an already issued request comes back as it stands. A denied one is a
+/// contradiction rather than a retry.
+fn settled_outcome(record: &EnrollmentRequest) -> Result<Option<EnrollmentRequest>, ApiError> {
+    match record.phase {
+        EnrollmentPhase::Issued => Ok(Some(record.clone())),
+        EnrollmentPhase::Denied | EnrollmentPhase::Failed => Err(ApiError::Conflict {
+            code: "already_decided",
+            message: "this request was already denied".to_owned(),
+        }),
+        EnrollmentPhase::Pending => Ok(None),
+    }
+}
+
 /// Deny a request.
 async fn deny(
     State(state): State<Arc<AppState>>,
+    Operator(operator): Operator,
     Path(request_id): Path<Uuid>,
     body: Option<Json<DenyInput>>,
 ) -> Result<Json<EnrollmentRequest>, ApiError> {
     let reason = body.and_then(|Json(input)| input.reason);
-    let updated = state.store.mark_denied(request_id, OPERATOR.to_owned(), reason)?;
-    tracing::info!(site = %updated.site_name, "enrollment denied");
+    let updated = state.store.mark_denied(request_id, operator.clone(), reason)?;
+    tracing::info!(site = %updated.site_name, %operator, "enrollment denied");
     Ok(Json(updated))
 }
-
-/// Recorded as the approver until operator authentication is wired up.
-///
-/// The interface records who decided so a grid can answer why a provider is
-/// trusted. Until the deciding routes sit behind authentication, that answer is
-/// only as good as whoever can reach them.
-const OPERATOR: &str = "unauthenticated-operator";
