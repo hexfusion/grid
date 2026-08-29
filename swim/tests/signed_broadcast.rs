@@ -247,3 +247,32 @@ fn an_unverified_handler_accepts_what_a_verified_one_refuses() {
         "the verified mode refuses it"
     );
 }
+
+/// A node given an identity signs whatever it publishes, without callers doing it.
+#[test]
+fn a_node_signs_every_broadcast_it_publishes() {
+    use swim::{NodeId, SwimNode};
+
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    let site_a = enrolled(&ca, "site-a");
+
+    let identity = NodeId::new("site-a".to_owned(), "127.0.0.1:7946".parse().expect("addr"));
+    let mut node = SwimNode::new(identity).speaking_as(site_a.cert_pem.clone(), site_a.key_der.clone());
+
+    // Published without a certificate or signature of its own.
+    let bare = StateBroadcast::new(
+        "site-a".to_owned(),
+        7,
+        GridStateSnapshot::new("site-a".to_owned()),
+        Some("site-a.example:8443".to_owned()),
+    );
+    assert!(bare.signature.is_none(), "the caller supplied no signature");
+    node.publish_state_broadcast(&bare).expect("publish");
+
+    // What a peer would receive is signed, so re-deriving it here proves the
+    // node stamped identity on the way out rather than the caller doing it.
+    let mut expected = bare;
+    expected.site_cert_pem = Some(site_a.cert_pem.clone());
+    expected.sign(&site_a.key_der).expect("sign");
+    assert!(accept(&ca.cert_pem, &expected), "the published shape verifies");
+}

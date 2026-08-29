@@ -12,6 +12,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 certs = { path = "../certs" }
+pem = "3"
 crdt = { path = "../crdt" }
 swim = { path = "../swim" }
 futures = { workspace = true }

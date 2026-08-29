@@ -213,6 +213,7 @@ async fn maybe_start_swim(client: &Client, config: &gateway::Config) -> Option<A
         seeds,
         gateway_address,
         swim_key,
+        identity: load_grid_identity(),
         revision_lease,
     };
     match swim_runtime::start(cfg).await {
@@ -1177,6 +1178,52 @@ async fn metrics_handler() -> impl axum::response::IntoResponse {
 /// Health check handler for liveness and readiness probes.
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+/// Path to the grid CA certificate, used to check a peer's certificate.
+const GRID_CA_CERT_PATH: &str = "GRID_CA_CERT_PATH";
+/// Path to this site's certificate, broadcast so peers can check its signature.
+const GRID_SITE_CERT_PATH: &str = "GRID_SITE_CERT_PATH";
+/// Path to this site's private key, used to sign outbound broadcasts.
+const GRID_SITE_KEY_PATH: &str = "GRID_SITE_KEY_PATH";
+
+/// Read the identity this site gossips under, from the mounted grid TLS secret.
+///
+/// All three have to be present. Returning `None` when any is missing keeps the
+/// runtime honest about which mode it is in, rather than half-configuring a
+/// node that signs but cannot verify.
+fn load_grid_identity() -> Option<swim_runtime::GridIdentity> {
+    let ca_path = std::env::var(GRID_CA_CERT_PATH).ok()?;
+    let cert_path = std::env::var(GRID_SITE_CERT_PATH).ok()?;
+    let key_path = std::env::var(GRID_SITE_KEY_PATH).ok()?;
+
+    let read = |path: &str, what: &str| match std::fs::read_to_string(path) {
+        Ok(contents) => Some(contents),
+        Err(error) => {
+            tracing::error!(%error, path, "could not read {what}; gossip identity not configured");
+            None
+        },
+    };
+
+    let grid_ca_pem = read(&ca_path, "the grid CA certificate")?;
+    let site_cert_pem = read(&cert_path, "this site's certificate")?;
+    let site_key_pem = read(&key_path, "this site's private key")?;
+
+    // The signer takes PKCS#8 DER; the mounted file is PEM.
+    let site_key_der = match pem::parse(&site_key_pem) {
+        Ok(parsed) => parsed.contents().to_vec(),
+        Err(error) => {
+            tracing::error!(%error, "site private key is not valid PEM; gossip identity not configured");
+            return None;
+        },
+    };
+
+    tracing::info!("gossip identity configured: broadcasts are signed and peers are verified");
+    Some(swim_runtime::GridIdentity {
+        grid_ca_pem,
+        site_cert_pem,
+        site_key_der,
+    })
 }
 
 #[cfg(test)]

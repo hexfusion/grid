@@ -68,6 +68,38 @@ pub struct RevisionLease {
     pub last_node_generation: u64,
 }
 
+/// The identity this site gossips under.
+///
+/// The three pieces belong together: without the CA a peer's broadcast cannot be
+/// checked, and without the key this site's own broadcasts cannot be signed. A
+/// runtime either has a full grid identity or none.
+#[derive(Clone)]
+pub struct GridIdentity {
+    /// The grid CA, used to check that a peer's certificate was issued here.
+    pub grid_ca_pem: String,
+
+    /// This site's certificate, broadcast so peers can check its signature.
+    pub site_cert_pem: String,
+
+    /// This site's private key in PKCS#8 DER, used to sign outbound broadcasts.
+    ///
+    /// # Security invariant
+    ///
+    /// Must never appear in logs, tracing spans, error messages, Kubernetes
+    /// resources, or process output.
+    pub site_key_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for GridIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GridIdentity")
+            .field("grid_ca_pem", &"<present>")
+            .field("site_cert_pem", &"<present>")
+            .field("site_key_der", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Configuration for the SWIM runtime.
 #[derive(Clone)]
 pub struct SwimConfig {
@@ -118,6 +150,14 @@ pub struct SwimConfig {
     /// Kubernetes resources, or process output.
     pub swim_key: Option<swim::crypto::SwimKey>,
 
+    /// Identity this site gossips under.
+    ///
+    /// When set, outbound broadcasts are signed and inbound ones are refused
+    /// unless they prove which site sent them. When `None`, broadcasts are
+    /// unsigned and any member's claim to be any other is accepted, which the
+    /// shared transport key alone permits.
+    pub identity: Option<GridIdentity>,
+
     /// Revision range and node generation reserved durably before startup.
     pub revision_lease: RevisionLease,
 }
@@ -131,8 +171,35 @@ impl std::fmt::Debug for SwimConfig {
             .field("seeds", &self.seeds)
             .field("gateway_address", &self.gateway_address)
             .field("swim_key", &self.swim_key.map(|_| "<redacted>"))
+            .field("identity", &self.identity)
             .field("revision_lease", &self.revision_lease)
             .finish()
+    }
+}
+
+/// Whether a broadcast really came from the site it names.
+///
+/// The certificate it carries has to be one this grid issued to that site, and
+/// the signature has to check out against it. The transport key proves only that
+/// some member sent the packet, so without this a member can speak for any other.
+fn verified_by_grid(grid_ca_pem: &str, broadcast: &swim::StateBroadcast) -> bool {
+    let Some(cert_pem) = broadcast.site_cert_pem.as_deref() else {
+        tracing::debug!(origin = %broadcast.origin_site, "broadcast carried no certificate");
+        return false;
+    };
+
+    match certs::verify_site_cert(grid_ca_pem, cert_pem, &broadcast.origin_site) {
+        Ok(public_key) => {
+            let signed = broadcast.verify(&public_key);
+            if !signed {
+                tracing::warn!(origin = %broadcast.origin_site, "broadcast signature did not verify");
+            }
+            signed
+        },
+        Err(err) => {
+            tracing::warn!(origin = %broadcast.origin_site, error = %err, "broadcast certificate refused");
+            false
+        },
     }
 }
 
@@ -900,7 +967,20 @@ async fn run_loop(
         config.revision_lease.first_node_generation,
         config.revision_lease.last_node_generation,
     );
-    let mut node = SwimNode::with_origin_capacity(identity, MAX_TRACKED_MEMBERS);
+    let mut node = if let Some(grid_identity) = config.identity.clone() {
+        let grid_ca_pem = grid_identity.grid_ca_pem.clone();
+        let trust =
+            swim::state_broadcast::BroadcastTrust::Verified(Arc::new(move |broadcast: &swim::StateBroadcast| {
+                verified_by_grid(&grid_ca_pem, broadcast)
+            }));
+        SwimNode::with_trust(identity, MAX_TRACKED_MEMBERS, trust)
+            .speaking_as(grid_identity.site_cert_pem, grid_identity.site_key_der)
+    } else {
+        tracing::warn!(
+            "no grid identity configured: broadcasts are unsigned and a peer claiming another site's name is accepted"
+        );
+        SwimNode::with_origin_capacity(identity, MAX_TRACKED_MEMBERS)
+    };
     let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
@@ -2298,6 +2378,7 @@ mod tests {
             seeds: Vec::new(),
             gateway_address: None,
             swim_key: None,
+            identity: None,
             revision_lease: test_revision_lease(1),
         };
         let handle = start(cfg).await;
@@ -2321,6 +2402,7 @@ mod tests {
             seeds: Vec::new(),
             gateway_address: None,
             swim_key: None,
+            identity: None,
             revision_lease: test_revision_lease(20_000),
         };
         let result = start(cfg).await;
@@ -2341,6 +2423,7 @@ mod tests {
             seeds: Vec::new(),
             gateway_address: None,
             swim_key: None,
+            identity: None,
             revision_lease: test_revision_lease(40_000),
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
@@ -2352,6 +2435,7 @@ mod tests {
             seeds: vec![addr1],
             gateway_address: None,
             swim_key: None,
+            identity: None,
             revision_lease: test_revision_lease(60_000),
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
@@ -2410,6 +2494,7 @@ mod tests {
             seeds: Vec::new(),
             gateway_address: None,
             swim_key: None,
+            identity: None,
             revision_lease: test_revision_lease(80_000),
         })
         .await
@@ -2422,6 +2507,7 @@ mod tests {
             seeds: vec![addr_a],
             gateway_address: None,
             swim_key: None,
+            identity: None,
             revision_lease: test_revision_lease(90_000),
         })
         .await
@@ -2457,6 +2543,7 @@ mod tests {
             seeds: vec![addr_a],
             gateway_address: None,
             swim_key: None,
+            identity: None,
             revision_lease: test_revision_lease(100_000),
         })
         .await

@@ -16,7 +16,9 @@ use tokio::sync::watch;
 use crate::{
     AccumulatedOutput, GridRuntime, NodeId,
     runtime::TimerEvent,
-    state_broadcast::{DEFAULT_MAX_RETAINED_ORIGINS, OriginStateHandle, StateBroadcast, StateBroadcastHandler},
+    state_broadcast::{
+        BroadcastTrust, DEFAULT_MAX_RETAINED_ORIGINS, OriginStateHandle, StateBroadcast, StateBroadcastHandler,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +70,21 @@ pub struct SwimNode {
 
     /// Immediate control path for coordinated per-origin state eviction.
     origin_state: OriginStateHandle,
+
+    /// Certificate and key this node signs its broadcasts with.
+    ///
+    /// `None` leaves broadcasts unsigned, which a peer enforcing verification
+    /// will refuse.
+    identity_material: Option<SiteIdentity>,
+}
+
+/// The certificate and private key one site speaks as.
+struct SiteIdentity {
+    /// The certificate the grid issued to this site, broadcast to peers.
+    cert_pem: String,
+
+    /// This site's private key in PKCS#8 DER. Never leaves the process.
+    key_der: Vec<u8>,
 }
 
 impl SwimNode {
@@ -83,8 +100,17 @@ impl SwimNode {
     }
 
     /// Create a node with an explicit hard bound for retained state origins.
-    #[expect(clippy::too_many_lines, reason = "seed + foca setup is one logical step")]
+    ///
+    /// Accepts every broadcast that decodes. Prefer
+    /// [`with_trust`](Self::with_trust), which makes a member prove it is the
+    /// site it claims to be.
     pub fn with_origin_capacity(identity: NodeId, max_origins: usize) -> Self {
+        Self::with_trust(identity, max_origins, BroadcastTrust::Unverified)
+    }
+
+    /// Create a node that checks which site a received broadcast came from.
+    #[expect(clippy::too_many_lines, reason = "seed + foca setup is one logical step")]
+    pub fn with_trust(identity: NodeId, max_origins: usize, trust: BroadcastTrust) -> Self {
         let seed = {
             // Truncate nanoseconds to u64; we want spread, not precision.
             #[expect(
@@ -107,6 +133,7 @@ impl SwimNode {
 
         let site_id = identity.site_name().to_owned();
         let (handler, origin_state) = StateBroadcastHandler::with_capacity(site_id, max_origins);
+        let handler = handler.with_trust(trust);
         let state_rx = handler.subscribe();
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
         let cert_pems_rx = handler.subscribe_cert_pems();
@@ -120,7 +147,43 @@ impl SwimNode {
             cert_pems_rx,
             site_labels_rx,
             origin_state,
+            identity_material: None,
         }
+    }
+
+    /// Attach this node's certificate and signature, when it has an identity.
+    ///
+    /// Returns `None` when signing failed, which means the broadcast must not go
+    /// out: a peer enforcing verification would refuse it anyway, and publishing
+    /// it unsigned would be worse.
+    fn stamped(&self, broadcast: &StateBroadcast) -> Option<StateBroadcast> {
+        let Some(identity) = self.identity_material.as_ref() else {
+            return Some(broadcast.clone());
+        };
+
+        let mut outgoing = broadcast.clone();
+        outgoing.site_cert_pem = Some(identity.cert_pem.clone());
+        match outgoing.sign(&identity.key_der) {
+            Ok(()) => Some(outgoing),
+            Err(err) => {
+                tracing::warn!(error = %err, "state broadcast could not be signed; not publishing");
+                None
+            },
+        }
+    }
+
+    /// Attach the identity this node speaks as.
+    ///
+    /// Every broadcast this node publishes then carries `cert_pem` and a
+    /// signature made with `key_der`, so a receiver can tell this site's
+    /// broadcasts from a peer's claim to be this site.
+    ///
+    /// `key_der` is the site's private key in PKCS#8 DER. It stays in this
+    /// process and is never broadcast.
+    #[must_use]
+    pub fn speaking_as(mut self, cert_pem: String, key_der: Vec<u8>) -> Self {
+        self.identity_material = Some(SiteIdentity { cert_pem, key_der });
+        self
     }
 
     /// Immediately remove provider, metadata, and revision state for one origin.
@@ -207,13 +270,19 @@ impl SwimNode {
     ///
     /// Returns an error if the broadcast payload cannot be encoded.
     pub fn publish_state_broadcast(&mut self, broadcast: &StateBroadcast) -> Result<(), bincode::error::EncodeError> {
-        let bytes = broadcast.encode()?;
+        // Signing happens here so every outbound broadcast is covered, whatever
+        // published it. A receiver enforcing verification drops anything that
+        // misses this path.
+        let Some(outgoing) = self.stamped(broadcast) else {
+            return Ok(());
+        };
+        let bytes = outgoing.encode()?;
         match self.foca.add_broadcast(&bytes) {
             Ok(true) => {
-                tracing::debug!(origin = %broadcast.origin_site, rev = broadcast.revision, "state broadcast queued");
+                tracing::debug!(origin = %outgoing.origin_site, rev = outgoing.revision, "state broadcast queued");
             },
             Ok(false) => {
-                tracing::debug!(origin = %broadcast.origin_site, "state broadcast rejected (stale or duplicate)");
+                tracing::debug!(origin = %outgoing.origin_site, "state broadcast rejected (stale or duplicate)");
             },
             Err(err) => tracing::warn!(error = %err, "foca add_broadcast failed"),
         }
