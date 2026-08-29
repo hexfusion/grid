@@ -63,10 +63,6 @@ pub(crate) struct ProbeConfig {
 
     /// Canonical DER fingerprint pins (1–2 entries).
     pub pins: Vec<CanonicalFingerprint>,
-
-    /// Optional SWIM-advertised leaf cert DER, compared with the configured
-    /// rotation pins for diagnostics only.
-    pub advertised_leaf_der: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,13 +238,6 @@ fn verify_peer_certificate(
         return GatewayProbeOutcome::PinMismatch;
     }
 
-    if let Some(advertised) = config.advertised_leaf_der.as_ref() {
-        let advertised_fp = CanonicalFingerprint::from_der(advertised);
-        if !fingerprint_matches_any(&advertised_fp, &config.pins) {
-            return GatewayProbeOutcome::AdvertisedCertificateMismatch;
-        }
-    }
-
     GatewayProbeOutcome::Verified
 }
 
@@ -305,20 +294,24 @@ fn classify_rustls_error(err: &rustls::Error) -> GatewayProbeOutcome {
 /// Used to parse `status.publicCertPem` for comparison against the
 /// live peer certificate.
 ///
+/// Only the tests need this now. Nothing in the probe reads a certificate from
+/// anywhere but the TLS handshake.
+///
 /// # Errors
 ///
 /// Returns a bounded description if the PEM is oversized, malformed, or
 /// contains no certificate.
+#[cfg(test)]
 pub(crate) fn first_cert_der_from_pem(pem: &str) -> Result<Vec<u8>, &'static str> {
     if pem.len() > MAX_CERT_BUNDLE_BYTES {
-        return Err("advertised certificate PEM exceeds maximum size");
+        return Err("certificate PEM exceeds maximum size");
     }
     let cert = CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
-        .ok_or("advertised certificate PEM contains no certificate")?
-        .map_err(|_err| "advertised certificate PEM is malformed")?;
+        .ok_or("certificate PEM contains no certificate")?
+        .map_err(|_err| "certificate PEM is malformed")?;
     if cert.as_ref().len() > MAX_CERT_BYTES {
-        return Err("advertised certificate exceeds maximum size");
+        return Err("certificate exceeds maximum size");
     }
     Ok(cert.as_ref().to_vec())
 }
@@ -490,7 +483,7 @@ mod tests {
         let oversized = "x".repeat(MAX_CERT_BUNDLE_BYTES + 1);
         assert_eq!(
             first_cert_der_from_pem(&oversized).unwrap_err(),
-            "advertised certificate PEM exceeds maximum size"
+            "certificate PEM exceeds maximum size"
         );
     }
 
@@ -604,7 +597,6 @@ mod tests {
             tls_config,
             server_name: ServerName::try_from("test-site.grid.internal").unwrap(),
             pins: vec![fp],
-            advertised_leaf_der: None,
         };
 
         assert!(!config.address.contains("PRIVATE KEY"), "address must not leak keys");
@@ -634,7 +626,6 @@ mod tests {
             tls_config: client_tls_config(ca, client),
             server_name: ServerName::try_from(server_name.to_owned()).unwrap(),
             pins,
-            advertised_leaf_der: None,
         }
     }
 
@@ -708,7 +699,6 @@ mod tests {
             tls_config: client_tls_config(&ca, &client),
             server_name: ServerName::try_from("test-site.grid.internal").unwrap(),
             pins: vec![pin],
-            advertised_leaf_der: None,
         };
         let outcome = probe_gateway(&config).await;
         assert_eq!(outcome, GatewayProbeOutcome::ConnectionFailed, "refused port must fail");
@@ -797,52 +787,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn advertised_cert_mismatch_detected() {
-        let ca = test_ca();
-        let server = test_site(&ca, "test-site");
-        let client = test_site(&ca, "client-site");
-        let addr = start_tls_server(&server, &ca);
-
-        let server_der = first_cert_der_from_pem(&server.cert_pem).unwrap();
-        let pin = CanonicalFingerprint::from_der(&server_der);
-
-        let different_cert = test_site(&ca, "other-site");
-        let different_der = first_cert_der_from_pem(&different_cert.cert_pem).unwrap();
-
-        let config = ProbeConfig {
-            advertised_leaf_der: Some(different_der),
-            ..make_probe_config(addr, &ca, &client, "test-site.grid.internal", vec![pin])
-        };
-        let outcome = probe_gateway(&config).await;
-        assert_eq!(
-            outcome,
-            GatewayProbeOutcome::AdvertisedCertificateMismatch,
-            "advertised cert outside the configured pin set must be detected"
-        );
-    }
-
-    #[tokio::test]
-    async fn advertised_cert_match_succeeds() {
-        let ca = test_ca();
-        let server = test_site(&ca, "test-site");
-        let client = test_site(&ca, "client-site");
-        let addr = start_tls_server(&server, &ca);
-
-        let server_der = first_cert_der_from_pem(&server.cert_pem).unwrap();
-        let pin = CanonicalFingerprint::from_der(&server_der);
-
-        let config = ProbeConfig {
-            advertised_leaf_der: Some(server_der),
-            ..make_probe_config(addr, &ca, &client, "test-site.grid.internal", vec![pin])
-        };
-        let outcome = probe_gateway(&config).await;
-        assert_eq!(
-            outcome,
-            GatewayProbeOutcome::Verified,
-            "matching advertised cert must succeed"
-        );
-    }
 
     #[tokio::test]
     async fn advertised_rotation_overlap_succeeds_when_both_pins_are_authorized() {
@@ -858,7 +802,6 @@ mod tests {
         let next_pin = CanonicalFingerprint::from_der(&next_der);
 
         let config = ProbeConfig {
-            advertised_leaf_der: Some(next_der),
             ..make_probe_config(addr, &ca, &client, "test-site.grid.internal", vec![live_pin, next_pin])
         };
         let outcome = probe_gateway(&config).await;

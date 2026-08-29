@@ -178,8 +178,21 @@ pub struct GridSiteStatus {
     #[serde(default)]
     pub phase: GridSitePhase,
 
-    /// Remote site's public certificate PEM (received
-    /// via SWIM state broadcast from the remote operator).
+    /// Remote site's public certificate PEM, as advertised over SWIM.
+    ///
+    /// Diagnostic only. Nothing may authenticate, authorize, or make a trust
+    /// decision from this field, and nothing does.
+    ///
+    /// It arrives over gossip, where the transport proves only that some member
+    /// sent it, so it is a claim rather than evidence. The certificate that
+    /// decides anything is the one a peer presents in the TLS handshake, which
+    /// is checked against the grid CA and the name it carries. A broadcast is
+    /// separately signed and refused unless it proves which site sent it, but
+    /// that establishes the sender, not that this copy should be trusted for
+    /// anything.
+    ///
+    /// Kept so an operator can see what a peer is advertising and compare it
+    /// against what the peer actually serves.
     pub public_cert_pem: Option<String>,
 
     /// Machine-readable reason for the current phase.
