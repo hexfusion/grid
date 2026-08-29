@@ -6,8 +6,11 @@
 #![allow(clippy::tests_outside_test_module, reason = "integration tests live in tests/")]
 #![expect(clippy::expect_used, reason = "tests")]
 
+use std::sync::Arc;
+
 use crdt::GridStateSnapshot;
-use swim::state_broadcast::StateBroadcast;
+use foca::BroadcastHandler as _;
+use swim::state_broadcast::{BroadcastTrust, StateBroadcast, StateBroadcastHandler};
 
 /// A site with an enrolled certificate and the key behind it.
 struct Site {
@@ -166,5 +169,81 @@ fn a_signature_survives_encoding_and_decoding() {
     assert!(
         accept(&ca.cert_pem, &decoded),
         "a decoded broadcast still verifies against the same bytes"
+    );
+}
+
+
+/// A handler configured the way the operator configures one.
+fn handler_trusting(ca_pem: &str) -> StateBroadcastHandler {
+    let ca = ca_pem.to_owned();
+    StateBroadcastHandler::new("receiver".to_owned()).with_trust(BroadcastTrust::Verified(Arc::new(
+        move |broadcast: &StateBroadcast| {
+            broadcast.site_cert_pem.as_deref().is_some_and(|cert| {
+                certs::verify_site_cert(&ca, cert, &broadcast.origin_site)
+                    .is_ok_and(|public_key| broadcast.verify(&public_key))
+            })
+        },
+    )))
+}
+
+/// A spoofed broadcast must be dropped before any of its data is stored.
+///
+/// The gateway address map is what the operator turns into a peer's egress, so
+/// a rejected broadcast reaching it would be the hijack even though the packet
+/// was refused.
+#[test]
+fn a_spoofed_broadcast_never_reaches_the_stored_maps() {
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    let site_a = enrolled(&ca, "site-a");
+    let site_b = enrolled(&ca, "site-b");
+
+    let mut handler = handler_trusting(&ca.cert_pem);
+    let gateways = handler.subscribe_gateway_addrs();
+    let certs_seen = handler.subscribe_cert_pems();
+
+    // site-b claims site-a's name and points it at itself.
+    let hijack = broadcast_from(&site_b, "site-a", "site-b.example:8443");
+    let refused = handler.receive_item(&hijack.encode().expect("encode"), None);
+    assert!(refused.is_err(), "a spoofed broadcast must be refused");
+
+    assert!(
+        !gateways.borrow().contains_key("site-a"),
+        "a refused broadcast must not set site-a's gateway address"
+    );
+    assert!(
+        !certs_seen.borrow().contains_key("site-a"),
+        "a refused broadcast must not set site-a's certificate"
+    );
+
+    // site-a's own broadcast is accepted and does land.
+    let genuine = broadcast_from(&site_a, "site-a", "site-a.example:8443");
+    handler
+        .receive_item(&genuine.encode().expect("encode"), None)
+        .expect("a genuine broadcast is accepted");
+    assert_eq!(
+        gateways.borrow().get("site-a").map(String::as_str),
+        Some("site-a.example:8443"),
+        "site-a's own gateway address is stored"
+    );
+}
+
+/// An unverified handler is the insecure mode, and it is named as such.
+#[test]
+fn an_unverified_handler_accepts_what_a_verified_one_refuses() {
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    let site_b = enrolled(&ca, "site-b");
+    let hijack = broadcast_from(&site_b, "site-a", "site-b.example:8443");
+    let encoded = hijack.encode().expect("encode");
+
+    let mut permissive = StateBroadcastHandler::new("receiver".to_owned());
+    assert!(
+        permissive.receive_item(&encoded, None).is_ok(),
+        "the unverified mode accepts a spoofed broadcast, which is why it is named"
+    );
+
+    let mut strict = handler_trusting(&ca.cert_pem);
+    assert!(
+        strict.receive_item(&encoded, None).is_err(),
+        "the verified mode refuses it"
     );
 }

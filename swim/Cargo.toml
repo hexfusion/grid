@@ -21,6 +21,7 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+foca = { workspace = true }
 certs = { path = "../certs" }
 pem = "3"
 rcgen = { workspace = true }

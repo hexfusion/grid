@@ -446,6 +446,36 @@ fn decode_extension(remaining: &[u8], origin: &str) -> DecodedExtension {
 /// a signature over anything else this grid signs.
 const SIGNING_DOMAIN: &[u8] = b"ai-grid:state-broadcast:v1\0";
 
+/// Decides whether a received broadcast really came from the site it names.
+///
+/// Takes the broadcast whole, because deciding needs the certificate it carries,
+/// the name it claims, and the signature over the rest together. Kept as a
+/// callback so this crate stays out of the grid's PKI.
+pub type BroadcastVerifier = Arc<dyn Fn(&StateBroadcast) -> bool + Send + Sync>;
+
+/// Whether received broadcasts have to prove who sent them.
+#[derive(Clone)]
+pub enum BroadcastTrust {
+    /// Accept every broadcast that decodes.
+    ///
+    /// The transport key is shared by the whole grid, so this accepts any
+    /// member's claim to be any other member. Only for tests and single-site
+    /// development.
+    Unverified,
+
+    /// Accept only broadcasts the verifier vouches for.
+    Verified(BroadcastVerifier),
+}
+
+impl std::fmt::Debug for BroadcastTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Unverified => f.write_str("Unverified"),
+            Self::Verified(_) => f.write_str("Verified"),
+        }
+    }
+}
+
 /// Reasons a broadcast could not be signed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SignError {
@@ -516,6 +546,17 @@ pub enum StateBroadcastError {
     /// The payload could not be decoded.
     #[error("state broadcast decode failed: {0}")]
     Decode(#[from] bincode::error::DecodeError),
+
+    /// The broadcast did not prove it came from the site it names.
+    ///
+    /// Either it carried no signature, its certificate was not issued by this
+    /// grid, that certificate names a different site, or the signature does not
+    /// check out. A member trying to speak for another lands here.
+    #[error("state broadcast from {origin} did not prove it came from that site")]
+    Unverified {
+        /// The name the broadcast claimed.
+        origin: String,
+    },
 
     /// The payload version is not supported.
     #[error("unsupported state broadcast version {actual}; expected {expected}")]
@@ -660,6 +701,9 @@ pub struct StateBroadcastHandler {
 
     /// Hard bound for per-origin revision and metadata maps.
     max_origins: usize,
+
+    /// Whether a received broadcast has to prove who sent it.
+    trust: BroadcastTrust,
 }
 
 impl StateBroadcastHandler {
@@ -687,6 +731,7 @@ impl StateBroadcastHandler {
         let (labels_tx, _) = watch::channel(BTreeMap::new());
         let max_origins = max_origins.max(1);
         let retained = Arc::new(Mutex::new(RetainedOrigins::default()));
+        let trust = BroadcastTrust::Unverified;
         let control = OriginStateHandle {
             retained: Arc::clone(&retained),
             state_tx: tx.clone(),
@@ -702,9 +747,28 @@ impl StateBroadcastHandler {
                 cert_pems_tx: cert_tx,
                 site_labels_tx: labels_tx,
                 max_origins,
+                trust,
             },
             control,
         )
+    }
+
+    /// Whether the configured verifier vouches for this broadcast.
+    fn vouches_for(&self, broadcast: &StateBroadcast) -> bool {
+        match &self.trust {
+            BroadcastTrust::Unverified => true,
+            BroadcastTrust::Verified(verifier) => verifier(broadcast),
+        }
+    }
+
+    /// Require received broadcasts to prove which site sent them.
+    ///
+    /// Without this a handler accepts any member's claim to be any other, since
+    /// the transport key is shared by the whole grid.
+    #[must_use]
+    pub fn with_trust(mut self, trust: BroadcastTrust) -> Self {
+        self.trust = trust;
+        self
     }
 
     /// Return a receiver for the live merged grid-state snapshot.
@@ -931,6 +995,14 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             return Err(StateBroadcastError::UnsupportedVersion {
                 expected: STATE_BROADCAST_VERSION,
                 actual: broadcast.version,
+            });
+        }
+        if matches!(self.trust, BroadcastTrust::Verified(_)) && !self.vouches_for(&broadcast) {
+            // Dropped before anything is stored. A broadcast that cannot prove
+            // who sent it must not reach the gateway address, certificate, or
+            // label maps, since those are what the operator acts on.
+            return Err(StateBroadcastError::Unverified {
+                origin: broadcast.origin_site,
             });
         }
         self.make_room_for(&broadcast.origin_site);
