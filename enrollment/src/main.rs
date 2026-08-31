@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use enrollment::{AppState, JoiningConfig, Operators, Store, router};
+use enrollment::{AppState, JoiningConfig, Operators, Store, authz::Authorizer, router};
 
 /// Where the CA that signs approved requests is read from.
 const CA_CERT_PATH: &str = "ENROLLMENT_CA_CERT";
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         store: open_store().await?,
         ca,
-        operators: load_operators()?,
+        authorizer: build_authorizer().await?,
         cert_lifetime: load_cert_lifetime(),
         joining: load_joining_config(),
     });
@@ -141,4 +141,40 @@ fn load_operators() -> Result<Operators, std::io::Error> {
         tracing::info!(operators = operators.len(), "operator tokens loaded");
     }
     Ok(operators)
+}
+
+/// Build the operator-authorization backend.
+///
+/// Defaults to the operator-token table. Built with `--features sar` and
+/// `ENROLLMENT_AUTHZ=kube`, it reuses Kubernetes RBAC (`TokenReview` +
+/// `SubjectAccessReview`) instead — the `FlightCtl` pattern. `gridctl` is
+/// unchanged either way; only the token's origin and who decides differ.
+#[cfg_attr(
+    not(feature = "sar"),
+    expect(clippy::unused_async, reason = "async only when the sar backend is built")
+)]
+async fn build_authorizer() -> Result<Authorizer, Box<dyn std::error::Error>> {
+    // Read the choice unconditionally and fail closed: an operator who asks for a
+    // backend this binary cannot provide (`kube` without `--features sar`, or an
+    // unrecognized value) must not silently fall back to the token table while
+    // believing something stronger is deciding.
+    match std::env::var("ENROLLMENT_AUTHZ").ok().as_deref() {
+        None | Some("" | "local") => {
+            tracing::info!("operator authorization: operator-token table");
+            Ok(Authorizer::Local(load_operators()?))
+        },
+        Some("kube") => {
+            #[cfg(feature = "sar")]
+            {
+                let kube = enrollment::authz::KubeAuthorizer::connect()
+                    .await
+                    .map_err(std::io::Error::other)?;
+                tracing::info!("operator authorization: Kubernetes RBAC (SubjectAccessReview)");
+                Ok(Authorizer::Kube(kube))
+            }
+            #[cfg(not(feature = "sar"))]
+            Err("ENROLLMENT_AUTHZ=kube requires a build with --features sar".into())
+        },
+        Some(other) => Err(format!("unknown ENROLLMENT_AUTHZ={other:?}; expected \"local\" or \"kube\"").into()),
+    }
 }

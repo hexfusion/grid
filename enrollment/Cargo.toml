@@ -14,6 +14,12 @@ path = "src/main.rs"
 name = "gridctl"
 path = "src/bin/gridctl.rs"
 
+[features]
+# Reuse Kubernetes RBAC for operator authorization (TokenReview + SubjectAccessReview).
+# Off by default so the standalone, cluster-free deployment pulls in no Kubernetes
+# client. Enable in-cluster with `--features sar`.
+sar = ["dep:kube", "dep:k8s-openapi"]
+
 [dependencies]
 axum = { workspace = true }
 base64 = { workspace = true }
@@ -23,6 +29,8 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-rustls = { workspace = true }
 hyper-util = { workspace = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
 pem = "3"
 rcgen = { workspace = true }
 serde = { workspace = true }

@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State},
-    http::{StatusCode, request::Parts},
+    extract::{DefaultBodyLimit, FromRequestParts, MatchedPath, Path, Query, State},
+    http::{Method, StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -18,7 +18,7 @@ use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, Validity, csr_public_key, si
 use uuid::Uuid;
 
 use crate::{
-    auth::Operators,
+    authz::{Authorizer, AuthzError, Operation},
     model::{
         DenyInput, EnrollmentPhase, EnrollmentRequest, EnrollmentRequestInput, ErrorBody, JoinProof, JoiningKit,
         ListQuery,
@@ -35,8 +35,8 @@ pub struct AppState {
     /// The CA that signs approved requests.
     pub ca: CaCert,
 
-    /// Who may decide on requests.
-    pub operators: Operators,
+    /// How decisions are authorized (operator token table, or Kubernetes RBAC).
+    pub authorizer: Authorizer,
 
     /// How long an issued certificate lasts.
     ///
@@ -88,9 +88,23 @@ pub enum ApiError {
     #[error("an operator credential is required")]
     Unauthorized,
 
+    /// The caller authenticated but is not permitted the action.
+    #[error("not permitted")]
+    Forbidden,
+
     /// The service itself failed.
     #[error("{0}")]
     Internal(String),
+}
+
+impl From<AuthzError> for ApiError {
+    fn from(error: AuthzError) -> Self {
+        match error {
+            AuthzError::Unauthenticated => Self::Unauthorized,
+            AuthzError::Forbidden(_) => Self::Forbidden,
+            AuthzError::Backend(message) => Self::Internal(message),
+        }
+    }
 }
 
 /// An authenticated operator.
@@ -112,19 +126,50 @@ impl FromRequestParts<Arc<AppState>> for Operator {
             .map(str::trim)
             .ok_or(ApiError::Unauthorized)?;
 
+        // The action being authorized, derived from the matched route. The local
+        // token backend ignores it; the Kubernetes-RBAC backend maps it to a
+        // SubjectAccessReview.
+        let operation = route_operation(parts);
+
         // An unknown token and a missing one are reported the same way, so the
         // interface cannot be used to test whether a token exists.
         state
-            .operators
-            .resolve(presented)
-            .map(|name| Self(name.to_owned()))
-            .ok_or(ApiError::Unauthorized)
+            .authorizer
+            .decide(presented, operation)
+            .await
+            .map(Self)
+            .map_err(ApiError::from)
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let (status, code, message) = match self {
+/// The authorization operation for the matched route.
+///
+/// Deciding (approve or deny) is `update` on the `approval` subresource, the way
+/// Kubernetes models CSR approval; reads are `list`/`get` on the resource.
+fn route_operation(parts: &Parts) -> Operation {
+    let path = parts.extensions.get::<MatchedPath>().map_or("", MatchedPath::as_str);
+    if path.ends_with("/approve") || path.ends_with("/deny") {
+        Operation {
+            verb: "update",
+            subresource: Some("approval"),
+        }
+    } else if parts.method == Method::GET {
+        Operation {
+            verb: "list",
+            subresource: None,
+        }
+    } else {
+        Operation {
+            verb: "get",
+            subresource: None,
+        }
+    }
+}
+
+impl ApiError {
+    /// The HTTP status, machine-readable code, and human message for the wire.
+    fn rendered(self) -> (StatusCode, &'static str, String) {
+        match self {
             Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
@@ -137,6 +182,11 @@ impl IntoResponse for ApiError {
                 "unauthorized",
                 "deciding on enrollment requests requires an operator credential".to_owned(),
             ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "not permitted to decide on enrollment requests".to_owned(),
+            ),
             Self::Internal(message) => {
                 tracing::error!(error = %message, "enrollment request could not be served");
                 (
@@ -145,8 +195,13 @@ impl IntoResponse for ApiError {
                     "the enrollment service could not complete the request".to_owned(),
                 )
             },
-        };
+        }
+    }
+}
 
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = self.rendered();
         (
             status,
             Json(ErrorBody {

@@ -13,7 +13,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use enrollment::{AppState, JoiningConfig, Operators, Store, router};
+use enrollment::{AppState, JoiningConfig, Operators, Store, authz::Authorizer, router};
 use http_body_util::BodyExt as _;
 use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 use serde_json::{Value, json};
@@ -28,7 +28,7 @@ fn service() -> axum::Router {
     router(Arc::new(AppState {
         store: Store::memory(),
         ca,
-        operators: Operators::from_table("tester: t0ken\n"),
+        authorizer: Authorizer::Local(Operators::from_table("tester: t0ken\n")),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         joining: JoiningConfig {
             gossip_key: Some("dGVzdC1nb3NzaXAta2V5LTMyLWJ5dGVzLWxvbmchIQ==".to_owned()),

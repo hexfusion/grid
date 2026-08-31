@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod authz;
 pub mod model;
 pub mod store;
 
