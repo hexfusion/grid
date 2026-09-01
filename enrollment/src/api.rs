@@ -252,7 +252,7 @@ fn signing_error(err: EnrollError) -> ApiError {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/requests", post(create).get(list))
-        .route("/v1/requests/{request_id}", get(fetch))
+        .route("/v1/requests/{request_id}", get(fetch).delete(remove))
         .route("/v1/requests/{request_id}/approve", post(approve))
         .route("/v1/requests/{request_id}/deny", post(deny))
         .route("/v1/requests/{request_id}/join", post(join))
@@ -452,4 +452,15 @@ async fn deny(
     let updated = state.store.mark_denied(request_id, operator.clone(), reason).await?;
     tracing::info!(site = %updated.site_name, %operator, "enrollment denied");
     Ok(Json(updated))
+}
+
+/// Delete an enrollment request. Requires an operator token.
+async fn remove(
+    State(state): State<Arc<AppState>>,
+    Operator(operator): Operator,
+    Path(request_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    state.store.delete(request_id).await?;
+    tracing::info!(%request_id, %operator, "enrollment deleted");
+    Ok(StatusCode::NO_CONTENT)
 }

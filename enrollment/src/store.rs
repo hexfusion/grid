@@ -180,6 +180,18 @@ impl Store {
             Self::Postgres(store) => store.mark_denied(request_id, decided_by, reason).await,
         }
     }
+
+    /// Delete a request, whatever phase it is in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] if no request has that identifier.
+    pub async fn delete(&self, request_id: Uuid) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(store) => store.delete(request_id),
+            Self::Postgres(store) => store.delete(request_id).await,
+        }
+    }
 }
 
 /// Requests held in this process.
@@ -263,6 +275,15 @@ impl MemoryStore {
     fn get(&self, request_id: Uuid) -> Result<StoredRequest, StoreError> {
         let inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
         inner.by_id.get(&request_id).cloned().ok_or(StoreError::NotFound)
+    }
+
+    /// Remove a request from both the index and the arrival order.
+    fn delete(&self, request_id: Uuid) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let existed = inner.by_id.remove(&request_id).is_some();
+        inner.order.retain(|id| *id != request_id);
+        drop(inner);
+        existed.then_some(()).ok_or(StoreError::NotFound)
     }
 
     /// Move a pending request to issued.

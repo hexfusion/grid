@@ -100,6 +100,19 @@ impl PgStore {
         })
     }
 
+    /// Delete one request, whatever phase it is in.
+    pub(super) async fn delete(&self, request_id: Uuid) -> Result<(), StoreError> {
+        let result = sqlx::query("DELETE FROM enrollment_requests WHERE id = $1")
+            .bind(request_id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     /// Move a pending request to issued.
     ///
     /// Guarded on `phase = 'pending'`, so two approvals racing from separate

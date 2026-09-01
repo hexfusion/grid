@@ -102,8 +102,9 @@ struct EnrollArgs {
     #[arg(long, default_value = "grid-system")]
     namespace: String,
 
-    /// How to hand back the kit: `files` under --out, or `embedded` Secrets on stdout.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Files)]
+    /// How to hand back the kit: `embedded` Secrets on stdout (default, implies --wait),
+    /// or `files` under --out.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Embedded)]
     output: OutputFormat,
 
     /// Wait for a decision rather than returning after submitting.
@@ -158,6 +159,12 @@ enum EnrollmentCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+
+    /// Delete an enrollment request, whatever phase it is in.
+    Delete {
+        /// The enrollment to delete.
+        request_id: String,
+    },
 }
 
 /// A string field of a record, or a dash when it is absent.
@@ -184,6 +191,7 @@ async fn main() -> Result<(), Failure> {
         Command::Enrollment(EnrollmentCommand::Deny { request_id, reason }) => {
             deny(&client, &request_id, reason.as_deref()).await
         },
+        Command::Enrollment(EnrollmentCommand::Delete { request_id }) => delete(&client, &request_id).await,
         Command::Enrollment(EnrollmentCommand::Export {
             request_id,
             namespace,
@@ -195,16 +203,22 @@ async fn main() -> Result<(), Failure> {
 /// Generate a key, ask for a name, and collect the certificate.
 async fn enroll(client: &Client, args: &EnrollArgs) -> Result<(), Failure> {
     let key = rcgen::KeyPair::generate()?;
-    let key_path = args.out.join(format!("{}-key.pem", args.site));
-    write_private(&key_path, &key.serialize_pem())?;
-    eprintln!("wrote {} (keep this; it is never sent)", key_path.display());
+    // In files mode the key is persisted next to the kit; in embedded mode it is
+    // carried inside the emitted identity Secret, so no separate file is written.
+    if args.output == OutputFormat::Files {
+        let key_path = args.out.join(format!("{}-key.pem", args.site));
+        write_private(&key_path, &key.serialize_pem())?;
+        eprintln!("wrote {} (keep this; it is never sent)", key_path.display());
+    }
 
     let body = submission(args, &key)?;
     let created = client.send(Method::POST, "/v1/requests", Some(body), false).await?;
     let request_id = field(&created, "requestId").to_owned();
     eprintln!("submitted request {request_id} for site {}", args.site);
 
-    if !args.wait {
+    // Embedded output emits the issued cert, so it always waits for a decision.
+    let wait = args.wait || args.output == OutputFormat::Embedded;
+    if !wait {
         eprintln!("an operator must approve it: gridctl enrollment approve {request_id}");
         return Ok(());
     }
@@ -424,6 +438,14 @@ async fn deny(client: &Client, request_id: &str, reason: Option<&str>) -> Result
     let body = reason.map(|reason| json!({"reason": reason}));
     let record = client.send(Method::POST, &path, body, true).await?;
     println!("denied {}", field(&record, "siteName"));
+    Ok(())
+}
+
+/// Delete one request.
+async fn delete(client: &Client, request_id: &str) -> Result<(), Failure> {
+    let path = format!("/v1/requests/{request_id}");
+    client.send(Method::DELETE, &path, None, true).await?;
+    println!("deleted {request_id}");
     Ok(())
 }
 
