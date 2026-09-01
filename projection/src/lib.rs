@@ -119,7 +119,13 @@ fn external_model(site: &str, namespace: &str, model: &Value) -> Value {
     let name = field(model, "name");
     let slug: String = name
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     json!({
         "apiVersion": "inference.opendatahub.io/v1alpha1",

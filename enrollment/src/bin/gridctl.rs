@@ -273,7 +273,10 @@ async fn collect(client: &Client, record: &Value, args: &EnrollArgs, key: &rcgen
         OutputFormat::Files => write_kit(&kit, args, key),
         OutputFormat::Embedded => {
             // The product goes to stdout so it can be piped to `kubectl apply -f -`.
-            print!("{}", kit_secrets_yaml(&args.site, &args.namespace, &kit, &key.serialize_pem()));
+            print!(
+                "{}",
+                kit_secrets_yaml(&args.site, &args.namespace, &kit, &key.serialize_pem())
+            );
             Ok(())
         },
     }
@@ -347,7 +350,11 @@ fn kit_secrets_yaml(site: &str, namespace: &str, kit: &Value, key_pem: &str) -> 
         &[("tls.crt", cert.as_str()), ("tls.key", key.as_str())],
     ));
     if let Some(gossip) = kit.get("gossipKey").and_then(Value::as_str) {
-        out.push_str(&secret_doc(&format!("{site}-swim-key"), namespace, &[("key", gossip.trim())]));
+        out.push_str(&secret_doc(
+            &format!("{site}-swim-key"),
+            namespace,
+            &[("key", gossip.trim())],
+        ));
     }
     out
 }

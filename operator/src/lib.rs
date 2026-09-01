@@ -19,10 +19,10 @@ pub mod cli;
 pub mod controller;
 /// Custom resource definitions.
 pub mod crd;
-/// Operator error types.
-pub mod error;
 /// Materializes a `GridSite` for each approved enrollment (server-side projection).
 pub mod enrollment_projector;
+/// Operator error types.
+pub mod error;
 /// Prometheus metrics for gateway probe and phase-transition observability.
 pub mod metrics;
 /// Pure Prometheus text-format parser for inference backend metrics.
