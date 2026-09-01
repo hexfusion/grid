@@ -25,17 +25,19 @@ COPY crdt/Cargo.toml crdt/Cargo.toml
 COPY operator/Cargo.toml operator/Cargo.toml
 COPY scoring/Cargo.toml scoring/Cargo.toml
 COPY swim/Cargo.toml swim/Cargo.toml
+COPY projection/Cargo.toml projection/Cargo.toml
 
 # Strip workspace members not needed for the operator binary so this image build
 # does not need their manifests or source.
-RUN sed -i '/forge/d; /mock-providers/d; /overlay-sync/d; /xtask/d' Cargo.toml
+RUN sed -i '/forge/d; /mock-providers/d; /overlay-sync/d; /xtask/d; /enrollment/d' Cargo.toml
 
-RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src \
+RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src projection/src \
     && echo '//! stub' > certs/src/lib.rs \
     && echo '//! stub' > crdt/src/lib.rs \
     && echo '//! stub' > operator/src/lib.rs \
     && echo '//! stub' > scoring/src/lib.rs \
     && echo '//! stub' > swim/src/lib.rs \
+    && echo '//! stub' > projection/src/lib.rs \
     && printf '//! stub\nfn main() {}\n' > operator/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -51,8 +53,9 @@ COPY crdt/src crdt/src
 COPY operator/src operator/src
 COPY scoring/src scoring/src
 COPY swim/src swim/src
+COPY projection/src projection/src
 
-RUN find certs/src crdt/src operator/src scoring/src swim/src \
+RUN find certs/src crdt/src operator/src scoring/src swim/src projection/src \
     -name '*.rs' -exec touch {} +
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

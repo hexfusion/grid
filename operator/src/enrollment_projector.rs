@@ -122,7 +122,11 @@ async fn list_issued(config: &Config) -> Result<Vec<Value>, Failure> {
         builder = builder.header("authorization", format!("Bearer {}", config.token));
     }
     let response = http.request(builder.body(Empty::new())?).await?;
+    let status = response.status();
     let bytes = response.into_body().collect().await?.to_bytes();
+    if !status.is_success() {
+        return Err(format!("enrollment service returned {status} listing issued requests").into());
+    }
     let body: Value = serde_json::from_slice(&bytes)?;
     Ok(body.as_array().cloned().unwrap_or_default())
 }

@@ -71,7 +71,7 @@ fn grid_site_spec(record: &Value, site: &str, address: &str, fingerprint: &str) 
         "gridNetworkRef": field(record, "gridNetworkRef"),
         "egress": {
             "address": address,
-            "tls": { "mode": "mutual", "serverName": format!("{site}.grid.internal") },
+            "tls": { "mode": "Mutual", "serverName": format!("{site}.grid.internal") },
         },
         "trust": { "canonicalFingerprints": [fingerprint] },
     })
@@ -189,7 +189,7 @@ mod tests {
         );
         assert_eq!(site["spec"]["gridNetworkRef"], "grid.internal");
         assert_eq!(site["spec"]["egress"]["address"], "site-x.example:8443");
-        assert_eq!(site["spec"]["egress"]["tls"]["mode"], "mutual");
+        assert_eq!(site["spec"]["egress"]["tls"]["mode"], "Mutual");
         assert_eq!(site["spec"]["egress"]["tls"]["serverName"], "site-x.grid.internal");
         let fingerprints = site["spec"]["trust"]["canonicalFingerprints"]
             .as_array()
