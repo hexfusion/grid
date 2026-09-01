@@ -19,15 +19,18 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY enrollment/Cargo.toml enrollment/Cargo.toml
 COPY certs/Cargo.toml certs/Cargo.toml
+COPY projection/Cargo.toml projection/Cargo.toml
 
-# Strip workspace members this binary does not need. certs stays: it signs.
+# Strip workspace members this binary does not need. certs signs; projection is
+# pulled in by gridctl, which this crate also builds.
 RUN sed -i '/"crdt"/d; /"forge"/d; /"mock-providers"/d; /"operator"/d; /"overlay-sync"/d; /"scoring"/d; /"swim"/d; /"xtask"/d' Cargo.toml
 
-RUN mkdir -p enrollment/src/bin certs/src \
+RUN mkdir -p enrollment/src/bin certs/src projection/src \
     && printf '//! stub\nfn main() {}\n' > enrollment/src/main.rs \
     && printf '//! stub\nfn main() {}\n' > enrollment/src/bin/gridctl.rs \
     && printf '//! stub\n' > enrollment/src/lib.rs \
-    && printf '//! stub\n' > certs/src/lib.rs
+    && printf '//! stub\n' > certs/src/lib.rs \
+    && printf '//! stub\n' > projection/src/lib.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
@@ -39,9 +42,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 COPY certs/src certs/src
 COPY enrollment/src enrollment/src
+COPY projection/src projection/src
 COPY enrollment/db enrollment/db
 
-RUN find certs/src enrollment/src -name '*.rs' -exec touch {} +
+RUN find certs/src enrollment/src projection/src -name '*.rs' -exec touch {} +
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
