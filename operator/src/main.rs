@@ -102,6 +102,12 @@ async fn main() {
         ));
     }
 
+    // Server-side project a GridSite for every approved enrollment, when the
+    // enrollment service is configured. Off by default (GRID_ENROLLMENT_URL unset).
+    if let Some(projector) = operator::enrollment_projector::Config::from_env() {
+        tokio::spawn(operator::enrollment_projector::run(client.clone(), projector));
+    }
+
     let swim_for_poller = swim.clone();
     let ctx = Arc::new(OperatorCtx::new(client.clone(), swim));
 

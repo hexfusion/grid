@@ -1,0 +1,17 @@
+[package]
+name = "projection"
+description = "Projects an approved enrollment into cluster resources (GridSite, MaaS)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+certs = { path = "../certs" }
+
+[lints]
+workspace = true

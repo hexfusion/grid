@@ -5,7 +5,11 @@
 //! certificate once an operator has approved. An operator runs `requests` to see
 //! what is waiting and to decide.
 
-#![expect(clippy::print_stdout, reason = "gridctl is a CLI; its output is the product")]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "gridctl is a CLI; stdout is the product, stderr is progress"
+)]
 
 use std::{
     path::{Path, PathBuf},
@@ -58,6 +62,15 @@ enum Command {
     Enrollment(EnrollmentCommand),
 }
 
+/// How to hand back the joining kit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    /// Write the kit as files under `<out>/<site>-grid/`.
+    Files,
+    /// Emit apply-ready Secret manifests on stdout, certs embedded.
+    Embedded,
+}
+
 /// How to ask for membership.
 #[derive(Debug, Parser)]
 struct EnrollArgs {
@@ -84,6 +97,14 @@ struct EnrollArgs {
     /// Where to write the key, and the certificate once issued.
     #[arg(long, default_value = ".")]
     out: PathBuf,
+
+    /// Namespace for the apply-ready trust Secrets.
+    #[arg(long, default_value = "grid-system")]
+    namespace: String,
+
+    /// How to hand back the kit: `files` under --out, or `embedded` Secrets on stdout.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Files)]
+    output: OutputFormat,
 
     /// Wait for a decision rather than returning after submitting.
     #[arg(long)]
@@ -176,15 +197,15 @@ async fn enroll(client: &Client, args: &EnrollArgs) -> Result<(), Failure> {
     let key = rcgen::KeyPair::generate()?;
     let key_path = args.out.join(format!("{}-key.pem", args.site));
     write_private(&key_path, &key.serialize_pem())?;
-    println!("wrote {} (keep this; it is never sent)", key_path.display());
+    eprintln!("wrote {} (keep this; it is never sent)", key_path.display());
 
     let body = submission(args, &key)?;
     let created = client.send(Method::POST, "/v1/requests", Some(body), false).await?;
     let request_id = field(&created, "requestId").to_owned();
-    println!("submitted request {request_id} for site {}", args.site);
+    eprintln!("submitted request {request_id} for site {}", args.site);
 
     if !args.wait {
-        println!("an operator must approve it: gridctl enrollment approve {request_id}");
+        eprintln!("an operator must approve it: gridctl enrollment approve {request_id}");
         return Ok(());
     }
 
@@ -230,11 +251,18 @@ async fn collect(client: &Client, record: &Value, args: &EnrollArgs, key: &rcgen
         other => return Err(format!("request ended in phase {}", other.unwrap_or("unknown")).into()),
     }
 
-    println!("approved as {}", field(record, "spiffeId"));
+    eprintln!("approved as {}", field(record, "spiffeId"));
 
     let request_id = field(record, "requestId");
     let kit = client.collect_kit(request_id, key).await?;
-    write_kit(&kit, args)
+    match args.output {
+        OutputFormat::Files => write_kit(&kit, args, key),
+        OutputFormat::Embedded => {
+            // The product goes to stdout so it can be piped to `kubectl apply -f -`.
+            print!("{}", kit_secrets_yaml(&args.site, &args.namespace, &kit, &key.serialize_pem()));
+            Ok(())
+        },
+    }
 }
 
 /// Write the joining kit where a proxy can be pointed at it.
@@ -242,7 +270,7 @@ async fn collect(client: &Client, record: &Value, args: &EnrollArgs, key: &rcgen
 /// A certificate on its own is not enough to join: a member also has to verify
 /// its peers and reach the mesh. All of it lands in one directory so the next
 /// step is configuration rather than assembly.
-fn write_kit(kit: &Value, args: &EnrollArgs) -> Result<(), Failure> {
+fn write_kit(kit: &Value, args: &EnrollArgs, key: &rcgen::KeyPair) -> Result<(), Failure> {
     let dir = args.out.join(format!("{}-grid", args.site));
     std::fs::create_dir_all(&dir)?;
 
@@ -258,30 +286,84 @@ fn write_kit(kit: &Value, args: &EnrollArgs) -> Result<(), Failure> {
 
     match kit.get("gossipKey").and_then(Value::as_str) {
         Some(gossip_key) => write_private(&dir.join("gossip.key"), gossip_key)?,
-        None => println!("warning: the grid returned no gossip key, so this site cannot join the mesh"),
+        None => eprintln!("warning: the grid returned no gossip key, so this site cannot join the mesh"),
     }
 
-    println!("wrote {}/", dir.display());
-    println!("  tls.crt     this site's certificate");
-    println!("  ca.crt      the grid CA, for verifying peers");
-    println!("  gossip.key  shared transport key");
-    println!("  seeds       peers to announce to");
-    println!();
-    println!("point the grid operator at it:");
-    println!("  GRID_SITE_CERT_PATH={}/tls.crt", dir.display());
-    println!("  GRID_CA_CERT_PATH={}/ca.crt", dir.display());
-    println!(
-        "  GRID_SITE_KEY_PATH={}",
-        args.out.join(format!("{}-key.pem", args.site)).display()
-    );
+    // The same material as apply-ready Secrets. Only enroll holds the private key,
+    // so only enroll can emit the identity Secret; export (operator-side) cannot.
+    std::fs::write(
+        dir.join("secrets.yaml"),
+        kit_secrets_yaml(&args.site, &args.namespace, kit, &key.serialize_pem()),
+    )?;
+
+    describe_kit(&dir, &args.site);
     Ok(())
+}
+
+/// Tell the operator what landed and how to bring it into a cluster.
+fn describe_kit(dir: &Path, site: &str) {
+    eprintln!("wrote {}/", dir.display());
+    eprintln!("  tls.crt      this site's certificate");
+    eprintln!("  ca.crt       the grid CA, for verifying peers");
+    eprintln!("  gossip.key   shared transport key");
+    eprintln!("  seeds        peers to announce to");
+    eprintln!("  secrets.yaml apply-ready Secrets ({site}-ca, {site}-identity, {site}-swim-key)");
+    eprintln!();
+    eprintln!("bring the identity into the operator's cluster:");
+    eprintln!("  kubectl apply -f {}/secrets.yaml", dir.display());
+    eprintln!("then point the GridNetwork tls refs at those Secret names.");
+}
+
+/// The trust material as apply-ready Secret manifests.
+///
+/// Names follow `<site>-{ca,identity,swim-key}`, the form a `GridNetwork`'s
+/// `caSecretRef` / `siteSecretRef` / `swimKeyRef` point at. The SWIM key is already
+/// base64 over its 32 raw bytes, which is exactly a Secret data value, so it is
+/// carried through unchanged; the PEM documents are base64-encoded here.
+fn kit_secrets_yaml(site: &str, namespace: &str, kit: &Value, key_pem: &str) -> String {
+    let enc = |text: &str| base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let ca = enc(field(kit, "caBundle"));
+    let cert = enc(field(kit, "certificate"));
+    let key = enc(key_pem);
+
+    let mut out = secret_doc(&format!("{site}-ca"), namespace, &[("ca.crt", ca.as_str())]);
+    out.push_str(&secret_doc(
+        &format!("{site}-identity"),
+        namespace,
+        &[("tls.crt", cert.as_str()), ("tls.key", key.as_str())],
+    ));
+    if let Some(gossip) = kit.get("gossipKey").and_then(Value::as_str) {
+        out.push_str(&secret_doc(&format!("{site}-swim-key"), namespace, &[("key", gossip.trim())]));
+    }
+    out
+}
+
+/// One Opaque Secret manifest with already-encoded data values.
+fn secret_doc(name: &str, namespace: &str, data: &[(&str, &str)]) -> String {
+    let mut doc = format!(
+        "---\n\
+         apiVersion: v1\n\
+         kind: Secret\n\
+         metadata:\n\
+        \x20 name: {name}\n\
+        \x20 namespace: {namespace}\n\
+         data:\n"
+    );
+    for (field_name, value) in data {
+        doc.push_str("  ");
+        doc.push_str(field_name);
+        doc.push_str(": ");
+        doc.push_str(value);
+        doc.push('\n');
+    }
+    doc
 }
 
 /// Poll one request until it leaves the pending phase.
 async fn poll_until_decided(client: &Client, request_id: &str, timeout: Duration) -> Result<Value, Failure> {
     let path = format!("/v1/requests/{request_id}");
     let started = tokio::time::Instant::now();
-    println!("waiting for a decision");
+    eprintln!("waiting for a decision");
 
     loop {
         let record = client.send(Method::GET, &path, None, false).await?;
@@ -365,127 +447,16 @@ async fn export(client: &Client, request_id: &str, namespace: &str, with_models:
         .into());
     }
 
-    let site = field(&record, "siteName");
-    let address = record
-        .get("egress")
-        .and_then(|egress| egress.get("address"))
-        .and_then(Value::as_str)
-        .ok_or("the enrollment recorded no egress address")?;
-
-    // The pin is derived from the certificate the grid just issued, so an
-    // operator no longer copies a fingerprint between machines by hand.
-    let fingerprint = certs::canonical_fingerprint(field(&record, "certificate"))?;
-
-    print!("{}", grid_site_yaml(site, namespace, &record, address, &fingerprint));
+    // One projection definition, shared with the operator (which applies the same
+    // objects typed). The GridSite carries reachability and trust; --with-models
+    // adds the MaaS resources that surface what the member serves.
+    let mut objects = vec![projection::grid_site(&record)?];
     if with_models {
-        print!("{}", maas_yaml(site, namespace, &record, address));
+        objects.extend(projection::maas(&record, namespace)?);
     }
+    print!("{}", projection::to_yaml(&objects)?);
     Ok(())
 }
-
-/// The `GridSite` that tells this cluster a member exists.
-fn grid_site_yaml(site: &str, namespace: &str, record: &Value, address: &str, fingerprint: &str) -> String {
-    format!(
-        "---\n\
-         apiVersion: grid.praxis-proxy.io/v1alpha1\n\
-         kind: GridSite\n\
-         metadata:\n\
-        \x20 name: {site}\n\
-        \x20 namespace: {namespace}\n\
-        \x20 annotations:\n\
-        \x20   grid.praxis-proxy.io/enrolled-as: {spiffe}\n\
-        \x20   grid.praxis-proxy.io/enrollment-request: {request}\n\
-         spec:\n\
-        \x20 gridNetworkRef: {grid}\n\
-        \x20 egress:\n\
-        \x20   address: {address}\n\
-        \x20   tls:\n\
-        \x20     mode: mutual\n\
-        \x20     serverName: {site}.grid.internal\n\
-        \x20 trust:\n\
-        \x20   canonicalFingerprints:\n\
-        \x20     - {fingerprint}\n",
-        spiffe = field(record, "spiffeId"),
-        request = field(record, "requestId"),
-        grid = field(record, "gridNetworkRef"),
-    )
-}
-
-/// The MaaS resources that surface a member's models in the dashboard.
-///
-/// `auth.type` is `mtls` because an enrolled peer authenticates with the certificate
-/// the grid issued it, not an API key. That value is not yet in the upstream
-/// enum, which is the change this asks for.
-fn maas_yaml(site: &str, namespace: &str, record: &Value, address: &str) -> String {
-    let models = record
-        .get("capabilities")
-        .and_then(|caps| caps.get("inference"))
-        .and_then(|inference| inference.get("models"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut out = external_provider_yaml(site, namespace, address);
-    for model in &models {
-        out.push_str(&external_model_yaml(site, namespace, model));
-    }
-    out
-}
-
-/// The provider entry for one enrolled member.
-fn external_provider_yaml(site: &str, namespace: &str, address: &str) -> String {
-    format!(
-        "---\n\
-         apiVersion: inference.opendatahub.io/v1alpha1\n\
-         kind: ExternalProvider\n\
-         metadata:\n\
-        \x20 name: {site}\n\
-        \x20 namespace: {namespace}\n\
-         spec:\n\
-        \x20 provider: {site}\n\
-        \x20 endpoint: {address}\n\
-        \x20 auth:\n\
-        \x20   type: mtls\n\
-        \x20   secretRef:\n\
-        \x20     name: {site}-grid-identity\n"
-    )
-}
-
-/// One model the member serves, pointed at its provider entry.
-fn external_model_yaml(site: &str, namespace: &str, model: &Value) -> String {
-    let name = field(model, "name");
-    let slug: String = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    format!(
-        "---\n\
-         apiVersion: inference.opendatahub.io/v1alpha1\n\
-         kind: ExternalModel\n\
-         metadata:\n\
-        \x20 name: {slug}-{site}\n\
-        \x20 namespace: {namespace}\n\
-         spec:\n\
-        \x20 modelName: {slug}\n\
-        \x20 externalProviderRefs:\n\
-        \x20   - ref:\n\
-        \x20       name: {site}\n\
-        \x20     targetModel: {name}\n\
-        \x20     path: {path}\n\
-        \x20     apiFormat: {api_format}\n\
-        \x20     weight: 100\n",
-        path = field(model, "path"),
-        api_format = field(model, "apiFormat"),
-    )
-}
-
 
 /// Write a file only the owner can read.
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {

@@ -8,6 +8,7 @@ members = [
     "mock-providers",
     "operator",
     "overlay-sync",
+    "projection",
     "scoring",
     "swim",
     "xtask",

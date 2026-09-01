@@ -22,6 +22,7 @@ hyper-rustls = { workspace = true }
 hyper = { workspace = true, features = ["server"] }
 hyper-util = { workspace = true }
 scoring = { path = "../scoring" }
+projection = { path = "../projection" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 percent-encoding = { workspace = true }
