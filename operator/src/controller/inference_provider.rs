@@ -2556,7 +2556,6 @@ mod tests {
                 capabilities: Vec::new(),
                 context_window: None,
                 exposed: true,
-                inference_pool: None,
             }],
             provider_kind: "self_hosted".to_owned(),
             routing_cluster_ref: None,

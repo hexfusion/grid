@@ -488,15 +488,6 @@ spec:
                           a provider running many pools does not expose all of them to the grid.
                           Set `true` to make the model grid-visible.
                         type: boolean
-                      inferencePool:
-                        description: |-
-                          Optional name of the InferencePool backing this model.
-
-                          Advisory: when set, the controller may resolve the pool for provenance,
-                          but a missing pool is ignored (never an error), so grid exposure does not
-                          hard-depend on the InferencePool CR existing.
-                        nullable: true
-                        type: string
                       name:
                         description: Model name.
                         type: string
