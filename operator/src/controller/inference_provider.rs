@@ -746,7 +746,10 @@ mod tests {
     }
 
     fn test_provider(name: &str, network: &str, models: &[&str]) -> InferenceProvider {
-        let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
+        let models_json: Vec<serde_json::Value> = models
+            .iter()
+            .map(|m| serde_json::json!({ "name": m, "exposed": true }))
+            .collect();
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "InferenceProvider",
@@ -2552,6 +2555,8 @@ mod tests {
                 name: "model-a".to_owned(),
                 capabilities: Vec::new(),
                 context_window: None,
+                exposed: true,
+                inference_pool: None,
             }],
             provider_kind: "self_hosted".to_owned(),
             routing_cluster_ref: None,

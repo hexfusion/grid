@@ -1741,7 +1741,14 @@ fn provider_state_from_kube(
 ) -> Option<crdt::ProviderState> {
     let provider_id = provider.metadata.name.as_deref()?;
     let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
-    let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
+    // Opt-in exposure: only publish grid-visible models to peers via the CRDT.
+    let models = provider
+        .spec
+        .models
+        .iter()
+        .filter(|m| m.exposed)
+        .map(|m| m.name.clone())
+        .collect();
     let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
     let revision = provider_revision(provider);
 
@@ -2866,7 +2873,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "GridNetwork",
-            "metadata": { "name": "net" },
+            "metadata": { "name": "net", "exposed": true },
             "spec": { "seeds": [], "gridId": "test-id" }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -3228,7 +3235,7 @@ mod tests {
                 "providerKind": "self_hosted",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8080",
-                "models": [{ "name": "model-a" }, { "name": "model-b" }]
+                "models": [{ "name": "model-a", "exposed": true }, { "name": "model-b", "exposed": true }]
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -3244,7 +3251,7 @@ mod tests {
                 "providerKind": "self_hosted",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
-                "models": [{ "name": "model-x" }],
+                "models": [{ "name": "model-x", "exposed": true }],
                 "routingClusterRef": routing_ref
             }
         }))
@@ -3261,7 +3268,7 @@ mod tests {
                 "providerKind": "self_hosted",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
-                "models": [{ "name": "model-x" }]
+                "models": [{ "name": "model-x", "exposed": true }]
             },
             "status": { "phase": phase }
         }))
@@ -3397,7 +3404,7 @@ mod tests {
         let p: InferenceProvider = serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "InferenceProvider",
-            "metadata": { "name": "prov-no-gen" },
+            "metadata": { "name": "prov-no-gen", "exposed": true },
             "spec": {
                 "gridNetworkRef": "net",
                 "providerKind": "self_hosted",
@@ -3965,7 +3972,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "GridNetwork",
-            "metadata": { "name": "glb-demo" },
+            "metadata": { "name": "glb-demo", "exposed": true },
             "spec": {
                 "gridId": "id",
                 "gatewayRefs": [{

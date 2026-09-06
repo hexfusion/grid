@@ -355,6 +355,23 @@ pub struct ModelInfo {
 
     /// Maximum context window size.
     pub context_window: Option<u32>,
+
+    /// Whether this model is published to the grid.
+    ///
+    /// Opt-in: when `false` (the default) the model is served locally but is NOT
+    /// rendered into routing overlay candidates and is NOT published to peers, so
+    /// a provider running many pools does not expose all of them to the grid.
+    /// Set `true` to make the model grid-visible.
+    #[serde(default)]
+    pub exposed: bool,
+
+    /// Optional name of the `InferencePool` backing this model.
+    ///
+    /// Advisory: when set, the controller may resolve the pool for provenance,
+    /// but a missing pool is ignored (never an error), so grid exposure does not
+    /// hard-depend on the `InferencePool` CR existing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_pool: Option<String>,
 }
 
 /// Health check configuration.

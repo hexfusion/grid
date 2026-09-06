@@ -478,6 +478,25 @@ spec:
                         minimum: 0.0
                         nullable: true
                         type: integer
+                      exposed:
+                        default: false
+                        description: |-
+                          Whether this model is published to the grid.
+
+                          Opt-in: when `false` (the default) the model is served locally but is NOT
+                          rendered into routing overlay candidates and is NOT published to peers, so
+                          a provider running many pools does not expose all of them to the grid.
+                          Set `true` to make the model grid-visible.
+                        type: boolean
+                      inferencePool:
+                        description: |-
+                          Optional name of the InferencePool backing this model.
+
+                          Advisory: when set, the controller may resolve the pool for provenance,
+                          but a missing pool is ignored (never an error), so grid exposure does not
+                          hard-depend on the InferencePool CR existing.
+                        nullable: true
+                        type: string
                       name:
                         description: Model name.
                         type: string
