@@ -101,6 +101,10 @@ pub struct EnrollmentRequest {
     /// The grid being joined.
     pub grid_network_ref: String,
 
+    /// The geo-fence region, stamped from the redeemed invite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
     /// Where the request has got to.
     pub phase: EnrollmentPhase,
 
@@ -188,6 +192,54 @@ pub struct JoinProof {
     /// Made with the private key whose public half the request carried, which
     /// only the provider that made it holds.
     pub signature: String,
+}
+
+/// What an operator submits to mint a site token (an enrollment invite).
+///
+/// The operator pins the name and region at issue, so identity and geo-fence are
+/// the grid's decision, not something the enrollee asserts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteInput {
+    /// The grid-assigned name the enrollee will be admitted under.
+    pub site_name: String,
+
+    /// The geo-fence region pinned onto the site.
+    pub region: String,
+
+    /// The grid the invite admits into.
+    pub grid_network_ref: String,
+
+    /// Seconds until the token expires; a default applies when unset.
+    #[serde(default)]
+    pub expires_in_secs: Option<i64>,
+}
+
+/// A freshly minted site token, returned once.
+///
+/// The raw token appears here and nowhere else: only its digest is stored, so a
+/// caller that loses it has to be issued another.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedInvite {
+    /// The invite's identifier.
+    pub invite_id: Uuid,
+
+    /// The bearer token, handed back this once.
+    pub token: String,
+
+    /// The pinned name.
+    pub site_name: String,
+
+    /// The pinned region.
+    pub region: String,
+
+    /// The grid this invite admits into.
+    pub grid_network_ref: String,
+
+    /// When the token stops being redeemable.
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
 }
 
 /// Narrowing applied when listing.

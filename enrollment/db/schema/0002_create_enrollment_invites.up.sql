@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS enrollment_invites (
     -- When set, the invited provider may only ask for this name, so the operator
     -- chose it before the provider ever spoke.
     site_name    TEXT,
+    -- The geo-fence region, pinned by the operator so the enrollee cannot assert it.
+    region       TEXT,
     grid_network_ref TEXT NOT NULL,
     issued_by    TEXT NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),

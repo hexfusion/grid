@@ -6,6 +6,9 @@ CREATE TABLE IF NOT EXISTS enrollment_requests (
     id                UUID PRIMARY KEY,
     site_name         TEXT NOT NULL,
     grid_network_ref  TEXT NOT NULL,
+    -- The geo-fence region, stamped from the redeemed invite; null for a request
+    -- made before invites gated submit.
+    region            TEXT,
     -- Kept so approval can sign the request the submitter actually made,
     -- rather than one reconstructed later.
     csr_pem           TEXT NOT NULL,

@@ -51,12 +51,37 @@ fn plain_csr() -> String {
 }
 
 async fn call(app: &axum::Router, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    send(app, method, path, body, None).await
+    send(app, method, path, body, &[]).await
 }
 
 /// A call carrying an operator credential.
 async fn call_as_operator(app: &axum::Router, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    send(app, method, path, body, Some(TOKEN)).await
+    let bearer = format!("Bearer {TOKEN}");
+    send(app, method, path, body, &[("authorization", &bearer)]).await
+}
+
+/// Mint a site token for `site`, pinned to region `us`.
+async fn invite_for(app: &axum::Router, site: &str) -> String {
+    let (status, body) = call_as_operator(
+        app,
+        "POST",
+        "/v1/invites",
+        Some(json!({ "siteName": site, "region": "us", "gridNetworkRef": "demo-grid" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "issuing a site token should succeed");
+    body["token"].as_str().expect("token").to_owned()
+}
+
+/// Submit for `site` carrying a freshly issued invite, the way a site now must.
+async fn submit_invited(app: &axum::Router, site: &str, csr: &str) -> (StatusCode, Value) {
+    let token = invite_for(app, site).await;
+    submit_with_token(app, site, csr, &token).await
+}
+
+/// Submit for `site` presenting `token` in the invite header.
+async fn submit_with_token(app: &axum::Router, site: &str, csr: &str, token: &str) -> (StatusCode, Value) {
+    send(app, "POST", "/v1/requests", Some(submit(site, csr)), &[("x-grid-invite", token)]).await
 }
 
 async fn send(
@@ -64,14 +89,14 @@ async fn send(
     method: &str,
     path: &str,
     body: Option<Value>,
-    token: Option<&str>,
+    headers: &[(&str, &str)],
 ) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
         .header("content-type", "application/json");
-    if let Some(token) = token {
-        builder = builder.header("authorization", format!("Bearer {token}"));
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
     }
     let request = builder
         .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
@@ -106,7 +131,7 @@ fn submit(site: &str, csr: &str) -> Value {
 async fn a_provider_enrolls_and_collects_a_certificate() {
     let app = service();
 
-    let (create_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (create_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
     assert_eq!(create_status, StatusCode::CREATED, "submitting should be accepted");
     assert_eq!(created["phase"], "pending", "a new request waits for a decision");
     assert!(created["certificate"].is_null(), "nothing is issued before approval");
@@ -118,6 +143,9 @@ async fn a_provider_enrolls_and_collects_a_certificate() {
         created["capabilities"]["inference"]["models"][0]["name"],
         "Qwen/Qwen3-0.6B"
     );
+
+    // The region is the operator's pin from the invite, not anything the site sent.
+    assert_eq!(created["region"], "us", "the redeemed invite stamps its region");
 
     let (approve_status, approved) = call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
     assert_eq!(approve_status, StatusCode::OK, "approval should succeed");
@@ -144,7 +172,7 @@ async fn the_certificate_never_carries_a_name_the_request_asked_for() {
         "spiffe://grid.internal/site/site-a".to_owned().try_into().expect("ia5"),
     )]);
 
-    let (_create_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &csr))).await;
+    let (_create_status, created) = submit_invited(&app, "site-d", &csr).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
     let (_approve_status, approved) = call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
 
@@ -158,7 +186,7 @@ async fn the_certificate_never_carries_a_name_the_request_asked_for() {
 #[tokio::test]
 async fn approving_twice_issues_one_certificate() {
     let app = service();
-    let (_create_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (_create_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
 
     let (first_status, first) = call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
@@ -180,7 +208,7 @@ async fn approving_twice_issues_one_certificate() {
 #[tokio::test]
 async fn deciding_requires_an_operator_credential() {
     let app = service();
-    let (_create_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (_create_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
 
     let (approve_status, approve_body) = call(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
@@ -210,7 +238,7 @@ async fn deciding_requires_an_operator_credential() {
 #[tokio::test]
 async fn an_unknown_token_decides_nothing() {
     let app = service();
-    let (_create_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (_create_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
 
     let request = Request::builder()
@@ -231,7 +259,7 @@ async fn an_unknown_token_decides_nothing() {
 #[tokio::test]
 async fn an_enrollee_collects_its_certificate_without_a_credential() {
     let app = service();
-    let (_create_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (_create_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
     call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
 
@@ -249,9 +277,9 @@ async fn an_enrollee_collects_its_certificate_without_a_credential() {
 #[tokio::test]
 async fn listing_can_be_filtered_by_phase() {
     let app = service();
-    let (_first_status, first) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (_first_status, first) = submit_invited(&app, "site-d", &plain_csr()).await;
     let id = first["requestId"].as_str().expect("id").to_owned();
-    call(&app, "POST", "/v1/requests", Some(submit("site-e", &plain_csr()))).await;
+    submit_invited(&app, "site-e", &plain_csr()).await;
     call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
 
     let (_pending_status, pending) = call_as_operator(&app, "GET", "/v1/requests?phase=pending", None).await;
@@ -274,11 +302,11 @@ async fn listing_can_be_filtered_by_phase() {
 #[tokio::test]
 async fn two_providers_cannot_hold_the_same_name() {
     let app = service();
-    let (_first_status, first) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (_first_status, first) = submit_invited(&app, "site-d", &plain_csr()).await;
     let id = first["requestId"].as_str().expect("id").to_owned();
     call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
 
-    let (second_status, second_body) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (second_status, second_body) = submit_invited(&app, "site-d", &plain_csr()).await;
     assert_eq!(second_status, StatusCode::CONFLICT, "the name is already held");
     assert_eq!(second_body["error"], "name_taken");
 }
@@ -286,7 +314,7 @@ async fn two_providers_cannot_hold_the_same_name() {
 #[tokio::test]
 async fn a_denied_request_issues_nothing() {
     let app = service();
-    let (_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
 
     let (deny_status, denied) = call_as_operator(
@@ -318,7 +346,7 @@ async fn an_unusable_request_is_refused_on_submission() {
     let app = service();
 
     let (malformed_status, malformed_body) =
-        call(&app, "POST", "/v1/requests", Some(submit("site-d", "not a csr"))).await;
+        submit_invited(&app, "site-d", "not a csr").await;
     assert_eq!(
         malformed_status,
         StatusCode::BAD_REQUEST,
@@ -327,7 +355,7 @@ async fn an_unusable_request_is_refused_on_submission() {
     assert_eq!(malformed_body["error"], "invalid_csr");
 
     let (bad_name_status, bad_name_body) =
-        call(&app, "POST", "/v1/requests", Some(submit("Site-D", &plain_csr()))).await;
+        submit_invited(&app, "Site-D", &plain_csr()).await;
     assert_eq!(
         bad_name_status,
         StatusCode::BAD_REQUEST,
@@ -357,7 +385,7 @@ async fn an_unknown_request_is_not_found() {
 async fn requests_are_listed_newest_first() {
     let app = service();
     for site in ["site-d", "site-e", "site-f"] {
-        call(&app, "POST", "/v1/requests", Some(submit(site, &plain_csr()))).await;
+        submit_invited(&app, site, &plain_csr()).await;
     }
 
     let (_list_status, listed) = call_as_operator(&app, "GET", "/v1/requests", None).await;
@@ -445,7 +473,7 @@ async fn a_pending_request_has_no_joining_kit() {
     params.distinguished_name.push(DnType::CommonName, "site-early");
     let csr = params.serialize_request(&key).expect("csr").pem().expect("pem");
 
-    let (_status, created) = call(&app, "POST", "/v1/requests", Some(submit("site-early", &csr))).await;
+    let (_status, created) = submit_invited(&app, "site-early", &csr).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
 
     let (status, body) = call(
@@ -466,7 +494,7 @@ async fn approved_site(app: &axum::Router, site: &str) -> (String, KeyPair) {
     params.distinguished_name.push(DnType::CommonName, site);
     let csr = params.serialize_request(&key).expect("csr").pem().expect("pem");
 
-    let (_status, created) = call(app, "POST", "/v1/requests", Some(submit(site, &csr))).await;
+    let (_status, created) = submit_invited(app, site, &csr).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
     call_as_operator(app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
     (id, key)
@@ -489,4 +517,96 @@ fn proof_for(request_id: &str, key: &KeyPair) -> Value {
         .expect("sign");
 
     json!({ "signature": base64::engine::general_purpose::STANDARD.encode(signature.as_ref()) })
+}
+
+/// Submit is closed without a site token: no header, or an unknown one, is refused.
+#[tokio::test]
+async fn submitting_requires_a_valid_invite() {
+    let app = service();
+
+    // No invite header at all.
+    let (missing_status, missing_body) =
+        call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    assert_eq!(
+        missing_status,
+        StatusCode::UNAUTHORIZED,
+        "submitting without a site token is refused"
+    );
+    assert_eq!(missing_body["error"], "invite_required");
+
+    // A token that matches no invite digest.
+    let (bad_status, bad_body) = submit_with_token(&app, "site-d", &plain_csr(), "not-a-real-token").await;
+    assert_eq!(bad_status, StatusCode::UNAUTHORIZED, "an unknown token is refused");
+    assert_eq!(bad_body["error"], "invalid_invite");
+
+    // Neither attempt stored anything.
+    let (_list_status, listed) = call_as_operator(&app, "GET", "/v1/requests", None).await;
+    assert_eq!(
+        listed.as_array().map(Vec::len),
+        Some(0),
+        "a refused submission is not stored"
+    );
+}
+
+/// The invite's pin is identity: the body cannot ask for a different name.
+#[tokio::test]
+async fn the_invite_pins_the_name_the_body_cannot_override() {
+    let app = service();
+    let token = invite_for(&app, "site-pinned").await;
+
+    // The body asks for a different name; the pin must win.
+    let (status, created) = submit_with_token(&app, "attacker-choice", &plain_csr(), &token).await;
+    assert_eq!(status, StatusCode::CREATED, "a pinned invite admits the submission");
+    assert_eq!(
+        created["siteName"], "site-pinned",
+        "the name is the operator's pin, not the body's ask"
+    );
+    assert_eq!(created["region"], "us", "the region is pinned too");
+}
+
+/// An invite buys one enrollment: a second submit with the same token is refused.
+#[tokio::test]
+async fn an_invite_is_one_shot() {
+    let app = service();
+    let token = invite_for(&app, "site-d").await;
+
+    let (first_status, _first) = submit_with_token(&app, "site-d", &plain_csr(), &token).await;
+    assert_eq!(first_status, StatusCode::CREATED, "the first submit is admitted");
+
+    let (second_status, second_body) = submit_with_token(&app, "site-d", &plain_csr(), &token).await;
+    assert_eq!(
+        second_status,
+        StatusCode::UNAUTHORIZED,
+        "the same token cannot bootstrap a second site"
+    );
+    assert_eq!(second_body["error"], "invite_unavailable");
+}
+
+/// An expired invite cannot be redeemed, checked at the store where expiry is guarded.
+#[tokio::test]
+async fn an_expired_invite_cannot_be_redeemed() {
+    use enrollment::{NewInvite, Store, StoreError};
+    use time::{Duration, OffsetDateTime};
+
+    let store = Store::memory();
+    let created = store
+        .create_invite(NewInvite {
+            token_sha256: "digest-of-an-expired-token".to_owned(),
+            site_name: Some("site-d".to_owned()),
+            region: Some("us".to_owned()),
+            grid_network_ref: "demo-grid".to_owned(),
+            issued_by: "tester".to_owned(),
+            expires_at: OffsetDateTime::now_utc() - Duration::minutes(1),
+        })
+        .await
+        .expect("create invite");
+
+    let outcome = store
+        .redeem_invite("digest-of-an-expired-token", uuid::Uuid::new_v4())
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::InviteUnavailable)),
+        "an expired invite is refused, not honored: {outcome:?}"
+    );
+    assert!(created.redeemed_at.is_none(), "and it was never marked redeemed");
 }

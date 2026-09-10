@@ -10,11 +10,13 @@ use sqlx::{PgPool, Row as _, postgres::PgRow};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{Issued, NewRequest, StoreError, StoredRequest};
+use super::{Invite, Issued, NewInvite, NewRequest, StoreError, StoredRequest};
 use crate::model::{EnrollmentPhase, EnrollmentRequest};
 
-/// The schema this backend expects.
+/// The request schema this backend expects.
 static SCHEMA: &str = include_str!("../../db/schema/0001_create_enrollment_requests.up.sql");
+/// The invite schema, applied alongside it so submit can be gated on a token.
+static SCHEMA_INVITES: &str = include_str!("../../db/schema/0002_create_enrollment_invites.up.sql");
 
 /// Requests held in Postgres.
 #[derive(Debug, Clone)]
@@ -33,6 +35,7 @@ impl PgStore {
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = PgPool::connect(url).await.map_err(backend)?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await.map_err(backend)?;
+        sqlx::raw_sql(SCHEMA_INVITES).execute(&pool).await.map_err(backend)?;
         Ok(Self { pool })
     }
 
@@ -44,13 +47,14 @@ impl PgStore {
 
         let row = sqlx::query(
             "INSERT INTO enrollment_requests
-                 (id, site_name, grid_network_ref, csr_pem, public_key_sha256, phase, egress, capabilities)
-             VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+                 (id, site_name, grid_network_ref, region, csr_pem, public_key_sha256, phase, egress, capabilities)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
              RETURNING *",
         )
         .bind(Uuid::new_v4())
         .bind(&new.site_name)
         .bind(&new.grid_network_ref)
+        .bind(new.region.as_deref())
         .bind(&new.csr_pem)
         .bind(&new.public_key_sha256)
         .bind(to_json(new.egress.as_ref())?)
@@ -182,6 +186,78 @@ impl PgStore {
             Err(err) => backend(err),
         }
     }
+
+    /// Record a new invite.
+    pub(super) async fn create_invite(&self, new: NewInvite) -> Result<Invite, StoreError> {
+        let row = sqlx::query(
+            "INSERT INTO enrollment_invites
+                 (id, token_sha256, site_name, region, grid_network_ref, issued_by, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING *",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&new.token_sha256)
+        .bind(new.site_name.as_deref())
+        .bind(new.region.as_deref())
+        .bind(&new.grid_network_ref)
+        .bind(&new.issued_by)
+        .bind(new.expires_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
+
+        invite_from(&row)
+    }
+
+    /// Look an invite up by token digest.
+    pub(super) async fn find_invite(&self, token_sha256: &str) -> Result<Invite, StoreError> {
+        let row = sqlx::query("SELECT * FROM enrollment_invites WHERE token_sha256 = $1")
+            .bind(token_sha256)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?
+            .ok_or(StoreError::InviteNotFound)?;
+        invite_from(&row)
+    }
+
+    /// Redeem an invite, one-shot and guarded on expiry.
+    ///
+    /// Guarded on `redeemed_at IS NULL AND expires_at > NOW()`, so two submits
+    /// racing with one token cannot both bootstrap: the second updates no rows.
+    pub(super) async fn redeem_invite(&self, token_sha256: &str, redeemed_by: Uuid) -> Result<Invite, StoreError> {
+        let updated = sqlx::query(
+            "UPDATE enrollment_invites
+                SET redeemed_at = NOW(), redeemed_by = $2
+              WHERE token_sha256 = $1 AND redeemed_at IS NULL AND expires_at > NOW()
+              RETURNING *",
+        )
+        .bind(token_sha256)
+        .bind(redeemed_by)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+
+        match updated {
+            Some(row) => invite_from(&row),
+            None => Err(self.why_not_redeemed(token_sha256).await),
+        }
+    }
+
+    /// Tell an unknown token apart from a spent or expired one.
+    ///
+    /// A guarded update that changes nothing does not say which happened, and the
+    /// caller owes the enrollee a different answer for each.
+    async fn why_not_redeemed(&self, token_sha256: &str) -> StoreError {
+        match sqlx::query("SELECT 1 AS present FROM enrollment_invites WHERE token_sha256 = $1")
+            .bind(token_sha256)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_present)) => StoreError::InviteUnavailable,
+            Ok(None) => StoreError::InviteNotFound,
+            Err(err) => backend(err),
+        }
+    }
 }
 
 /// Build the public view of a stored row.
@@ -191,6 +267,7 @@ fn public_from(row: &PgRow) -> Result<EnrollmentRequest, StoreError> {
         request_id: row.try_get("id").map_err(backend)?,
         site_name: row.try_get("site_name").map_err(backend)?,
         grid_network_ref: row.try_get("grid_network_ref").map_err(backend)?,
+        region: row.try_get("region").map_err(backend)?,
         phase: phase_from(&phase)?,
         created_at: row.try_get::<OffsetDateTime, _>("created_at").map_err(backend)?,
         decided_at: row.try_get("decided_at").map_err(backend)?,
@@ -201,6 +278,21 @@ fn public_from(row: &PgRow) -> Result<EnrollmentRequest, StoreError> {
         public_key_sha256: row.try_get("public_key_sha256").map_err(backend)?,
         egress: from_json(row, "egress")?,
         capabilities: from_json(row, "capabilities")?,
+    })
+}
+
+/// Build an invite from a stored row. The token digest stays in the database.
+fn invite_from(row: &PgRow) -> Result<Invite, StoreError> {
+    Ok(Invite {
+        id: row.try_get("id").map_err(backend)?,
+        site_name: row.try_get("site_name").map_err(backend)?,
+        region: row.try_get("region").map_err(backend)?,
+        grid_network_ref: row.try_get("grid_network_ref").map_err(backend)?,
+        issued_by: row.try_get("issued_by").map_err(backend)?,
+        created_at: row.try_get::<OffsetDateTime, _>("created_at").map_err(backend)?,
+        expires_at: row.try_get::<OffsetDateTime, _>("expires_at").map_err(backend)?,
+        redeemed_at: row.try_get("redeemed_at").map_err(backend)?,
+        redeemed_by: row.try_get("redeemed_by").map_err(backend)?,
     })
 }
 

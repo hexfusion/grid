@@ -9,22 +9,30 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, FromRequestParts, MatchedPath, Path, Query, State},
-    http::{Method, StatusCode, request::Parts},
+    http::{HeaderMap, Method, StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine as _;
 use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, Validity, csr_public_key, sign_csr};
+use ring::rand::SecureRandom as _;
 use uuid::Uuid;
 
 use crate::{
+    auth::token_digest,
     authz::{Authorizer, AuthzError, Operation},
     model::{
-        DenyInput, EnrollmentPhase, EnrollmentRequest, EnrollmentRequestInput, ErrorBody, JoinProof, JoiningKit,
-        ListQuery,
+        DenyInput, EnrollmentPhase, EnrollmentRequest, EnrollmentRequestInput, ErrorBody, InviteInput, IssuedInvite,
+        JoinProof, JoiningKit, ListQuery,
     },
-    store::{Issued, NewRequest, Store, StoreError},
+    store::{Invite, Issued, NewInvite, NewRequest, Store, StoreError},
 };
+
+/// Header the enrollee presents its site token in on submit.
+const INVITE_HEADER: &str = "x-grid-invite";
+
+/// How long a minted invite is redeemable when the operator names no expiry.
+const DEFAULT_INVITE_LIFETIME: time::Duration = time::Duration::days(7);
 
 /// What the handlers need.
 #[derive(Debug)]
@@ -88,6 +96,19 @@ pub enum ApiError {
     #[error("an operator credential is required")]
     Unauthorized,
 
+    /// The submission carried no usable site token.
+    ///
+    /// Missing, unknown, already redeemed, or expired all land here: submit is
+    /// closed without a valid invite, and the distinction is not the enrollee's
+    /// to act on beyond getting a fresh token.
+    #[error("{message}")]
+    InviteRejected {
+        /// Machine-readable code.
+        code: &'static str,
+        /// What went wrong.
+        message: String,
+    },
+
     /// The caller authenticated but is not permitted the action.
     #[error("not permitted")]
     Forbidden,
@@ -148,7 +169,9 @@ impl FromRequestParts<Arc<AppState>> for Operator {
 /// Kubernetes models CSR approval; reads are `list`/`get` on the resource.
 fn route_operation(parts: &Parts) -> Operation {
     let path = parts.extensions.get::<MatchedPath>().map_or("", MatchedPath::as_str);
-    if path.ends_with("/approve") || path.ends_with("/deny") {
+    // Issuing an invite admits a site as surely as approving does, so it takes the
+    // same decide permission rather than a weaker read.
+    if path.ends_with("/approve") || path.ends_with("/deny") || path.ends_with("/invites") {
         Operation {
             verb: "update",
             subresource: Some("approval"),
@@ -182,6 +205,7 @@ impl ApiError {
                 "unauthorized",
                 "deciding on enrollment requests requires an operator credential".to_owned(),
             ),
+            Self::InviteRejected { code, message } => (StatusCode::UNAUTHORIZED, code, message),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -225,6 +249,14 @@ impl From<StoreError> for ApiError {
                 code: "name_taken",
                 message: "another member already holds this site name".to_owned(),
             },
+            StoreError::InviteNotFound => Self::InviteRejected {
+                code: "invalid_invite",
+                message: "a valid site token is required to enroll".to_owned(),
+            },
+            StoreError::InviteUnavailable => Self::InviteRejected {
+                code: "invite_unavailable",
+                message: "this site token has already been redeemed or has expired".to_owned(),
+            },
             StoreError::Backend(detail) => Self::Internal(detail),
         }
     }
@@ -252,6 +284,7 @@ fn signing_error(err: EnrollError) -> ApiError {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/requests", post(create).get(list))
+        .route("/v1/invites", post(issue_invite))
         .route("/v1/requests/{request_id}", get(fetch).delete(remove))
         .route("/v1/requests/{request_id}/approve", post(approve))
         .route("/v1/requests/{request_id}/deny", post(deny))
@@ -262,29 +295,38 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Submit a request.
 ///
+/// Closed by the site token: an operator issues an invite that pins the name and
+/// region, and submit needs it. The name and region come from the invite, not
+/// the enrollee, so the CSR still contributes only its key.
+///
 /// The request is verified here rather than at approval, so an operator is never
 /// shown something that cannot be signed, and unusable submissions are not
 /// stored.
 async fn create(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(input): Json<EnrollmentRequestInput>,
 ) -> Result<(StatusCode, Json<EnrollmentRequest>), ApiError> {
-    if input.grid_network_ref.trim().is_empty() {
-        return Err(ApiError::BadRequest {
-            code: "missing_grid_network",
-            message: "gridNetworkRef must name the grid being joined".to_owned(),
-        });
-    }
+    let token = presented_invite(&headers)?;
+    let digest = token_digest(&token);
+    let invite = usable_invite(&state, &digest).await?;
+
+    // The operator's pins win: the enrollee cannot choose its name, region, or
+    // grid. A pinned name falls back to the submitted one only for an unpinned
+    // invite, which this service does not mint but the schema allows.
+    let site_name = invite.site_name.clone().unwrap_or_else(|| input.site_name.clone());
+    let grid_network_ref = invite.grid_network_ref.clone();
 
     // Signing here proves the submission is usable and yields the key
     // fingerprint. The certificate is thrown away; only approval issues one.
-    let checked = issue_for(&state, &input.site_name, &input.csr)?;
+    let checked = issue_for(&state, &site_name, &input.csr)?;
 
     let created = state
         .store
         .create(NewRequest {
-            site_name: input.site_name,
-            grid_network_ref: input.grid_network_ref,
+            site_name,
+            grid_network_ref,
+            region: invite.region.clone(),
             csr_pem: input.csr,
             public_key_sha256: checked.public_key_sha256,
             egress: input.egress,
@@ -292,7 +334,109 @@ async fn create(
         })
         .await?;
 
+    // Redeem last, so the one-shot mark lands on a request that exists. On a lost
+    // race the request is undone, so a burnt token never leaves a stray record.
+    if let Err(err) = state.store.redeem_invite(&digest, created.request_id).await {
+        let _undone = state.store.delete(created.request_id).await;
+        return Err(err.into());
+    }
+
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Fetch an invite by digest and check it is still redeemable.
+///
+/// Rejected here, before anything is created, so the common spent-or-lapsed case
+/// leaves no orphan request behind; the redeem guard still catches a lost race.
+async fn usable_invite(state: &AppState, digest: &str) -> Result<Invite, ApiError> {
+    let invite = state.store.find_invite(digest).await?;
+    let refuse = |message: &str| ApiError::InviteRejected {
+        code: "invite_unavailable",
+        message: message.to_owned(),
+    };
+    if invite.redeemed_at.is_some() {
+        return Err(refuse("this site token has already been redeemed"));
+    }
+    if invite.expires_at <= time::OffsetDateTime::now_utc() {
+        return Err(refuse("this site token has expired"));
+    }
+    Ok(invite)
+}
+
+/// The site token the submission carried, or a refusal when it carried none.
+fn presented_invite(headers: &HeaderMap) -> Result<String, ApiError> {
+    headers
+        .get(INVITE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ApiError::InviteRejected {
+            code: "invite_required",
+            message: "enrolling requires a site token in the X-Grid-Invite header".to_owned(),
+        })
+}
+
+/// Mint a site token pinning a name and region, returning it once.
+///
+/// The federation-plane counterpart to a consumer API key: an operator issues
+/// it, hands it to the site, and the site presents it once to start enrolling.
+async fn issue_invite(
+    State(state): State<Arc<AppState>>,
+    Operator(operator): Operator,
+    Json(input): Json<InviteInput>,
+) -> Result<(StatusCode, Json<IssuedInvite>), ApiError> {
+    if input.grid_network_ref.trim().is_empty() {
+        return Err(ApiError::BadRequest {
+            code: "missing_grid_network",
+            message: "gridNetworkRef must name the grid being joined".to_owned(),
+        });
+    }
+
+    let token = new_invite_token()?;
+    let lifetime = input
+        .expires_in_secs
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_INVITE_LIFETIME, time::Duration::seconds);
+    let expires_at = time::OffsetDateTime::now_utc().saturating_add(lifetime);
+
+    let stored = state
+        .store
+        .create_invite(NewInvite {
+            token_sha256: token_digest(&token),
+            site_name: Some(input.site_name),
+            region: Some(input.region),
+            grid_network_ref: input.grid_network_ref,
+            issued_by: operator.clone(),
+            expires_at,
+        })
+        .await?;
+
+    tracing::info!(invite = %stored.id, site = ?stored.site_name, region = ?stored.region, %operator, "site token issued");
+    Ok((StatusCode::CREATED, Json(issued_invite(stored, token))))
+}
+
+/// Render a stored invite plus its one-time token for the response.
+fn issued_invite(stored: Invite, token: String) -> IssuedInvite {
+    IssuedInvite {
+        invite_id: stored.id,
+        token,
+        site_name: stored.site_name.unwrap_or_default(),
+        region: stored.region.unwrap_or_default(),
+        grid_network_ref: stored.grid_network_ref,
+        expires_at: stored.expires_at,
+    }
+}
+
+/// A random bearer token for a site invite.
+///
+/// 32 bytes from the system CSPRNG, URL-safe so it drops straight into a header.
+fn new_invite_token() -> Result<String, ApiError> {
+    let mut bytes = [0_u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_unavailable| ApiError::Internal("could not generate a site token".to_owned()))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Every request, newest first.

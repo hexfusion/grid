@@ -14,8 +14,9 @@
 
 use enrollment::{
     model::{Capabilities, Egress, EnrollmentPhase, InferenceCapability, ModelCapability},
-    store::{Issued, NewRequest, Store, StoreError},
+    store::{Issued, NewInvite, NewRequest, Store, StoreError},
 };
+use time::{Duration, OffsetDateTime};
 
 /// A store against the test database, or `None` when none is configured.
 async fn store() -> Option<Store> {
@@ -34,6 +35,7 @@ fn request_for(site: &str) -> NewRequest {
     NewRequest {
         site_name: site.to_owned(),
         grid_network_ref: "demo-grid".to_owned(),
+        region: Some("us".to_owned()),
         csr_pem: "-----BEGIN CERTIFICATE REQUEST-----\nstub\n-----END CERTIFICATE REQUEST-----".to_owned(),
         public_key_sha256: "a".repeat(64),
         egress: Some(Egress {
@@ -163,6 +165,62 @@ async fn an_unknown_request_is_told_apart_from_a_decided_one() {
             Err(StoreError::NotFound)
         ),
         "approving something that does not exist is not found, not already decided"
+    );
+}
+
+/// A digest unique to a test, so invite rows can share one database.
+fn invite_for(site: &str, expires_at: OffsetDateTime) -> NewInvite {
+    NewInvite {
+        token_sha256: unique("digest"),
+        site_name: Some(site.to_owned()),
+        region: Some("us".to_owned()),
+        grid_network_ref: "demo-grid".to_owned(),
+        issued_by: "sam".to_owned(),
+        expires_at,
+    }
+}
+
+/// The guarded UPDATE is what makes redemption one-shot across replicas.
+#[tokio::test]
+async fn an_invite_redeems_once_and_pins_survive() {
+    let Some(store) = store().await else { return };
+    let new = invite_for("site-inv", OffsetDateTime::now_utc() + Duration::hours(1));
+    let digest = new.token_sha256.clone();
+    store.create_invite(new).await.expect("create invite");
+
+    let found = store.find_invite(&digest).await.expect("find");
+    assert_eq!(found.site_name.as_deref(), Some("site-inv"), "the name pin round trips");
+    assert_eq!(found.region.as_deref(), Some("us"), "the region pin round trips");
+
+    let request_id = uuid::Uuid::new_v4();
+    let redeemed = store.redeem_invite(&digest, request_id).await.expect("redeem");
+    assert_eq!(redeemed.redeemed_by, Some(request_id), "redemption records the request");
+
+    let again = store.redeem_invite(&digest, uuid::Uuid::new_v4()).await;
+    assert!(
+        matches!(again, Err(StoreError::InviteUnavailable)),
+        "a spent invite cannot be redeemed again, got {again:?}"
+    );
+}
+
+/// Expiry is enforced by the guard, and an unknown digest is told apart from a spent one.
+#[tokio::test]
+async fn an_expired_or_unknown_invite_is_refused() {
+    let Some(store) = store().await else { return };
+    let new = invite_for("site-exp", OffsetDateTime::now_utc() - Duration::minutes(1));
+    let digest = new.token_sha256.clone();
+    store.create_invite(new).await.expect("create invite");
+
+    let expired = store.redeem_invite(&digest, uuid::Uuid::new_v4()).await;
+    assert!(
+        matches!(expired, Err(StoreError::InviteUnavailable)),
+        "an expired invite is refused, got {expired:?}"
+    );
+
+    let unknown = store.redeem_invite("no-such-digest", uuid::Uuid::new_v4()).await;
+    assert!(
+        matches!(unknown, Err(StoreError::InviteNotFound)),
+        "an unknown token is not found, not merely unavailable, got {unknown:?}"
     );
 }
 

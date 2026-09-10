@@ -16,4 +16,4 @@ pub mod store;
 
 pub use api::{AppState, JoiningConfig, router};
 pub use auth::Operators;
-pub use store::{Issued, NewRequest, Store, StoreError};
+pub use store::{Invite, Issued, NewInvite, NewRequest, Store, StoreError};

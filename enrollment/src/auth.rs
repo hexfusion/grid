@@ -35,7 +35,7 @@ impl Operators {
             .filter_map(|(name, token)| {
                 let name = name.trim();
                 let token = token.trim();
-                (!name.is_empty() && !token.is_empty()).then(|| (digest(token), name.to_owned()))
+                (!name.is_empty() && !token.is_empty()).then(|| (token_digest(token), name.to_owned()))
             })
             .collect();
 
@@ -45,7 +45,7 @@ impl Operators {
     /// The operator a token belongs to, if any.
     #[must_use]
     pub fn resolve(&self, presented: &str) -> Option<&str> {
-        self.by_digest.get(&digest(presented)).map(String::as_str)
+        self.by_digest.get(&token_digest(presented)).map(String::as_str)
     }
 
     /// Whether any operator is configured.
@@ -65,7 +65,11 @@ impl Operators {
 }
 
 /// Lowercase hex SHA-256 of a token.
-fn digest(token: &str) -> String {
+///
+/// The one hashing used for every bearer credential: operator tokens and site
+/// invites alike are stored and compared as this digest, never in the clear.
+#[must_use]
+pub fn token_digest(token: &str) -> String {
     Sha256::digest(token.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))

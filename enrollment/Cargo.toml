@@ -54,4 +54,5 @@ uuid = { workspace = true, features = ["serde"] }
 http-body-util = { workspace = true }
 pem = "3"
 rcgen = { workspace = true }
+time = { workspace = true }
 tower = { workspace = true }

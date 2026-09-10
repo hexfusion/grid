@@ -82,6 +82,10 @@ struct EnrollArgs {
     #[arg(long)]
     grid: String,
 
+    /// The site token an operator issued, presented to open the submit endpoint.
+    #[arg(long, env = "GRID_INVITE_TOKEN")]
+    invite: String,
+
     /// Host and port peers should reach this provider on.
     #[arg(long)]
     address: String,
@@ -119,6 +123,28 @@ struct EnrollArgs {
 /// Operator actions on enrollments.
 #[derive(Debug, Subcommand)]
 enum EnrollmentCommand {
+    /// Mint a site token that lets one site start enrolling.
+    ///
+    /// Pins the name and region, so the enrollee cannot choose either. Prints the
+    /// token once; only its digest is kept, so a lost token cannot be recovered.
+    Invite {
+        /// The grid-assigned name the site will be admitted under.
+        #[arg(long)]
+        site: String,
+
+        /// The geo-fence region pinned onto the site.
+        #[arg(long)]
+        region: String,
+
+        /// The grid the invite admits into.
+        #[arg(long)]
+        network: String,
+
+        /// Seconds until the token expires; the service's default applies when unset.
+        #[arg(long)]
+        expires_secs: Option<i64>,
+    },
+
     /// List enrollments, newest first.
     List {
         /// Show only requests in this phase.
@@ -182,10 +208,20 @@ fn parse_model(raw: &str) -> Result<(String, String), String> {
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
     let cli = Cli::parse();
-    let client = Client::new(&cli.server, cli.token);
+    let mut client = Client::new(&cli.server, cli.token);
 
     match cli.command {
-        Command::Enroll(args) => enroll(&client, &args).await,
+        Command::Enroll(args) => {
+            // The site token rides the submit; it is inert on the later poll/join.
+            client.invite = Some(args.invite.clone());
+            enroll(&client, &args).await
+        },
+        Command::Enrollment(EnrollmentCommand::Invite {
+            site,
+            region,
+            network,
+            expires_secs,
+        }) => invite(&client, &site, &region, &network, expires_secs).await,
         Command::Enrollment(EnrollmentCommand::List { phase }) => list(&client, phase.as_deref()).await,
         Command::Enrollment(EnrollmentCommand::Approve { request_id }) => approve(&client, &request_id).await,
         Command::Enrollment(EnrollmentCommand::Deny { request_id, reason }) => {
@@ -427,6 +463,36 @@ async fn list(client: &Client, phase: Option<&str>) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Mint a site token and print it.
+///
+/// The token is shown once; the service keeps only its digest. Print it on
+/// stdout alone so it can be captured, with the detail on stderr.
+async fn invite(
+    client: &Client,
+    site: &str,
+    region: &str,
+    network: &str,
+    expires_secs: Option<i64>,
+) -> Result<(), Failure> {
+    let mut body = Map::new();
+    body.insert("siteName".to_owned(), json!(site));
+    body.insert("region".to_owned(), json!(region));
+    body.insert("gridNetworkRef".to_owned(), json!(network));
+    if let Some(secs) = expires_secs {
+        body.insert("expiresInSecs".to_owned(), json!(secs));
+    }
+
+    let issued = client
+        .send(Method::POST, "/v1/invites", Some(Value::Object(body)), true)
+        .await?;
+    eprintln!(
+        "site token for {site} in {region}, expires {} (keep it; it is shown only once)",
+        field(&issued, "expiresAt")
+    );
+    println!("{}", field(&issued, "token"));
+    Ok(())
+}
+
 /// Approve one request.
 async fn approve(client: &Client, request_id: &str) -> Result<(), Failure> {
     let path = format!("/v1/requests/{request_id}/approve");
@@ -505,6 +571,9 @@ struct Client {
 
     /// Operator token, when one was given.
     token: Option<String>,
+
+    /// Site token, sent on submit to open the enrollment endpoint.
+    invite: Option<String>,
 }
 
 impl Client {
@@ -513,6 +582,7 @@ impl Client {
         Self {
             server: server.trim_end_matches('/').to_owned(),
             token,
+            invite: None,
         }
     }
 
@@ -589,6 +659,9 @@ impl Client {
             .header("content-type", "application/json");
         if let Some(token) = self.token.as_deref() {
             builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(invite) = self.invite.as_deref() {
+            builder = builder.header("x-grid-invite", invite);
         }
 
         let payload = body.map(|value| value.to_string()).unwrap_or_default();

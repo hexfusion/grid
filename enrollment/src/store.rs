@@ -33,6 +33,17 @@ pub enum StoreError {
     #[error("site name is already taken")]
     NameTaken,
 
+    /// No invite matched the presented token.
+    #[error("no such enrollment invite")]
+    InviteNotFound,
+
+    /// The invite was already redeemed or has expired.
+    ///
+    /// An invite buys one enrollment, not a standing right to ask, so a spent or
+    /// lapsed one is refused rather than honored again.
+    #[error("enrollment invite is already redeemed or expired")]
+    InviteUnavailable,
+
     /// The backend itself failed.
     #[error("store backend failed: {0}")]
     Backend(String),
@@ -47,6 +58,9 @@ pub struct NewRequest {
     /// The grid being joined.
     pub grid_network_ref: String,
 
+    /// The geo-fence region, stamped from the redeemed invite.
+    pub region: Option<String>,
+
     /// The request as submitted, kept so approval can sign it.
     pub csr_pem: String,
 
@@ -60,6 +74,31 @@ pub struct NewRequest {
     pub capabilities: Option<Capabilities>,
 }
 
+impl NewRequest {
+    /// The pending record this submission becomes, under `request_id`.
+    fn into_pending(self, request_id: Uuid) -> StoredRequest {
+        StoredRequest {
+            public: EnrollmentRequest {
+                request_id,
+                site_name: self.site_name,
+                grid_network_ref: self.grid_network_ref,
+                region: self.region,
+                phase: EnrollmentPhase::Pending,
+                created_at: OffsetDateTime::now_utc(),
+                decided_at: None,
+                decided_by: None,
+                reason: None,
+                certificate: None,
+                spiffe_id: None,
+                public_key_sha256: Some(self.public_key_sha256),
+                egress: self.egress,
+                capabilities: self.capabilities,
+            },
+            csr_pem: self.csr_pem,
+        }
+    }
+}
+
 /// What approval recorded.
 #[derive(Debug, Clone)]
 pub struct Issued {
@@ -71,6 +110,62 @@ pub struct Issued {
 
     /// Who approved.
     pub decided_by: String,
+}
+
+/// An invite to store, before it has been redeemed.
+///
+/// Carries the token's digest, never the token: the raw token is handed to the
+/// operator once and only its digest is kept, like the operator tokens.
+#[derive(Debug, Clone)]
+pub struct NewInvite {
+    /// Lowercase hex SHA-256 of the bearer token.
+    pub token_sha256: String,
+
+    /// The name the enrollee is pinned to, when the invite pins one.
+    pub site_name: Option<String>,
+
+    /// The geo-fence region pinned onto the enrollee.
+    pub region: Option<String>,
+
+    /// The grid this invite admits into.
+    pub grid_network_ref: String,
+
+    /// The operator that minted it.
+    pub issued_by: String,
+
+    /// When the token stops being redeemable.
+    pub expires_at: OffsetDateTime,
+}
+
+/// A stored invite. The token digest is never surfaced.
+#[derive(Debug, Clone)]
+pub struct Invite {
+    /// The invite's identifier.
+    pub id: Uuid,
+
+    /// The pinned name, when one was pinned.
+    pub site_name: Option<String>,
+
+    /// The pinned geo-fence region.
+    pub region: Option<String>,
+
+    /// The grid this invite admits into.
+    pub grid_network_ref: String,
+
+    /// The operator that minted it.
+    pub issued_by: String,
+
+    /// When it was minted.
+    pub created_at: OffsetDateTime,
+
+    /// When it stops being redeemable.
+    pub expires_at: OffsetDateTime,
+
+    /// When it was redeemed, if it has been.
+    pub redeemed_at: Option<OffsetDateTime>,
+
+    /// The request the redemption bootstrapped, if any.
+    pub redeemed_by: Option<Uuid>,
 }
 
 /// A stored request, including material not put on the wire.
@@ -192,6 +287,44 @@ impl Store {
             Self::Postgres(store) => store.delete(request_id).await,
         }
     }
+
+    /// Record a new invite, keyed by its token digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] if the backend failed.
+    pub async fn create_invite(&self, new: NewInvite) -> Result<Invite, StoreError> {
+        match self {
+            Self::Memory(store) => store.create_invite(new),
+            Self::Postgres(store) => store.create_invite(new).await,
+        }
+    }
+
+    /// Look an invite up by its token digest, redeemed or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InviteNotFound`] if no invite has that digest.
+    pub async fn find_invite(&self, token_sha256: &str) -> Result<Invite, StoreError> {
+        match self {
+            Self::Memory(store) => store.find_invite(token_sha256),
+            Self::Postgres(store) => store.find_invite(token_sha256).await,
+        }
+    }
+
+    /// Redeem an invite for `redeemed_by`, one-shot and guarded on expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InviteNotFound`] if the digest is unknown, and
+    /// [`StoreError::InviteUnavailable`] if it was already redeemed or has
+    /// expired, so a token cannot bootstrap two sites.
+    pub async fn redeem_invite(&self, token_sha256: &str, redeemed_by: Uuid) -> Result<Invite, StoreError> {
+        match self {
+            Self::Memory(store) => store.redeem_invite(token_sha256, redeemed_by),
+            Self::Postgres(store) => store.redeem_invite(token_sha256, redeemed_by).await,
+        }
+    }
 }
 
 /// Requests held in this process.
@@ -210,6 +343,10 @@ struct Inner {
 
     /// The requests themselves.
     by_id: HashMap<Uuid, StoredRequest>,
+
+    /// Invites, keyed by token digest. Under the same lock as the requests, so
+    /// redeeming one and creating the request it authorizes cannot interleave.
+    invites: HashMap<String, Invite>,
 }
 
 impl MemoryStore {
@@ -231,32 +368,11 @@ impl MemoryStore {
         }
 
         let request_id = Uuid::new_v4();
-        let public = EnrollmentRequest {
-            request_id,
-            site_name: new.site_name,
-            grid_network_ref: new.grid_network_ref,
-            phase: EnrollmentPhase::Pending,
-            created_at: OffsetDateTime::now_utc(),
-            decided_at: None,
-            decided_by: None,
-            reason: None,
-            certificate: None,
-            spiffe_id: None,
-            public_key_sha256: Some(new.public_key_sha256),
-            egress: new.egress,
-            capabilities: new.capabilities,
-        };
-
-        inner.by_id.insert(
-            request_id,
-            StoredRequest {
-                public: public.clone(),
-                csr_pem: new.csr_pem,
-            },
-        );
+        let stored = new.into_pending(request_id);
+        let public = stored.public.clone();
+        inner.by_id.insert(request_id, stored);
         inner.order.push(request_id);
         drop(inner);
-
         Ok(public)
     }
 
@@ -334,6 +450,48 @@ impl MemoryStore {
         let updated = row.public.clone();
         drop(inner);
         Ok(updated)
+    }
+
+    /// Record a new invite.
+    fn create_invite(&self, new: NewInvite) -> Result<Invite, StoreError> {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let invite = Invite {
+            id: Uuid::new_v4(),
+            site_name: new.site_name,
+            region: new.region,
+            grid_network_ref: new.grid_network_ref,
+            issued_by: new.issued_by,
+            created_at: OffsetDateTime::now_utc(),
+            expires_at: new.expires_at,
+            redeemed_at: None,
+            redeemed_by: None,
+        };
+        inner.invites.insert(new.token_sha256, invite.clone());
+        drop(inner);
+        Ok(invite)
+    }
+
+    /// Look an invite up by token digest.
+    fn find_invite(&self, token_sha256: &str) -> Result<Invite, StoreError> {
+        let inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        inner.invites.get(token_sha256).cloned().ok_or(StoreError::InviteNotFound)
+    }
+
+    /// Redeem an invite, one-shot and guarded on expiry.
+    ///
+    /// Holding the lock across the check and the mark is what makes it one-shot:
+    /// a second redemption sees `redeemed_at` already set.
+    fn redeem_invite(&self, token_sha256: &str, redeemed_by: Uuid) -> Result<Invite, StoreError> {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let invite = inner.invites.get_mut(token_sha256).ok_or(StoreError::InviteNotFound)?;
+        if invite.redeemed_at.is_some() || invite.expires_at <= OffsetDateTime::now_utc() {
+            return Err(StoreError::InviteUnavailable);
+        }
+        invite.redeemed_at = Some(OffsetDateTime::now_utc());
+        invite.redeemed_by = Some(redeemed_by);
+        let redeemed = invite.clone();
+        drop(inner);
+        Ok(redeemed)
     }
 }
 
