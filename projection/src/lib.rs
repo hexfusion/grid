@@ -56,6 +56,7 @@ pub fn grid_site(record: &Value) -> Result<Value, ProjectionError> {
         "kind": "GridSite",
         "metadata": {
             "name": site,
+            "labels": grid_site_labels(record, site),
             "annotations": {
                 "grid.praxis-proxy.io/enrolled-as": field(record, "spiffeId"),
                 "grid.praxis-proxy.io/enrollment-request": field(record, "requestId"),
@@ -63,6 +64,21 @@ pub fn grid_site(record: &Value) -> Result<Value, ProjectionError> {
         },
         "spec": grid_site_spec(record, site, address, &fingerprint),
     }))
+}
+
+/// The binding labels the data plane selects on. `siteSelector.matchLabels`
+/// resolves against these, so an enrolled site is selectable: the site name
+/// always, and the geo-fence region when the record carries one. Keys mirror
+/// the operator's `LABEL_SITE` / `LABEL_REGION` (this crate holds no Kubernetes
+/// dependency, so it cannot import them).
+fn grid_site_labels(record: &Value, site: &str) -> Value {
+    let mut labels = serde_json::Map::new();
+    labels.insert("grid.praxis-proxy.io/site".to_owned(), json!(site));
+    let region = field(record, "region");
+    if !region.is_empty() {
+        labels.insert("grid.praxis-proxy.io/region".to_owned(), json!(region));
+    }
+    Value::Object(labels)
 }
 
 /// The `spec` of a member's `GridSite`: where to reach it and how to trust it.
@@ -170,6 +186,7 @@ mod tests {
     fn record() -> Value {
         json!({
             "siteName": "site-x",
+            "region": "eu-west-2",
             "gridNetworkRef": "grid.internal",
             "spiffeId": "spiffe://grid.internal/site/site-x",
             "requestId": "req-123",
@@ -193,6 +210,9 @@ mod tests {
             site["metadata"]["annotations"]["grid.praxis-proxy.io/enrolled-as"],
             "spiffe://grid.internal/site/site-x"
         );
+        // Binding labels the data plane selects on.
+        assert_eq!(site["metadata"]["labels"]["grid.praxis-proxy.io/site"], "site-x");
+        assert_eq!(site["metadata"]["labels"]["grid.praxis-proxy.io/region"], "eu-west-2");
         assert_eq!(site["spec"]["gridNetworkRef"], "grid.internal");
         assert_eq!(site["spec"]["egress"]["address"], "site-x.example:8443");
         assert_eq!(site["spec"]["egress"]["tls"]["mode"], "Mutual");
@@ -202,6 +222,15 @@ mod tests {
             .expect("fingerprints is an array");
         assert_eq!(fingerprints.len(), 1);
         assert!(!fingerprints[0].as_str().expect("fingerprint is a string").is_empty());
+    }
+
+    #[test]
+    fn grid_site_omits_region_label_when_absent() {
+        let mut record = record();
+        record.as_object_mut().expect("object").remove("region");
+        let site = grid_site(&record).expect("projects");
+        assert_eq!(site["metadata"]["labels"]["grid.praxis-proxy.io/site"], "site-x");
+        assert!(site["metadata"]["labels"].get("grid.praxis-proxy.io/region").is_none());
     }
 
     #[test]

@@ -1284,7 +1284,12 @@ fn collect_candidates(
 /// Returns [`SiteResolution::Unavailable`] when no site inventory exists,
 /// which enables the Phase 1 provider-name fallback.  Returns
 /// [`SiteResolution::Known`] otherwise — with an empty `Vec` if the
-/// selector matched nothing, which suppresses candidate generation.
+/// selector matched nothing (or matched only sites that are not routable),
+/// which suppresses candidate generation.
+///
+/// Only enrolled, Active sites ([`GridSite::is_enrolled_and_active`]) are
+/// eligible: a hand-authored or pending site is never a routing target, so
+/// control-plane membership and data-plane routability are one fact.
 fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite]) -> SiteResolution {
     if network_sites.is_empty() {
         return SiteResolution::Unavailable;
@@ -1294,6 +1299,7 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite]) -> S
 
     let names: Vec<String> = network_sites
         .iter()
+        .filter(|site| site.is_enrolled_and_active())
         .filter(|site| {
             let site_labels = site.metadata.labels.as_ref();
             selector
@@ -1645,12 +1651,19 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    // Test sites are enrolled and Active by default, so they pass the
+    // routability gate; the gate itself is exercised by the tests that build
+    // un-enrolled or non-Active sites directly.
     fn test_site(name: &str, network: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "GridSite",
-            "metadata": { "name": name },
-            "spec": { "gridNetworkRef": network }
+            "metadata": {
+                "name": name,
+                "annotations": { "grid.praxis-proxy.io/enrolled-as": format!("spiffe://grid.internal/site/{name}") }
+            },
+            "spec": { "gridNetworkRef": network },
+            "status": { "phase": "Active" }
         }))
         .unwrap_or_else(|_| std::process::abort())
     }
@@ -1665,9 +1678,11 @@ mod tests {
             "kind": "GridSite",
             "metadata": {
                 "name": name,
-                "labels": labels_map
+                "labels": labels_map,
+                "annotations": { "grid.praxis-proxy.io/enrolled-as": format!("spiffe://grid.internal/site/{name}") }
             },
-            "spec": { "gridNetworkRef": network }
+            "spec": { "gridNetworkRef": network },
+            "status": { "phase": "Active" }
         }))
         .unwrap_or_else(|_| std::process::abort())
     }
@@ -2959,6 +2974,69 @@ mod tests {
         assert!(
             overlay.candidates.is_empty(),
             "selector matched nothing in a known site inventory — must emit no candidates"
+        );
+    }
+
+    #[test]
+    fn unenrolled_site_is_not_a_routing_target() {
+        // A site that matches the selector but carries no enrollment marker is
+        // hand-authored, not enrolled: it must not route.
+        let network = test_network("net");
+        let unenrolled: GridSite = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "metadata": { "name": "rogue-site", "labels": { "hw": "gpu" } },
+            "spec": { "gridNetworkRef": "net" },
+            "status": { "phase": "Active" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let provider = test_provider_with_selector("prov", "net", &["model"], &[("hw", "gpu")]);
+        let overlay = render_routing_overlay(
+            &network,
+            &[unenrolled],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            overlay.candidates.is_empty(),
+            "an un-enrolled site must never be a routing target"
+        );
+    }
+
+    #[test]
+    fn pending_site_is_not_a_routing_target() {
+        // An enrolled site that is not yet Active (or has left) must not route.
+        let network = test_network("net");
+        let pending: GridSite = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "metadata": {
+                "name": "warming-site",
+                "labels": { "hw": "gpu" },
+                "annotations": { "grid.praxis-proxy.io/enrolled-as": "spiffe://grid.internal/site/warming-site" }
+            },
+            "spec": { "gridNetworkRef": "net" },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let provider = test_provider_with_selector("prov", "net", &["model"], &[("hw", "gpu")]);
+        let overlay = render_routing_overlay(
+            &network,
+            &[pending],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            overlay.candidates.is_empty(),
+            "a pending (not-yet-Active) site must never be a routing target"
         );
     }
 
@@ -5998,8 +6076,13 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "GridSite",
-            "metadata": { "name": name, "labels": { "site": name } },
-            "spec": spec
+            "metadata": {
+                "name": name,
+                "labels": { "site": name },
+                "annotations": { "grid.praxis-proxy.io/enrolled-as": format!("spiffe://grid.internal/site/{name}") }
+            },
+            "spec": spec,
+            "status": { "phase": "Active" }
         }))
         .unwrap_or_else(|_| std::process::abort())
     }

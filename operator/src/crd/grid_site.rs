@@ -9,6 +9,18 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Label the data plane selects a site on. `InferenceProvider.spec.siteSelector.matchLabels`
+/// resolves against this, so a site is a routing target only when it carries it.
+pub const LABEL_SITE: &str = "grid.praxis-proxy.io/site";
+
+/// Label carrying a site's geo-fence region, stamped by the enrollment projector.
+pub const LABEL_REGION: &str = "grid.praxis-proxy.io/region";
+
+/// Annotation the enrollment projector stamps with the site's SPIFFE id. Its
+/// presence marks a site as enrolled (projected from an issued record) rather
+/// than hand-authored.
+pub const ANNOTATION_ENROLLED_AS: &str = "grid.praxis-proxy.io/enrolled-as";
+
 // ---------------------------------------------------------------------------
 // Spec
 // ---------------------------------------------------------------------------
@@ -255,6 +267,27 @@ pub enum GridSitePhase {
 
     /// Site has left the grid (graceful or timeout).
     Left,
+}
+
+impl GridSite {
+    /// Whether this site may be selected as a routing target: it came through
+    /// enrollment (carries [`ANNOTATION_ENROLLED_AS`]) and its liveness phase is
+    /// [`GridSitePhase::Active`]. An un-enrolled, hand-authored site grants no
+    /// routability, and a site that goes stale or leaves stops routing.
+    #[must_use]
+    pub fn is_enrolled_and_active(&self) -> bool {
+        let enrolled = self
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(ANNOTATION_ENROLLED_AS))
+            .is_some_and(|value| !value.is_empty());
+        let active = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.phase == GridSitePhase::Active);
+        enrolled && active
+    }
 }
 
 // ---------------------------------------------------------------------------
