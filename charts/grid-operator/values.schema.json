@@ -112,6 +112,16 @@
         }
       }
     },
+    "signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "polling": {
+          "type": "boolean",
+          "description": "Source routing signals by polling provider metrics endpoints and serving them on the signals endpoint, instead of SWIM gossip."
+        }
+      }
+    },
     "metrics": {
       "type": "object",
       "additionalProperties": false,

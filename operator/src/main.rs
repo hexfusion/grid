@@ -73,6 +73,7 @@ use operator::{
         inference_provider::InferenceProvider,
     },
     gateway,
+    resources::tls_backend::{self, ServerTlsConfig},
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
@@ -830,7 +831,7 @@ async fn serve_signals_once(
 async fn serve_signals(
     addr: &str,
     app: axum::Router,
-    tls: Arc<rustls::ServerConfig>,
+    tls: ServerTlsConfig,
     identity: SignalsIdentity,
     changed: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -878,11 +879,10 @@ async fn observe_own_key(client: &Client) -> Option<Option<String>> {
 async fn serve_signals_tls(
     listener: tokio::net::TcpListener,
     app: axum::Router,
-    tls: Arc<rustls::ServerConfig>,
+    tls: ServerTlsConfig,
     identity: SignalsIdentity,
     changed: impl Future<Output = ()> + Send,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let mut changed = std::pin::pin!(changed);
     loop {
         let accepted = tokio::select! {
@@ -893,7 +893,7 @@ async fn serve_signals_tls(
             continue;
         };
         tokio::spawn(serve_signals_connection(
-            acceptor.clone(),
+            Arc::clone(&tls),
             app.clone(),
             stream,
             remote,
@@ -908,12 +908,8 @@ async fn serve_signals_tls(
 /// one carrying a key nobody declared, is named so it is served nothing. Only
 /// this site's own certificate earns `Local`, so "no cert" is never as
 /// privileged as the site's own workload.
-fn caller_for(
-    presented: Option<&[rustls::pki_types::CertificateDer<'static>]>,
-    identity: &SignalsIdentity,
-    remote: SocketAddr,
-) -> Caller {
-    let Some(leaf) = presented.and_then(<[_]>::first) else {
+fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAddr) -> Caller {
+    let Some(leaf) = leaf else {
         tracing::debug!(%remote, "signals caller presented no certificate");
         return Caller::Peer(None);
     };
@@ -929,19 +925,22 @@ fn caller_for(
 }
 
 /// Handshake one connection, then serve it with the scope its certificate earns.
-#[expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")]
+#[cfg_attr(
+    not(feature = "fips"),
+    expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")
+)]
 async fn serve_signals_connection(
-    acceptor: tokio_rustls::TlsAcceptor,
+    tls: ServerTlsConfig,
     app: axum::Router,
     stream: tokio::net::TcpStream,
     remote: SocketAddr,
     identity: SignalsIdentity,
 ) {
-    let Ok(stream) = acceptor.accept(stream).await else {
+    let Ok(stream) = tls_backend::accept(stream, &tls).await else {
         tracing::debug!(%remote, "signals handshake failed");
         return;
     };
-    let caller = caller_for(stream.get_ref().1.peer_certificates(), &identity, remote);
+    let caller = caller_for(tls_backend::server_peer_leaf_der(&stream).as_deref(), &identity, remote);
     let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
         use tower::Service as _;
         let mut request = request;
@@ -1023,7 +1022,7 @@ fn served(body: String, oldest: std::time::Duration) -> axum::response::Response
 /// Both resolve to `None` when the network declares no TLS or the material
 /// cannot be read; the serve loop treats either as "do not expose", so a load
 /// failure fails closed rather than downgrading to plaintext.
-async fn signals_identity(client: &Client) -> (Option<Arc<rustls::ServerConfig>>, Option<String>) {
+async fn signals_identity(client: &Client) -> (Option<ServerTlsConfig>, Option<String>) {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let network = networks
         .list(&kube::api::ListParams::default())
@@ -1040,7 +1039,7 @@ async fn signals_identity(client: &Client) -> (Option<Arc<rustls::ServerConfig>>
 }
 
 /// TLS for the listener, or `None` when unconfigured or unreadable.
-async fn signals_listener_tls(network: &GridNetwork, client: &Client) -> Option<Arc<rustls::ServerConfig>> {
+async fn signals_listener_tls(network: &GridNetwork, client: &Client) -> Option<ServerTlsConfig> {
     match grid_network::signals_server_config(network, client).await {
         Ok(config) => {
             if config.is_none() {
@@ -1324,31 +1323,24 @@ mod tests {
     #[test]
     fn signals_caller_scope_requires_a_positive_credential() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let leaf = rustls::pki_types::CertificateDer::from(vec![1_u8, 2, 3, 4]);
+        let leaf = [1_u8, 2, 3, 4];
         let own_key = operator::signals::leaf_fingerprint(&leaf);
 
         let owner = SignalsIdentity {
             peers: operator::signals::PeerIdentities::new(),
             own_key: Some(own_key),
         };
-        // No certificate and an empty chain are both served nothing, never Local.
+        // A caller that presents no certificate is served nothing, never Local.
         assert_eq!(caller_for(None, &owner, addr), Caller::Peer(None));
-        assert_eq!(caller_for(Some(&[]), &owner, addr), Caller::Peer(None));
         // This site's own certificate is the only key that earns Local.
-        assert_eq!(
-            caller_for(Some(std::slice::from_ref(&leaf)), &owner, addr),
-            Caller::Local
-        );
+        assert_eq!(caller_for(Some(&leaf), &owner, addr), Caller::Local);
 
         // A certificate this site has not declared is served nothing, not Local.
         let stranger = SignalsIdentity {
             peers: operator::signals::PeerIdentities::new(),
             own_key: Some("0".repeat(64)),
         };
-        assert_eq!(
-            caller_for(Some(std::slice::from_ref(&leaf)), &stranger, addr),
-            Caller::Peer(None)
-        );
+        assert_eq!(caller_for(Some(&leaf), &stranger, addr), Caller::Peer(None));
     }
 
     #[test]

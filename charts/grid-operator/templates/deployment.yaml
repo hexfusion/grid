@@ -34,6 +34,10 @@ spec:
         - name: operator
           image: {{ include "grid-operator.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
+          {{- if .Values.signals.polling }}
+          args:
+            - --polling-signals
+          {{- end }}
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false

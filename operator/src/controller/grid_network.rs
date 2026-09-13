@@ -36,6 +36,7 @@ use crate::{
     resources::{
         consumer_config::{self, ConsumerConfigError},
         overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
     },
     signals,
@@ -244,8 +245,11 @@ fn peer_identities(sites: &[GridSite]) -> std::collections::BTreeMap<String, sig
                     .spec
                     .trust
                     .as_ref()
-                    .and_then(|trust| trust.canonical_fingerprints.clone())
-                    .unwrap_or_default(),
+                    .and_then(|trust| trust.canonical_fingerprints.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|fp| signals::canonical_fingerprint(fp))
+                    .collect(),
             };
             Some((name, record))
         })
@@ -326,17 +330,14 @@ pub async fn peer_tls_config(
 /// `Ok(None)` when the network declares no TLS. `Err` when the configured
 /// material cannot be read or parsed, so the listener fails closed rather than
 /// serving every caller unauthenticated.
-pub async fn signals_server_config(
-    network: &GridNetwork,
-    client: &Client,
-) -> Result<Option<Arc<rustls::ServerConfig>>, String> {
+pub async fn signals_server_config(network: &GridNetwork, client: &Client) -> Result<Option<ServerTlsConfig>, String> {
     let (Some(ca), Some(site)) = (&network.spec.tls.ca_secret_ref, &network.spec.tls.site_secret_ref) else {
         return Ok(None);
     };
     let ca_pem = read_signals_pem(client, ca, "ca.crt").await?;
     let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
     let key_pem = read_signals_pem(client, site, "tls.key").await?;
-    build_signals_server_config(&ca_pem, &cert_pem, &key_pem).map(Some)
+    crate::resources::tls_backend::build_server_config(&ca_pem, &cert_pem, &key_pem).map(Some)
 }
 
 /// This site's own certificate fingerprint, for recognising its own workloads.
@@ -348,17 +349,13 @@ pub async fn signals_server_config(
 ///
 /// Returns a message when the configured material cannot be read or parsed.
 pub async fn signals_own_key(network: &GridNetwork, client: &Client) -> Result<Option<String>, String> {
-    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
-
     let Some(site) = &network.spec.tls.site_secret_ref else {
         return Ok(None);
     };
     let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
-    let der = CertificateDer::pem_slice_iter(&cert_pem)
-        .next()
-        .transpose()
-        .map_err(|e| format!("signals TLS: certificate is not valid PEM: {e}"))?;
-    Ok(der.map(|der| signals::leaf_fingerprint(&der)))
+    let pem = std::str::from_utf8(&cert_pem).map_err(|_e| "signals TLS: certificate is not valid UTF-8".to_owned())?;
+    let der = crate::resources::tls_backend::first_cert_der_from_pem(pem).map_err(str::to_owned)?;
+    Ok(Some(signals::leaf_fingerprint(&der)))
 }
 
 /// Read one PEM value out of a Secret.
@@ -375,37 +372,6 @@ async fn read_signals_pem(
     crate::resources::endpoint_tls::read_secret_bytes_for_tls(client, secret, key, "signals", "signals TLS")
         .await
         .map_err(|(_, message)| message)
-}
-
-/// Assemble the listener config from PEM material.
-///
-/// Split from the loader so the assembly is testable without a cluster.
-fn build_signals_server_config(
-    ca_pem: &[u8],
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<Arc<rustls::ServerConfig>, String> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
-
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_slice_iter(ca_pem) {
-        let cert = cert.map_err(|e| format!("signals TLS: CA is not valid PEM: {e}"))?;
-        roots.add(cert).map_err(|e| format!("signals TLS: CA rejected: {e}"))?;
-    }
-    let chain = CertificateDer::pem_slice_iter(cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("signals TLS: certificate is not valid PEM: {e}"))?;
-    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("signals TLS: key is not valid PEM: {e}"))?;
-
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-        .allow_unauthenticated()
-        .build()
-        .map_err(|e| format!("signals TLS: client verifier: {e}"))?;
-    rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(chain, key)
-        .map(Arc::new)
-        .map_err(|e| format!("signals TLS: server config: {e}"))
 }
 
 // ---------------------------------------------------------------------------

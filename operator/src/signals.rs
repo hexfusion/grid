@@ -16,7 +16,10 @@ use std::{
 use futures::StreamExt as _;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
-use crate::metrics_scraper::{MetricsScrapeError, scrape_metrics};
+use crate::{
+    metrics_scraper::{MetricsScrapeError, scrape_metrics},
+    resources::tls_backend::{self, ClientTlsConfig},
+};
 
 /// The single mTLS path the coarse rollup is served and polled on.
 ///
@@ -204,6 +207,19 @@ pub struct SignalStore {
 pub fn leaf_fingerprint(der: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     Sha256::digest(der).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Normalise a declared fingerprint to the form [`leaf_fingerprint`] emits.
+///
+/// Strips colons and lowercases so the raw-compare serve side agrees with the
+/// separator-tolerant poll side.
+#[must_use]
+pub fn canonical_fingerprint(declared: &str) -> String {
+    declared
+        .chars()
+        .filter(|c| *c != ':')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// What this site holds about one peer.
@@ -612,7 +628,7 @@ fn classify(error: &MetricsScrapeError) -> PollOutcome {
 fn classify_transport(error: &(dyn std::error::Error + 'static)) -> PollOutcome {
     let mut current = Some(error);
     while let Some(err) = current {
-        if err.downcast_ref::<rustls::Error>().is_some() {
+        if tls_backend::is_tls_error(err) {
             return PollOutcome::Tls;
         }
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
@@ -647,9 +663,8 @@ fn backoff(base: Duration, attempt: u32, peer: &str) -> Duration {
     scaled.saturating_add(jitter)
 }
 
-/// Reads each peer's signals endpoint directly.
 /// One peer's client config, verifying against the keys declared for it.
-fn peer_client_config(material: &PeerTlsMaterial, pins: &[String]) -> Result<rustls::ClientConfig, MetricsScrapeError> {
+fn peer_client_config(material: &PeerTlsMaterial, pins: &[String]) -> Result<ClientTlsConfig, MetricsScrapeError> {
     crate::metrics_scraper::build_pinned_client_config(
         &material.ca,
         material.identity.as_ref().map(|id| id.cert.as_slice()),
@@ -757,7 +772,7 @@ impl PollPeers {
 
         // Once per peer, not per attempt: this parses a private key.
         let tls = match self.tls.as_ref().map(|m| peer_client_config(m, pins)) {
-            Some(Ok(config)) => Some(Arc::new(config)),
+            Some(Ok(config)) => Some(config),
             Some(Err(error)) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
                 guard.finish(PollOutcome::Config, 0);
@@ -778,7 +793,7 @@ impl PollPeers {
     async fn scrape_or_stand_down(
         &self,
         url: &str,
-        tls: Option<&Arc<rustls::ClientConfig>>,
+        tls: Option<&ClientTlsConfig>,
     ) -> Option<Result<String, MetricsScrapeError>> {
         tokio::select! {
             biased;
@@ -806,7 +821,7 @@ impl PollPeers {
         &self,
         peer: &str,
         url: &str,
-        tls: Option<&Arc<rustls::ClientConfig>>,
+        tls: Option<&ClientTlsConfig>,
         started: Instant,
     ) -> (PollOutcome, Option<String>) {
         let attempts = self.attempts.max(1);
@@ -1097,8 +1112,11 @@ mod tests {
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(classify_transport(&refused), PollOutcome::Refused);
 
-        let tls = rustls::Error::DecryptError;
-        assert_eq!(classify_transport(&tls), PollOutcome::Tls);
+        #[cfg(not(feature = "fips"))]
+        let tls_err = rustls::Error::DecryptError;
+        #[cfg(feature = "fips")]
+        let tls_err = openssl::error::ErrorStack::get();
+        assert_eq!(classify_transport(&tls_err), PollOutcome::Tls);
     }
 
     #[test]
@@ -1364,6 +1382,35 @@ mod tests {
         assert_eq!(leaf_fingerprint(b"a").len(), 64, "sha256 as lowercase hex");
         assert_eq!(leaf_fingerprint(b"a"), leaf_fingerprint(b"a"), "stable");
         assert_ne!(leaf_fingerprint(b"a"), leaf_fingerprint(b"b"), "distinguishing");
+    }
+
+    #[test]
+    fn a_non_canonical_declared_fingerprint_authorizes_and_authenticates() {
+        // A pin declared with uppercase hex and colons must both authorize (serve
+        // side, raw compare) and authenticate (poll side) the same peer.
+        let leaf = leaf_fingerprint(b"peer-leaf-der");
+        let declared: String = leaf
+            .char_indices()
+            .flat_map(|(i, c)| {
+                let upper = c.to_ascii_uppercase();
+                if i > 0 && i.is_multiple_of(2) {
+                    vec![':', upper]
+                } else {
+                    vec![upper]
+                }
+            })
+            .collect();
+        assert_ne!(declared, leaf);
+        assert_eq!(canonical_fingerprint(&declared), leaf);
+
+        let record = PeerRecord {
+            labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
+            pins: vec![canonical_fingerprint(&declared)],
+        };
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([("peer".to_owned(), record)]));
+        assert!(identities.resolve_by_key(&leaf).is_some());
+        assert_eq!(identities.pins_for("peer"), vec![leaf]);
     }
 
     #[test]
