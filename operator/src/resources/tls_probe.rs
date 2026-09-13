@@ -513,6 +513,7 @@ mod tests {
     /// and verifies the client cert against the grid CA (mTLS), so the probe
     /// handshake tests exercise the real OpenSSL path under `fips`.
     #[cfg(feature = "fips")]
+    #[expect(clippy::too_many_lines, reason = "OpenSSL test server setup")]
     fn start_tls_server(server_cert: &certs::SiteCertOutput, ca: &certs::CaCert) -> std::net::SocketAddr {
         use openssl::{
             pkey::PKey,

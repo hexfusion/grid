@@ -2329,6 +2329,7 @@ mod tests {
 
     /// OpenSSL twin of the one-shot TLS server for `fips` probe tests.
     #[cfg(feature = "fips")]
+    #[expect(clippy::too_many_lines, reason = "OpenSSL test server setup")]
     async fn start_tls_test_server(server_cert_pem: &str, server_key_pem: &str, response: Vec<u8>) -> String {
         use openssl::{
             pkey::PKey,
