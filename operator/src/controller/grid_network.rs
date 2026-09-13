@@ -160,35 +160,6 @@ impl OperatorCtx {
 // Signals (poll mode)
 // ---------------------------------------------------------------------------
 
-/// Label key for this site's region, read from `GRID_SITE_REGION`.
-const SITE_REGION_LABEL: &str = "topology.grid.praxis-proxy.io/region";
-/// Label key for this site's zone, read from `GRID_SITE_ZONE`.
-const SITE_ZONE_LABEL: &str = "topology.grid.praxis-proxy.io/zone";
-
-/// The labels a local consumer reads as, which are this site's own.
-///
-/// A target whose `accessPolicy.siteSelector` this site does not satisfy is
-/// withheld from the local reader just as it is from a peer, so the listener
-/// fails closed rather than serving the co-located gateway a target no site may
-/// route to. Empty when neither topology variable is set, which restricts the
-/// local reader to unrestricted targets.
-#[must_use]
-pub fn local_site_labels() -> std::collections::BTreeMap<String, String> {
-    let mut labels = std::collections::BTreeMap::new();
-    for (key, var) in [
-        (SITE_REGION_LABEL, "GRID_SITE_REGION"),
-        (SITE_ZONE_LABEL, "GRID_SITE_ZONE"),
-    ] {
-        if let Ok(value) = std::env::var(var) {
-            let value = value.trim();
-            if !value.is_empty() {
-                labels.insert(key.to_owned(), value.to_owned());
-            }
-        }
-    }
-    labels
-}
-
 /// How long a published site signal is served before it expires.
 ///
 /// Several scrape intervals, so a couple of missed scrapes do not erase what is

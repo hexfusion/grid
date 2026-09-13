@@ -157,7 +157,6 @@ async fn main() {
             Published {
                 site: ctx.signals(),
                 peers: ctx.peers(),
-                local_labels: Arc::new(grid_network::local_site_labels()),
             },
             ctx.peer_identities(),
         ),
@@ -757,8 +756,6 @@ struct Published {
     site: operator::signals::SignalStore,
     /// What peers reported about themselves.
     peers: operator::signals::SignalStore,
-    /// Labels a local consumer reads as, which are this site's own.
-    local_labels: Arc<BTreeMap<String, String>>,
 }
 
 /// Serve the coarse signal rollup on the single mTLS wire path, fail closed.
@@ -972,19 +969,17 @@ async fn signals_handler(
         .map(|(_, v)| v.clone())
         .collect();
 
-    let reader = match &caller {
-        Caller::Local => &*published.local_labels,
-        Caller::Peer(Some(labels)) => labels,
+    // Local, the site's own data plane, gets the whole grid view unscoped.
+    // Access policy bounds peer reads, not the site reading itself.
+    let (mut body, mut oldest) = match &caller {
+        Caller::Local => published.site.render_unrestricted(target, &collect),
+        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels)),
         Caller::Peer(None) => return refused(),
     };
-    let reader = Some(reader);
-    let (mut body, mut oldest) = published.site.render(target, &collect, reader);
     if caller == Caller::Local {
-        // Relayed peer signals are served only to Local (this site's own data
-        // plane), so the peers store carries no access map. Relaying peers to a
-        // `Peer(Some)` caller in future must add scoping here, or it would
-        // bypass the per-target access policy the site store enforces.
-        let (relayed, relayed_age) = published.peers.render(target, &collect, reader);
+        // Peers relay only to Local, and the peers store carries no access map.
+        // A Peer(Some) relay would need per-target scoping added here.
+        let (relayed, relayed_age) = published.peers.render_unrestricted(target, &collect);
         body.push_str(&relayed);
         oldest = oldest.max(relayed_age);
     }

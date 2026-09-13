@@ -1050,10 +1050,10 @@ impl OpensslServerConfig {
 
 /// Build the signals listener TLS config from PEM material.
 ///
-/// Client auth is optional on purpose: the co-located gateway presents this
-/// site's own certificate and a peer presents its own, and the scope rule reads
-/// that difference. A presented certificate is still verified against the grid
-/// roots.
+/// Client auth is not forced at the TLS layer: the co-located gateway and a
+/// peer each present their own certificate, and the scope rule reads the
+/// difference. A presented certificate is verified against the grid roots. A
+/// caller presenting none, or an unpinned one, is refused by the scope rule.
 ///
 /// # Errors
 ///
@@ -1082,10 +1082,10 @@ pub fn build_server_config(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Re
 
 /// Build the signals listener TLS config from PEM material.
 ///
-/// Client auth is optional on purpose: the co-located gateway presents this
-/// site's own certificate and a peer presents its own, and the scope rule reads
-/// that difference. A presented certificate is still verified against the grid
-/// roots.
+/// Client auth is not forced at the TLS layer: the co-located gateway and a
+/// peer each present their own certificate, and the scope rule reads the
+/// difference. A presented certificate is verified against the grid roots. A
+/// caller presenting none, or an unpinned one, is refused by the scope rule.
 ///
 /// # Errors
 ///

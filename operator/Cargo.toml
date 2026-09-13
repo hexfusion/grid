@@ -38,6 +38,7 @@ swim = { path = "../swim" }
 futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+httpdate = { workspace = true }
 hyper = { workspace = true, features = ["server"] }
 hyper-rustls = { workspace = true, optional = true }
 hyper-openssl = { workspace = true, optional = true }

@@ -25,11 +25,12 @@
 //!
 //! [`rustls::ClientConfig`]: rustls::ClientConfig
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
+
 use crate::resources::tls_backend::ClientTlsConfig;
 pub(crate) use crate::resources::tls_backend::{
     build_custom_tls_connector, build_native_connector, build_pinned_client_config, build_tls_client_config,
@@ -103,15 +104,30 @@ pub enum MetricsScrapeError {
 /// Returns [`MetricsScrapeError::Timeout`] if the request exceeds `timeout`.
 /// Returns [`MetricsScrapeError::NonOkStatus`] for non-2xx responses.
 /// Returns [`MetricsScrapeError::Transport`] for connection failures.
-#[expect(
-    clippy::too_many_lines,
-    reason = "URL parse + scheme check + client build + request + body read: sequential steps"
-)]
 pub(crate) async fn scrape_metrics(
     url: &str,
     timeout: Duration,
     tls_config: Option<ClientTlsConfig>,
 ) -> Result<String, MetricsScrapeError> {
+    scrape_metrics_with_date(url, timeout, tls_config)
+        .await
+        .map(|(body, _)| body)
+}
+
+/// Like [`scrape_metrics`], but also returns the response `Date` header parsed
+/// to a [`SystemTime`], or `None` when it is absent or unparseable.
+///
+/// The peer poller uses the date to re-express a relayed sample's age on one
+/// clock.
+#[expect(
+    clippy::too_many_lines,
+    reason = "URL parse + scheme check + client build + request + body read: sequential steps"
+)]
+pub(crate) async fn scrape_metrics_with_date(
+    url: &str,
+    timeout: Duration,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
     let uri = url
         .parse::<http::Uri>()
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
@@ -153,6 +169,12 @@ pub(crate) async fn scrape_metrics(
         });
     }
 
+    let date = response
+        .headers()
+        .get(http::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| httpdate::parse_http_date(text).ok());
+
     let body_bytes = Limited::new(response.into_body(), MAX_RESPONSE_BODY_BYTES)
         .collect()
         .await
@@ -167,9 +189,8 @@ pub(crate) async fn scrape_metrics(
         })?
         .to_bytes();
 
-    // Vec::from reclaims the buffer when this Bytes uniquely owns it (a body that
-    // arrived in one chunk), avoiding a copy of up to the full megabyte cap.
-    String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)
+    let body = String::from_utf8(body_bytes.to_vec()).map_err(MetricsScrapeError::Encoding)?;
+    Ok((body, date))
 }
 
 
