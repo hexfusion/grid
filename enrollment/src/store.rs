@@ -87,6 +87,7 @@ impl NewRequest {
                 created_at: OffsetDateTime::now_utc(),
                 decided_at: None,
                 decided_by: None,
+                issued_via: None,
                 reason: None,
                 certificate: None,
                 spiffe_id: None,
@@ -99,7 +100,7 @@ impl NewRequest {
     }
 }
 
-/// What approval recorded.
+/// What issuance recorded.
 #[derive(Debug, Clone)]
 pub struct Issued {
     /// The issued certificate, PEM encoded.
@@ -108,8 +109,14 @@ pub struct Issued {
     /// The name bound into the certificate.
     pub spiffe_id: String,
 
-    /// Who approved.
+    /// The operator that minted the redeemed invite (auto-issue), or the
+    /// operator that approved (the retained manual path).
     pub decided_by: String,
+
+    /// The invite the redemption spent, for an auto-issued row.
+    ///
+    /// `None` on the manual approve path, which has no invite in hand.
+    pub invite_id: Option<Uuid>,
 }
 
 /// An invite to store, before it has been redeemed.
@@ -260,6 +267,8 @@ impl Store {
     }
 
     /// Move a pending request to [`EnrollmentPhase::Denied`].
+    ///
+    /// Retained for the manual decision path that auto-issue supersedes.
     ///
     /// # Errors
     ///
@@ -423,6 +432,7 @@ impl MemoryStore {
         row.public.phase = EnrollmentPhase::Issued;
         row.public.decided_at = Some(OffsetDateTime::now_utc());
         row.public.decided_by = Some(issued.decided_by);
+        row.public.issued_via = issued.invite_id;
         row.public.certificate = Some(issued.certificate);
         row.public.spiffe_id = Some(issued.spiffe_id);
         let updated = row.public.clone();
@@ -430,7 +440,7 @@ impl MemoryStore {
         Ok(updated)
     }
 
-    /// Move a pending request to denied.
+    /// Move a pending request to denied. Retained legacy of the manual path.
     fn mark_denied(
         &self,
         request_id: Uuid,
@@ -474,7 +484,11 @@ impl MemoryStore {
     /// Look an invite up by token digest.
     fn find_invite(&self, token_sha256: &str) -> Result<Invite, StoreError> {
         let inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
-        inner.invites.get(token_sha256).cloned().ok_or(StoreError::InviteNotFound)
+        inner
+            .invites
+            .get(token_sha256)
+            .cloned()
+            .ok_or(StoreError::InviteNotFound)
     }
 
     /// Redeem an invite, one-shot and guarded on expiry.

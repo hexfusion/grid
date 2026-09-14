@@ -105,6 +105,16 @@ async fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
     }
 }
 
+/// One year, the default issued-certificate lifetime.
+///
+/// Sam's call: without renewal, a short lifetime strands every site the first
+/// time one expires, so the cert is long-lived until renewal exists. Security
+/// recommends the 30-day floor instead, since a one-year, no-revocation window
+/// is a materially larger exposure and the gossip plane has no lever short of
+/// mesh-key rotation. Recorded as risk-acceptance, and the single knob below
+/// still overrides it.
+const DEFAULT_CERT_LIFETIME: time::Duration = time::Duration::days(365);
+
 /// Read how long issued certificates should last.
 ///
 /// Expiry is the only thing that removes a member, so this is what bounds how
@@ -116,7 +126,7 @@ fn load_cert_lifetime() -> time::Duration {
         .filter(|secs| *secs > 0)
         .map(time::Duration::seconds);
 
-    let lifetime = configured.unwrap_or(certs::DEFAULT_SITE_CERT_LIFETIME);
+    let lifetime = configured.unwrap_or(DEFAULT_CERT_LIFETIME);
     tracing::info!(
         seconds = lifetime.whole_seconds(),
         "issued certificates expire after this"

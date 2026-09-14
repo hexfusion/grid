@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::{
     auth::token_digest,
     authz::{Authorizer, AuthzError, Operation},
+    metrics::{self, RejectReason},
     model::{
         DenyInput, EnrollmentPhase, EnrollmentRequest, EnrollmentRequestInput, ErrorBody, InviteInput, IssuedInvite,
         JoinProof, JoiningKit, ListQuery,
@@ -286,81 +287,186 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/requests", post(create).get(list))
         .route("/v1/invites", post(issue_invite))
         .route("/v1/requests/{request_id}", get(fetch).delete(remove))
+        // Retained legacy of the manual decision path that auto-issue supersedes.
+        // Deleting these (and their store/model support) is the one remaining
+        // step and needs Sam's direct authorization; see the branch note.
         .route("/v1/requests/{request_id}/approve", post(approve))
         .route("/v1/requests/{request_id}/deny", post(deny))
         .route("/v1/requests/{request_id}/join", post(join))
+        .route("/metrics", get(metrics_handler))
         .layer(DefaultBodyLimit::max(MAX_CSR_PEM_BYTES.saturating_mul(2)))
         .with_state(state)
 }
 
-/// Submit a request.
+/// Submit a request, and issue on the spot.
 ///
-/// Closed by the site token: an operator issues an invite that pins the name and
-/// region, and submit needs it. The name and region come from the invite, not
-/// the enrollee, so the CSR still contributes only its key.
+/// Closed by the site token: an operator mints an invite that pins the name and
+/// region, and submit needs it. Redeeming that one-shot invite issues the
+/// certificate directly, with no separate approve step. The name and region come
+/// from the invite, not the enrollee, so the CSR contributes only its key.
 ///
-/// The request is verified here rather than at approval, so an operator is never
-/// shown something that cannot be signed, and unusable submissions are not
-/// stored.
+/// Restart-safe: a redeemed invite reads its issued record back rather than
+/// minting again, so an operator re-submitting after a restart is a read, not a
+/// replay. The redeem lock is the anti-replay for a genuinely new issue.
 async fn create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(input): Json<EnrollmentRequestInput>,
 ) -> Result<(StatusCode, Json<EnrollmentRequest>), ApiError> {
-    let token = presented_invite(&headers)?;
+    let token = presented_invite(&headers).inspect_err(|_no_token| {
+        metrics::record_rejection(RejectReason::NoToken);
+    })?;
     let digest = token_digest(&token);
-    let invite = usable_invite(&state, &digest).await?;
 
-    // The operator's pins win: the enrollee cannot choose its name, region, or
-    // grid. A pinned name falls back to the submitted one only for an unpinned
-    // invite, which this service does not mint but the schema allows.
+    let invite = match state.store.find_invite(&digest).await {
+        Ok(invite) => invite,
+        Err(err @ StoreError::InviteNotFound) => {
+            metrics::record_rejection(RejectReason::InvalidInvite);
+            return Err(err.into());
+        },
+        Err(err) => return Err(err.into()),
+    };
+
+    // Restart-safe: a spent invite returns the certificate it already
+    // bootstrapped rather than being refused as a replay.
+    if let Some(existing) = redeemed_outcome(&state, &invite).await? {
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+
+    if invite.expires_at <= time::OffsetDateTime::now_utc() {
+        metrics::record_rejection(RejectReason::Expired);
+        return Err(ApiError::InviteRejected {
+            code: "invite_unavailable",
+            message: "this site token has expired".to_owned(),
+        });
+    }
+
+    // Box the mint future to keep this handler's stack frame small.
+    let issued = Box::pin(mint(&state, &invite, &digest, input)).await?;
+    Ok((StatusCode::CREATED, Json(issued)))
+}
+
+/// Sign, store, redeem, and record an issue for an unredeemed invite.
+///
+/// Redeem lands before the mark, so the one-shot lock is the anti-replay: a
+/// racing second submit of the same token is undone here and reads the issued
+/// record back on retry. The cost of that order: if the mark fails after the
+/// redeem succeeds, the invite is spent but the row stays Pending with no cert,
+/// and `redeemed_outcome` then refuses the retry. Recovery today is the retained
+/// `approve` on that Pending row; resuming it automatically is a tracked
+/// follow-up.
+///
+/// `sign_csr` rebuilds every SAN from the assigned name and drops the CSR's
+/// requested names, so the grant is exactly name, region, and grid; egress and
+/// capabilities are enrollee-asserted, bounded by the mTLS identity this issues,
+/// not part of the grant.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear issue sequence: sign, store, redeem, mark"
+)]
+async fn mint(
+    state: &AppState,
+    invite: &Invite,
+    digest: &str,
+    input: EnrollmentRequestInput,
+) -> Result<EnrollmentRequest, ApiError> {
     let site_name = invite.site_name.clone().unwrap_or_else(|| input.site_name.clone());
-    let grid_network_ref = invite.grid_network_ref.clone();
-
-    // Signing here proves the submission is usable and yields the key
-    // fingerprint. The certificate is thrown away; only approval issues one.
-    let checked = issue_for(&state, &site_name, &input.csr)?;
+    let issued = issue_for(state, &site_name, &input.csr).inspect_err(|err| {
+        if matches!(
+            err,
+            ApiError::BadRequest {
+                code: "invalid_csr",
+                ..
+            }
+        ) {
+            metrics::record_rejection(RejectReason::InvalidCsr);
+        }
+    })?;
 
     let created = state
         .store
         .create(NewRequest {
             site_name,
-            grid_network_ref,
+            grid_network_ref: invite.grid_network_ref.clone(),
             region: invite.region.clone(),
             csr_pem: input.csr,
-            public_key_sha256: checked.public_key_sha256,
+            public_key_sha256: issued.public_key_sha256.clone(),
             egress: input.egress,
             capabilities: input.capabilities,
         })
-        .await?;
+        .await
+        .inspect_err(record_name_taken)?;
 
-    // Redeem last, so the one-shot mark lands on a request that exists. On a lost
-    // race the request is undone, so a burnt token never leaves a stray record.
-    if let Err(err) = state.store.redeem_invite(&digest, created.request_id).await {
+    if let Err(err) = state.store.redeem_invite(digest, created.request_id).await {
+        // The real lost-race is an already-redeemed invite; a backend blip is not,
+        // so only the race counts as a rejection. If the undo delete itself fails
+        // the pending row is a rare orphan, logged but not otherwise cleaned up.
         let _undone = state.store.delete(created.request_id).await;
+        if matches!(err, StoreError::InviteUnavailable) {
+            metrics::record_rejection(RejectReason::AlreadyRedeemed);
+        }
         return Err(err.into());
     }
 
-    Ok((StatusCode::CREATED, Json(created)))
+    let issue = Issued {
+        certificate: issued.cert_pem,
+        spiffe_id: issued.spiffe_id,
+        decided_by: invite.issued_by.clone(),
+        invite_id: Some(invite.id),
+    };
+    let updated = match state.store.mark_issued(created.request_id, issue).await {
+        Ok(updated) => updated,
+        // Defensive no-op: this request id is freshly minted and unseen by any
+        // other caller, so nothing else can have decided it. Kept for safety.
+        Err(StoreError::AlreadyDecided) => state.store.get(created.request_id).await?.public,
+        // The invite is already spent, so a mark failure here (a backend error, or
+        // a name-collision surfacing late at the unique index) strands the row
+        // Pending with no cert; `redeemed_outcome` then refuses the retry, and the
+        // retained `approve` on that Pending row is the only recovery until the
+        // resume-on-retry follow-up lands. See the branch note.
+        Err(err) => {
+            record_name_taken(&err);
+            return Err(err.into());
+        },
+    };
+
+    tracing::info!(site = %updated.site_name, invite = %invite.id, operator = %invite.issued_by, "enrollment auto-issued");
+    Ok(updated)
 }
 
-/// Fetch an invite by digest and check it is still redeemable.
+/// Count a name-collision refusal.
 ///
-/// Rejected here, before anything is created, so the common spent-or-lapsed case
-/// leaves no orphan request behind; the redeem guard still catches a lost race.
-async fn usable_invite(state: &AppState, digest: &str) -> Result<Invite, ApiError> {
-    let invite = state.store.find_invite(digest).await?;
-    let refuse = |message: &str| ApiError::InviteRejected {
+/// A valid invite whose pinned name is already held is the silent refusal
+/// auto-issue could otherwise leave uncounted, so it joins the rejection metric.
+fn record_name_taken(err: &StoreError) {
+    if matches!(err, StoreError::NameTaken) {
+        metrics::record_rejection(RejectReason::NameTaken);
+    }
+}
+
+/// The certificate a spent invite already bootstrapped, if any.
+///
+/// A redeemed invite is not a fresh grant. When its redemption produced an
+/// Issued record, that record comes back, so a retry (an operator re-submitting
+/// after a restart) reads the certificate rather than being refused. Anything
+/// else, a spent invite with no Issued record (including the rare redeemed-but-
+/// Pending row from a mid-mint failure), is a refusal by design: recovery of
+/// that stranded case is the retained `approve` path, not this read.
+async fn redeemed_outcome(state: &AppState, invite: &Invite) -> Result<Option<EnrollmentRequest>, ApiError> {
+    if invite.redeemed_at.is_none() {
+        return Ok(None);
+    }
+    if let Some(request_id) = invite.redeemed_by
+        && let Ok(stored) = state.store.get(request_id).await
+        && stored.public.phase == EnrollmentPhase::Issued
+    {
+        return Ok(Some(stored.public));
+    }
+    metrics::record_rejection(RejectReason::AlreadyRedeemed);
+    Err(ApiError::InviteRejected {
         code: "invite_unavailable",
-        message: message.to_owned(),
-    };
-    if invite.redeemed_at.is_some() {
-        return Err(refuse("this site token has already been redeemed"));
-    }
-    if invite.expires_at <= time::OffsetDateTime::now_utc() {
-        return Err(refuse("this site token has expired"));
-    }
-    Ok(invite)
+        message: "this site token has already been redeemed".to_owned(),
+    })
 }
 
 /// The site token the submission carried, or a refusal when it carried none.
@@ -487,6 +593,7 @@ async fn approve(
                 certificate: issued.cert_pem,
                 spiffe_id: issued.spiffe_id,
                 decided_by: operator.clone(),
+                invite_id: None,
             },
         )
         .await
@@ -497,12 +604,7 @@ async fn approve(
         Err(err) => return Err(err.into()),
     };
 
-    tracing::info!(
-        site = %updated.site_name,
-        spiffe_id = ?updated.spiffe_id,
-        %operator,
-        "enrollment approved"
-    );
+    tracing::info!(site = %updated.site_name, spiffe_id = ?updated.spiffe_id, %operator, "enrollment approved");
     Ok(Json(updated))
 }
 
@@ -607,4 +709,15 @@ async fn remove(
     state.store.delete(request_id).await?;
     tracing::info!(%request_id, %operator, "enrollment deleted");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Prometheus exposition.
+///
+/// Open, so a scrape needs no operator credential: it carries counts, never a
+/// token or a certificate.
+async fn metrics_handler() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics::encode(),
+    )
 }

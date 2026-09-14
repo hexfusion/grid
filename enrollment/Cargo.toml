@@ -33,6 +33,7 @@ kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 pem = "3"
 projection = { path = "../projection" }
+prometheus = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
 ring = { workspace = true }

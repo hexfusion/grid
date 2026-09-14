@@ -59,6 +59,7 @@ fn issued_for(site: &str) -> Issued {
         certificate: format!("-----BEGIN CERTIFICATE-----\n{site}\n-----END CERTIFICATE-----"),
         spiffe_id: format!("spiffe://grid.internal/site/{site}"),
         decided_by: "sam".to_owned(),
+        invite_id: None,
     }
 }
 

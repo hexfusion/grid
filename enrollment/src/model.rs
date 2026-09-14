@@ -118,10 +118,19 @@ pub struct EnrollmentRequest {
 
     /// Who decided.
     ///
-    /// Recorded so a grid can answer why a provider is trusted, which a
-    /// hand-edited allow list cannot.
+    /// Under auto-issue this is the operator that minted the redeemed invite,
+    /// so the grid can still answer why a provider is trusted without a human
+    /// approve step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decided_by: Option<String>,
+
+    /// The invite this enrollment was issued against.
+    ///
+    /// Provenance for an auto-issued row: names the one-shot invite whose
+    /// redemption authorized the certificate, so an issue traces back to the
+    /// mint even though no human approved it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_via: Option<Uuid>,
 
     /// Why it was refused, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,7 +260,7 @@ pub struct ListQuery {
     pub phase: Option<EnrollmentPhase>,
 }
 
-/// Why a request was refused.
+/// Why a request was refused, on the retained manual deny path.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DenyInput {

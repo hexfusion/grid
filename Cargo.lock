@@ -726,6 +726,7 @@ dependencies = [
  "kube",
  "pem",
  "projection",
+ "prometheus",
  "rcgen",
  "ring",
  "serde",

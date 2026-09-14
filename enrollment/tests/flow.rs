@@ -81,7 +81,14 @@ async fn submit_invited(app: &axum::Router, site: &str, csr: &str) -> (StatusCod
 
 /// Submit for `site` presenting `token` in the invite header.
 async fn submit_with_token(app: &axum::Router, site: &str, csr: &str, token: &str) -> (StatusCode, Value) {
-    send(app, "POST", "/v1/requests", Some(submit(site, csr)), &[("x-grid-invite", token)]).await
+    send(
+        app,
+        "POST",
+        "/v1/requests",
+        Some(submit(site, csr)),
+        &[("x-grid-invite", token)],
+    )
+    .await
 }
 
 async fn send(
@@ -128,13 +135,22 @@ fn submit(site: &str, csr: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_provider_enrolls_and_collects_a_certificate() {
+async fn a_valid_invite_issues_a_certificate_on_submit() {
     let app = service();
 
     let (create_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
     assert_eq!(create_status, StatusCode::CREATED, "submitting should be accepted");
-    assert_eq!(created["phase"], "pending", "a new request waits for a decision");
-    assert!(created["certificate"].is_null(), "nothing is issued before approval");
+    assert_eq!(
+        created["phase"], "issued",
+        "a valid invite issues on submit, with no separate approve"
+    );
+    assert!(
+        created["certificate"]
+            .as_str()
+            .is_some_and(|pem| pem.contains("BEGIN CERTIFICATE")),
+        "the certificate is issued at submit"
+    );
+    assert_eq!(created["spiffeId"], "spiffe://grid.internal/site/site-d");
     let id = created["requestId"].as_str().expect("request id").to_owned();
 
     // The capabilities and egress it advertised come back on the record.
@@ -147,22 +163,18 @@ async fn a_provider_enrolls_and_collects_a_certificate() {
     // The region is the operator's pin from the invite, not anything the site sent.
     assert_eq!(created["region"], "us", "the redeemed invite stamps its region");
 
-    let (approve_status, approved) = call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
-    assert_eq!(approve_status, StatusCode::OK, "approval should succeed");
-    assert_eq!(approved["phase"], "issued");
-    assert_eq!(approved["spiffeId"], "spiffe://grid.internal/site/site-d");
+    // Provenance replaces the human approver: the minting operator and the spent
+    // invite are recorded so an auto-issued certificate still traces to a decision.
+    assert_eq!(created["decidedBy"], "tester", "the minting operator is recorded");
     assert!(
-        approved["certificate"]
-            .as_str()
-            .is_some_and(|pem| pem.contains("BEGIN CERTIFICATE")),
-        "approval issues a certificate"
+        created["issuedVia"].is_string(),
+        "the invite that authorized the issue is recorded"
     );
-    assert!(approved["decidedBy"].is_string(), "who decided is recorded");
 
     // Collecting it again returns the same certificate.
     let (fetch_status, fetched) = call(&app, "GET", &format!("/v1/requests/{id}"), None).await;
     assert_eq!(fetch_status, StatusCode::OK, "collecting should succeed");
-    assert_eq!(fetched["certificate"], approved["certificate"], "the record is durable");
+    assert_eq!(fetched["certificate"], created["certificate"], "the record is durable");
 }
 
 #[tokio::test]
@@ -173,11 +185,9 @@ async fn the_certificate_never_carries_a_name_the_request_asked_for() {
     )]);
 
     let (_create_status, created) = submit_invited(&app, "site-d", &csr).await;
-    let id = created["requestId"].as_str().expect("id").to_owned();
-    let (_approve_status, approved) = call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
 
     assert_eq!(
-        approved["spiffeId"], "spiffe://grid.internal/site/site-d",
+        created["spiffeId"], "spiffe://grid.internal/site/site-d",
         "a request asking to be site-a must not be granted it"
     );
 }
@@ -229,10 +239,15 @@ async fn deciding_requires_an_operator_credential() {
         "who has asked to join is not public"
     );
 
-    // The request is untouched by the refused attempts.
+    // The auto-issued request is untouched by the refused decision attempts.
     let (_fetch_status, fetched) = call(&app, "GET", &format!("/v1/requests/{id}"), None).await;
-    assert_eq!(fetched["phase"], "pending", "a refused decision changes nothing");
-    assert!(fetched["certificate"].is_null(), "nothing was issued");
+    assert_eq!(fetched["phase"], "issued", "a refused decision changes nothing");
+    assert!(
+        fetched["certificate"]
+            .as_str()
+            .is_some_and(|pem| pem.contains("BEGIN CERTIFICATE")),
+        "the certificate issued at submit is still there"
+    );
 }
 
 #[tokio::test]
@@ -277,66 +292,63 @@ async fn an_enrollee_collects_its_certificate_without_a_credential() {
 #[tokio::test]
 async fn listing_can_be_filtered_by_phase() {
     let app = service();
-    let (_first_status, first) = submit_invited(&app, "site-d", &plain_csr()).await;
-    let id = first["requestId"].as_str().expect("id").to_owned();
+    submit_invited(&app, "site-d", &plain_csr()).await;
     submit_invited(&app, "site-e", &plain_csr()).await;
-    call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
 
+    // Auto-issue leaves nothing pending: both requests are issued on submit.
     let (_pending_status, pending) = call_as_operator(&app, "GET", "/v1/requests?phase=pending", None).await;
-    let pending_names: Vec<&str> = pending
+    assert_eq!(
+        pending.as_array().map(Vec::len),
+        Some(0),
+        "auto-issue leaves nothing pending"
+    );
+
+    let (_issued_status, issued) = call_as_operator(&app, "GET", "/v1/requests?phase=issued", None).await;
+    let issued_names: Vec<&str> = issued
         .as_array()
         .expect("array")
         .iter()
         .filter_map(|row| row["siteName"].as_str())
         .collect();
-    assert_eq!(pending_names, vec!["site-e"], "only site-e is still pending");
-
-    let (_issued_status, issued) = call_as_operator(&app, "GET", "/v1/requests?phase=issued", None).await;
-    assert_eq!(
-        issued.as_array().map(Vec::len),
-        Some(1),
-        "site-d is the only issued member"
-    );
+    assert_eq!(issued_names, vec!["site-e", "site-d"], "both are issued, newest first");
 }
 
 #[tokio::test]
 async fn two_providers_cannot_hold_the_same_name() {
     let app = service();
-    let (_first_status, first) = submit_invited(&app, "site-d", &plain_csr()).await;
-    let id = first["requestId"].as_str().expect("id").to_owned();
-    call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
+    submit_invited(&app, "site-d", &plain_csr()).await;
 
     let (second_status, second_body) = submit_invited(&app, "site-d", &plain_csr()).await;
     assert_eq!(second_status, StatusCode::CONFLICT, "the name is already held");
     assert_eq!(second_body["error"], "name_taken");
 }
 
+/// Auto-issue leaves no pending request to deny, so the retained deny path
+/// cannot take back a certificate the submit already issued. Revocation on the
+/// routing plane is deleting the `GridSite`, not deny.
 #[tokio::test]
-async fn a_denied_request_issues_nothing() {
+async fn the_retained_deny_cannot_revoke_an_auto_issued_certificate() {
     let app = service();
     let (_status, created) = submit_invited(&app, "site-d", &plain_csr()).await;
+    assert_eq!(created["phase"], "issued", "submit auto-issues");
     let id = created["requestId"].as_str().expect("id").to_owned();
 
-    let (deny_status, denied) = call_as_operator(
+    let (deny_status, deny_body) = call_as_operator(
         &app,
         "POST",
         &format!("/v1/requests/{id}/deny"),
-        Some(json!({"reason": "not a known operator"})),
+        Some(json!({"reason": "too late"})),
     )
     .await;
-    assert_eq!(deny_status, StatusCode::OK, "denial should succeed");
-    assert_eq!(denied["phase"], "denied");
-    assert_eq!(denied["reason"], "not a known operator");
-    assert!(denied["certificate"].is_null(), "denial issues nothing");
-
-    let (approve_status, approve_body) =
-        call_as_operator(&app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
     assert_eq!(
-        approve_status,
+        deny_status,
         StatusCode::CONFLICT,
-        "a denied request cannot then be approved"
+        "an already-issued request cannot be denied"
     );
-    assert_eq!(approve_body["error"], "already_decided");
+    assert_eq!(deny_body["error"], "already_decided");
+
+    let (_fetch_status, fetched) = call(&app, "GET", &format!("/v1/requests/{id}"), None).await;
+    assert_eq!(fetched["phase"], "issued", "the certificate still stands");
 }
 
 /// An unusable submission is refused at the door, so an operator is never shown
@@ -345,8 +357,7 @@ async fn a_denied_request_issues_nothing() {
 async fn an_unusable_request_is_refused_on_submission() {
     let app = service();
 
-    let (malformed_status, malformed_body) =
-        submit_invited(&app, "site-d", "not a csr").await;
+    let (malformed_status, malformed_body) = submit_invited(&app, "site-d", "not a csr").await;
     assert_eq!(
         malformed_status,
         StatusCode::BAD_REQUEST,
@@ -354,8 +365,7 @@ async fn an_unusable_request_is_refused_on_submission() {
     );
     assert_eq!(malformed_body["error"], "invalid_csr");
 
-    let (bad_name_status, bad_name_body) =
-        submit_invited(&app, "Site-D", &plain_csr()).await;
+    let (bad_name_status, bad_name_body) = submit_invited(&app, "Site-D", &plain_csr()).await;
     assert_eq!(
         bad_name_status,
         StatusCode::BAD_REQUEST,
@@ -404,7 +414,7 @@ async fn requests_are_listed_newest_first() {
 #[tokio::test]
 async fn an_approved_provider_collects_what_it_needs_to_join() {
     let app = service();
-    let (id, key) = approved_site(&app, "site-join").await;
+    let (id, key) = enrolled_site(&app, "site-join").await;
 
     let (status, kit) = call(
         &app,
@@ -437,7 +447,7 @@ async fn an_approved_provider_collects_what_it_needs_to_join() {
 #[tokio::test]
 async fn the_joining_kit_is_refused_without_proof_of_the_key() {
     let app = service();
-    let (id, _key) = approved_site(&app, "site-proof").await;
+    let (id, _key) = enrolled_site(&app, "site-proof").await;
 
     // Somebody else's key, which is what an interloper would have.
     let other = KeyPair::generate().expect("other key");
@@ -464,9 +474,10 @@ async fn the_joining_kit_is_refused_without_proof_of_the_key() {
     assert_eq!(garbage_status, StatusCode::UNAUTHORIZED, "rubbish must not collect it");
 }
 
-/// Nothing to join with before a decision.
+/// Auto-issue makes a submitted request joinable at once: no approve step, the
+/// joining kit is available as soon as submit returns.
 #[tokio::test]
-async fn a_pending_request_has_no_joining_kit() {
+async fn a_submitted_request_is_immediately_joinable() {
     let app = service();
     let key = KeyPair::generate().expect("key");
     let mut params = CertificateParams::default();
@@ -476,19 +487,24 @@ async fn a_pending_request_has_no_joining_kit() {
     let (_status, created) = submit_invited(&app, "site-early", &csr).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
 
-    let (status, body) = call(
+    let (status, kit) = call(
         &app,
         "POST",
         &format!("/v1/requests/{id}/join"),
         Some(proof_for(&id, &key)),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "there is nothing to collect yet");
-    assert_eq!(body["error"], "not_issued");
+    assert_eq!(status, StatusCode::OK, "an auto-issued request is joinable at once");
+    assert!(
+        kit["certificate"]
+            .as_str()
+            .is_some_and(|pem| pem.contains("BEGIN CERTIFICATE")),
+        "the kit carries the certificate"
+    );
 }
 
-/// Submit for `site`, approve it, and hand back the request id and the key.
-async fn approved_site(app: &axum::Router, site: &str) -> (String, KeyPair) {
+/// Submit for `site`, which auto-issues, and hand back the request id and the key.
+async fn enrolled_site(app: &axum::Router, site: &str) -> (String, KeyPair) {
     let key = KeyPair::generate().expect("key");
     let mut params = CertificateParams::default();
     params.distinguished_name.push(DnType::CommonName, site);
@@ -496,7 +512,6 @@ async fn approved_site(app: &axum::Router, site: &str) -> (String, KeyPair) {
 
     let (_status, created) = submit_invited(app, site, &csr).await;
     let id = created["requestId"].as_str().expect("id").to_owned();
-    call_as_operator(app, "POST", &format!("/v1/requests/{id}/approve"), None).await;
     (id, key)
 }
 
@@ -525,8 +540,7 @@ async fn submitting_requires_a_valid_invite() {
     let app = service();
 
     // No invite header at all.
-    let (missing_status, missing_body) =
-        call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
+    let (missing_status, missing_body) = call(&app, "POST", "/v1/requests", Some(submit("site-d", &plain_csr()))).await;
     assert_eq!(
         missing_status,
         StatusCode::UNAUTHORIZED,
@@ -564,22 +578,32 @@ async fn the_invite_pins_the_name_the_body_cannot_override() {
     assert_eq!(created["region"], "us", "the region is pinned too");
 }
 
-/// An invite buys one enrollment: a second submit with the same token is refused.
+/// An invite buys one enrollment. Re-presenting a spent token does not mint a
+/// second certificate: it reads the first back, which is the restart-safe path
+/// for an operator re-submitting after a restart.
 #[tokio::test]
-async fn an_invite_is_one_shot() {
+async fn a_spent_invite_returns_the_first_certificate_not_a_second() {
     let app = service();
     let token = invite_for(&app, "site-d").await;
 
-    let (first_status, _first) = submit_with_token(&app, "site-d", &plain_csr(), &token).await;
-    assert_eq!(first_status, StatusCode::CREATED, "the first submit is admitted");
+    let (first_status, first) = submit_with_token(&app, "site-d", &plain_csr(), &token).await;
+    assert_eq!(first_status, StatusCode::CREATED, "the first submit issues");
+    assert_eq!(first["phase"], "issued");
 
-    let (second_status, second_body) = submit_with_token(&app, "site-d", &plain_csr(), &token).await;
+    let (second_status, second) = submit_with_token(&app, "site-d", &plain_csr(), &token).await;
     assert_eq!(
         second_status,
-        StatusCode::UNAUTHORIZED,
-        "the same token cannot bootstrap a second site"
+        StatusCode::OK,
+        "re-presenting the spent token reads the issued record back, not a replay"
     );
-    assert_eq!(second_body["error"], "invite_unavailable");
+    assert_eq!(
+        second["requestId"], first["requestId"],
+        "no second enrollment: the same request comes back"
+    );
+    assert_eq!(
+        second["certificate"], first["certificate"],
+        "and the same certificate, not a freshly minted one"
+    );
 }
 
 /// An expired invite cannot be redeemed, checked at the store where expiry is guarded.

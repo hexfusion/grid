@@ -17,6 +17,8 @@ use crate::model::{EnrollmentPhase, EnrollmentRequest};
 static SCHEMA: &str = include_str!("../../db/schema/0001_create_enrollment_requests.up.sql");
 /// The invite schema, applied alongside it so submit can be gated on a token.
 static SCHEMA_INVITES: &str = include_str!("../../db/schema/0002_create_enrollment_invites.up.sql");
+/// Provenance column for auto-issued rows, naming the invite the redemption spent.
+static SCHEMA_ISSUED_VIA: &str = include_str!("../../db/schema/0003_add_issued_via.up.sql");
 
 /// Requests held in Postgres.
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ impl PgStore {
         let pool = PgPool::connect(url).await.map_err(backend)?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await.map_err(backend)?;
         sqlx::raw_sql(SCHEMA_INVITES).execute(&pool).await.map_err(backend)?;
+        sqlx::raw_sql(SCHEMA_ISSUED_VIA).execute(&pool).await.map_err(backend)?;
         Ok(Self { pool })
     }
 
@@ -125,7 +128,7 @@ impl PgStore {
         let updated = sqlx::query(
             "UPDATE enrollment_requests
                 SET phase = 'issued', certificate = $2, spiffe_id = $3,
-                    decided_by = $4, decided_at = NOW()
+                    decided_by = $4, issued_via = $5, decided_at = NOW()
               WHERE id = $1 AND phase = 'pending'
               RETURNING *",
         )
@@ -133,6 +136,7 @@ impl PgStore {
         .bind(&issued.certificate)
         .bind(&issued.spiffe_id)
         .bind(&issued.decided_by)
+        .bind(issued.invite_id)
         .fetch_optional(&self.pool)
         .await;
 
@@ -272,6 +276,7 @@ fn public_from(row: &PgRow) -> Result<EnrollmentRequest, StoreError> {
         created_at: row.try_get::<OffsetDateTime, _>("created_at").map_err(backend)?,
         decided_at: row.try_get("decided_at").map_err(backend)?,
         decided_by: row.try_get("decided_by").map_err(backend)?,
+        issued_via: row.try_get("issued_via").map_err(backend)?,
         reason: row.try_get("reason").map_err(backend)?,
         certificate: row.try_get("certificate").map_err(backend)?,
         spiffe_id: row.try_get("spiffe_id").map_err(backend)?,
