@@ -10,6 +10,8 @@
 //! This is the only non-test module that names either TLS stack; every other
 //! module refers to the aliases and functions exposed here.
 
+#[cfg(feature = "fips")]
+use std::sync::OnceLock;
 use std::{borrow::Cow, sync::Arc};
 
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -103,6 +105,9 @@ pub(crate) struct OpensslClientConfig {
     identity: Option<(Vec<X509>, PKey<Private>)>,
     /// Declared leaf digests for a pinned peer, empty for ordinary trust.
     pins: Vec<[u8; 32]>,
+    /// The connector built from the fields above, shared by every connection.
+    /// Built lazily so a config derived with different pins caches its own.
+    connector: OnceLock<SslConnector>,
 }
 
 #[cfg(feature = "fips")]
@@ -148,6 +153,22 @@ impl OpensslClientConfig {
             builder.check_private_key()?;
         }
         Ok(builder)
+    }
+
+    /// The shared connector, built once from the parsed material and reused by
+    /// every connection. `connector_builder` parses the CA store and installs
+    /// the verify callback, so that runs once here rather than per connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OpenSSL error stack if building the connector fails.
+    fn connector(&self) -> Result<&SslConnector, openssl::error::ErrorStack> {
+        if let Some(connector) = self.connector.get() {
+            return Ok(connector);
+        }
+        let connector = self.connector_builder()?.build();
+        // A lost race drops our connector; both callers get the stored winner.
+        Ok(self.connector.get_or_init(|| connector))
     }
 
     /// Whether this config pins a peer's leaf key rather than trusting any name.
@@ -384,6 +405,7 @@ pub(crate) fn build_tls_config(
         ca_roots: roots,
         identity,
         pins: Vec::new(),
+        connector: OnceLock::new(),
     };
     config
         .connector_builder()
@@ -651,6 +673,7 @@ pub(crate) fn build_tls_client_config(
         ca_roots,
         identity,
         pins: Vec::new(),
+        connector: OnceLock::new(),
     };
     config
         .connector_builder()
@@ -881,7 +904,13 @@ pub(crate) fn build_pinned_client_config(
     }
     let base = build_tls_client_config(ca_pem, client_cert_pem, client_key_pem)?;
     let pins = pins.iter().map(|pin| decode_pin(pin)).collect::<Result<_, _>>()?;
-    Ok(Arc::new(OpensslClientConfig { pins, ..base }))
+    // A fresh cache: the pins change the verify callback, so this config must
+    // build its own connector rather than inherit the unpinned base's.
+    Ok(Arc::new(OpensslClientConfig {
+        pins,
+        connector: OnceLock::new(),
+        ..base
+    }))
 }
 
 /// Verify callback for a pinned peer: standard chain checks, plus the leaf
@@ -944,7 +973,7 @@ pub(crate) async fn connect(
     server_name: &ServerName,
 ) -> Result<ClientTlsStream, std::io::Error> {
     let to_io = |e: openssl::error::ErrorStack| std::io::Error::other(e);
-    let connector = config.connector_builder().map_err(to_io)?.build();
+    let connector = config.connector().map_err(to_io)?;
     let ssl = connector
         .configure()
         .and_then(|mut c| {
@@ -1010,6 +1039,8 @@ pub struct OpensslServerConfig {
     chain: Vec<X509>,
     /// Private key for `leaf`.
     key: PKey<Private>,
+    /// The acceptor built from the fields above, shared by every connection.
+    acceptor: OnceLock<SslAcceptor>,
 }
 
 #[cfg(feature = "fips")]
@@ -1045,6 +1076,21 @@ impl OpensslServerConfig {
         // certificate must verify.
         builder.set_verify(SslVerifyMode::PEER);
         Ok(builder)
+    }
+
+    /// The shared acceptor, built once from the parsed material and reused by
+    /// every connection, so each accept only calls `Ssl::new` on its context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OpenSSL error stack if building the acceptor fails.
+    fn acceptor(&self) -> Result<&SslAcceptor, openssl::error::ErrorStack> {
+        if let Some(acceptor) = self.acceptor.get() {
+            return Ok(acceptor);
+        }
+        let acceptor = self.acceptor_builder()?.build();
+        // A lost race drops our acceptor; both callers get the stored winner.
+        Ok(self.acceptor.get_or_init(|| acceptor))
     }
 }
 
@@ -1110,6 +1156,7 @@ pub fn build_server_config(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Re
         leaf,
         chain,
         key,
+        acceptor: OnceLock::new(),
     };
     config
         .acceptor_builder()
@@ -1142,7 +1189,7 @@ pub async fn accept(
     tcp_stream: tokio::net::TcpStream,
     config: &ServerTlsConfig,
 ) -> Result<ServerTlsStream, std::io::Error> {
-    let acceptor = config.acceptor_builder().map_err(std::io::Error::other)?.build();
+    let acceptor = config.acceptor().map_err(std::io::Error::other)?;
     let ssl = openssl::ssl::Ssl::new(acceptor.context()).map_err(std::io::Error::other)?;
     let mut stream = tokio_openssl::SslStream::new(ssl, tcp_stream).map_err(std::io::Error::other)?;
     std::pin::Pin::new(&mut stream)

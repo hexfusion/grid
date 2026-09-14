@@ -189,7 +189,7 @@ pub(crate) async fn scrape_metrics_with_date(
         })?
         .to_bytes();
 
-    let body = String::from_utf8(body_bytes.to_vec()).map_err(MetricsScrapeError::Encoding)?;
+    let body = String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)?;
     Ok((body, date))
 }
 
