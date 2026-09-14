@@ -321,11 +321,11 @@ components:
             The name the grid assigned, carried as a URI SAN on the
             certificate.
           examples: ['spiffe://grid.internal/site/site-d']
-        fingerprint:
+        publicKeySha256:
           type: string
           description: |
-            Lowercase hex SHA-256 of the issued leaf in DER form. Peers
-            pin this.
+            Lowercase hex SHA-256 of the request's public key. Names the
+            key rather than the certificate, so it survives reissue.
           pattern: '^[0-9a-f]{64}$'
         egress:
           $ref: '#/components/schemas/Egress'
