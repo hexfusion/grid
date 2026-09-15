@@ -23,9 +23,30 @@ use openssl::{
 };
 #[cfg(not(feature = "fips"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName as RustlsServerName, UnixTime, pem::PemObject as _};
-use sha2::{Digest as _, Sha256};
 
 use crate::{metrics_scraper::MetricsScrapeError, resources::gateway_probe::GatewayProbeOutcome};
+
+/// SHA-256 of `data`. The fips build routes this through the OpenSSL EVP digest
+/// so identity hashes run in the validated provider, not the pure-Rust sha2 crate.
+#[cfg(not(feature = "fips"))]
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(data).into()
+}
+
+/// EVP one-shot through the system provider. Not `openssl::sha`, a legacy non-EVP
+/// path that bypasses the FIPS provider.
+#[cfg(feature = "fips")]
+#[expect(
+    clippy::expect_used,
+    reason = "a sha256 failure means the FIPS provider is broken; crashing is the fail-closed response"
+)]
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), data).expect("openssl sha256 digest");
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
 
 /// Maximum number of intermediate certificates accepted in a peer chain.
 pub(crate) const MAX_CHAIN_DEPTH: usize = 4;
@@ -848,8 +869,8 @@ impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
             now,
             self.algorithms.all,
         )?;
-        let presented = Sha256::digest(end_entity);
-        if self.pins.iter().any(|pin| pin == presented.as_slice()) {
+        let presented = sha256(end_entity);
+        if self.pins.contains(&presented) {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
         Err(rustls::Error::General(
@@ -937,8 +958,8 @@ fn verify_pinned_leaf(preverify_ok: bool, ctx: &mut X509StoreContextRef, pins: &
     let Ok(der) = cert.to_der() else {
         return false;
     };
-    let digest = Sha256::digest(&der);
-    pins.iter().any(|pin| pin == digest.as_slice())
+    let digest = sha256(&der);
+    pins.contains(&digest)
 }
 
 /// Perform the client TLS handshake over an established TCP stream.

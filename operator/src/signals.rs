@@ -218,8 +218,7 @@ pub struct SignalStore {
 /// gateway probe pins with, so a site is known by one hash everywhere.
 #[must_use]
 pub fn leaf_fingerprint(der: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-    Sha256::digest(der).iter().map(|b| format!("{b:02x}")).collect()
+    tls_backend::sha256(der).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Normalise a declared fingerprint to the form [`leaf_fingerprint`] emits.
