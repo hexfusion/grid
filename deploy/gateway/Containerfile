@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build
+# ------------------------------------------------------------------------------
+#
+# Copy workspace manifests first, build with a stub source to cache dependency
+# compilation, then copy real source and rebuild only the gateway crate.
+
+FROM rust:1.96-alpine AS builder
+
+ENV OPENSSL_STATIC=1
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake make g++
+
+WORKDIR /src
+
+# ------------------------------------------------------------------------------
+# Cache Build
+# ------------------------------------------------------------------------------
+
+COPY Cargo.toml Cargo.lock ./
+COPY gateway/Cargo.toml gateway/Cargo.toml
+
+# Strip workspace members not needed for the gateway binary so this image build
+# does not need their manifests or source.
+RUN sed -i '/"certs"/d; /"crdt"/d; /"enrollment"/d; /"forge"/d; /"mock-providers"/d; /"operator"/d; /"overlay-sync"/d; /"scoring"/d; /"swim"/d; /"xtask"/d' Cargo.toml
+
+RUN mkdir -p gateway/src \
+    && printf '//! stub\nfn main() {}\n' > gateway/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p gateway --bin grid-gateway
+
+# ------------------------------------------------------------------------------
+# Build
+# ------------------------------------------------------------------------------
+
+COPY gateway/src gateway/src
+
+RUN find gateway/src -name '*.rs' -exec touch {} +
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p gateway --bin grid-gateway \
+    && cp target/release/grid-gateway /usr/local/bin/grid-gateway
+
+# ------------------------------------------------------------------------------
+# Stage 2: Runtime
+# ------------------------------------------------------------------------------
+
+FROM alpine:3.23
+
+LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
+    org.opencontainers.image.description="Praxis-based grid data-plane gateway" \
+    org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S grid \
+    && adduser -S -G grid -h /nonexistent -s /sbin/nologin grid
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/local/bin/grid-gateway /usr/local/bin/grid-gateway
+
+USER 100:101
+
+ENTRYPOINT ["grid-gateway"]
