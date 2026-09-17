@@ -25,8 +25,10 @@ COPY Cargo.toml Cargo.lock ./
 # Only the operator binary and its path dependencies need full source; the rest
 # are manifest-only stubs.
 COPY certs/Cargo.toml certs/Cargo.toml
+COPY common/Cargo.toml common/Cargo.toml
 COPY crdt/Cargo.toml crdt/Cargo.toml
 COPY enrollment/Cargo.toml enrollment/Cargo.toml
+COPY filter/Cargo.toml filter/Cargo.toml
 COPY forge/Cargo.toml forge/Cargo.toml
 COPY gateway/Cargo.toml gateway/Cargo.toml
 COPY mock-providers/Cargo.toml mock-providers/Cargo.toml
@@ -38,10 +40,13 @@ COPY xtask/Cargo.toml xtask/Cargo.toml
 
 # Create stub sources so cargo can validate each workspace member manifest
 # without compiling them. Only operator and its path deps are actually built.
-RUN mkdir -p certs/src crdt/src forge/src gateway/src mock-providers/src \
-             operator/src overlay-sync/src scoring/src swim/src xtask/src \
+RUN mkdir -p certs/src common/src crdt/src filter/src forge/src gateway/src \
+             mock-providers/src operator/src overlay-sync/src scoring/src swim/src \
+             xtask/src \
     && echo '//! stub' > certs/src/lib.rs \
+    && echo '//! stub' > common/src/lib.rs \
     && echo '//! stub' > crdt/src/lib.rs \
+    && echo '//! stub' > filter/src/lib.rs \
     && echo '//! stub' > forge/src/lib.rs \
     && echo '//! stub' > operator/src/lib.rs \
     && echo '//! stub' > scoring/src/lib.rs \

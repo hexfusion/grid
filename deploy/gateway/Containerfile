@@ -24,8 +24,10 @@ COPY Cargo.toml Cargo.lock ./
 # Copy Cargo.toml for every workspace member so cargo can resolve the workspace.
 # Only gateway needs full source; the rest are manifest-only stubs.
 COPY certs/Cargo.toml certs/Cargo.toml
+COPY common/Cargo.toml common/Cargo.toml
 COPY crdt/Cargo.toml crdt/Cargo.toml
 COPY enrollment/Cargo.toml enrollment/Cargo.toml
+COPY filter/Cargo.toml filter/Cargo.toml
 COPY forge/Cargo.toml forge/Cargo.toml
 COPY gateway/Cargo.toml gateway/Cargo.toml
 COPY mock-providers/Cargo.toml mock-providers/Cargo.toml
@@ -37,10 +39,11 @@ COPY xtask/Cargo.toml xtask/Cargo.toml
 
 # Create stub sources so cargo can validate each workspace member manifest
 # without compiling them. Only gateway is actually built.
-RUN mkdir -p certs/src crdt/src forge/src operator/src scoring/src swim/src \
-             overlay-sync/src mock-providers/src xtask/src gateway/src \
-    && touch certs/src/lib.rs crdt/src/lib.rs forge/src/lib.rs \
-             operator/src/lib.rs scoring/src/lib.rs swim/src/lib.rs \
+RUN mkdir -p certs/src common/src crdt/src filter/src forge/src operator/src \
+             scoring/src swim/src overlay-sync/src mock-providers/src xtask/src \
+             gateway/src \
+    && touch certs/src/lib.rs common/src/lib.rs crdt/src/lib.rs filter/src/lib.rs \
+             forge/src/lib.rs operator/src/lib.rs scoring/src/lib.rs swim/src/lib.rs \
     && printf 'fn main() {}\n' > overlay-sync/src/main.rs \
     && printf 'fn main() {}\n' > mock-providers/src/main.rs \
     && printf 'fn main() {}\n' > xtask/src/main.rs \
