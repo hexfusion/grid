@@ -28,10 +28,12 @@ const MAX_PROVIDERS: usize = 4_096;
 /// names past the provider cap.
 const MAX_METRICS_PER_PROVIDER: usize = 64;
 
-/// Cap on samples retained per series, bounding both memory and the request-path
-/// window scan when one ingest carries far more in-window points than a normal
-/// scrape cadence produces. Retention past the cap drops the oldest first.
-const MAX_SAMPLES_PER_SERIES: usize = 1_024;
+/// Samples retained per series; past the cap the oldest drop. A flood bound, not a
+/// working-set size: a normal scrape cadence holds far fewer.
+const MAX_SAMPLES_PER_SERIES: usize = 128;
+
+/// Byte cap on a metric name or target label value before it keys the store.
+const MAX_KEY_INPUT_BYTES: usize = 256;
 
 /// Tolerance for a sample stamped ahead of the operator's own clock (its `Date`
 /// header). Kept small: a legitimate sample is never meaningfully ahead of the
@@ -64,11 +66,16 @@ impl Series {
             return;
         }
         self.samples.push(sample);
-        let Ok(window_ms) = i64::try_from(window.as_millis()) else {
-            return;
+        // Window eviction needs the window in millis. If it does not fit i64 (a
+        // caller passing an implausible Duration), skip only the window cutoff; the
+        // count cap below still runs, so the series stays bounded regardless.
+        let keep_from = match i64::try_from(window.as_millis()) {
+            Ok(window_ms) => {
+                let cutoff = sample.at_ms.saturating_sub(window_ms);
+                self.samples.partition_point(|held| held.at_ms < cutoff)
+            },
+            Err(_) => 0,
         };
-        let cutoff = sample.at_ms.saturating_sub(window_ms);
-        let keep_from = self.samples.partition_point(|held| held.at_ms < cutoff);
         // Drop from the front to satisfy both bounds in one pass: everything past
         // the window, and any excess over the count cap when a flood packs more
         // in-window points than a normal scrape cadence produces.
@@ -244,34 +251,49 @@ struct Observation<'text> {
 fn parse_sample(line: &str) -> Option<Observation<'_>> {
     let metric = exposition::parse(line)?;
     let at_ms = metric.timestamp_ms()?;
-    let mut site: Option<Cow<'_, str>> = None;
-    let mut cluster: Option<Cow<'_, str>> = None;
+    // The metric name keys a provider's series; a relayed over-long name is
+    // rejected before it can bloat the store.
+    if metric.name().len() > MAX_KEY_INPUT_BYTES {
+        return None;
+    }
+    let (site, cluster) = target_labels(&metric)?;
+    Some(Observation {
+        metric: metric.name(),
+        site,
+        cluster,
+        sample: Sample {
+            at_ms,
+            value: metric.value(),
+        },
+    })
+}
+
+/// The `grid_site` and `grid_provider` label values, or `None` if either is
+/// missing, over-long, carries a control char or `/`, or is repeated.
+///
+/// The values key the store as `site/cluster` and are logged, so a separator or
+/// control char is rejected before it can inject one or corrupt a log, and a
+/// repeated target label is anomalous for a well-formed operator.
+fn target_labels<'text>(metric: &exposition::Metric<'text>) -> Option<(Cow<'text, str>, Cow<'text, str>)> {
+    let mut site: Option<Cow<'text, str>> = None;
+    let mut cluster: Option<Cow<'text, str>> = None;
     for (name, value) in metric.labels() {
         let slot = match name {
             SITE_LABEL => &mut site,
             PROVIDER_LABEL => &mut cluster,
             _ => continue,
         };
-        // The value keys the store as `site/cluster` and is logged. Reject a
-        // control char or `/` so it cannot inject a separator or corrupt a log.
+        if value.len() > MAX_KEY_INPUT_BYTES {
+            return None;
+        }
         if value.chars().any(|ch| ch.is_control() || ch == '/') {
             return None;
         }
-        // A repeated target label is anomalous for a well-formed operator.
         if slot.replace(value).is_some() {
             return None;
         }
     }
-    let sample = Sample {
-        at_ms,
-        value: metric.value(),
-    };
-    Some(Observation {
-        metric: metric.name(),
-        site: site?,
-        cluster: cluster?,
-        sample,
-    })
+    Some((site?, cluster?))
 }
 
 /// Milliseconds since the epoch.
