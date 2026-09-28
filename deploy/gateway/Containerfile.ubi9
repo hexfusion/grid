@@ -2,7 +2,7 @@
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:9295c5c688f487fa5cf27a734fa55ecd57aeb7dc0904ba537da4f42dfa1d0acb AS build
 
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        gcc gcc-c++ make \
+        gcc gcc-c++ make cmake openssl-devel pkgconf-pkg-config \
     && dnf clean all
 
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -12,8 +12,8 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-too
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p gateway --bin grid-gateway \
-    && cp target/release/grid-gateway /usr/local/bin/grid-gateway
+RUN cargo build --release --manifest-path gateway/Cargo.toml --bin grid-gateway \
+    && cp gateway/target/release/grid-gateway /usr/local/bin/grid-gateway
 
 FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:fac0bde5012de6a8475bb5dc18db968cdc90b12d9dc2ffaddb4a4975d0b8a04f
 
