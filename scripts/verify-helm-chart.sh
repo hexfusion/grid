@@ -83,6 +83,15 @@ for crd in agenttoolprovider gridnetwork gridsite inferenceprovider; do
   fi
 done
 
+# A CRD missing from the kustomization is silently dropped by kustomize consumers.
+listed=$(sed -n 's/^  - //p' "$DEPLOY_CRDS/kustomization.yaml" | sort)
+present=$(cd "$DEPLOY_CRDS" && ls -1 *.yaml | grep -vx kustomization.yaml | sort)
+if [ "$listed" = "$present" ]; then
+  pass "crd kustomization lists every CRD"
+else
+  fail "crd kustomization out of sync with $DEPLOY_CRDS (rerun scripts/generate-deployment-crds.sh)"
+fi
+
 # ── Default template rendering ───────────────────────────────────────
 echo ""
 echo "=== Template rendering ==="
@@ -139,6 +148,7 @@ try_reject "$CHART_DIR" "invalid digest" --set image.digest=invalid
 try_reject "$CHART_DIR" "port zero" --set metrics.service.port=0
 try_reject "$CHART_DIR" "invalid SWIM type" --set swim.service.type=ExternalName
 try_reject "$CHART_DIR" "unknown key" --set typoField=true
+try_template "$CHART_DIR" "subchart keys" --set enabled=true --set global.foo=bar
 
 # ── Metrics-dependent resource coherence ────────────────────────────
 echo ""
@@ -318,6 +328,7 @@ try_reject "$GW_DIR" "missing config" --set image.tag=v0.1.0-test --namespace gr
 try_reject "$GW_DIR" "invalid digest (gw)" "${GW_REQ[@]}" --set image.digest=invalid
 try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.type=ExternalName
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
+try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --set global.foo=bar
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
 try_reject "$GW_DIR" "overlay enabled no name" "${GW_REQ[@]}" --set overlay.enabled=true
 try_reject "$GW_DIR" "tls enabled no secret" "${GW_REQ[@]}" --set tls.enabled=true
@@ -520,6 +531,15 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
 
   KCTX="kind-${KIND_CLUSTER}"
 
+  # ── CRD kustomization ────────────────────────────────────────────
+  echo ""
+  echo "=== CRD kustomization ==="
+  if kubectl --context "$KCTX" apply --dry-run=server -k "$DEPLOY_CRDS" >/dev/null 2>&1; then
+    pass "kind: crds apply -k (server dry-run)"
+  else
+    fail "kind: crds apply -k (server dry-run)"
+  fi
+
   # Build install args — use CI tag override when set
   OP_INSTALL_ARGS=()
   if [ -n "${GRID_OPERATOR_CI_TAG:-}" ]; then
@@ -544,6 +564,14 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
       pass "kind: crd $crd established"
     else
       fail "kind: crd $crd not found"
+    fi
+  done
+
+  for short in gnw infpvd; do
+    if kubectl --context "$KCTX" get "$short" >/dev/null 2>&1; then
+      pass "kind: kubectl get $short"
+    else
+      fail "kind: kubectl get $short does not resolve"
     fi
   done
 
