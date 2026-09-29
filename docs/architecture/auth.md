@@ -12,24 +12,24 @@ Each serves a different trust boundary and must not be conflated.
 | **Provider credential injection** | The final-hop gateway's credential for a SaaS/cloud provider API. | At the final-hop gateway, via `credential_inject`. |
 
 The customer's `Authorization` header must not be forwarded as a provider
-credential.  Public TLS certificates (for external endpoints) must be kept
+credential. Public TLS certificates (for external endpoints) must be kept
 separate from Grid site mTLS certificates.
 
 **External caller authentication** is relevant for external client ingress,
-where customers outside the cluster reach a public endpoint.  Grid's provider
+where customers outside the cluster reach a public endpoint. Grid's provider
 `accessPolicy` is site-oriented, not tenant-oriented: an edge site's provider
-eligibility does not authorize every customer to every model.  Production
+eligibility does not authorize every customer to every model. Production
 external service requires request-time tenant-to-model authorization that is
-separate from Grid's site-level access control.  This is not yet implemented.
+separate from Grid's site-level access control. This is not yet implemented.
 
 See [External Client Ingress](external-ingress.md) for the full external
 authentication model.
 
 ## Provider Authentication Strategies
 
-Authentication in this section means provider authentication: how the final-hop
-gateway or provider component that makes the final upstream call authenticates
-to the selected backend after routing has chosen a candidate.  It does not
+Authentication in this section means provider authentication: how the
+final-hop gateway or provider component authenticates the final upstream call
+to the selected backend, after routing has chosen a candidate. It does not
 replace or rewrite credentials on the inbound client request.
 
 The implemented native path is `bearer_token`:
@@ -48,8 +48,8 @@ consumer gateway `ConfigMap`s.
 
 **Implementation status:** the Grid-side contract is implemented: the operator
 validates `secretRef`, projects only the reference into `routing-config.json`, and
-can render consumer Praxis config with file-backed credential references.  The
-request-time filter is the Praxis AI `credential_inject` filter.  Runtime
+can render consumer Praxis config with file-backed credential references. The
+request-time filter is the Praxis AI `credential_inject` filter. Runtime
 deployments must use a Praxis AI image that includes `credential_inject`.
 
 | Strategy | Status | Request-time behavior |
@@ -60,7 +60,7 @@ deployments must use a Praxis AI image that includes `credential_inject`.
 | `service_account` | Extension point | Kubernetes service-account token injection when implemented. |
 | `sigv4` | Extension point | Per-request signing when implemented. |
 | `oauth2` | Extension point | Refresh-on-expiry token handling when implemented. |
-| `mtls_only` | Extension point | No HTTP credential injection; authentication is certificate-based. |
+| `mtls_only` | Extension point | No HTTP credential injection, authentication is certificate-based. |
 
 ## Implemented request path
 
@@ -82,21 +82,21 @@ Credential placement follows the final-hop rule:
 |---|---|---|
 | Direct API or cloud fallback from the consumer gateway | Secret mounted into that consumer/final-hop gateway pod | The same gateway injects or signs before calling the provider API. |
 | Remote Grid site reached over gateway-to-gateway mTLS | Secret mounted only in the remote provider site or provider-side component | The provider-side final-hop component injects before calling its local backend, if that backend needs a provider credential. |
-| Local self-hosted backend with no provider API credential | No provider token required | No HTTP credential injection; mTLS or local network policy handles gateway/backend trust. |
+| Local self-hosted backend with no provider API credential | No provider token required | No HTTP credential injection, mTLS or local network policy handles gateway/backend trust. |
 
 In this document, **consumer gateway** (or **ingress gateway**) means the Praxis
 gateway receiving the workload request.  **Final-hop gateway** means the Praxis
 gateway or provider-side component that makes the final outbound call to the
-backend.  For direct API-provider or cloud-provider fallback, the consumer
+backend. For direct API-provider or cloud-provider fallback, the consumer
 gateway is often also the final-hop gateway.
 
 ### Controller behavior
 
 The `InferenceProvider` controller validates credentials during every reconcile:
 
-- Parses `spec.auth` strategy — unsupported strategies immediately drive the
+- Parses `spec.auth` strategy. Unsupported strategies immediately drive the
   provider phase to `Unavailable`.
-- Validates `spec.auth.secretRef` shape — blank or missing fields drive
+- Validates `spec.auth.secretRef` shape. Blank or missing fields drive
   `Unavailable` before any API call.
 - Verifies the referenced Kubernetes Secret exists, contains the declared key,
   and the key value is valid UTF-8.
@@ -104,14 +104,14 @@ The `InferenceProvider` controller validates credentials during every reconcile:
   `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`,
   `CredentialSecretMissing`, `CredentialSecretKeyMissing`,
   `CredentialSecretValueInvalid`.
-- `BearerToken` is an opaque type whose `Debug` output is redacted; operator
+- `BearerToken` is an opaque type whose `Debug` output is redacted. Operator
   resources store only credential references, never token values.
 - The `CredentialResolver` trait and `KubernetesSecretResolver` v1 backend are
   in production operator code.
 - **Credential reference projection into the routing overlay**: when a provider's
   `spec.auth` declares `strategy: bearer_token` with a valid `secretRef`, the
   operator includes a `credential` field in every routing candidate produced for
-  that provider. The field carries `{ strategy, secretRef: { name, namespace, key } }` —
+  that provider. The field carries `{ strategy, secretRef: { name, namespace, key } }`,
   only the Secret reference, never the token value. This appears in the
   operator-produced `routing-config.json` ConfigMap.
 
@@ -128,18 +128,18 @@ prove the data-plane side for the direct API-provider fallback path:
   reference from the operator overlay, resolves the token, then generates consumer
   config using `intelligent_route` (with credential `secretRef` in candidates) +
   `credential_inject` filter with a `file:` source pointing at a mounted
-  Kubernetes Secret.  The token does not appear in the operator overlay JSON,
+  Kubernetes Secret. The token does not appear in the operator overlay JSON,
   in `intelligent_route` candidates, or in the consumer Praxis `ConfigMap`.
 
 Both paths prove the operator-to-overlay-to-gateway routing chain for a direct
-API-provider route.  The native path is the target architecture; static header
-injection is kept for regression comparison while the xtask bridge still exists.
+API-provider route. The native path is the target architecture. Static header
+injection stays for regression comparison while the xtask bridge still exists.
 
 ### Supplying provider tokens
 
 For both validation paths, the install-time input is the same Kubernetes Secret
-plus an `InferenceProvider.spec.auth.secretRef`.  The Secret contains the
-provider token; the `InferenceProvider` points at the Secret without copying the
+plus an `InferenceProvider.spec.auth.secretRef`. The Secret contains the
+provider token. The `InferenceProvider` points at the Secret without copying the
 token into Grid resources.
 
 ```yaml
@@ -181,7 +181,7 @@ ownership for credential Secret placement and rotation:
 
 - **Final-hop Secret lifecycle**: the token lives in a Kubernetes Secret mounted
   into the final-hop gateway or provider-side component that is authorized to
-  make the final backend call.  The Secret can be created by users, platform
+  make the final backend call. The Secret can be created by users, platform
   automation, or an external secret manager.
 - **Operator-owned consumer config generation**: `GatewayRef.consumerConfig`
   can render the consumer Praxis `ConfigMap` from routing overlay data,
@@ -216,12 +216,12 @@ reads that file at filter construction time and injects
 `Authorization: Bearer <token>` after `intelligent_route`
 selects a credential-bearing candidate.
 
-The current tested Praxis AI `credential_inject` implementation uses
-read-once/cache behavior: the mounted Secret file is read once during filter
-construction, the `Authorization` value is stored in an in-memory `HashMap`, and
-per-request injection is a metadata lookup plus header injection.  There is no
-Kubernetes API call and no per-request file read.  Secret rotation requires a
-Praxis AI config reload or pod restart; automatic rotation is not yet supported.
+The current tested Praxis AI `credential_inject` implementation reads the
+mounted Secret file once, during filter construction, and stores the
+`Authorization` value in an in-memory `HashMap`. Per-request injection is a
+metadata lookup plus header injection, with no Kubernetes API call and no
+per-request file read. Secret rotation requires a Praxis AI config reload or
+pod restart. Automatic rotation is not yet supported.
 
 Static `api_key` and `custom` strategies use the same file-backed injection
 seam when implemented.
@@ -276,10 +276,10 @@ How workloads discover and consume grid providers:
 Workloads send requests to well-known DNS names:
 
 ```text
-inference.grid.local        → inference routing
-claude-sonnet-4.grid.local  → model-specific
-tools.grid.local            → MCP tool federation
-agents.grid.local           → A2A agent routing
+inference.grid.local        -> inference routing
+claude-sonnet-4.grid.local  -> model-specific
+tools.grid.local            -> MCP tool federation
+agents.grid.local           -> A2A agent routing
 ```
 
 The Gateway uses SNI to identify grid traffic and
@@ -306,14 +306,14 @@ model prefix:
 ### 4. MCP Discovery
 
 Connect to the Gateway's MCP endpoint:
-- `tools/list` → federated tool inventory
-- `tools/call` → routed to hosting site
+- `tools/list` returns the federated tool inventory
+- `tools/call` routes to the hosting site
 
 ### 5. A2A Discovery
 
-- `GET /.well-known/agent.json` → aggregated Agent
+- `GET /.well-known/agent.json` returns aggregated Agent
   Cards
-- A2A `SendMessage` → capability-based routing
+- A2A `SendMessage` uses capability-based routing
 
 ### 6. Provider Discovery API
 
@@ -327,17 +327,18 @@ workload's identity and access policies.
 ## SWIM Transport Authentication
 
 SWIM gossip carries membership packets, gateway address broadcasts, public
-certificate PEM broadcasts, and CRDT provider state.  When
-`GridNetwork.spec.tls.swimKeyRef` is configured and the referenced Secret
-resolves to a valid 32-byte key, the Grid operator applies the key before
-announcing CRD seeds or publishing certificate/provider state for that
-`GridNetwork`.  Authenticated SWIM traffic uses AES-256-GCM.  Incoming packets
-that do not authenticate are silently dropped before reaching the membership
-state machine.
+certificate PEM broadcasts, and CRDT provider state.
+
+`GridNetwork.spec.tls.swimKeyRef` names a Secret holding a 32-byte key. When
+that Secret resolves, the Grid operator applies the key before announcing CRD
+seeds or publishing certificate/provider state for that `GridNetwork`.
+Authenticated SWIM traffic uses AES-256-GCM. Incoming packets that do not
+authenticate get dropped silently before reaching the membership state
+machine.
 
 **Secret contract:** `swimKeyRef` points to a Kubernetes Secret in a specified
-namespace.  The Secret must contain a key named `"key"` (or the value of
-`swimKeyRef.key` if set) with exactly 32 bytes of key material.  The key is
+namespace. The Secret must contain a key named `"key"` (or the value of
+`swimKeyRef.key` if set) with exactly 32 bytes of key material. The key is
 loaded at `GridNetwork` reconcile time.
 
 ```yaml
@@ -350,66 +351,67 @@ spec:
 ```
 
 **Configured-key behavior:** when `swimKeyRef` is configured but the Secret is
-missing, unreadable, or contains a key of the wrong length, the reconcile fails
-before CRD seed announcement and certificate/provider broadcasts.  The operator
-does not silently degrade that configured reconcile to plaintext.  Because the
+missing, unreadable, or contains a key of the wrong length, the reconcile
+fails. It fails before CRD seed announcement and certificate/provider
+broadcasts. The operator does not silently degrade that configured reconcile
+to plaintext. Because the
 SWIM runtime is process-global, a key loaded by an earlier successful reconcile
 remains active until restart.
 
 **Environment variable path:** for local development and Kind-based
 testing, set `GRID_SWIM_ENCRYPT_KEY` (a 64-character lowercase hex string
-representing 32 bytes) on the operator process.  This takes effect at startup
+representing 32 bytes) on the operator process. This takes effect at startup
 before the UDP socket processes packets, but environment variables are visible
-to same-host process inspectors.  Use Kubernetes Secret references for the
+to same-host process inspectors. Use Kubernetes Secret references for the
 production configuration path.
 
 **Startup plaintext window:** when the operator process starts, the SWIM UDP
-socket begins receiving immediately.  If only `swimKeyRef` is configured (no
+socket begins receiving immediately. If only `swimKeyRef` is configured (no
 `GRID_SWIM_ENCRYPT_KEY` env var), the runtime has no key until the first
-`GridNetwork` reconcile loads it from the Secret.  During this window — typically
-a few seconds — the SWIM socket accepts plaintext packets.  The env var path
+`GridNetwork` reconcile loads it from the Secret. During this window (typically
+a few seconds), the SWIM socket accepts plaintext packets. The env var path
 closes this window at startup because the key is loaded before the UDP socket
-begins processing.  This is a known limitation of the CRD-only key path.
+begins processing. This is a known limitation of the CRD-only key path.
 
 **What SWIM encryption protects:** gossip membership messages, gateway address
-and public certificate broadcasts, and CRDT provider state.  It does not protect
+and public certificate broadcasts, and CRDT provider state. It does not protect
 data-plane request traffic (that is Praxis/Praxis AI's responsibility).
 
-**Key rotation:** changing the key requires an operator restart.  Multi-key
+**Key rotation:** changing the key requires an operator restart. Multi-key
 keyring support (allowing zero-downtime rotation) is not yet implemented.
 
 ## Grid mTLS Identity
 
 Grid-generated site certificates set
 `OrganizationName = "ai-grid"` (see
-`certs::DEFAULT_ORGANIZATION`).  Gateway deployments
+`certs::DEFAULT_ORGANIZATION`). Gateway deployments
 that enable peer identity trust can match incoming peer certificates on
 `organization: ai-grid` by default.
 
 Any certificate signed by the Grid CA but with a
-different organization value will pass TLS handshake
-and fail at the filter, producing an HTTP 403.  This
-is the intended fail-closed behaviour for cert-based
+different organization value passes the TLS handshake
+and fails at the filter, producing an HTTP 403. This
+is the intended fail-closed behavior for cert-based
 bootstrap authentication.
 
 Production deployments should switch to cert-digest
 pinning (`cert_digest` field on `trusted_peers`) once
-cert identities are stable, as organization matching
-is weaker — any cert signed by a trusted CA with the
-correct `O=` value is accepted.
+cert identities are stable. Organization matching is
+weaker: any cert signed by a trusted CA with the
+correct `O=` value gets accepted.
 
 ### Authentication vs authorization
 
-Authentication answers: "is this peer really the Grid site or gateway it claims
-to be?"  In the data plane, this is handled by mTLS peer identity and certificate
+Authentication answers: "is this peer the Grid site or gateway it claims
+to be?" In the data plane, mTLS peer identity and certificate matching handle this
 validation.
 
 Authorization answers: "is this authenticated peer allowed to participate in
-this Grid or carry this traffic?"  Grid policy and gateway trust configuration
+this Grid or carry this traffic?" Grid policy and gateway trust configuration
 make that decision.
 
-SWIM discovery is neither authentication nor authorization.  A peer discovered
-through gossip must not become routable solely because it is alive.  The control
+SWIM discovery is neither authentication nor authorization. A peer discovered
+through gossip must not become routable solely because it is alive. The control
 plane can record discovered sites and trust material, but the provider gateway
 still enforces peer identity on every request.
 
@@ -417,7 +419,7 @@ still enforces peer identity on every request.
 
 The Grid operator propagates a site's public certificate PEM to peers via SWIM
 state broadcasts when the local `GridNetwork` has `spec.tls.siteSecretRef`
-configured.  Before storage, the receiving operator runs a structural check:
+configured. Before storage, the receiving operator runs a structural check:
 
 - Input containing `PRIVATE KEY` markers is discarded and logged at error level.
   Private key material must never enter status fields or SWIM broadcasts.
@@ -426,7 +428,7 @@ configured.  Before storage, the receiving operator runs a structural check:
 - Input with a valid `CERTIFICATE` header passes the structural check and is
   stored in `GridSite.status.publicCertPem`.
 
-This structural check is **not** cryptographic verification.  It does not parse
+This structural check is **not** cryptographic verification. It does not parse
 DER bytes as X.509, check the issuer or validity period, or validate the signature
 against a CA.
 
@@ -467,7 +469,7 @@ spec:
 Pins are lowercase SHA-256 digests of the leaf certificate's canonical DER
 bytes, with no separators. Verify them through an independent trust channel
 before configuration. The demo's tooling derives the canonical value from the
-staged certificate; production certificate tooling should expose the same
+staged certificate. Production certificate tooling should expose the same
 DER-based digest.
 
 **Certificate rotation:** `canonicalFingerprints` accepts one current pin and
@@ -475,16 +477,16 @@ one next pin. Add the next pin before deploying the new gateway certificate,
 wait for the live and SWIM-advertised certificate state to converge, then remove
 the old pin. An unexpected third identity is rejected. Trust failures demote an
 Active site to `Connecting`, while connection failures demote it to
-`Unreachable`; both phases exclude its CRDT providers from routing.
+`Unreachable`. Both phases exclude its CRDT providers from routing.
 
-Private keys are never broadcast.  The operator reads only the `tls.crt` key from
-the site certificate Secret — the `tls.key` key is never accessed for broadcast
+Private keys are never broadcast. The operator reads only the `tls.crt` key from
+the site certificate Secret. It never accesses the `tls.key` key for broadcast
 purposes. The local operator reads its own `tls.key` only to authenticate the
 bounded mTLS health probe. The provider gateway separately enforces peer identity
 on every request.
 
 **Routing eligibility:** Remote CRDT provider records are included in the routing overlay
-only when the source `GridSite.status.phase == Active`.  Records from peers in any other
+only when the source `GridSite.status.phase == Active`. Records from peers in any other
 phase (`Discovered`, `Connecting`, `Unreachable`, or missing) are excluded at the
 control-plane overlay level.
 
@@ -496,10 +498,10 @@ provider-side authorization, which are enforced separately by the data plane.
 
 | Who | What |
 |-----|------|
-| **Grid Operator** | Validates provider credential `secretRef`; projects credential references (never token values) into routing overlays; can render opt-in consumer Praxis `ConfigMap`; generates local CA and site cert Secrets; marks `GridSite.status.phase = Active` after the configured identity-aware gateway probe succeeds. |
-| **Gateway filters** | `intelligent_route` selects candidates and writes credential metadata; `credential_inject` reads a mounted Secret file and injects credentials per request; `peer_identity_trust` verifies peer certificate identity on provider gateways. |
-| **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`; distributes the Grid CA cert to remote clusters where gateways need to verify peer identity; configures the provider gateway's peer identity filter; manages gateway rollout when trust material changes. |
-| **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials. |
+| **Grid Operator** | Validates provider credential `secretRef`, projects credential references (never token values) into routing overlays, can render opt-in consumer Praxis `ConfigMap`, generates local CA and site cert Secrets, and marks `GridSite.status.phase = Active` after the configured identity-aware gateway probe succeeds. |
+| **Gateway filters** | `intelligent_route` selects candidates and writes credential metadata. `credential_inject` reads a mounted Secret file and injects credentials per request. `peer_identity_trust` verifies peer certificate identity on provider gateways. |
+| **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`, distributes the Grid CA cert to remote clusters where gateways need to verify peer identity, configures the provider gateway's peer identity filter, and manages gateway rollout when trust material changes. |
+| **Workload** | Sends requests to the Gateway, optionally with routing headers. Never handles provider credentials. |
 
 `Active` GridSite status is the control-plane eligibility gate: it controls whether a remote
 site's providers appear in the routing overlay. Active means the control plane has enough

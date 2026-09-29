@@ -378,15 +378,15 @@ filter parses the field and makes it available to downstream filters, but does
 not perform Kubernetes API calls or inject credentials itself.
 
 Credential injection is handled by the final-hop gateway that makes the final
-backend call.  For direct API-provider or cloud-provider fallback, the consumer
+backend call. For direct API-provider or cloud-provider fallback, the consumer
 gateway is often also the final-hop gateway, so it mounts the Secret and Praxis
-AI injects the credential before forwarding to the provider API.  For remote
+AI injects the credential before forwarding to the provider API. For remote
 Grid sites, provider backend credentials stay in the remote provider site or
 provider-side component; the consumer gateway should not receive those provider
 tokens.
 
 Native file-backed injection requires the Praxis AI `credential_inject`
-filter.  Grid can render the overlay and generated config for that path today,
+filter. Grid can render the overlay and generated config for that path today,
 but runtime deployments must use a Praxis AI image that includes the filter.
 
 ## Candidate scoring and ordering
@@ -469,8 +469,8 @@ Locality tier is derived from `GridSite.spec.region` and `GridSite.spec.zone`:
 | Either site has no region | `unknown` |
 
 Zone comparison requires a region match because zone names are not globally
-unique.  When no `GridSite` geography is configured, all candidates receive
-`unknown` tier and ordering falls through to score-based ranking — preserving
+unique. When no `GridSite` geography is configured, all candidates receive
+`unknown` tier and ordering falls through to score-based ranking, preserving
 backward compatibility with deployments that predate geography fields.
 
 `Unavailable` providers are excluded. `Degraded` providers remain in the
@@ -485,14 +485,14 @@ than recomputing the full scoring formula.
 ### Policy
 
 Stale candidates (`fresh: false`) are **retained in the overlay** rather than
-immediately excluded.  This policy supports:
-- **Observability** — operators can see that a remote peer is degraded before
+immediately excluded. This policy supports:
+- **Observability**: operators can see that a remote peer is degraded before
   it recovers.
-- **Last-resort fallback** — if no healthy candidate exists for a model, a
+- **Last-resort fallback**: if no healthy candidate exists for a model, a
   stale candidate is better than a hard 404.
 
 The authoritative GC policy function is `should_retain_candidate` in
-`operator/src/resources/routing_overlay.rs`.  Rules, in priority order:
+`operator/src/resources/routing_overlay.rs`. Rules, in priority order:
 
 | Condition | Result |
 |---|---|
@@ -508,53 +508,53 @@ The authoritative GC policy function is `should_retain_candidate` in
 to `Dead` or `Suspect`.
 
 The SWIM runtime (`operator/src/swim_runtime.rs`) records the transition instant
-in a private `status_changed_at: Option<Instant>` field for each member.  When a
+in a private `status_changed_at: Option<Instant>` field for each member. When a
 member transitions to `Dead` or `Suspect`, the instant is recorded and preserved
-monotonically.  When the member rejoins (`Alive`), the instant is cleared.  The
+monotonically. When the member rejoins (`Alive`), the instant is cleared. The
 public `MemberRecord.age_secs` is computed as `now.saturating_duration_since(status_changed_at).as_secs()`
 at snapshot time.
 
 A `age_secs = 0` has two distinct meanings:
-- **Alive member** — no Dead/Suspect transition has occurred.
-- **Dead/Suspect member with `age_secs = 0`** — the runtime has just transitioned
+- **Alive member**: no Dead/Suspect transition has occurred.
+- **Dead/Suspect member with `age_secs = 0`**: the runtime has just transitioned
   (elapsed is less than one second), or a synthetic snapshot did not include age.
   The GC helper `dead_or_suspect_age_secs` treats `age_secs = 0` on a
   Dead/Suspect member as "unknown" and retains conservatively.
 
 **`crdt::ProviderState`** carries only a monotonic `revision` counter, not
-a wall-clock timestamp.  CRDT storage-level GC is outside the current operator contract.
+a wall-clock timestamp. CRDT storage-level GC is outside the current operator contract.
 
-### Per-GridNetwork TTL — `spec.staleCandidateTtlSeconds`
+### Per-GridNetwork TTL: `spec.staleCandidateTtlSeconds`
 
 The `GridNetwork` CRD exposes `spec.staleCandidateTtlSeconds` (optional `u32`)
 to control when stale candidates are removed from the overlay.
 
 | `spec.staleCandidateTtlSeconds` | Behaviour |
 |---|---|
-| Absent (default) | No-op — stale candidates retained indefinitely |
+| Absent (default) | No-op, stale candidates retained indefinitely |
 | `0` | Rejected by the CRD schema (`minimum: 1`) |
 | `N >= 1` | Remote `fresh=false` candidates with SWIM member age `>= N` seconds are omitted from the overlay |
 
 The filter runs every reconcile cycle after `apply_swim_staleness_override`.
-Only remote candidates in the `Degraded` phase are subject to GC.  Local
+Only remote candidates in the `Degraded` phase are subject to GC. Local
 candidates and `Available` remote candidates are always retained.
 
 The controller also defensively treats an internally observed `0` as absent, so
 malformed data cannot accidentally trigger immediate eviction outside the normal
 Kubernetes API validation path.
 
-**Recommended starting value:** `3600` (one hour) — allows short outages to
+**Recommended starting value:** `3600` (one hour), allows short outages to
 recover without overlay churn while bounding accumulation of truly dead peers.
 
-**Important:** The TTL is applied at overlay-rendering time.  CRDT provider
-records in storage are not deleted by this mechanism.  CRDT storage-level GC
+**Important:** The TTL is applied at overlay-rendering time. CRDT provider
+records in storage are not deleted by this mechanism. CRDT storage-level GC
 is outside the current operator contract.
 
 ### Not implemented: hard exclusion
 
 The GC policy does not implement hard exclusion of all `fresh=false` candidates.
 A `fresh=false` candidate is only evicted after the TTL expires; it is
-**deprioritized**, not excluded.  See the scoring section for how `fresh=false`
+**deprioritized**, not excluded. See the scoring section for how `fresh=false`
 affects candidate ordering.
 
 ## Backend kinds
@@ -633,8 +633,8 @@ semantics, error mapping, streaming behavior, and credential rotation.
 ## Credential injection
 
 When an `InferenceProvider` has `spec.auth.strategy: bearer_token` with a
-`spec.auth.secretRef`, the operator projects a credential reference — never the
-token value — into the routing overlay candidate:
+`spec.auth.secretRef`, the operator projects a credential reference (never the
+token value) into the routing overlay candidate:
 
 ```json
 {
@@ -661,7 +661,7 @@ The native injection path uses two gateway filters in sequence:
 1. **`intelligent_route`** selects the candidate and writes the secretRef fields to
    in-process filter metadata: `intelligent_route.credential.strategy`,
    `intelligent_route.credential.name`, `intelligent_route.credential.namespace`,
-   `intelligent_route.credential.key`.  No token value is written.
+   `intelligent_route.credential.key`. No token value is written.
 
 2. **`credential_inject`** reads those metadata keys, looks up the
    matching token in its configured credential map, and injects
@@ -676,14 +676,14 @@ load_balancer           → upstream cluster selection with injected headers
 ```
 
 This filter chain requires a Praxis AI image that includes
-`credential_inject`.  Grid renders the overlay and generated config shape;
+`credential_inject`. Grid renders the overlay and generated config shape;
 the runtime image must provide the filter implementation.
 
 ### File-backed token source
 
 In the current xtask validation mode for direct API-provider fallback, the token
 value is resolved from a Kubernetes Secret by the xtask harness and written into
-a Kubernetes Secret in the consumer cluster.  The consumer pod mounts that
+a Kubernetes Secret in the consumer cluster. The consumer pod mounts that
 Secret as a file, and `credential_inject` reads the token from its
 configured `file:` path at filter construction time.
 
@@ -703,27 +703,27 @@ The token does NOT appear in:
 ### Deployment ownership
 
 The operator generates the consumer Praxis config including the `credential_inject`
-section for direct API-provider routes.  Secret provisioning — creating,
+section for direct API-provider routes. Secret provisioning (creating,
 rotating, and synchronizing the mounted credential Secret in the final-hop
-cluster — is the responsibility of platform automation or an external Secret
+cluster) is the responsibility of platform automation or an external Secret
 manager.
 
-The `intelligent_route` → `credential_inject` filter chain interface is the same
+The `intelligent_route` to `credential_inject` filter chain interface is the same
 regardless of how the final-hop Secret is provisioned.
 
 ## Routing eligibility
 
 The Grid operator enforces a routing eligibility gate on remote provider state
-received over SWIM CRDT broadcasts.  A remote provider record is included in the
+received over SWIM CRDT broadcasts. A remote provider record is included in the
 routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
 
 | Site state | Remote CRDT providers eligible |
 |---|---|
-| No matching `GridSite` | No — fail-closed |
+| No matching `GridSite` | No, fail-closed |
 | `Pending` | No |
 | `Discovered` | No |
 | `Connecting` | No |
-| `Active` | Yes — control-plane eligible |
+| `Active` | Yes, control-plane eligible |
 | `Unreachable` | No |
 | `Left` | No |
 
@@ -746,7 +746,7 @@ traffic. Data-plane readiness is enforced separately at request time.
 See [Authentication and Access Policy](auth.md) for the trust contract.
 
 **Local providers** (from `InferenceProvider` resources in the same cluster) are
-always eligible.  They are not filtered by `GridSite.status.phase`.
+always eligible. They are not filtered by `GridSite.status.phase`.
 
 **Claim**: SWIM membership + TCP reachability + public cert material alone are not
 sufficient for a remote provider to become routable.  `Active` is the explicit
@@ -754,9 +754,9 @@ routing eligibility gate; the operator only sets it after the configured
 fingerprint trust policy matches.
 
 **Validation**: `verify-swim-mesh-three-node` proves the eligibility gate in a
-three-node mesh (A→B→C topology).  It asserts that C's provider is absent from
+three-node mesh (A to B to C topology). It asserts that C's provider is absent from
 A's overlay before C's `GridSite` is `Active`, and appears only after `Active`
-is set — even though CRDT state from C reached A transitively through B.  The
+is set, even though CRDT state from C reached A transitively through B. The
 same validation confirms wrong-network provider records are absent from A's
 correct-network overlay.
 
@@ -764,7 +764,7 @@ correct-network overlay.
 
 At request time, `intelligent_route` matches the requested model against the
 already-loaded overlay candidates, then chooses from Grid's pre-rendered
-candidate order.  It does not call Kubernetes, SWIM, or the operator, and it
+candidate order. It does not call Kubernetes, SWIM, or the operator, and it
 does not recompute the full scoring formula per request.
 
 The Praxis consumer gateway extracts request facts such as the requested model
@@ -784,8 +784,8 @@ gateway.
 
 The difference is upstream of `intelligent_route`: the external edge sits behind a
 global traffic manager that selects a healthy edge before the request body or
-model is known.  The edge then parses the OpenAI-compatible request, extracts
-the model, and runs the loaded overlay selection.  Two-stage routing separates
+model is known. The edge then parses the OpenAI-compatible request, extracts
+the model, and runs the loaded overlay selection. Two-stage routing separates
 edge selection (network proximity, health) from provider selection (model,
 policy, capacity, location affinity).
 
@@ -865,7 +865,7 @@ not route to its own CRDT echo or to providers from another `GridNetwork`.
 ## Metrics normalization contract
 
 The `scoring::BackendMetrics` struct is the handoff point between metrics
-ingestion and the scoring engine.  The following table defines the normalization
+ingestion and the scoring engine. The following table defines the normalization
 responsibility at each layer:
 
 | Signal | Expected range in `BackendMetrics` | Normalization owner |
@@ -908,9 +908,9 @@ and health/error signals default to no evidence of failure:
 
 ### NaN and infinity
 
-Prometheus scraping drops NaN and ±Inf values at parse time.  CRDT values
+Prometheus scraping drops NaN and ±Inf values at parse time. CRDT values
 are treated as absent when non-finite and then defaulted/clamped in
-`crdt_metrics_to_backend`.  The scoring engine does not re-validate for
+`crdt_metrics_to_backend`. The scoring engine does not re-validate for
 NaN/Inf; callers must not propagate non-finite values.
 
 ### Stale metrics grace period
@@ -918,7 +918,7 @@ NaN/Inf; callers must not propagate non-finite values.
 For metrics without `tls`, a Prometheus scrape failure immediately causes the
 provider to fall back to neutral (0.5) scoring for all signals. When
 `spec.metricsConfig.staleMetricsSeconds` is set, the operator keeps a
-cross-reconcile cache of the last successful scrape for each provider.  If
+cross-reconcile cache of the last successful scrape for each provider. If
 the current scrape fails but the cached sample is no older than
 `staleMetricsSeconds`, the cached values are used instead of neutral
 scoring.
@@ -929,9 +929,9 @@ resolution or scrape failure with no unexpired successful sample instead
 marks the provider unhealthy, excluding it from routing. The cache is
 per-operator-process; restarting the operator clears all cached samples.
 
-`staleMetricsSeconds` has no effect on successful scrapes — fresh scraped
-values always win.  Setting it only extends the window in which a
-temporarily-unavailable endpoint's last known metrics influence scoring.
+`staleMetricsSeconds` has no effect on successful scrapes. Fresh scraped
+values always win. Setting it only extends the window in which a
+temporarily unavailable endpoint's last known metrics influence scoring.
 
 The field is optional. When absent (default), plaintext scrape failures
 produce neutral scoring immediately; TLS-configured failures fail closed once
@@ -939,10 +939,10 @@ there is no usable last-known-good sample.
 
 ### KV-cache affinity
 
-Routing decisions based on KV-cache affinity — routing requests to backends
-that already hold relevant KV-cache entries — are not implemented in the current
-operator.  The `kv_cache_utilization` signal influences scoring but does not
-implement affinity-aware routing.
+Routing decisions based on KV-cache affinity (routing requests to backends
+that already hold relevant KV-cache entries) are not implemented in the
+current operator. The `kv_cache_utilization` signal influences scoring but
+does not implement affinity-aware routing.
 
 ## When the routing overlay regenerates
 
@@ -959,8 +959,8 @@ The overlay `ConfigMap` is regenerated by the Grid Operator whenever the owning
 During each render pass, the operator uses the current local CRDs, current
 provider metrics, and current SWIM/CRDT state it has received so far.
 
-Overlay regeneration is reconcile-driven, not per-request.  If a remote cluster
-disappears, the overlay is not rewritten at packet time — it updates when the
+Overlay regeneration is reconcile-driven, not per-request. If a remote cluster
+disappears, the overlay is not rewritten at packet time. It updates when the
 operator's next reconciliation loop observes the new SWIM/member/provider state
 and re-renders.
 

@@ -62,7 +62,7 @@ helm uninstall grid-operator -n grid-system
 Helm removes all namespaced resources (Deployment, ServiceAccount, Services,
 RoleBindings) but **does not remove CRDs**. This is standard Helm CRD
 behavior. Custom resources (GridNetworks, GridSites, InferenceProviders)
-created by other chart releases (e.g., grid-site) are not affected by
+created by other chart releases (for example, grid-site) are not affected by
 operator uninstall.
 
 To remove CRDs and all custom resources:
@@ -127,7 +127,7 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 | `podAnnotations` | object | `{}` | Annotations on the operator pod. |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount. |
 | `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname when `create` is true, `"default"` when false. |
-| `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations (e.g. IAM role binding). |
+| `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations (for example, IAM role binding). |
 | `rbac.create` | bool | `true` | Create RBAC resources. |
 | `resourceNamespaces` | list | `[]` | Additional namespaces for resource access. The release namespace is always included. |
 | `log.level` | string | `info` | RUST_LOG filter directive. |
@@ -168,12 +168,15 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 
 The chart creates two ClusterRoles:
 
-1. **CRD access** (`<release>-crd`): cluster-wide get/list/watch/patch on
-   GridNetworks and InferenceProviders; get/list/watch/patch/create/update on
-   GridSites; get/patch on all three status subresources.
-2. **Resource access** (`<release>-resources`): get/create/patch on Secrets;
-   get on Services; create/patch on Events (`events.k8s.io`);
-   get/create/patch/update on ConfigMaps.
+1. **CRD access** (`<release>-crd`), cluster-wide:
+   - get/list/watch/patch on GridNetworks and InferenceProviders
+   - get/list/watch/patch/create/update on GridSites
+   - get/patch on all three status subresources
+2. **Resource access** (`<release>-resources`):
+   - get/create/patch on Secrets
+   - get on Services
+   - create/patch on Events (`events.k8s.io`)
+   - get/create/patch/update on ConfigMaps
 
 Resource access is bound via RoleBindings. The release namespace always gets
 a RoleBinding. Additional namespaces are added through `resourceNamespaces`:

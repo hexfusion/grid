@@ -8,7 +8,7 @@ Kubernetes clusters.
 
 ## Guides
 
-- **[Adding an Inference Provider](../adding-provider.md)** —
+- **[Adding an Inference Provider](../adding-provider.md)**:
   step-by-step workflow for adding in-cluster, existing-service, or
   external HTTPS providers to a running Grid installation.
 
@@ -106,12 +106,12 @@ user's current context.
 
 Values are merged in Helm's last-wins order:
 
-1. **Chart defaults** — `charts/*/values.yaml`
-2. **Topology example values** — `examples/helm/existing-clusters/{topology}/values/{site}-{role}.yaml`
-3. **User override files** — via `--site-values` (see below)
-4. **Inventory image overrides** — `.images.operator` / `.images.gateway`
+1. **Chart defaults**: `charts/*/values.yaml`
+2. **Topology example values**: `examples/helm/existing-clusters/{topology}/values/{site}-{role}.yaml`
+3. **User override files**: via `--site-values` (see below)
+4. **Inventory image overrides**: `.images.operator` / `.images.gateway`
    in the inventory, applied as `--set`
-5. **Explicit `--set`** — reserved for SWIM seeds (auto-computed)
+5. **Explicit `--set`**: reserved for SWIM seeds (auto-computed)
 
 Later sources override earlier ones. Use override files for structured
 configuration and reserve `--set` for small scalar changes.
@@ -162,15 +162,15 @@ for traceability.
 For combined-site topology, the installer deploys components in this
 order per site:
 
-1. `grid-operator` — registers SWIM identity, installs CRDs, reconciles CRs
-2. `grid-mock-providers` — deploys mock inference backends (optional, skipped if no values file)
-3. `grid-site` — creates GridNetwork, GridSite, and InferenceProvider CRs
-4. **Overlay wait** — polls until the operator creates the overlay
+1. `grid-operator`: registers SWIM identity, installs CRDs, reconciles CRs
+2. `grid-mock-providers`: deploys mock inference backends (optional, skipped if no values file)
+3. `grid-site`: creates GridNetwork, GridSite, and InferenceProvider CRs
+4. **Overlay wait**: polls until the operator creates the overlay
    ConfigMap (up to 120 seconds)
-5. **Provider config** — reads overlay stable IDs and renders provider
+5. **Provider config**: reads overlay stable IDs and renders provider
    Praxis config from template
-6. `provider-gateway` — serves inference routes over mTLS
-7. `consumer-gateway` — mounts the overlay for intelligent routing
+6. `provider-gateway`: serves inference routes over mTLS
+7. `consumer-gateway`: mounts the overlay for intelligent routing
 
 The operator needs CRDs before CRs can be applied (step 3 depends on
 step 1). Mock backends must be healthy when InferenceProvider CRs
@@ -205,7 +205,7 @@ separate trust boundaries:
 ## Candidate Identity
 
 The provider gateway's `provider_route` filter requires a `candidate_id` for
-each route. This value must match the `stable_id` in the routing overlay — it
+each route. This value must match the `stable_id` in the routing overlay. It
 is **not** the InferenceProvider CR `.metadata.name`.
 
 The operator computes `stable_id` as a deterministic FNV-1a hash of
@@ -354,7 +354,7 @@ When routing to external APIs (such as OpenAI), the provider gateway's
 `load_balancer` cluster configuration requires:
 
 - **`authority`**: Sets the HTTP Host header for upstream connections. Must
-  match the external hostname (e.g., `authority: api.openai.com`). Without
+  match the external hostname (for example, `authority: api.openai.com`). Without
   this field, the gateway sends the internal service name as the Host header,
   which external CDNs reject.
 
@@ -371,19 +371,19 @@ When routing to external APIs (such as OpenAI), the provider gateway's
 
 The `grid-mock-providers` chart is a **validation tool**, not a
 production requirement. It deploys simulated inference backends so you
-can verify the full routing pipeline — mTLS, credential injection,
-overlay convergence, NetworkPolicy — without real model infrastructure.
+can verify the full routing pipeline (mTLS, credential injection,
+overlay convergence, NetworkPolicy) without real model infrastructure.
 
 **When to use mock providers:**
 - First-time installation validation
 - CI/CD pipeline verification
 - Development and testing environments
 
-**Production alternatives — replace mock providers with:**
+**Production alternatives, replace mock providers with:**
 - **In-cluster inference services** such as vLLM, TGI, or Ollama
   running as Deployments with matching InferenceProvider CRs
 - **Externally managed HTTPS inference APIs** such as OpenAI,
-  Anthropic, or Bedrock — configure the provider gateway's
+  Anthropic, or Bedrock, configure the provider gateway's
   `load_balancer` clusters with the external endpoint, `authority`,
   and `tls.sni` fields (see [External Provider Configuration](#external-provider-configuration))
 
@@ -438,7 +438,7 @@ InferenceProvider CR, credential Secret, and stable ID.
 ### InferenceProvider CRs
 
 Create one InferenceProvider per backend. Both can serve the same model
-— the overlay lists both as candidates and the consumer gateway selects
+The overlay lists both as candidates and the consumer gateway selects
 between them:
 
 ```yaml
@@ -541,7 +541,7 @@ cluster in `provider_hop_clusters`:
 ```
 
 Each cluster also needs a `load_balancer` entry. Both clusters route
-through the same provider gateway endpoint — the `provider_route`
+through the same provider gateway endpoint. The `provider_route`
 filter on the provider side selects the correct backend based on
 candidate ID:
 
@@ -562,7 +562,7 @@ candidate ID:
 
 The NetworkPolicy must allow ingress from **both** the provider gateway
 and the grid operator. The operator probes each InferenceProvider's
-`spec.endpoint` for health checks — if blocked, the provider stays
+`spec.endpoint` for health checks. If blocked, the provider stays
 `Unavailable` and the overlay has no candidates:
 
 ```yaml
@@ -633,7 +633,7 @@ To add sites after a single-cluster trial:
 2. Set SWIM seeds to include the existing site's SWIM address
 3. Create prerequisite resources (namespace, TLS, configs, CRs) on
    the new clusters
-4. Run `install.sh` — it uses `helm upgrade --install`, which is
+4. Run `install.sh`. It uses `helm upgrade --install`, which is
    idempotent on the existing site and installs on new sites
 5. Run `verify.sh` to confirm overlay convergence across all sites
 
@@ -836,7 +836,7 @@ operator values.
 ### Overlay ConfigMap not created
 
 **Symptom:** Consumer gateway pod stuck in ContainerCreating; operator
-logs: "routing overlay has no candidates; skipping ConfigMap apply".
+logs: "routing overlay has no candidates, skipping ConfigMap apply."
 
 **Cause:** No InferenceProvider matches any GridSite. The GridSite is
 missing the `grid.praxis-proxy.io/provider-site` label that the
@@ -848,7 +848,7 @@ InferenceProvider's `siteSelector.matchLabels` requires.
 ### TLS handshake failure between gateways
 
 **Symptom:** Consumer gateway returns HTTP 502; logs show
-"certificate not valid for name".
+"certificate not valid for name."
 
 **Cause:** The provider TLS certificate SANs don't include the
 hostname used in the consumer's `sni` field. Common when reusing
@@ -894,7 +894,7 @@ private CAs.
 ### Consumer returns 500 for some models
 
 **Symptom:** Mock model works but external model returns HTTP 500;
-consumer logs: "unknown cluster".
+consumer logs: "unknown cluster."
 
 **Cause:** The consumer config's `provider_hop_clusters` and
 `load_balancer.clusters` are missing an entry for the external
@@ -906,7 +906,7 @@ serve the consumer site.
 ### Mock inference CrashLoopBackOff
 
 **Symptom:** mock-inference pod restarts with "required arguments not
-provided".
+provided."
 
 **Cause:** Missing `--provider` and `--port` startup arguments.
 
@@ -920,7 +920,7 @@ has no candidates; consumer gateway returns 503.
 
 **Cause:** A NetworkPolicy blocks the grid operator from reaching the
 mock backend health endpoint. The operator must probe each
-InferenceProvider's `spec.endpoint` — if the health check fails, the
+InferenceProvider's `spec.endpoint`. If the health check fails, the
 provider stays Unavailable and is excluded from the overlay.
 
 **Fix:** Ensure the NetworkPolicy allows ingress from pods with label
@@ -929,7 +929,7 @@ gateway. See [NetworkPolicy for Multiple Backends](#networkpolicy-for-multiple-b
 
 ### Incompatible yq version
 
-**Symptom:** Preflight fails with "unsupported yq implementation".
+**Symptom:** Preflight fails with "unsupported yq implementation."
 
 **Cause:** The Python `yq` wrapper or an older Go `yq` version is
 installed instead of Mike Farah's `yq` >= 4.18.0.

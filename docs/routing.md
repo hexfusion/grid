@@ -430,7 +430,7 @@ Use this when the need is:
 
 > Prefer provider pools with more available serving capacity.
 
-There is **not** a `selectionPolicy.mode: loadAware`.
+No `selectionPolicy.mode: loadAware` exists.
 
 Load awareness is a separate scoring dimension. Mainline Grid currently exposes provider-level scoring strategies such as:
 
@@ -1085,7 +1085,7 @@ The picker runs only inside the first viable group.
 
 ## Load-aware routing is not a selection mode
 
-There is no stable `selectionPolicy.mode: loadAware`.
+No stable `selectionPolicy.mode: loadAware` exists.
 
 Use scoring to express provider-level load preference.
 

@@ -142,7 +142,7 @@ Required fields: `name`, `gridNetworkRef`, `providerKind`,
 
 Add a route, credential injection entry, and load balancer cluster for
 the new provider. Use the InferenceProvider CR name as the
-`candidate_id` placeholder — `install.sh`'s `render_provider_config`
+`candidate_id` placeholder. `install.sh`'s `render_provider_config`
 replaces it with the overlay's `stable_id` after reconciliation.
 
 ```yaml
@@ -291,7 +291,7 @@ fullnameOverride: consumer-gateway
 
 This produces Service names `provider-gateway` and `consumer-gateway`.
 Without `fullnameOverride`, Helm generates names like
-`{release-name}-praxis-gateway` (e.g. `provider-gateway-praxis-gateway`),
+`{release-name}-praxis-gateway` (for example, `provider-gateway-praxis-gateway`),
 which couples consumer and provider configs to Helm release names.
 
 Existing installations that omit `fullnameOverride` work correctly but
@@ -373,7 +373,7 @@ Key differences from in-cluster providers:
 | Field | In-Cluster | External HTTPS |
 |-------|-----------|----------------|
 | `authority` | Not needed (uses endpoint hostname) | Required (external hostname) |
-| `tls.sni` | Internal SNI (e.g. `east1-provider.grid.internal`) | External hostname (e.g. `api.openai.com`) |
+| `tls.sni` | Internal SNI (for example, `east1-provider.grid.internal`) | External hostname (for example, `api.openai.com`) |
 | `tls.verify` | `true` with `ca_path` to private CA | `true` without `ca:` block (system CA) |
 | `tls.ca` | `ca_path: /etc/praxis/tls/ca.crt` | Omit (system trust store) |
 | Backend Deployment | Chart-managed or user-managed | None |
@@ -409,7 +409,7 @@ kubectl create secret generic provider-tls \
 ## Credential Isolation
 
 Each provider uses a distinct credential Secret and mount path.
-Credentials are mounted only on the provider gateway — never on the
+Credentials are mounted only on the provider gateway, never on the
 consumer gateway or operator.
 
 ```
@@ -482,10 +482,10 @@ kubectl delete secret my-removed-credential -n grid-system --context "$CONTEXT"
 The `grid-mock-providers` chart creates a NetworkPolicy that permits
 ingress from two sources:
 
-1. **Provider gateway** pods (`app.kubernetes.io/instance: provider-gateway`)
-   — for request forwarding
-2. **Grid operator** pods (`app.kubernetes.io/name: grid-operator`)
-   — for health check probes
+1. **Provider gateway** pods (`app.kubernetes.io/instance: provider-gateway`),
+   for request forwarding
+2. **Grid operator** pods (`app.kubernetes.io/name: grid-operator`),
+   for health check probes
 
 If the operator cannot reach a backend's endpoint, the InferenceProvider
 stays `Unavailable` and the overlay excludes it.

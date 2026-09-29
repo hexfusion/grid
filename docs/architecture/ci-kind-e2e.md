@@ -15,7 +15,7 @@ validation suite.
 
 ## Gate implementation
 
-CI gating is organized as static + unit + smoke Kind for the fast path.  The
+CI gating is organized as static + unit + smoke Kind for the fast path. The
 multi-cluster suite runs on `main`, nightly, or release validation because it
 requires multiple Kind clusters and serialized execution.
 
@@ -30,12 +30,13 @@ Sequence:
 ## Single-cluster multi-gateway coverage
 
 The `run-grid-single-cluster-multi-gateway-qualification` command uses one Kind
-cluster, one Grid operator, one GridNetwork, and one GridSite named `single`, with
-two consumer gateways and three provider gateways. It is distinct from both a
-single gateway smoke test and the multi-cluster provider-traffic qualification:
-the single-cluster test shares one site, Kubernetes control plane, and overlay
-state, while the multi-cluster test exercises multiple sites connected through
-SWIM. Provider-selection cursors remain local to each Praxis process. The
+cluster, one Grid operator, one GridNetwork, and one GridSite named `single`.
+That site runs two consumer gateways and three provider gateways. It is
+distinct from both a single gateway smoke test and the multi-cluster
+provider-traffic qualification. The single-cluster test shares one site,
+Kubernetes control plane, and overlay state. The multi-cluster test exercises
+multiple sites connected through SWIM. Provider-selection cursors remain local
+to each Praxis process. The
 qualification must prove accepted and serving overlay revisions, per-consumer
 attributed traffic, provider withdrawal and restoration, consumer failure, and
 positive and negative security probes before it can report success.
@@ -57,15 +58,15 @@ Topology and execution details are maintained in the
 
 ## Sequencing requirements
 
-Multi-cluster validations run sequentially.  The current suite assumes shared
-cluster names and shared local operator process ports.  Sequential execution avoids:
+Multi-cluster validations run sequentially. The current suite assumes shared
+cluster names and shared local operator process ports. Sequential execution avoids:
 
 - SWIM UDP port conflicts
 - Overlapping writes to the same Kind clusters
 - Stale test fixtures from a previous validation affecting the next
 - Competing gateway or provider deployments with the same names
 
-Static and unit jobs run in parallel with each other.  Kind jobs are serialized
+Static and unit jobs run in parallel with each other. Kind jobs are serialized
 until the harness supports per-job cluster name isolation.
 
 ## Environment requirements
@@ -81,7 +82,7 @@ CI runners require:
 - Permission to create and delete local Kind clusters
 
 The gateway image must include the Grid data-plane filters required by the
-validation suite.  CI consumes a reviewed, published image rather than building
+validation suite. CI consumes a reviewed, published image rather than building
 an unpinned image during the test job.
 
 ## Flake controls
@@ -94,9 +95,9 @@ cargo xtask env up -c tests/env/<config>.toml
 cargo xtask env load-gateway-images -c tests/env/<config>.toml
 ```
 
-SWIM and failover tests do not use automatic retries.  Those tests exercise
-process lifecycle and membership timing; retrying from a partially mutated cluster
-state can hide real bugs.  If a retry is needed, it is a full clean `down` / `up`
+SWIM and failover tests do not use automatic retries. Those tests exercise
+process lifecycle and membership timing, and retrying from a partially mutated
+cluster state can hide real bugs. A retry means a full clean `down` / `up`
 rerun.
 
 ## Runtime tiers

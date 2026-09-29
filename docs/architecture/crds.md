@@ -37,7 +37,7 @@ spec:
           - cluster: api-provider
             address: "mock-api.default.svc:8080"
             transport:
-              mode: plaintext          # explicit insecure/dev-only — no TLS
+              mode: plaintext          # explicit insecure/dev-only, no TLS
   region: us-east-1
   zone: us-east-1a
   swim:
@@ -83,13 +83,13 @@ behavior, see the [Grid Routing Guide](../routing.md).
 Explicit grouping fields such as `selectionPolicy.grouping.localityScope` are
 not part of this CRD.
 
-**Phases**: Pending → Initializing → Active → Degraded
+**Phases**: Pending -> Initializing -> Active -> Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
 `observedGeneration`, `phase`, `consumerConfigStatus[]`, `budgetStatus[]`
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
-records received from peer sites via CRDT broadcast.  Local providers and records
+records received from peer sites via CRDT broadcast. Local providers and records
 from other `GridNetwork`s are excluded from the count.
 
 `consumerConfigStatus[]` is populated for each gateway with
@@ -100,26 +100,26 @@ render/apply attempt.
 
 `budgetPolicy.tenants[]` opts individual tenants into cumulative spend
 tracking. Grid merges each site's locally recorded spend for a tenant into a
-per-tenant CRDT counter (a `GCounter`, one slot per originating site) that is
-gossiped over SWIM alongside provider state, so the reported total reflects
-spend recorded anywhere in the grid, not just the local site.
+per-tenant CRDT counter, a `GCounter` with one slot per originating site.
+That counter gossips over SWIM alongside provider state, so the reported
+total reflects spend recorded anywhere in the grid, not just the local site.
 
 For every tenant declared in `budgetPolicy`, `budgetStatus[]` reports:
 
-- `tenantId` — matches `budgetPolicy.tenants[].tenantId`
-- `capUsd` — copied from the policy, in USD
-- `spendUsd` — the converged cross-site total, in USD
-- `spendRatio` — `spendUsd / capUsd`, for at-a-glance dashboarding
+- `tenantId`: matches `budgetPolicy.tenants[].tenantId`
+- `capUsd`: copied from the policy, in USD
+- `spendUsd`: the converged cross-site total, in USD
+- `spendRatio`: `spendUsd / capUsd`, for at-a-glance dashboarding
 
 `budgetStatus[]` is a status **signal only**. Grid does not itself degrade or
-reject traffic when a tenant's `spendRatio` reaches or exceeds `1.0` — that
+reject traffic when a tenant's `spendRatio` reaches or exceeds `1.0`. That
 enforcement decision is expected to live in a gateway-side policy filter
 (cross-repo, `praxis-ai`), the same split used for `provider_route`
 authorization. Real per-request tenant attribution also depends on
 upstream work (`praxis-ai#130`/`praxis-ai#104`) and does not exist yet.
 
-Because `budgetStatus[]` is visible to any caller with read access to the
-`GridNetwork` resource, and Kubernetes RBAC is not field-level, a reader
+`budgetStatus[]` is visible to any caller with read access to the
+`GridNetwork` resource, and Kubernetes RBAC is not field-level. A reader
 authorized to view one tenant's status can see every other tracked tenant's
 spend on the same `GridNetwork`. See
 [`grid#48`](https://github.com/praxis-proxy/grid/issues/48) for the
@@ -131,7 +131,7 @@ options under consideration if per-tenant confidentiality is required.
 | `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
 | `configMapName` | string | Name of the generated `ConfigMap` |
 | `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
-| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
+| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`), empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
 
@@ -165,7 +165,7 @@ status:
 SWIM mesh formation. Each entry may be a literal IPv4 address, a bracketed IPv6
 address, or a DNS hostname. Hostnames are resolved with a bounded lookup before
 they are announced to the running SWIM runtime on every
-`GridNetwork` reconcile.  Re-announcing to an existing peer is idempotent — foca
+`GridNetwork` reconcile. Re-announcing to an existing peer is idempotent, foca
 ignores redundant joins.
 
 **Runtime update behavior:**
@@ -181,31 +181,31 @@ ignores redundant joins.
 Seeds are not guaranteed to be joined within one reconcile cycle under heavy
 broadcast load, but the retry is automatic.
 
-**Scope:** `spec.seeds` targets the SWIM site-membership layer.  The SWIM runtime
-is process-global — all `GridNetwork` resources in the operator process share the
-same SWIM node.  Seeds from any `GridNetwork` reach the shared SWIM membership
-table.  Provider CRDT state remains scoped per network.
+**Scope:** `spec.seeds` targets the SWIM site-membership layer. The SWIM runtime
+is process-global, so all `GridNetwork` resources in the operator process share
+the same SWIM node. Seeds from any `GridNetwork` reach the shared SWIM membership
+table. Provider CRDT state remains scoped per network.
 
 **Self-filtering:** The operator removes its own SWIM bind address from
 `spec.seeds` before announcing, preventing self-join loops.
 
 **`spec.tls.swimKeyRef`:** References a Kubernetes Secret containing the 32-byte
-AES-256-GCM key for SWIM transport authentication.  When configured, the
-`GridNetwork` controller reads the key from the Secret and configures the
-SWIM runtime to encrypt all outgoing UDP packets and reject incoming packets
-that fail authentication before it announces CRD seeds or publishes
-certificate/provider state for that reconcile.
+AES-256-GCM key for SWIM transport authentication. When configured, the
+`GridNetwork` controller reads the key from the Secret before it announces CRD
+seeds or publishes certificate/provider state for that reconcile. It then
+configures the SWIM runtime to encrypt all outgoing UDP packets and reject
+incoming packets that fail authentication.
 
 The Secret must contain a `"key"` field (or the field named by `swimKeyRef.key`)
-with exactly 32 bytes.  If the Secret is absent, unreadable, or has the wrong
+with exactly 32 bytes. If the Secret is absent, unreadable, or has the wrong
 length, the reconcile fails before CRD seed announcement and state broadcast.
 The process-global SWIM runtime keeps any previously loaded key until restart;
 it does not switch to plaintext for that configured reconcile.
 
 For local development and testing, the `GRID_SWIM_ENCRYPT_KEY` environment
-variable (64-character hex) provides an alternative key injection path without
-requiring a Kubernetes Secret.  Because environment variables are visible to
-same-host process inspectors, this is not the production Secret delivery path.
+variable (64-character hex) provides an alternative key injection path. It
+needs no Kubernetes Secret. Environment variables are visible to same-host
+process inspectors, so this is not the production Secret delivery path.
 
 Routing eligibility remains gated separately by `GridSite.status.phase == Active`
 regardless of SWIM encryption configuration. Active status indicates control-plane
@@ -224,7 +224,7 @@ candidates are evicted from the rendered overlay.
 | `0` | Rejected by the CRD schema (`minimum: 1`). |
 | `N >= 1` | Remote candidates with SWIM member age `>= N` seconds are omitted from the overlay. |
 
-Local and healthy remote candidates are never evicted.  CRDT storage records
+Local and healthy remote candidates are never evicted. CRDT storage records
 are not deleted by this mechanism.
 
 ### GatewayRef.consumerConfig
@@ -244,34 +244,34 @@ Praxis `ConfigMap` generation.
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
 
 When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
-`ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
+`ConfigMap` in the gateway namespace on each reconcile. The generated config is a
 complete, runnable Praxis config containing:
 
-- `listeners:` — one public listener at `0.0.0.0:{listenerPort}`
-- `filter_chains:` — the consumer chain with:
+- `listeners:`, one public listener at `0.0.0.0:{listenerPort}`
+- `filter_chains:`, the consumer chain with:
   - `intelligent_route` candidates from the routing overlay (with `credential.secretRef` for
     credential-bearing candidates)
   - `credential_inject` entries (one per unique credential reference) using
-    `file:` sources — token bytes are never written to the `ConfigMap`
+    `file:` sources. Token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
     cluster must have a matching `clusterEndpoints[]` entry with endpoint address
-    and explicit `transport` configuration.  `transport.mode` is the security
-    switch — not `sni` presence.  Missing transport fails closed
-- `admin:` — admin listener at `127.0.0.1:9901`
+    and explicit `transport` configuration. `transport.mode` is the security
+    switch, not `sni` presence. Missing transport fails closed
+- `admin:`, admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
 The generated credential-injection config assumes the gateway is the egress
-component for the selected backend.  This is correct for direct API-provider and
-cloud-provider fallback routes.  For remote provider sites, provider credentials
+component for the selected backend. This is correct for direct API-provider and
+cloud-provider fallback routes. For remote provider sites, provider credentials
 should be mounted only in the remote site or provider-side component that makes
 the final backend call.
 
-The `credential_inject` filter is a Praxis AI runtime dependency.  The Grid
+The `credential_inject` filter is a Praxis AI runtime dependency. The Grid
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
-When `enabled: false` or `consumerConfig` is absent, this gateway behaves as before
-— only the routing overlay `ConfigMap` is applied.
+When `enabled: false` or `consumerConfig` is absent, this gateway behaves as
+before, only the routing overlay `ConfigMap` is applied.
 
 ## GridSite
 
@@ -300,7 +300,7 @@ spec:
   sovereigntyZone: us
 ```
 
-**Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
+**Phases**: Pending -> Discovered -> Connecting -> Active -> Unreachable -> Left
 
 **Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
@@ -324,7 +324,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
 | `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
-| `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
+| `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active to Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
 
 **Reason codes** (in `status.reason`):
@@ -351,40 +351,40 @@ A discovered SWIM peer is not automatically authorized for routing.
 
 **GridSite phase transitions:**
 
-- Pending → Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
+- Pending to Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
   peer is first observed as Alive (requires `grid.praxis-proxy.io/auto-discover-sites: "true"`
   label on the `GridNetwork`).
-- Discovered → Connecting: the `GridSite` controller advances automatically when
+- Discovered to Connecting: the `GridSite` controller advances automatically when
   `spec.egress.address` is non-empty. For auto-discovered sites, the egress address comes from
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
   If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
   and the site stays Discovered with reason `GatewayAddressMissing`.
-- Connecting: the `GridSite` controller probes the egress gateway on each reconcile.  For
+- Connecting: the `GridSite` controller probes the egress gateway on each reconcile. For
   `Mutual` TLS mode, the probe performs a bounded TLS handshake verifying the CA chain,
   `serverName` SAN, and required `canonicalFingerprints` pin. For explicit
   `Plaintext` mode, it performs a bounded TCP connect for diagnostics but keeps
   the site in `Connecting`; TCP reachability alone cannot make a site
   routing-eligible. Active also requires mTLS client credentials
   (`siteSecretRef` must be configured on the `GridNetwork`).
-- Active → Unreachable: the `GridSite` controller demotes Active to Unreachable when the probe
+- Active to Unreachable: the `GridSite` controller demotes Active to Unreachable when the probe
   cannot connect. Identity or trust failures demote Active to Connecting, distinguishing a
   reachable but unverified endpoint from an unreachable endpoint.
 
 **`spec.egress.address` source:** For auto-discovered sites, the egress address is sourced from
 the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
-state broadcast.  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the field
-is empty and the site stays Discovered.  For manually-applied `GridSite` resources, set
+state broadcast. If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the field
+is empty and the site stays Discovered. For manually applied `GridSite` resources, set
 `spec.egress.address` explicitly to the data-plane gateway endpoint.
 
 **`status.publicCertPem`:** The public site certificate PEM received from the remote site via
-SWIM state broadcast.  Before storage, the operator performs a structural check:
+SWIM state broadcast. Before storage, the operator performs a structural check:
 private-key markers (`PRIVATE KEY`) cause the input to be discarded entirely and an error
-logged.  Non-certificate PEM triggers `TrustMaterialInvalid` status.  A valid `CERTIFICATE`
+logged. Non-certificate PEM triggers `TrustMaterialInvalid` status. A valid `CERTIFICATE`
 header passes the structural check.
 
-This field contains only the public certificate — never a private key.  A non-empty
+This field contains only the public certificate, never a private key. A non-empty
 `publicCertPem` means the remote site has shared its public identity material and the
-structural check passed.  It does **not** mean:
+structural check passed. It does **not** mean:
 
 - The certificate has been chain-verified against a trusted CA.
 - The peer is authenticated or authorized for routing.
@@ -397,7 +397,7 @@ be written to status.
 
 | Field | Meaning |
 |---|---|
-| `mode` | `Mutual` (default) — TLS handshake with CA verification and client auth; `Plaintext` — TCP-only diagnostics that never become routing-eligible |
+| `mode` | `Mutual` (default): TLS handshake with CA verification and client auth. `Plaintext`: TCP-only diagnostics that never become routing-eligible |
 | `serverName` | Expected DNS identity for TLS SNI and SAN verification; required for `Mutual`, must be absent for `Plaintext` |
 
 **`spec.trust` fields:**
@@ -429,15 +429,15 @@ stays `Pending` with reason `AwaitingDiscovery`. **This is expected and does not
 block local serving:** local `InferenceProvider`s are eligible regardless of
 `GridSite.status.phase`; only *remote* CRDT provider records are phase-gated (see
 "Routing eligibility" above). Do not add SWIM seeds or extra operator replicas to
-try to force the site `Active` - there is no second site to discover, and a lone
+try to force the site `Active`. No second site exists to discover, and a lone
 operator legitimately runs a single-node mesh with zero peers. The `Active` phase
 and its mTLS gateway probe (`spec.egress` + `spec.trust`) apply to reaching
-*remote* sites, or a manually-configured peer gateway endpoint. See
+*remote* sites, or a manually configured peer gateway endpoint. See
 [Architecture Overview -> Single-Site and Combined Deployments](overview.md#single-site-and-combined-deployments).
 
 See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
 
-Example status — Mutual TLS verified:
+Example status, Mutual TLS verified:
 
 ```yaml
 status:
@@ -449,7 +449,7 @@ status:
   lastTransitionTime: "2026-07-30T11:55:00Z"
 ```
 
-Example status — trust material missing:
+Example status, trust material missing:
 
 ```yaml
 status:
@@ -459,7 +459,7 @@ status:
   observedGeneration: 3
 ```
 
-Example status — gateway address not configured on remote operator:
+Example status, gateway address not configured on remote operator:
 
 ```yaml
 status:
@@ -476,7 +476,7 @@ The current `GridSite` status uses a flat
 Kubernetes-style `conditions[]` array.
 
 Issue #11's acceptance criteria include a conditions-based
-status contract.  That criterion is **not yet resolved**:
+status contract. That criterion is **not yet resolved**:
 it requires either (a) implementing a `conditions[]` array
 or (b) formally amending the issue to accept the
 `phase`/`reason`/`message` model as the replacement.
@@ -487,13 +487,13 @@ The flat model is the current contract:
 - `phase` provides the primary lifecycle state;
   `reason` encodes the machine-readable probe outcome;
   `message` gives a bounded human-readable explanation.
-- Richer conditions (e.g. `Reachable`, `IdentityVerified`,
+- Richer conditions (for example, `Reachable`, `IdentityVerified`,
   `CertificatePinned`) may be added when multi-signal
   readiness is needed (see `docs/architecture/overview.md`,
   Trust and Readiness section).
 
 Tools and automation **must not** depend on a
-`conditions[]` field existing.  Match on `phase` for
+`conditions[]` field existing. Match on `phase` for
 coarse state and on `reason` for specific probe outcomes.
 
 ## InferenceProvider
@@ -534,7 +534,7 @@ provide the provider-pool metrics used by Grid scoring. The referenced
 `openai-token` Secret must exist in `praxis-system` before controller-managed
 credential projection can become available.
 
-**Phases**: Pending → Available → Degraded → Unavailable
+**Phases**: Pending -> Available -> Degraded -> Unavailable
 
 `spec.capacityWeight` is an optional positive relative provider capacity from
 `1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
@@ -565,7 +565,7 @@ scoring candidate. Use a listed value unless the implementation is extended.
 ### Credential projection
 
 `spec.auth.secretRef` points to a Kubernetes Secret that contains provider
-credential bytes.  For the current native `bearer_token` path:
+credential bytes. For the current native `bearer_token` path:
 
 1. The operator validates that the Secret exists and contains the referenced key.
 2. The routing overlay candidate receives only:
@@ -605,7 +605,7 @@ feeds the resulting `BackendMetrics` into overlay scoring.
 | `queueCapacity` | absent | For raw queue-depth counts, divide by this positive capacity and clamp the normalized value to `0.0..1.0`. Without it, queue depth must already be normalized. |
 | `signalNames` | all unset | Mapping from scoring signals to Prometheus metric names. |
 | `staleMetricsSeconds` | absent | Maximum age in seconds for reusing the last successful sample after a failed scrape. Minimum: `1`. For plaintext metrics, absence means immediate neutral fallback; when TLS is configured, an expired/absent sample makes the provider unhealthy and excluded. |
-| `tls` | absent | TLS configuration for metrics scraping.  See [TLS and mTLS](#tls-and-mtls). |
+| `tls` | absent | TLS configuration for metrics scraping. See [TLS and mTLS](#tls-and-mtls). |
 
 Providers without `metricsConfig` and signals without configured metric names
 use neutral metric scores. For scrape failures, plaintext configuration retains
@@ -628,7 +628,7 @@ routing architecture for full semantics.
 #### TLS and mTLS
 
 `metricsConfig.tls` enables Secret-backed TLS (and optionally mutual TLS)
-for metrics scraping.  When configured, the operator resolves PEM material
+for metrics scraping. When configured, the operator resolves PEM material
 from Kubernetes Secrets at reconcile time and uses it for all scrape
 requests to this provider's metrics endpoint.
 
@@ -661,7 +661,7 @@ that, a TLS-configured provider is marked unhealthy (`healthy: false`) and
 excluded from routing. Without TLS, scrape failures retain the neutral-scoring
 compatibility behavior.
 
-There is no `insecureSkipVerify` option.
+No `insecureSkipVerify` option exists.
 
 Example (one-way TLS):
 
@@ -728,11 +728,11 @@ spec:
         grid.praxis-proxy.io/site: cluster-a
 ```
 
-**Phases**: Pending → Available → Unavailable
+**Phases**: Pending -> Available -> Unavailable
 
 `Degraded` is not currently reachable for this CRD: unlike
 `InferenceProvider`'s metrics-scrape path, the MCP `tools/list` probe has no
-partial-success state to represent — it either succeeds (`Available`) or
+partial-success state to represent. It either succeeds (`Available`) or
 fails outright (`Unavailable`), mirroring `phase_and_reason_from_probe`'s and
 `phase_from_matching`'s explicit design (both are tested to never emit
 `Degraded`).
@@ -746,20 +746,20 @@ below), `observedGeneration`
 
 | Reason | Phase | Meaning |
 |---|---|---|
-| `ProviderConfigInvalid` | Unavailable | Static spec validation failed (e.g. malformed `siteSelector`) before any `GridNetwork`/site/probe work runs. |
+| `ProviderConfigInvalid` | Unavailable | Static spec validation failed (for example, malformed `siteSelector`) before any `GridNetwork`/site/probe work runs. |
 | `GridNetworkNotFound` | Unavailable | `spec.gridNetworkRef` does not resolve to an existing `GridNetwork`. |
 | `CredentialSecretMissing` | Unavailable | `spec.auth.secretRef` does not resolve to an accessible Secret. |
 | `McpEndpointUnreachable` | Unavailable | The MCP endpoint could not be reached: transport failure, DNS error, timeout, or a blocked (SSRF-sensitive) address. |
 | `McpToolsListInvalidResponse` | Unavailable | The endpoint was reached but the `tools/list` exchange failed or returned an unparseable response. |
 | `McpAuthRejected` | Unavailable | The MCP server rejected the configured `spec.auth` credentials (HTTP 401/403). |
 | `McpAuthTokenInvalid` | Unavailable | The resolved `spec.auth` bearer token contains characters that cannot be sent as an HTTP header value; the probe fails closed rather than proceeding unauthenticated. |
-| `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist (or the requested key is absent — see [`grid#58`](https://github.com/praxis-proxy/grid/issues/58) for a known misclassification of the latter). |
+| `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist (or the requested key is absent, see [`grid#58`](https://github.com/praxis-proxy/grid/issues/58) for a known misclassification of the latter). |
 | `EndpointTlsKeyMissing` | Unavailable | The expected key exists in the Secret but its value is empty. |
 | `EndpointTlsMaterialInvalid` | Unavailable | CA certificate PEM material could not be parsed. |
 | `EndpointTlsIdentityMismatch` | Unavailable | Client certificate or private key PEM material could not be parsed. |
 
-An empty `reason` with `phase: Available` means `SitesMatched`; an empty
-`reason` with `phase: Pending` means `AwaitingSiteMatch` — both are
+An empty `reason` with `phase: Available` means `SitesMatched`. An empty
+`reason` with `phase: Pending` means `AwaitingSiteMatch`. Both are
 telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
 `status.reason` itself.
 
@@ -787,4 +787,4 @@ spec:
         grid.praxis-proxy.io/site: cluster-a
 ```
 
-**Phases**: Pending → Available → Degraded → Unavailable
+**Phases**: Pending -> Available -> Degraded -> Unavailable

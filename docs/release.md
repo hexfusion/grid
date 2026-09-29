@@ -50,28 +50,28 @@ silently substitute a Grid-owned AI build.
 
 Before opening a release preparation pull request:
 
-- [ ] Update the workspace version in `Cargo.toml` and regenerate `Cargo.lock`.
-- [ ] Update every Helm chart `version`.
-- [ ] Update Grid workload chart `appVersion` values to the Grid tag.
-- [ ] Verify the `praxis-gateway` `appVersion` and default image match the
+- Update the workspace version in `Cargo.toml` and regenerate `Cargo.lock`.
+- Update every Helm chart `version`.
+- Update Grid workload chart `appVersion` values to the Grid tag.
+- Verify the `praxis-gateway` `appVersion` and default image match the
       intended official Praxis AI release.
-- [ ] Confirm the release workflow builds
+- Confirm the release workflow builds
       `ghcr.io/praxis-proxy/grid-gateway:v<version>` from the same tagged Grid
       source, publishes the version tag, and records the resulting immutable
       digest.
-- [ ] Update the release workflow's pinned AI tag, digest, and source revision
+- Update the release workflow's pinned AI tag, digest, and source revision
       when the default Praxis AI image changes.
-- [ ] Run `cargo +nightly-2026-03-28 fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `make test`, `make doc`, and `make lint`.
-- [ ] Run `git diff --check` and validate the release workflow with
+- Run `cargo +nightly-2026-03-28 fmt --all -- --check`.
+- Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- Run `make test`, `make doc`, and `make lint`.
+- Run `git diff --check` and validate the release workflow with
       `actionlint`.
-- [ ] Lint and render all Helm charts with their required values.
-- [ ] Validate affected Forge topologies.
-- [ ] Run the relevant integration qualifications when routing, overlay, or
+- Lint and render all Helm charts with their required values.
+- Validate affected Forge topologies.
+- Run the relevant integration qualifications when routing, overlay, or
       gateway compatibility changes.
-- [ ] Confirm generated evidence and local build artifacts are not committed.
-- [ ] Review pull request labels so generated release notes are useful.
+- Confirm generated evidence and local build artifacts are not committed.
+- Review pull request labels so generated release notes are useful.
 
 The first-class integration qualifications are documented in
 [the documentation index](README.md#integration-qualifications). They build
@@ -81,8 +81,8 @@ clean up their resources.
 ## Integration qualification checklist
 
 Run the individual qualification commands below against fresh source builds
-and fresh, uniquely tagged images. There is deliberately no aggregate release
-qualification command. Run the commands sequentially because several use Kind
+and fresh, uniquely tagged images. No aggregate release qualification command
+exists, deliberately. Run the commands sequentially because several use Kind
 clusters and Docker networks whose names can otherwise collide.
 
 | Area | Command | Topology/config path | Classification | Required when | Feature docs |
@@ -222,10 +222,10 @@ manual dispatch does not replace the requirement for a reviewed, signed tag.
 
 For every release:
 
-- [ ] Confirm `ghcr.io/praxis-proxy/grid-gateway:v<version>` exists and its
+- Confirm `ghcr.io/praxis-proxy/grid-gateway:v<version>` exists and its
       registry digest matches the digest recorded in the GitHub Release
       manifest.
-- [ ] Confirm that deployments using the `praxis-gateway` chart still resolve
+- Confirm that deployments using the `praxis-gateway` chart still resolve
       the separately released `ghcr.io/praxis-proxy/ai:<tag>` image; that chart
       is not evidence that the Grid gateway operand is wired.
 
@@ -233,10 +233,10 @@ For every release:
 
 Before deploying the Grid gateway operand:
 
-- [ ] Identify the intended chart or operator consumer and verify that its
+- Identify the intended chart or operator consumer and verify that its
       rendered image reference uses the release's `grid-gateway` image by its
       recorded immutable digest, or a version tag that resolves to that digest.
-- [ ] Preserve the rendered consumer reference with the deployment evidence.
+- Preserve the rendered consumer reference with the deployment evidence.
 
 Until that consumer exists and passes this check, record Grid gateway
 consumption as **NOT QUALIFIED**. This does not block publication of
@@ -244,8 +244,8 @@ consumption as **NOT QUALIFIED**. This does not block publication of
 
 ## Release Notes
 
-Grid uses [GitHub Releases][releases] for release notes. There is no committed
-version-specific changelog. Add the user-facing summary, compatibility notes,
+Grid uses [GitHub Releases][releases] for release notes. No committed
+version-specific changelog exists. Add the user-facing summary, compatibility notes,
 upgrade considerations, qualification results, and demonstration links to the
 GitHub Release page.
 

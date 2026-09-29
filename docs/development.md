@@ -48,7 +48,7 @@ produce a warning. All crates enforce
 ### Formatting
 
 Formatting requires nightly (`group_imports` and
-`imports_granularity` are nightly-only). Both stable and
+`imports_granularity` are nightly only). Both stable and
 nightly toolchains must be installed.
 
 ```console
@@ -90,7 +90,7 @@ and tracking work.
 ### Milestones
 
 Milestones represent a body of work toward a shared
-goal (e.g. a release, a feature area, or a hardening
+goal (for example, a release, a feature area, or a hardening
 pass). Every issue and pull request should belong to
 a milestone. Milestones provide scope boundaries and
 help answer "what ships together?"

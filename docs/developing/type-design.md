@@ -25,7 +25,7 @@ not at runtime.
   the key set is known. Use a struct with
   `#[serde(deny_unknown_fields)]`. Maps silently absorb
   unknown keys. Only use maps when the key set is
-  genuinely open (e.g. user-defined header names).
+  genuinely open (for example, user-defined header names).
 
 - **Enums over multiple `Option<T>` fields.** When
   exactly one of N fields must be set, use an N-variant
@@ -41,7 +41,7 @@ not at runtime.
 
 - **`#[serde(try_from)]` for constrained numerics.**
   When a numeric field only accepts specific values
-  (e.g. HTTP redirect status 301/302/307/308), define
+  (for example, HTTP redirect status 301/302/307/308), define
   an enum with `TryFrom<u16>` and
   `#[serde(try_from = "u16")]`. Validation moves to
   parse time.
