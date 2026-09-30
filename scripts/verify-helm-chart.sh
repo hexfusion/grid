@@ -249,7 +249,7 @@ try_reject_msg "$CHART_DIR" "gateway.namespace kube-system" "is a system namespa
 try_reject_msg "$CHART_DIR" "gateway.namespace openshift-ingress" "is a system namespace" --set-string gateway.namespace=openshift-ingress
 try_reject_msg "$CHART_DIR" "gateway.namespace default" "is a system namespace" --set-string gateway.namespace=default
 try_reject "$CHART_DIR" "gateway.namespace not DNS-1123" --set-string gateway.namespace=Edge_NS
-try_reject_msg "$CHART_DIR" "gateway.serviceName with whitespace" "/gateway/serviceName" \
+try_reject_msg "$CHART_DIR" "gateway.serviceName with whitespace" "gateway[./]serviceName" \
   --set-string gateway.namespace=edge-ns --set-string 'gateway.serviceName= edge-gateway '
 try_template "$CHART_DIR" "gateway.namespace system with gateway.address" --set-string gateway.namespace=kube-system \
   --set-string gateway.address=gw.example.com:443
@@ -663,13 +663,13 @@ else
 fi
 try_reject_msg "$GW_DIR" "tls backend: IP endpoint without sni (gw)" "without transport.sni" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000"
-try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" "transport/ca': 'oneOf' failed" "${TLS1[@]}" \
+try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
   --set "gatewayConfig.backends[0].transport.ca.configMap=a" --set "gatewayConfig.backends[0].transport.ca.secret=b"
-try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" "transport/ca': 'oneOf' failed" "${TLS1[@]}" \
+try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
   --set-json 'gatewayConfig.backends[0].transport.ca={}'
-try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value must be 'tls'" "${TLS1[@]}" \
+try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value must be 'tls'|transport: Must validate \"then\"" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.mode=plaintext" \
   --set "gatewayConfig.backends[0].transport.ca.configMap=a"
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
