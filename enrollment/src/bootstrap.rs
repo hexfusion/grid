@@ -2,7 +2,7 @@
 //!
 //! Mints or loads the Grid CA and issues the enrollment endpoint's serving
 //! certificate, then writes them as Kubernetes Secrets for a pre-install Job.
-//! Compiled only with `--features bootstrap`.
+//! Compiled with the `bootstrap` feature, on by default.
 //!
 //! Key separation is deliberate: the signing key lives only in the CA-key Secret
 //! the enrollment service mounts, while peers receive the bundle Secret, which
@@ -64,7 +64,7 @@ struct BootstrapArgs {
 /// sits in the argv0 slot clap ignores and the flags parse as usual.
 pub(crate) async fn run() -> Result<(), BoxError> {
     let args = BootstrapArgs::parse_from(std::env::args_os().skip(1));
-    bootstrap(&args).await
+    Box::pin(bootstrap(&args)).await
 }
 
 /// Generate or load the CA, then ensure the bundle and serving Secrets.
@@ -94,7 +94,7 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
         ensure_db_serving(&secrets, &ca, args).await?,
         args.db_deployment.as_deref(),
     ) {
-        reconcile_db_roll(client, &namespace, deployment, &fingerprint).await?;
+        Box::pin(reconcile_db_roll(client, &namespace, deployment, &fingerprint)).await?;
     }
     Ok(())
 }
@@ -317,30 +317,28 @@ async fn reconcile_db_roll(
     deployment: &str,
     fingerprint: &str,
 ) -> Result<(), BoxError> {
-    use k8s_openapi::api::apps::v1::Deployment;
-    use kube::api::{Api, Patch, PatchParams};
+    use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
 
-    let deployments: Api<Deployment> = Api::namespaced(client, namespace);
-    let Some(current) = deployments.get_opt(deployment).await? else {
+    // Untyped: the typed Deployment overflows the stack-frame budget.
+    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk("apps", "v1", "Deployment"));
+    let deployments: Api<DynamicObject> = Api::namespaced_with(client, namespace, &resource);
+    let Some(current) = Box::pin(deployments.get_opt(deployment)).await? else {
         return Ok(());
     };
     let stamped = current
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.template.metadata.as_ref())
-        .and_then(|meta| meta.annotations.as_ref())
+        .data
+        .pointer("/spec/template/metadata/annotations")
         .and_then(|annotations| annotations.get(DB_CERT_ANNOTATION))
-        .map(String::as_str);
+        .and_then(serde_json::Value::as_str);
     if !needs_roll(stamped, fingerprint) {
         return Ok(());
     }
-    deployments
-        .patch(
-            deployment,
-            &PatchParams::default(),
-            &Patch::Merge(roll_patch(fingerprint)),
-        )
-        .await?;
+    Box::pin(deployments.patch(
+        deployment,
+        &PatchParams::default(),
+        &Patch::Merge(roll_patch(fingerprint)),
+    ))
+    .await?;
     tracing::info!(
         deployment,
         "rolled the builtin Postgres onto its current serving certificate"

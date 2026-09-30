@@ -7,7 +7,9 @@
 grid-enrollment {{ .Chart.AppVersion }} is running in namespace {{ $ns }}.
 
 Endpoint: {{ $url }}
-{{- if not $route }}
+{{- if and (include "grid-enrollment.routeEnabled" .) (not .Values.route.host) }}
+  A Route renders with a router-assigned host: oc -n {{ $ns }} get route
+{{- else if not $route }}
   In-cluster only. Expose the Service with your own ingress or load balancer
   (TLS passthrough) so remote sites can reach it.
 {{- end }}

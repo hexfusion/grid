@@ -332,7 +332,8 @@ fn reviewed_identity(
         .ok_or(AuthzError::Unauthenticated)
 }
 
-#[cfg(all(test, feature = "sar"))]
+#[cfg(test)]
+#[cfg(feature = "sar")]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -360,7 +361,7 @@ mod tests {
     fn accepts_a_token_bound_to_the_audience() {
         let identity = reviewed_identity(status(true, Some(&["grid-enrollment"])), "grid-enrollment");
         assert!(
-            matches!(identity, Ok(ref user) if user.username.as_deref() == Some("alice")),
+            matches!(&identity, Ok(user) if user.username.as_deref() == Some("alice")),
             "got {identity:?}"
         );
     }

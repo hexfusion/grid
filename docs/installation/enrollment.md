@@ -6,7 +6,7 @@ A site joins a grid by redeeming a one-time token at the enrollment service, whi
 
 - Kubernetes 1.26 or later, Helm 3.12 or later
 - etcd encryption at rest, since the CA signing key is stored in a Secret
-- Enrollment images built with `--features sar,bootstrap`
+- An enrollment image with the default `sar` and `bootstrap` features (not a `--no-default-features` build)
 
 ## Install
 
@@ -93,5 +93,5 @@ site's trust anchor.
 ## Troubleshooting
 
 - **`route.host is required`**: a passthrough Route is rendering without a host. Set `route.host` to `<name>.apps.<cluster-domain>`, or set `route.enabled=false`. Under an umbrella chart, prefix both with the subchart name.
-- **CA bootstrap Job fails with `built without --features bootstrap`**: rebuild the enrollment image with `--features sar,bootstrap`.
+- **CA bootstrap Job fails with `built without --features bootstrap`**: the image was built with `--no-default-features`. Use a default build, which includes `sar` and `bootstrap`.
 - **`TokenReview` or `SubjectAccessReview` calls fail**: `enrollment.authz=kube` needs the `sar` feature and `enrollment.serviceAccount.create=true`, which binds the pod to `system:auth-delegator`.
