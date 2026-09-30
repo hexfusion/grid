@@ -85,35 +85,18 @@ pub enum VerifyError {
 /// Returns [`VerifyError`] if the certificate is unparseable, was not issued by
 /// this grid's CA, is outside its validity period, or names a different site.
 pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -> Result<Vec<u8>, VerifyError> {
-    if leaf_pem.len() > MAX_CERT_PEM_BYTES {
-        return Err(VerifyError::TooLarge);
-    }
-
-    let ca_der = pem::parse(ca_cert_pem).map_err(|_bad| VerifyError::MalformedCa)?;
-    let (_after_ca, ca) = X509Certificate::from_der(ca_der.contents()).map_err(|_bad| VerifyError::MalformedCa)?;
-
-    let leaf_der = pem::parse(leaf_pem).map_err(|_bad| VerifyError::Malformed)?;
-    let (_after_leaf, leaf) = X509Certificate::from_der(leaf_der.contents()).map_err(|_bad| VerifyError::Malformed)?;
-
-    if leaf.issuer() != ca.subject() {
-        return Err(VerifyError::WrongIssuer);
-    }
-    crate::backend::verify_leaf_signature(ca_cert_pem, leaf_pem).map_err(|_bad| VerifyError::BadSignature)?;
-    if !leaf.validity().is_valid() {
-        return Err(VerifyError::NotCurrentlyValid);
-    }
-
-    // The name has to be bound by the signature, not asserted next to it.
-    let expected = spiffe_id(claimed_site);
-    let found = single_spiffe_name(&leaf).ok_or(VerifyError::NotOneSpiffeName)?;
-    if found != expected {
-        return Err(VerifyError::NameMismatch {
-            found,
-            claimed: expected,
-        });
-    }
-
-    Ok(leaf.public_key().subject_public_key.data.to_vec())
+    with_issued_leaf(ca_cert_pem, leaf_pem, |leaf| {
+        // The name has to be bound by the signature, not asserted next to it.
+        let expected = spiffe_id(claimed_site);
+        let found = single_spiffe_name(leaf).ok_or(VerifyError::NotOneSpiffeName)?;
+        if found != expected {
+            return Err(VerifyError::NameMismatch {
+                found,
+                claimed: expected,
+            });
+        }
+        Ok(leaf.public_key().subject_public_key.data.to_vec())
+    })
 }
 
 /// Check that `leaf_pem` was issued by the CA in `ca_cert_pem` and is currently
@@ -124,6 +107,15 @@ pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -
 /// Returns [`VerifyError`] if either certificate is unparseable, the leaf was
 /// not signed by this CA, or it is outside its validity period.
 pub fn verify_issued_by(ca_cert_pem: &str, leaf_pem: &str) -> Result<(), VerifyError> {
+    with_issued_leaf(ca_cert_pem, leaf_pem, |_leaf| Ok(()))
+}
+
+/// Run `then` on the leaf once it is proven issued by the CA and currently valid.
+fn with_issued_leaf<T>(
+    ca_cert_pem: &str,
+    leaf_pem: &str,
+    then: impl FnOnce(&X509Certificate<'_>) -> Result<T, VerifyError>,
+) -> Result<T, VerifyError> {
     if leaf_pem.len() > MAX_CERT_PEM_BYTES {
         return Err(VerifyError::TooLarge);
     }
@@ -139,7 +131,7 @@ pub fn verify_issued_by(ca_cert_pem: &str, leaf_pem: &str) -> Result<(), VerifyE
     if !leaf.validity().is_valid() {
         return Err(VerifyError::NotCurrentlyValid);
     }
-    Ok(())
+    then(&leaf)
 }
 
 /// A certificate's issuer name and `notAfter`, for logging. Carries no key
