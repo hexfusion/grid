@@ -64,8 +64,12 @@ also settable when a deployment needs to override it.
 
 - `kube` (default): Kubernetes RBAC. The service authenticates the caller
   with `TokenReview` and authorizes with `SubjectAccessReview` against the
-  `enrollmenttokens` resource in the `grid.praxis-proxy.io` API group. No CRD
-  is required, only ordinary `Role` or `ClusterRole` objects. Set
+  `enrollmenttokens` resource in the `grid.praxis-proxy.io` API group, in the
+  enrollment service's namespace. No CRD is required: a `Role` and
+  `RoleBinding` in the enrollment namespace grant it, or a `ClusterRole` with
+  a `ClusterRoleBinding`. Grid-admin is delegated through RBAC in the
+  enrollment namespace, so keep that namespace dedicated to enrollment and its
+  CA. Set
   `enrollment.serviceAccount.create=true` (and optionally
   `enrollment.serviceAccount.name`) so the pod runs as a `ServiceAccount`
   bound to `system:auth-delegator`, which is what lets the review calls
@@ -126,7 +130,53 @@ rules:
     resources: ["serviceaccounts/token"]
     resourceNames: ["<grid-admin-sa>"]
     verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grid-admin-token
+  namespace: grid
+subjects:
+  - kind: Group
+    name: <grid-admin-group>
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: grid-admin-token
+  apiGroup: rbac.authorization.k8s.io
 ```
+
+Grant that ServiceAccount the grid-admin actions with a Role in the
+enrollment namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grid-admin
+  namespace: grid
+rules:
+  - apiGroups: ["grid.praxis-proxy.io"]
+    resources: ["enrollmenttokens"]
+    verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grid-admin
+  namespace: grid
+subjects:
+  - kind: ServiceAccount
+    name: <grid-admin-sa>
+    namespace: grid
+roleRef:
+  kind: Role
+  name: grid-admin
+  apiGroup: rbac.authorization.k8s.io
+```
+
+The Role must be written as YAML: `kubectl create role --resource` cannot
+resolve `enrollmenttokens`, because no CRD publishes it for discovery.
 
 The enrollment service records the ServiceAccount as the grid-admin that
 minted a site token. The human who requested the ServiceAccount token
