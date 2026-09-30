@@ -218,7 +218,8 @@
         },
         "serviceName": {
           "type": "string",
-          "description": "Gateway Kubernetes Service name for discovery."
+          "pattern": "^([a-z]([-a-z0-9]{0,61}[a-z0-9])?)?$",
+          "description": "Gateway Kubernetes Service name for discovery; empty uses provider-gateway."
         },
         "namespace": {
           "type": "string",

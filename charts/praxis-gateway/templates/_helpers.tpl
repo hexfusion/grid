@@ -149,17 +149,8 @@ carry a sni.
 {{- if regexMatch "^(\\[|[0-9.]+$)" (include "praxis-gateway.backendSni" .) }}
 {{- fail (printf "backend %q uses tls to an IP endpoint without transport.sni: set transport.sni to a DNS name on the certificate, or use the Service hostname as the endpoint" .cluster) }}
 {{- end }}
-{{- if hasKey (.transport | default dict) "ca" }}
-{{- $ca := .transport.ca | default dict }}
-{{- if ne (len (compact (list $ca.configMap $ca.secret))) 1 }}
-{{- fail (printf "backend %q transport.ca: set exactly one of configMap or secret" .cluster) }}
-{{- end }}
-{{- end }}
 {{- else }}
 {{- fail (printf "backend %q transport.mode must be mutual_tls, tls, or plaintext, got %q" .cluster $mode) }}
-{{- end }}
-{{- if and (.transport).ca (ne $mode "tls") }}
-{{- fail (printf "backend %q sets transport.ca, which applies only to transport.mode tls" .cluster) }}
 {{- end }}
 {{- end }}
 {{- end }}

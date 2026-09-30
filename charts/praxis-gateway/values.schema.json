@@ -90,9 +90,15 @@
                       "configMap": { "type": "string" },
                       "secret": { "type": "string" },
                       "key": { "type": "string" }
-                    }
+                    },
+                    "oneOf": [
+                      { "required": ["configMap"], "properties": { "configMap": { "minLength": 1 }, "secret": { "maxLength": 0 } } },
+                      { "required": ["secret"], "properties": { "secret": { "minLength": 1 }, "configMap": { "maxLength": 0 } } }
+                    ]
                   }
-                }
+                },
+                "if": { "required": ["ca"] },
+                "then": { "required": ["mode"], "properties": { "mode": { "const": "tls" } } }
               }
             }
           }

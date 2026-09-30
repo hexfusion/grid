@@ -249,6 +249,8 @@ try_reject_msg "$CHART_DIR" "gateway.namespace kube-system" "is a system namespa
 try_reject_msg "$CHART_DIR" "gateway.namespace openshift-ingress" "is a system namespace" --set-string gateway.namespace=openshift-ingress
 try_reject_msg "$CHART_DIR" "gateway.namespace default" "is a system namespace" --set-string gateway.namespace=default
 try_reject "$CHART_DIR" "gateway.namespace not DNS-1123" --set-string gateway.namespace=Edge_NS
+try_reject_msg "$CHART_DIR" "gateway.serviceName with whitespace" "/gateway/serviceName" \
+  --set-string gateway.namespace=edge-ns --set-string 'gateway.serviceName= edge-gateway '
 try_template "$CHART_DIR" "gateway.namespace system with gateway.address" --set-string gateway.namespace=kube-system \
   --set-string gateway.address=gw.example.com:443
 try_template "$CHART_DIR" "gateway.namespace system opt-in" --set-string gateway.namespace=kube-system \
@@ -661,13 +663,13 @@ else
 fi
 try_reject_msg "$GW_DIR" "tls backend: IP endpoint without sni (gw)" "without transport.sni" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000"
-try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" 'backend "kserve" transport.ca: set exactly one' "${TLS1[@]}" \
+try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" "transport/ca': 'oneOf' failed" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
   --set "gatewayConfig.backends[0].transport.ca.configMap=a" --set "gatewayConfig.backends[0].transport.ca.secret=b"
-try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" 'backend "kserve" transport.ca: set exactly one' "${TLS1[@]}" \
+try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" "transport/ca': 'oneOf' failed" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
   --set-json 'gatewayConfig.backends[0].transport.ca={}'
-try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "applies only to transport.mode tls" "${TLS1[@]}" \
+try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value must be 'tls'" "${TLS1[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.mode=plaintext" \
   --set "gatewayConfig.backends[0].transport.ca.configMap=a"
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
@@ -1436,7 +1438,8 @@ try_reject "$ENROLL_DIR" "route.enabled not true, false, or auto" --namespace gr
 
 echo ""
 echo "=== Route + serving-cert SAN auto-wire (enrollment) ==="
-ENROLL_RENDERED=$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com 2>/dev/null)
+render v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com || true
+ENROLL_RENDERED=$RENDERED
 if echo "$ENROLL_RENDERED" | grep -q 'kind: Route'; then
   pass "enrollment: Route renders by default on OpenShift"
 else
@@ -1452,17 +1455,20 @@ if [ "$(echo "$ENROLL_RENDERED" | grep -c 'haproxy.router.openshift.io/rate-limi
 else
   fail "enrollment: Route should carry rate-limit-connections annotations"
 fi
-if helm template v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com \
-    --set route.rateLimit.enabled=false | grep -q 'rate-limit-connections'; then
-  fail "enrollment: route.rateLimit.enabled=false should drop the annotations"
-else
-  pass "enrollment: route.rateLimit.enabled=false drops the annotations"
+if render v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com \
+    --set route.rateLimit.enabled=false; then
+  if echo "$RENDERED" | grep -q 'rate-limit-connections'; then
+    fail "enrollment: route.rateLimit.enabled=false should drop the annotations"
+  else
+    pass "enrollment: route.rateLimit.enabled=false drops the annotations"
+  fi
 fi
-NO_ROUTE=$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system --set route.host=enroll.example.com 2>/dev/null)
-if echo "$NO_ROUTE" | grep -q 'kind: Route' || echo "$NO_ROUTE" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
-  fail "enrollment: without the Route API, no Route and no Route SAN"
-else
-  pass "enrollment: without the Route API, no Route and no Route SAN"
+if render v-enroll "$ENROLL_DIR" --namespace grid-system --set route.host=enroll.example.com; then
+  if echo "$RENDERED" | grep -q 'kind: Route' || echo "$RENDERED" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
+    fail "enrollment: without the Route API, no Route and no Route SAN"
+  else
+    pass "enrollment: without the Route API, no Route and no Route SAN"
+  fi
 fi
 if [ "$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system --show-only templates/certs/ca-bootstrap-rbac.yaml \
     | grep -c 'hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed')" = 3 ]; then
