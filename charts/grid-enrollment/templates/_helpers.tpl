@@ -143,3 +143,14 @@ Enrollment image: repository@digest when image.digest is set, else repository:ta
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
 {{- end }}
 {{- end }}
+
+{{/*
+Builtin Postgres image, pinned by imageDigest when set.
+*/}}
+{{- define "grid-enrollment.dbImage" -}}
+{{- if .Values.db.builtin.imageDigest }}
+{{- printf "%s@%s" .Values.db.builtin.image .Values.db.builtin.imageDigest }}
+{{- else }}
+{{- .Values.db.builtin.image }}
+{{- end }}
+{{- end }}
