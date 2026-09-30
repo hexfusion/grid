@@ -120,19 +120,24 @@ async fn resolve_ca(
 /// The `app.kubernetes.io/managed-by` value on every Secret bootstrap writes.
 const MANAGED_BY: &str = "grid-enrollment-bootstrap";
 
-/// Another manager's claim on a Secret: a different `managed-by` label, or
-/// cert-manager annotations. An unlabelled Secret counts as ours, since earlier
-/// bootstrap runs wrote it without the label.
-fn foreign_manager(
-    labels: Option<&std::collections::BTreeMap<String, String>>,
-    annotations: Option<&std::collections::BTreeMap<String, String>>,
-) -> Option<String> {
-    if let Some(owner) = labels.and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+/// Another manager's claim on a Secret: an owner reference (External Secrets,
+/// Sealed Secrets, an operator), a different `managed-by` label, or cert-manager
+/// annotations. An unlabelled Secret counts as ours, since earlier bootstrap runs
+/// wrote it without the label.
+fn foreign_manager(meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> Option<String> {
+    if let Some(owner) = meta.owner_references.as_deref().and_then(<[_]>::first) {
+        return Some(format!("its owner {} {}", owner.kind, owner.name));
+    }
+    if let Some(owner) = meta
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
         && owner != MANAGED_BY
     {
         return Some(format!("app.kubernetes.io/managed-by={owner}"));
     }
-    annotations
+    meta.annotations
+        .as_ref()
         .is_some_and(|annotations| annotations.keys().any(|key| key.starts_with("cert-manager.io/")))
         .then(|| "cert-manager".to_owned())
 }
@@ -157,7 +162,7 @@ async fn load_serving_cert(
     let Some(secret) = secrets.get_opt(name).await? else {
         return Ok((ServingCert::Absent, None));
     };
-    let foreign = foreign_manager(secret.metadata.labels.as_ref(), secret.metadata.annotations.as_ref());
+    let foreign = foreign_manager(&secret.metadata);
     let pem = secret
         .data
         .as_ref()
@@ -348,6 +353,8 @@ fn should_write(exists: bool, force: bool) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+
     use super::{MANAGED_BY, ServingCert, foreign_manager, serving_needs_issue, should_write};
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -359,10 +366,13 @@ mod tests {
 
     #[test]
     fn secrets_bootstrap_wrote_are_ours_to_replace() {
-        let ours = map(&[("app.kubernetes.io/managed-by", MANAGED_BY)]);
-        assert_eq!(foreign_manager(Some(&ours), None), None, "stamped by bootstrap");
+        let ours = ObjectMeta {
+            labels: Some(map(&[("app.kubernetes.io/managed-by", MANAGED_BY)])),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(foreign_manager(&ours), None, "stamped by bootstrap");
         assert_eq!(
-            foreign_manager(None, None),
+            foreign_manager(&ObjectMeta::default()),
             None,
             "unlabelled: written before the label existed"
         );
@@ -370,13 +380,33 @@ mod tests {
 
     #[test]
     fn secrets_another_manager_owns_are_refused() {
-        let helm = map(&[("app.kubernetes.io/managed-by", "Helm")]);
+        let helm = ObjectMeta {
+            labels: Some(map(&[("app.kubernetes.io/managed-by", "Helm")])),
+            ..ObjectMeta::default()
+        };
         assert_eq!(
-            foreign_manager(Some(&helm), None).as_deref(),
+            foreign_manager(&helm).as_deref(),
             Some("app.kubernetes.io/managed-by=Helm")
         );
-        let issued = map(&[("cert-manager.io/certificate-name", "enrollment")]);
-        assert_eq!(foreign_manager(None, Some(&issued)).as_deref(), Some("cert-manager"));
+        let issued = ObjectMeta {
+            annotations: Some(map(&[("cert-manager.io/certificate-name", "enrollment")])),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(foreign_manager(&issued).as_deref(), Some("cert-manager"));
+        // An owner reference wins even over our own label.
+        let synced = ObjectMeta {
+            labels: Some(map(&[("app.kubernetes.io/managed-by", MANAGED_BY)])),
+            owner_references: Some(vec![OwnerReference {
+                kind: "ExternalSecret".to_owned(),
+                name: "enrollment-serving".to_owned(),
+                ..OwnerReference::default()
+            }]),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(
+            foreign_manager(&synced).as_deref(),
+            Some("its owner ExternalSecret enrollment-serving")
+        );
     }
 
     fn names(list: &[&str]) -> Vec<String> {
