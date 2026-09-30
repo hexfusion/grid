@@ -55,8 +55,10 @@ clean:
 
 test: test-unit
 
+# The enrollment image features gate tests out of the default workspace build.
 test-unit:
 	cargo test --workspace $(_NOCAPTURE)
+	cargo test -p enrollment --features sar,bootstrap $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
 # Quality
@@ -64,6 +66,7 @@ test-unit:
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy -p enrollment --features sar,bootstrap --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
 	cargo machete
 
