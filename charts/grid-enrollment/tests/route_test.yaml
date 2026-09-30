@@ -90,3 +90,15 @@ tests:
       - notContains:
           path: spec.template.spec.containers[0].args
           content: --serving-secret
+
+  - it: refuses reencrypt without a destination CA
+    template: templates/enrollment/route.yaml
+    capabilities:
+      apiVersions:
+        - route.openshift.io/v1
+    set:
+      route.host: h.example.com
+      route.tls.termination: reencrypt
+    asserts:
+      - failedTemplate:
+          errorMessage: "reencrypt needs route.tls.destinationCACertificate (the grid CA bundle, ca.crt from Secret grid-ca-bundle); passthrough is recommended"

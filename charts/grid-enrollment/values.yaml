@@ -81,7 +81,8 @@ route:
     termination: passthrough
     # -- Redirect or None. Allow is refused: plaintext would leak the token.
     insecureEdgeTerminationPolicy: None
-    # -- PEM CA for reencrypt to verify the backend (grid-CA bundle).
+    # -- PEM CA for reencrypt to verify the backend (grid-CA bundle, ca.crt from
+    # Secret grid-ca-bundle). Required for reencrypt.
     destinationCACertificate: ""
 
 # ------------------------------------------------------------------------------

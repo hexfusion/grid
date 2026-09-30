@@ -154,6 +154,9 @@ would hit a SAN mismatch.
 {{- if and $route (eq .Values.route.tls.termination "passthrough") (not .Values.route.host) }}
 {{- fail "route.host is required when a passthrough Route renders, so the serving cert SAN covers it: set route.host=<name>.apps.<cluster-domain>, or route.enabled=false (prefix both with the subchart name under an umbrella chart)" }}
 {{- end }}
+{{- if and $route (eq .Values.route.tls.termination "reencrypt") (not .Values.route.tls.destinationCACertificate) }}
+{{- fail "reencrypt needs route.tls.destinationCACertificate (the grid CA bundle, ca.crt from Secret grid-ca-bundle); passthrough is recommended" }}
+{{- end }}
 {{- if and $route (eq .Values.route.tls.insecureEdgeTerminationPolicy "Allow") }}
 {{- fail "route.tls.insecureEdgeTerminationPolicy=Allow is refused: it would serve the one-time enrollment token over plaintext. Use Redirect or None." }}
 {{- end }}

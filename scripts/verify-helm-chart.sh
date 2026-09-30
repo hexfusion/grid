@@ -1290,6 +1290,11 @@ try_template "$ENROLL_DIR" "enrollment: no Route API, no host" --namespace grid-
 try_reject "$ENROLL_DIR" "passthrough route without host (OpenShift)" --namespace grid-system "${OCP[@]}"
 try_reject "$ENROLL_DIR" "route.enabled=true without host" --namespace grid-system --set route.enabled=true
 try_reject "$ENROLL_DIR" "insecureEdgeTerminationPolicy Allow (plaintext token)" --namespace grid-system "${OCP[@]}" --set route.host=h.example.com --set route.tls.insecureEdgeTerminationPolicy=Allow
+try_reject "$ENROLL_DIR" "reencrypt without destinationCACertificate" --namespace grid-system "${OCP[@]}" \
+  --set route.host=h.example.com --set route.tls.termination=reencrypt
+try_template "$ENROLL_DIR" "enrollment: reencrypt with a destination CA" --namespace grid-system \
+  "${OCP[@]}" --set route.host=h.example.com --set route.tls.termination=reencrypt \
+  --set-string route.tls.destinationCACertificate=placeholder-ca
 try_reject "$ENROLL_DIR" "wildcard route.host" --namespace grid-system "${OCP[@]}" --set 'route.host=*.apps.example.com'
 try_reject "$ENROLL_DIR" "route.host label over 63 characters" --namespace grid-system "${OCP[@]}" \
   --set "route.host=$(printf 'a%.0s' $(seq 64)).example.com"
