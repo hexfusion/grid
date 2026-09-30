@@ -312,10 +312,15 @@ praxis-proxy = "0.7.0"
 praxis-proxy-filter = "0.7.0"
 praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1" }
 ai-grid-filters = { path = "ai-grid-filters" }
+praxis-policy = { version = "0.4", default-features = false, optional = true }
+
+[features]
+default = ["experimental-quota"]
+experimental-quota = ["dep:praxis-policy", "praxis-policy/experimental-quota"]
 
 # machete can't see these: used as `praxis` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]
-ignored = ["praxis-proxy", "praxis-proxy-filter"]
+ignored = ["praxis-proxy", "praxis-proxy-filter", "praxis-policy"]
 
 [lints]
 workspace = true
