@@ -32,9 +32,14 @@ Serving cert: Secret/{{ .Values.serving.existingSecretRef }} (provided). It must
   TOKEN=$(kubectl -n {{ $ns }} get secret {{ include "grid-enrollment.fullname" . }}-grid-admin-tokens -o jsonpath='{.data.tokens}' | base64 -d | head -1 | cut -d: -f2-)
 {{- end }}
 {{- else }}
-  The caller needs "create" (mint) and "delete" (revoke) on the cluster-scoped
-  resource enrollmenttokens in API group grid.praxis-proxy.io. cluster-admin has it.
-  TOKEN=$(oc whoami -t)   # or: kubectl -n <namespace> create token <service-account>
+  Grid-admins hold Role/{{ include "grid-enrollment.fullname" . }}-grid-admin in this namespace.
+{{- if .Values.enrollment.gridAdmins.serviceAccount.create }}
+  TOKEN=$(kubectl -n {{ $ns }} create token {{ .Values.enrollment.gridAdmins.serviceAccount.name }} --audience {{ .Values.enrollment.tokenAudience }} --duration 10m)
+{{- else }}
+  Bind it with enrollment.gridAdmins.subjects, or set
+  enrollment.gridAdmins.serviceAccount.create=true, then mint an audience-bound token:
+  TOKEN=$(kubectl -n {{ $ns }} create token <grid-admin-sa> --audience {{ .Values.enrollment.tokenAudience }} --duration 10m)
+{{- end }}
 {{- end }}
 
 3. Mint a one-time site token:

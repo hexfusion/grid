@@ -134,28 +134,6 @@ DB_CONNECTION_URL
 {{- end }}
 
 {{/*
-Enrollment image: repository@digest when image.digest is set, else repository:tag.
-*/}}
-{{- define "grid-enrollment.image" -}}
-{{- if .Values.image.digest }}
-{{- printf "%s@%s" .Values.image.repository .Values.image.digest }}
-{{- else }}
-{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
-{{- end }}
-{{- end }}
-
-{{/*
-Builtin Postgres image, pinned by imageDigest when set.
-*/}}
-{{- define "grid-enrollment.dbImage" -}}
-{{- if .Values.db.builtin.imageDigest }}
-{{- printf "%s@%s" .Values.db.builtin.image .Values.db.builtin.imageDigest }}
-{{- else }}
-{{- .Values.db.builtin.image }}
-{{- end }}
-{{- end }}
-
-{{/*
 Whether a Route renders: route.enabled true or false, or auto when the cluster serves
 route.openshift.io/v1. Emits "true" or nothing.
 */}}
@@ -192,5 +170,27 @@ the user provides; with neither, the pod would mount a Secret that does not exis
 {{- $tokens := .Values.enrollment.gridAdminTokens }}
 {{- if and (eq .Values.enrollment.authz "local") (not $tokens.generate) (not $tokens.existingSecretRef) }}
 {{- fail "enrollment.authz=local needs grid-admin tokens: set enrollment.gridAdminTokens.generate=true or enrollment.gridAdminTokens.existingSecretRef" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Enrollment image: repository@digest when image.digest is set, else repository:tag.
+*/}}
+{{- define "grid-enrollment.image" -}}
+{{- if .Values.image.digest }}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest }}
+{{- else }}
+{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Builtin Postgres image, pinned by imageDigest when set.
+*/}}
+{{- define "grid-enrollment.dbImage" -}}
+{{- if .Values.db.builtin.imageDigest }}
+{{- printf "%s@%s" .Values.db.builtin.image .Values.db.builtin.imageDigest }}
+{{- else }}
+{{- .Values.db.builtin.image }}
 {{- end }}
 {{- end }}

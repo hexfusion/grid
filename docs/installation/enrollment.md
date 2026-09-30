@@ -29,8 +29,9 @@ A pre-install Job runs `enrollment bootstrap` to create the grid CA and the serv
 | `route.host` | Required when a Route renders. Added to the issued serving certificate. A BYO certificate (`serving.existingSecretRef`) must already carry it. |
 | `route.tls.termination` | Keep `passthrough`. `edge` and `reencrypt` terminate at the router and break the site's grid-CA pin. |
 | `db.type` | `builtin` runs Postgres in the chart. `external` reads the connection URL from the Secret in `db.external.connectionUrlSecretRef`. |
-| `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens`. `local` uses a grid-admin token table. |
-| `image.repository`, `image.tag` | The enrollment image. The tag defaults to the chart's `appVersion`. |
+| `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a grid-admin token table. |
+| `image.repository`, `image.tag`, `image.digest` | The enrollment image. The tag defaults to the chart's `appVersion`; `image.digest` pins it. |
+| `db.builtin.image`, `db.builtin.imageDigest` | The builtin Postgres image, a pinned tag by default; `imageDigest` pins it. |
 
 The chart README and `values.yaml` cover the remaining values.
 
@@ -38,8 +39,11 @@ The chart README and `values.yaml` cover the remaining values.
 
 Mint a token with the grid CA bundle:
 
+Under `kube`, the chart ships the grid-admin Role, `<release>-grid-enrollment-grid-admin`, with `create` and `delete` on `enrollmenttokens`. Bind it with `enrollment.gridAdmins.subjects`, or set `enrollment.gridAdmins.serviceAccount.create=true`. The bearer must be bound to `enrollment.tokenAudience` (default `grid-enrollment`); a general API token is refused. Mint a short-lived one:
+
 ```bash
 kubectl -n grid get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d > grid-ca-bundle.crt
+GRID_ADMIN_TOKEN=$(kubectl -n grid create token <grid-admin-sa> --audience grid-enrollment --duration 10m)
 
 curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollmenttokens \
   --cacert grid-ca-bundle.crt \

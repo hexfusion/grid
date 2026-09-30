@@ -57,15 +57,6 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: pins the bootstrap Job image by digest when image.digest is set
-    template: templates/certs/ca-bootstrap-job.yaml
-    set:
-      image.digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
-    asserts:
-      - equal:
-          path: spec.template.spec.containers[0].image
-          value: quay.io/praxis-proxy/grid-enrollment@sha256:0000000000000000000000000000000000000000000000000000000000000000
-
   - it: lets bootstrap read and roll only the builtin DB Deployment
     template: templates/certs/ca-bootstrap-rbac.yaml
     documentSelector:
@@ -99,3 +90,12 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].args
           content: --db-deployment
+
+  - it: pins the bootstrap Job image by digest when image.digest is set
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      image.digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: quay.io/praxis-proxy/grid-enrollment@sha256:0000000000000000000000000000000000000000000000000000000000000000
