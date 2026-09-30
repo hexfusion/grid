@@ -635,10 +635,41 @@ try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "tls.enabled is
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
   --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set gatewayConfig.backends[0].transport.mode=mutual_tls --set gatewayConfig.backends[0].transport.sni=a.grid --namespace grid-system
-try_reject_msg "$GW_DIR" "plaintext with sni (gw)" "sni belongs to mutual_tls" \
+try_reject_msg "$GW_DIR" "plaintext with sni (gw)" "sni belongs to a TLS transport" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
   --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set gatewayConfig.backends[0].transport.mode=plaintext --set gatewayConfig.backends[0].transport.sni=x --namespace grid-system
+# tls transport: server-verified backend with no client cert (a KServe workload).
+TLS1=(--set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q
+  --set "gatewayConfig.backends[0].cluster=kserve" --set "gatewayConfig.backends[0].transport.mode=tls" --namespace grid-system)
+TLS_RENDER=$(helm template v-tls "$GW_DIR" "${TLS1[@]}" --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" \
+  --set "gatewayConfig.backends[0].transport.sni=qwen3-kserve-workload-svc.llm.svc" \
+  --set "gatewayConfig.backends[0].transport.ca.configMap=openshift-service-ca.crt" \
+  --set "gatewayConfig.backends[0].transport.ca.key=service-ca.crt" 2>&1)
+if echo "$TLS_RENDER" | grep -q 'ca_path: "/etc/praxis/backend-ca/0/service-ca.crt"' \
+    && echo "$TLS_RENDER" | grep -q 'sni: "qwen3-kserve-workload-svc.llm.svc"' \
+    && ! echo "$TLS_RENDER" | awk '/- name: "kserve"/{f=1} f&&/client_cert/{print; exit}' | grep -q client_cert \
+    && echo "$TLS_RENDER" | grep -A2 'name: backend-ca-0' | grep -q 'name: "openshift-service-ca.crt"'; then
+  pass "tls backend: server-verified with transport.ca and sni, no client cert"
+else
+  fail "tls backend: should render ca_path, sni, verify, no client_cert, and mount the CA"
+fi
+if echo "$TLS_RENDER" | awk '/- name: "kserve"/{f=1} f&&/type:/{print; exit}' | grep -q 'type: "tcp"'; then
+  pass "tls backend: health_check defaults to tcp"
+else
+  fail "tls backend: health_check should default to tcp"
+fi
+try_reject_msg "$GW_DIR" "tls backend: IP endpoint without sni (gw)" "without transport.sni" "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000"
+try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" 'backend "kserve" transport.ca: set exactly one' "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
+  --set "gatewayConfig.backends[0].transport.ca.configMap=a" --set "gatewayConfig.backends[0].transport.ca.secret=b"
+try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" 'backend "kserve" transport.ca: set exactly one' "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
+  --set-json 'gatewayConfig.backends[0].transport.ca={}'
+try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "applies only to transport.mode tls" "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.mode=plaintext" \
+  --set "gatewayConfig.backends[0].transport.ca.configMap=a"
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
   --set gatewayConfig.listenerTls.enabled=true --namespace grid-system
 
