@@ -2,6 +2,12 @@
 # is qualified.
 replicaCount: 1
 
+# -- Grid CRD lifecycle.
+crds:
+  # -- Render the CRDs as templates so they upgrade with the release. Install
+  # with --skip-crds when enabled. Uninstall retains them.
+  managed: false
+
 # -- Operator container image settings.
 image:
   # -- Image repository.

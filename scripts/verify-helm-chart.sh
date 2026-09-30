@@ -83,6 +83,35 @@ for crd in agenttoolprovider gridnetwork gridsite inferenceprovider; do
   fi
 done
 
+# crds.managed renders the same CRDs as templates, plus the keep annotation.
+for crd in agenttoolprovider gridnetwork gridsite inferenceprovider; do
+  rendered=$(helm template verify-crd "$CHART_DIR" --set crds.managed=true \
+    --show-only "templates/crds/${crd}.yaml" 2>/dev/null | sed -e '/^# Source:/d' -e '/^---$/d')
+  stripped=$(echo "$rendered" |
+    yq -P 'del(.metadata.annotations."helm.sh/resource-policy") | del(.metadata.annotations | select(length == 0))')
+  if [ -n "$rendered" ] && [ "$stripped" = "$(yq -P '.' "$DEPLOY_CRDS/${crd}.yaml")" ]; then
+    pass "managed crd sync: rendered ${crd}.yaml matches $DEPLOY_CRDS"
+  else
+    fail "managed crd sync: rendered ${crd}.yaml differs from $DEPLOY_CRDS (rerun scripts/generate-deployment-crds.sh)"
+  fi
+  if [ "$(echo "$rendered" | yq '.metadata.annotations."helm.sh/resource-policy"')" = "keep" ]; then
+    pass "managed crd keep: ${crd}.yaml survives uninstall"
+  else
+    fail "managed crd keep: ${crd}.yaml lacks helm.sh/resource-policy: keep"
+  fi
+  if sed '1d;$d' "$CHART_DIR/templates/crds/${crd}.yaml" | grep -q '{{'; then
+    fail "managed crd: ${crd}.yaml body contains '{{', which Helm would template"
+  else
+    pass "managed crd: ${crd}.yaml body has no template directives"
+  fi
+done
+
+if helm template verify-nocrd "$CHART_DIR" 2>/dev/null | grep -q '^kind: CustomResourceDefinition'; then
+  fail "default install renders templated CRDs alongside crds/"
+else
+  pass "default install leaves CRDs to crds/"
+fi
+
 # A CRD missing from the kustomization is silently dropped by kustomize consumers.
 listed=$(sed -n 's/^  - //p' "$DEPLOY_CRDS/kustomization.yaml" | sort)
 present=$(cd "$DEPLOY_CRDS" && ls -1 *.yaml | grep -vx kustomization.yaml | sort)
@@ -178,7 +207,7 @@ if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
   for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml crds/agenttoolprovider.yaml \
-    crds/gridnetwork.yaml crds/gridsite.yaml crds/inferenceprovider.yaml; do
+    crds/gridnetwork.yaml crds/gridsite.yaml crds/inferenceprovider.yaml templates/crds/gridnetwork.yaml; do
     if echo "$CONTENTS" | grep -q "$f"; then
       pass "package contains: $f"
     else

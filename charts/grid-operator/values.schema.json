@@ -17,6 +17,16 @@
       "maximum": 1,
       "description": "Number of operator replicas. Must be 1 until multi-replica operation is qualified."
     },
+    "crds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "managed": {
+          "type": "boolean",
+          "description": "Render the Grid CRDs as templates so they upgrade with the release; they are retained on uninstall."
+        }
+      }
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,

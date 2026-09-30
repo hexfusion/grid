@@ -38,6 +38,10 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
   --version <new-version> --namespace grid-system
 ```
 
+With `crds.managed=true` the chart renders the CRDs as templates and upgrades
+them with the release. See
+[Managed CRDs](../../charts/grid-operator/README.md#managed-crds).
+
 Uninstalling the chart removes namespaced resources but retains CRDs.
 Custom resources created by other chart releases (e.g., grid-site) are
 not affected. See the [chart README](../../charts/grid-operator/README.md)

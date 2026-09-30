@@ -68,7 +68,8 @@ operator uninstall.
 To remove CRDs and all custom resources:
 
 ```bash
-kubectl delete crd gridnetworks.grid.praxis-proxy.io \
+kubectl delete crd agenttoolproviders.grid.praxis-proxy.io \
+  gridnetworks.grid.praxis-proxy.io \
   gridsites.grid.praxis-proxy.io \
   inferenceproviders.grid.praxis-proxy.io
 ```
@@ -95,12 +96,10 @@ helm pull oci://ghcr.io/praxis-proxy/charts/grid-operator --version <new-version
 kubectl apply -f grid-operator/crds/
 ```
 
-From the source repository:
+From the repository, pinned to the release commit rather than a tag:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/gridnetwork.yaml
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/gridsite.yaml
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/inferenceprovider.yaml
+kubectl apply -k "https://github.com/praxis-proxy/grid/deploy/crds?ref=<commit-sha>"
 ```
 
 Then upgrade the chart:
@@ -110,11 +109,58 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
   --version <new-version> --namespace grid-system
 ```
 
+### Managed CRDs
+
+> **Install with `--skip-crds` when `crds.managed=true`.** Otherwise Helm
+> creates the CRDs from `crds/` and then fails to create the templated copies.
+
+Set `crds.managed=true` to render the CRDs as templates, so `helm upgrade`
+upgrades them with the release. They carry `helm.sh/resource-policy: keep`,
+so uninstall leaves them and their custom resources in place. The default
+(`false`) leaves the CRDs to `crds/`, which coexists with CRDs applied from
+`deploy/crds` or another release.
+
+Grid CRDs are cluster-scoped, so only one release per cluster may manage
+them. A `helm rollback` or downgrade applies the older schema cluster-wide,
+and the API server prunes fields it doesn't define from every Grid resource.
+
+On a new install, skip `crds/` so the templates own the CRDs:
+
+```bash
+helm install grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version <version> --namespace grid-system --create-namespace \
+  --set crds.managed=true --skip-crds
+```
+
+To switch an existing release (Helm >= 3.17), confirm that no other Grid
+install uses these CRDs, then take ownership. The check stops on a CRD owned by
+another release. A CRD with no Helm owner was applied by hand or by another
+tool, so confirm that tool no longer manages it:
+
+```bash
+set -euo pipefail
+release=grid-operator namespace=grid-system
+for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do
+  owner=$(kubectl get crd "$crd.grid.praxis-proxy.io" \
+    -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-namespace}/{.metadata.annotations.meta\.helm\.sh/release-name}')
+  if [ "$owner" = "/" ]; then
+    echo "$crd has no Helm owner; confirm nothing else manages it" >&2
+  elif [ "$owner" != "$namespace/$release" ]; then
+    echo "$crd is owned by $owner" >&2
+    exit 1
+  fi
+done
+helm upgrade "$release" oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version <new-version> --namespace "$namespace" \
+  --set crds.managed=true --take-ownership
+```
+
 ## Values
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `replicaCount` | int | `1` | Operator replicas. Must be 1 (schema-enforced). |
+| `crds.managed` | bool | `false` | Render the CRDs as templates so they upgrade with the release. See [Managed CRDs](#managed-crds). |
 | `image.repository` | string | `ghcr.io/praxis-proxy/grid-operator` | Image repository. |
 | `image.tag` | string | `""` | Image tag. Defaults to chart appVersion. |
 | `image.digest` | string | `""` | Immutable digest. When set, tag is ignored. Must match `sha256:<64 hex>`. |

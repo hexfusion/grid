@@ -29,7 +29,12 @@ Next steps:
   4. Install a compatible Praxis gateway separately.
 
 CRD lifecycle:
-
+{{ if .Values.crds.managed }}
+  crds.managed is set: the CRDs are templates and upgrade with this release.
+  Install with --skip-crds, or Helm also creates them from crds/ and fails.
+  helm uninstall keeps them (helm.sh/resource-policy: keep). A rollback
+  applies the older schema cluster-wide.
+{{ else }}
   Helm installs CRDs from the crds/ directory on initial install, but does
   NOT upgrade or delete them on helm upgrade or helm uninstall. To upgrade
   CRDs from a release artifact:
@@ -37,18 +42,17 @@ CRD lifecycle:
     helm pull oci://ghcr.io/praxis-proxy/charts/grid-operator --version <version> --untar
     kubectl apply -f grid-operator/crds/
 
-  Or from the source repository:
+  Or from the repository, pinned to the release commit:
 
-    kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/<version>/deploy/crds/gridnetwork.yaml
-    kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/<version>/deploy/crds/gridsite.yaml
-    kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/<version>/deploy/crds/inferenceprovider.yaml
+    kubectl apply -k "https://github.com/praxis-proxy/grid/deploy/crds?ref=<commit-sha>"
 
   From a local checkout:
 
     kubectl apply -f charts/grid-operator/crds/
-
+{{ end }}
   To remove CRDs (this deletes ALL custom resources of those types):
 
+    kubectl delete crd agenttoolproviders.grid.praxis-proxy.io
     kubectl delete crd gridnetworks.grid.praxis-proxy.io
     kubectl delete crd gridsites.grid.praxis-proxy.io
     kubectl delete crd inferenceproviders.grid.praxis-proxy.io

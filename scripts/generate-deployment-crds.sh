@@ -29,6 +29,24 @@ cargo run -p operator --bin generate_crds | jq -r '.items[3]' | yq eval -P > "$C
   done
 } > "$CRD_DIR/kustomization.yaml"
 
+# Opt-in managed CRDs (crds.managed): the same CRDs as templates, so they
+# upgrade with the release. resource-policy keep retains them on uninstall.
+CHART_CRD_DIR="$REPO_ROOT/charts/grid-operator/templates/crds"
+mkdir -p "$CHART_CRD_DIR"
+rm -f "$CHART_CRD_DIR"/*.yaml
+for f in "$CRD_DIR"/*.yaml; do
+  [ "$(basename "$f")" = kustomization.yaml ] && continue
+  if grep -q '{{' "$f"; then
+    echo "error: $f contains '{{', which Helm would template" >&2
+    exit 1
+  fi
+  {
+    echo '{{- if .Values.crds.managed }}'
+    yq -P '.metadata.annotations = ((.metadata.annotations // {}) + {"helm.sh/resource-policy": "keep"})' "$f"
+    echo '{{- end }}'
+  } > "$CHART_CRD_DIR/$(basename "$f")"
+done
+
 echo "CRDs generated in $CRD_DIR:"
 ls -la "$CRD_DIR"
 
