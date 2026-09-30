@@ -1,6 +1,6 @@
 # Site Enrollment
 
-A site joins a grid by redeeming a one-time token at the enrollment service, which returns a certificate carrying a grid-assigned identity.
+A site enrolls with a grid by redeeming a one-time token at the enrollment service, which returns a certificate carrying a grid-assigned identity. Enrollment does not provision the mesh. The GridNetwork carries the SWIM key and seed peers, as [CRD-driven SWIM seeds](../architecture/crds.md#crd-driven-swim-seeds) describes.
 
 ## Prerequisites
 
@@ -45,10 +45,12 @@ Under `kube`, the chart ships the grid-admin Role, `<release>-grid-enrollment-gr
 kubectl -n grid get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d > grid-ca-bundle.crt
 GRID_ADMIN_SA=grid-admin  # a ServiceAccount bound to the grid-admin Role
 GRID_ADMIN_TOKEN=$(kubectl -n grid create token "$GRID_ADMIN_SA" --audience grid-enrollment --duration 10m)
+# printf is a builtin, so the token stays out of process arguments.
+(umask 077 && printf 'Authorization: Bearer %s\n' "$GRID_ADMIN_TOKEN" > admin.hdr)
 
 curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollmenttokens \
   --cacert grid-ca-bundle.crt \
-  -H "Authorization: Bearer $GRID_ADMIN_TOKEN" \
+  -H @admin.hdr \
   -H "Content-Type: application/json" \
   -d '{"siteName": "east2", "gridNetworkRef": "my-grid"}'
 ```
@@ -60,11 +62,12 @@ On the site, create a key and CSR, then redeem the token:
 ```bash
 openssl ecparam -genkey -name prime256v1 -noout -out site.key
 openssl req -new -key site.key -subj "/CN=east2" -out site.csr
+(umask 077 && printf 'Authorization: Bearer %s\n' "$SITE_TOKEN" > site.hdr)
 
 jq -n --rawfile csr site.csr '{csr: $csr}' \
   | curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollments \
       --cacert grid-ca-bundle.crt \
-      -H "Authorization: Bearer $SITE_TOKEN" \
+      -H @site.hdr \
       -H "Content-Type: application/json" \
       -d @-
 ```
