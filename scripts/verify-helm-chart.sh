@@ -40,6 +40,15 @@ try_template() {
   fi
 }
 
+# render <helm template args...>: stdout into RENDERED. A failed render is a FAIL, never a pass.
+render() {
+  if RENDERED=$(helm template "$@"); then
+    return 0
+  fi
+  fail "render failed: helm template $*"
+  return 1
+}
+
 # Run a helm template command and expect failure (schema rejection).
 # Usage: try_reject <chart> <label> [helm-args...]
 try_reject() {
@@ -153,6 +162,97 @@ if [ "$POD_NAME_LABEL" = "grid-operator" ]; then
 else
   fail "selector: podLabels overrode app.kubernetes.io/name to '$POD_NAME_LABEL'"
 fi
+
+# ── Service link env vars ───────────────────────────────────────────
+echo ""
+echo "=== Service links ==="
+# A Service named grid-gateway injects GRID_GATEWAY_PORT=tcp://..., which clap
+# parses as --gateway-port and the operator crashes.
+if render verify-links "$CHART_DIR" --namespace grid-system --show-only templates/deployment.yaml; then
+  if grep -q 'enableServiceLinks: false' <<<"$RENDERED"; then
+    pass "operator pod disables service link env vars"
+  else
+    fail "operator pod must set enableServiceLinks: false"
+  fi
+  # Even with service links off, pin the port so no injected value can win.
+  if grep -A1 'name: GRID_GATEWAY_PORT' <<<"$RENDERED" | grep -q 'value: "8080"'; then
+    pass "operator pod sets GRID_GATEWAY_PORT by default"
+  else
+    fail "operator pod must set GRID_GATEWAY_PORT by default"
+  fi
+fi
+# Every grid workload pod disables service links, not just the operator.
+for spec in "charts/grid-enrollment:3" "charts/grid-mock-providers:1" \
+  "charts/praxis-gateway:1:--set-string config.existingConfigMap=verify"; do
+  IFS=: read -r chart want extra <<<"$spec"
+  # shellcheck disable=SC2086 # extra is a flag list
+  render verify-links "$chart" $extra || continue
+  got=$(grep -c 'enableServiceLinks: false' <<<"$RENDERED" || true)
+  if [ "$got" = "$want" ]; then
+    pass "$chart: all $want workload pods disable service links"
+  else
+    fail "$chart: expected $want pods with enableServiceLinks: false, got $got"
+  fi
+done
+
+# ── Gateway discovery namespace ─────────────────────────────────────
+echo ""
+echo "=== Gateway discovery namespace ==="
+# Without GRID_GATEWAY_NAMESPACE the operator reads the gateway Service in
+# grid-system and a release anywhere else gets a 403.
+if render verify-gwns "$CHART_DIR" --namespace release-ns --show-only templates/deployment.yaml; then
+  GW_NS=$(grep -A1 'name: GRID_GATEWAY_NAMESPACE' <<<"$RENDERED" | awk '/value:/{print $2}' | tr -d '"')
+  if [ "$GW_NS" = "release-ns" ]; then
+    pass "gateway namespace defaults to the release namespace"
+  else
+    fail "gateway namespace: expected release-ns, got '$GW_NS'"
+  fi
+fi
+if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=edge-ns; then
+  GW_NS=$(grep -A1 'name: GRID_GATEWAY_NAMESPACE' <<<"$RENDERED" | awk '/value:/{print $2}' | tr -d '"')
+  if [ "$GW_NS" = "edge-ns" ]; then
+    pass "gateway.namespace override sets the env"
+  else
+    fail "gateway.namespace override: expected edge-ns, got '$GW_NS'"
+  fi
+  # In the gateway namespace the operator may only get the one gateway Service.
+  GW_ROLE=$(yq 'select(.kind == "Role" and .metadata.namespace == "edge-ns") | .rules' -o json <<<"$RENDERED" | jq -c .)
+  if [ "$GW_ROLE" = '[{"apiGroups":[""],"resources":["services"],"resourceNames":["provider-gateway"],"verbs":["get"]}]' ]; then
+    pass "gateway namespace Role grants only get on the gateway Service"
+  else
+    fail "gateway namespace Role: unexpected rules '$GW_ROLE'"
+  fi
+  if yq 'select(.kind == "RoleBinding" and .metadata.namespace == "edge-ns") | .roleRef.kind' <<<"$RENDERED" | grep -qx ClusterRole; then
+    fail "gateway namespace binds the resources ClusterRole"
+  else
+    pass "gateway namespace does not bind the resources ClusterRole"
+  fi
+fi
+if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=release-ns; then
+  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | grep -q gateway-discovery; then
+    fail "gateway namespace Role rendered where the resources Role already applies"
+  else
+    pass "no gateway namespace Role inside the resource namespaces"
+  fi
+fi
+if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=edge-ns \
+  --set-string gateway.address=gw.example.com:443; then
+  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | grep -q gateway-discovery; then
+    fail "gateway namespace Role rendered although gateway.address skips discovery"
+  else
+    pass "no gateway namespace Role when gateway.address is set"
+  fi
+fi
+try_reject_msg "$CHART_DIR" "gateway.address blank" "gateway.address must not be blank" \
+  --set-string gateway.namespace=edge-ns --set-string 'gateway.address=  '
+try_reject_msg "$CHART_DIR" "gateway.namespace kube-system" "is a system namespace" --set-string gateway.namespace=kube-system
+try_reject_msg "$CHART_DIR" "gateway.namespace openshift-ingress" "is a system namespace" --set-string gateway.namespace=openshift-ingress
+try_reject_msg "$CHART_DIR" "gateway.namespace default" "is a system namespace" --set-string gateway.namespace=default
+try_reject "$CHART_DIR" "gateway.namespace not DNS-1123" --set-string gateway.namespace=Edge_NS
+try_template "$CHART_DIR" "gateway.namespace system with gateway.address" --set-string gateway.namespace=kube-system \
+  --set-string gateway.address=gw.example.com:443
+try_template "$CHART_DIR" "gateway.namespace system opt-in" --set-string gateway.namespace=kube-system \
+  --set gateway.allowSystemNamespace=true
 
 # ── Schema rejection ────────────────────────────────────────────────
 echo ""
