@@ -183,10 +183,12 @@ render "$WORK/tls-noca" "${TLS_BACKEND[@]}"
 port=$(gateway tls-noca "$DEFAULT_GATEWAY_IMAGE" --config "$WORK/tls-noca")
 wait_up "$port" || true
 code=$(chat "$port")
-if [ "$code" != 200 ] && [ "$code" != 000 ]; then
-  pass "tls backend: without transport.ca the private-CA backend is refused ($code)"
+# A 502 alone could be routing; the log must show the certificate was refused.
+"$CRT" logs "$NET-tls-noca" >"$WORK/tls-noca.log" 2>&1 || true
+if [ "$code" = 502 ] && grep -qiE 'certificate|unknownissuer' "$WORK/tls-noca.log"; then
+  pass "tls backend: without transport.ca the private-CA certificate is refused (502)"
 else
-  fail "tls backend: without transport.ca, want a refusal, got $code"
+  fail "tls backend: without transport.ca, want 502 with a certificate error, got $code: $(grep -iE 'tls|upstream|error' "$WORK/tls-noca.log" | tail -2)"
 fi
 
 if [ -z "$API_KEY_IMAGE" ]; then

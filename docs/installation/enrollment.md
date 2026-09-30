@@ -20,14 +20,14 @@ helm install grid-enrollment ./charts/grid-enrollment \
 
 On OpenShift the chart renders a passthrough Route for `route.host`, so remote sites can reach enrollment. `route.enabled` defaults to `auto`, which renders the Route only when the cluster serves `route.openshift.io/v1`. `true` or `false` forces it. Elsewhere, omit `route.host` and front the Service with your own ingress. For GitOps renders with `helm template`, pass `--api-versions route.openshift.io/v1` on OpenShift, or `auto` renders no Route.
 
-A pre-install Job runs `enrollment bootstrap` to create the grid CA and the serving certificates for enrollment and its database. It is idempotent: on upgrade it keeps the CA and re-issues a serving certificate only when a requested name, such as a new `route.host`, is missing. `ca.forceRegenerate` replaces the CA and invalidates every certificate it signed.
+A pre-install Job runs `enrollment bootstrap` to create the grid CA and the serving certificates for enrollment and its database. It is idempotent: on upgrade it keeps the CA and re-issues a serving certificate when a requested name, such as a new `route.host`, is missing, or when fewer than 30 days remain. `ca.forceRegenerate` replaces the CA and invalidates every certificate it signed.
 
 ## Configure
 
 | Value | Decide |
 |---|---|
 | `route.host` | Required when a Route renders. Added to the issued serving certificate. A BYO certificate (`serving.existingSecretRef`) must already carry it. |
-| `route.tls.termination` | Keep `passthrough`. `edge` and `reencrypt` terminate at the router and break the site's grid-CA pin. |
+| `route.tls.termination` | Keep `passthrough`. `reencrypt` terminates at the router and breaks the site's grid-CA pin. `edge` is rejected, since enrollment serves TLS only. |
 | `db.type` | `builtin` runs Postgres in the chart. `external` reads the connection URL from the Secret in `db.external.connectionUrlSecretRef`. |
 | `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a grid-admin token table. |
 | `image.repository`, `image.tag`, `image.digest` | The enrollment image. The tag defaults to the chart's `appVersion`; `image.digest` pins it. |
@@ -43,7 +43,8 @@ Under `kube`, the chart ships the grid-admin Role, `<release>-grid-enrollment-gr
 
 ```bash
 kubectl -n grid get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d > grid-ca-bundle.crt
-GRID_ADMIN_TOKEN=$(kubectl -n grid create token <grid-admin-sa> --audience grid-enrollment --duration 10m)
+GRID_ADMIN_SA=grid-admin  # a ServiceAccount bound to the grid-admin Role
+GRID_ADMIN_TOKEN=$(kubectl -n grid create token "$GRID_ADMIN_SA" --audience grid-enrollment --duration 10m)
 
 curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollmenttokens \
   --cacert grid-ca-bundle.crt \

@@ -37,6 +37,9 @@ spec:
   port:
     targetPort: https
   tls:
+    {{- if eq .Values.route.tls.termination "edge" }}
+    {{- fail "route.tls.termination=edge requires an HTTP backend; use passthrough or reencrypt" }}
+    {{- end }}
     termination: {{ .Values.route.tls.termination }}
     {{- if eq .Values.route.tls.termination "reencrypt" }}
     {{- with .Values.route.tls.destinationCACertificate }}

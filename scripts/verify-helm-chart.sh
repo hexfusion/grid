@@ -1413,7 +1413,7 @@ echo "=== Template rendering (enrollment) ==="
 # route.enabled=auto renders a Route only where route.openshift.io/v1 is served.
 OCP=(--api-versions route.openshift.io/v1)
 try_template "$ENROLL_DIR" "enrollment: passthrough with route.host (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com
-try_template "$ENROLL_DIR" "enrollment: edge without host (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.tls.termination=edge
+try_reject_msg "$ENROLL_DIR" "enrollment: edge termination (TLS-only backend)" 'termination' --namespace grid-system "${OCP[@]}" --set route.tls.termination=edge
 try_template "$ENROLL_DIR" "enrollment: route disabled (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.enabled=false
 try_template "$ENROLL_DIR" "enrollment: no Route API, no host" --namespace grid-system
 # The install gate: a rendered passthrough Route with no host must fail so an

@@ -27,7 +27,7 @@
         "tls": {
           "type": "object",
           "properties": {
-            "termination": { "enum": ["passthrough", "edge", "reencrypt"] },
+            "termination": { "enum": ["passthrough", "reencrypt"] },
             "insecureEdgeTerminationPolicy": { "enum": ["None", "Redirect", "Allow", ""] }
           }
         }

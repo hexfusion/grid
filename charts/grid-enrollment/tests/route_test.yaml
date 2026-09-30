@@ -23,6 +23,16 @@ tests:
           path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections"]
           value: "true"
 
+  - it: rejects edge termination, since enrollment serves TLS only
+    template: templates/enrollment/route.yaml
+    capabilities:
+      apiVersions: [route.openshift.io/v1]
+    set:
+      route.host: enroll.apps.example.com
+      route.tls.termination: edge
+    asserts:
+      - failedTemplate: {}
+
   - it: renders no Route without the Route API
     template: templates/enrollment/route.yaml
     set:

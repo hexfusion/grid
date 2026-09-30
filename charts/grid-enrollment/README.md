@@ -40,8 +40,9 @@ failed, so retry a failed bootstrap with `helm upgrade`, not by re-running the J
 
 `helm template` sees no cluster APIs, so `auto` renders no Route there. GitOps
 renders for OpenShift pass `--api-versions route.openshift.io/v1` (Argo CD passes
-the cluster's APIs itself). `edge` and `reencrypt` terminate at the router and break
-the site's grid-CA pin, so keep `passthrough`.
+the cluster's APIs itself). `reencrypt` terminates at the router and breaks the
+site's grid-CA pin, so keep `passthrough`. `edge` is rejected: enrollment serves
+TLS only.
 
 ## Topology
 
