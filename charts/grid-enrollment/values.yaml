@@ -64,6 +64,16 @@ enrollment:
   # Never an API-server audience (kubernetes, https://kubernetes.default.svc,
   # or the cluster's service account issuer): every API token carries it.
   tokenAudience: grid-enrollment
+  # Grid-admins under authz=kube. The chart always creates the
+  # <fullname>-grid-admin Role (create/delete on enrollmenttokens) in the release
+  # namespace and binds it to these subjects.
+  gridAdmins:
+    # RBAC subjects, e.g. [{kind: Group, name: grid-admins}].
+    subjects: []
+    serviceAccount:
+      # Create a ServiceAccount to mint grid-admin tokens from, and bind it.
+      create: false
+      name: grid-admin
   gridAdminTokens:
     generate: true                   # generate a grid-admin-token Secret on install
     existingSecretRef: ""            # BYO Secret with key "tokens" (name:token lines)

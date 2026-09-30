@@ -14,8 +14,14 @@ Enrollment endpoint (TLS): {{ include "grid-enrollment.serviceDns" . }}:{{ inclu
 Grid-admin token (a name:token line; the token part mints site tokens and decides enrollments):
   kubectl -n {{ .Release.Namespace }} get secret {{ include "grid-enrollment.fullname" . }}-grid-admin-tokens -o jsonpath='{.data.tokens}' | base64 -d
 {{- else if eq .Values.enrollment.authz "kube" -}}
-Grid-admin token (a short-lived ServiceAccount token bound to the enrollment audience):
-  kubectl -n {{ .Release.Namespace }} create token <grid-admin-sa> --audience {{ .Values.enrollment.tokenAudience }} --duration 10m
+Grid-admins hold Role/{{ include "grid-enrollment.fullname" . }}-grid-admin in this namespace.
+{{- if .Values.enrollment.gridAdmins.serviceAccount.create }}
+Grid-admin token (short-lived, bound to the enrollment audience):
+  kubectl -n {{ .Release.Namespace }} create token {{ .Values.enrollment.gridAdmins.serviceAccount.name }} --audience {{ .Values.enrollment.tokenAudience }} --duration 10m
+{{- else }}
+Bind grid-admins with enrollment.gridAdmins.subjects, or set
+enrollment.gridAdmins.serviceAccount.create=true to mint tokens from a ServiceAccount.
+{{- end }}
 {{- end }}
 
 Give a site the trust anchor and mint it a token, then it can enroll:

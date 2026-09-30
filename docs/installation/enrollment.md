@@ -146,37 +146,31 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-Grant that ServiceAccount the grid-admin actions with a Role in the
-enrollment namespace:
+The chart creates the grid-admin Role, `<release>-grid-enrollment-grid-admin`,
+with `create` and `delete` on `enrollmenttokens` in the enrollment namespace.
+Bind it with values:
 
 ```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: grid-admin
-  namespace: grid
-rules:
-  - apiGroups: ["grid.praxis-proxy.io"]
-    resources: ["enrollmenttokens"]
-    verbs: ["create", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: grid-admin
-  namespace: grid
-subjects:
-  - kind: ServiceAccount
-    name: <grid-admin-sa>
-    namespace: grid
-roleRef:
-  kind: Role
-  name: grid-admin
-  apiGroup: rbac.authorization.k8s.io
+enrollment:
+  gridAdmins:
+    subjects:
+      - kind: Group
+        name: grid-admins
+    serviceAccount:
+      create: true      # a grid-admin ServiceAccount to mint tokens from
+      name: grid-admin
 ```
 
-The Role must be written as YAML: `kubectl create role --resource` cannot
-resolve `enrollmenttokens`, because no CRD publishes it for discovery.
+Binding grants grid-admin to whoever can act as the subject. A ServiceAccount
+subject in another namespace delegates grid-admin to anyone who can mint its
+`grid-enrollment` tokens there. With `serviceAccount.create=true`, anyone with
+admin or edit in the enrollment namespace can mint its tokens and is effectively
+a grid-admin, so keep that namespace dedicated to enrollment. The chart refuses
+cluster-wide groups such as `system:authenticated` and `system:masters`.
+
+A `ClusterRole` and `ClusterRoleBinding` with the same rule also work. Write
+such a role as YAML: `kubectl create role --resource` cannot resolve
+`enrollmenttokens`, because no CRD publishes it for discovery.
 
 The enrollment service records the ServiceAccount as the grid-admin that
 minted a site token. The human who requested the ServiceAccount token
