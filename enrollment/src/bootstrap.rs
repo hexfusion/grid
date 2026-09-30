@@ -36,6 +36,9 @@ struct BootstrapArgs {
     /// Secret holding the enrollment serving certificate (`tls.crt`, `tls.key`).
     #[arg(long, default_value = "enrollment-serving-tls")]
     serving_secret: String,
+    /// Leave the serving certificate alone: a user-provided Secret serves instead.
+    #[arg(long)]
+    skip_serving: bool,
     /// A DNS name the serving certificate must cover. Repeatable.
     #[arg(long = "serving-dns")]
     serving_dns: Vec<String>,
@@ -80,7 +83,9 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
 
     let ca = resolve_ca(&secrets, args).await?;
     write_opaque_secret(&secrets, &args.ca_bundle_secret, "ca.crt", &ca.cert_pem).await?;
-    ensure_serving(&secrets, &ca, args).await?;
+    if !args.skip_serving {
+        ensure_serving(&secrets, &ca, args).await?;
+    }
     ensure_db_serving(&secrets, &ca, args).await?;
     Ok(())
 }
@@ -93,7 +98,7 @@ async fn resolve_ca(
     secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
     args: &BootstrapArgs,
 ) -> Result<certs::CaCert, BoxError> {
-    match load_ca_material(secrets, &args.ca_key_secret).await? {
+    match load_tls_material(secrets, &args.ca_key_secret).await? {
         Some((cert_pem, key_pem)) if !args.force_regenerate => {
             Ok(certs::load_ca(&args.common_name, &key_pem, &cert_pem)?)
         },
@@ -112,27 +117,102 @@ async fn resolve_ca(
     }
 }
 
-/// Issue the serving certificate when it is absent or a regenerate is forced.
+/// The `app.kubernetes.io/managed-by` value on every Secret bootstrap writes.
+const MANAGED_BY: &str = "grid-enrollment-bootstrap";
+
+/// Another manager's claim on a Secret: a different `managed-by` label, or
+/// cert-manager annotations. An unlabelled Secret counts as ours, since earlier
+/// bootstrap runs wrote it without the label.
+fn foreign_manager(
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+    annotations: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    if let Some(owner) = labels.and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+        && owner != MANAGED_BY
+    {
+        return Some(format!("app.kubernetes.io/managed-by={owner}"));
+    }
+    annotations
+        .is_some_and(|annotations| annotations.keys().any(|key| key.starts_with("cert-manager.io/")))
+        .then(|| "cert-manager".to_owned())
+}
+
+/// The serving certificate a Secret holds, as far as re-issue is concerned.
+enum ServingCert {
+    /// No Secret by that name.
+    Absent,
+    /// The Secret exists without a UTF-8 `tls.crt`.
+    Unusable,
+    /// The Secret's `tls.crt` PEM.
+    Pem(String),
+}
+
+/// Read the serving certificate and any other manager's claim on its Secret. API
+/// errors propagate, so a transient failure fails the Job instead of overwriting
+/// the Secret.
+async fn load_serving_cert(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+) -> Result<(ServingCert, Option<String>), BoxError> {
+    let Some(secret) = secrets.get_opt(name).await? else {
+        return Ok((ServingCert::Absent, None));
+    };
+    let foreign = foreign_manager(secret.metadata.labels.as_ref(), secret.metadata.annotations.as_ref());
+    let pem = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get("tls.crt"))
+        .and_then(|cert| String::from_utf8(cert.0.clone()).ok());
+    Ok((pem.map_or(ServingCert::Unusable, ServingCert::Pem), foreign))
+}
+
+/// Issue the serving certificate when needed; see [`serving_needs_issue`]. The CA is
+/// preserved: only the leaf is re-signed under it.
 async fn ensure_serving(
     secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
     ca: &certs::CaCert,
     args: &BootstrapArgs,
 ) -> Result<(), BoxError> {
-    if should_write(
-        secret_exists(secrets, &args.serving_secret).await?,
-        args.force_regenerate,
-    ) {
+    let (current, foreign) = load_serving_cert(secrets, &args.serving_secret).await?;
+    if serving_needs_issue(args.force_regenerate, &current, &args.serving_dns) {
+        if let Some(owner) = foreign {
+            return Err(format!(
+                "serving Secret {} is managed by {owner}; refusing to replace it. Set serving.existingSecretRef to use it, \
+                 or choose another serving.secretName",
+                args.serving_secret
+            )
+            .into());
+        }
         let serving = certs::generate_dns_only_cert(ca, &args.common_name, &args.serving_dns)?;
-        write_tls_secret(
-            secrets,
-            &args.serving_secret,
-            &serving.cert_pem,
-            &serving.key_pem,
-            args.force_regenerate,
-        )
-        .await?;
+        write_tls_secret(secrets, &args.serving_secret, &serving.cert_pem, &serving.key_pem, true).await?;
     }
     Ok(())
+}
+
+/// Whether to issue the serving certificate: forced, absent, unusable, or missing a
+/// requested DNS name.
+fn serving_needs_issue(force: bool, current: &ServingCert, requested: &[String]) -> bool {
+    force
+        || match current {
+            ServingCert::Absent | ServingCert::Unusable => true,
+            ServingCert::Pem(cert_pem) => serving_sans_missing(cert_pem, requested),
+        }
+}
+
+/// Whether the serving cert lacks any requested DNS name, or cannot be parsed. A
+/// subset check: extra names on the cert do not trigger a re-issue.
+fn serving_sans_missing(cert_pem: &str, requested: &[String]) -> bool {
+    // DNS names compare case-insensitively and ignore a trailing dot.
+    fn norm(name: &str) -> String {
+        name.trim_end_matches('.').to_ascii_lowercase()
+    }
+    match certs::cert_dns_sans(cert_pem) {
+        Ok(current) => {
+            let have: std::collections::BTreeSet<String> = current.iter().map(|name| norm(name)).collect();
+            requested.iter().any(|name| !have.contains(&norm(name)))
+        },
+        Err(_unparseable) => true,
+    }
 }
 
 /// Issue the Postgres serving certificate when it is absent or a regenerate is forced.
@@ -162,10 +242,7 @@ async fn ensure_db_serving(
 }
 
 /// The `tls.crt`/`tls.key` PEM from a Secret, or `None` if it does not exist.
-///
-/// Fetches the full Secret to read the key material. One-shot init, off any
-/// request path.
-async fn load_ca_material(
+async fn load_tls_material(
     secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
     name: &str,
 ) -> Result<Option<(String, String)>, BoxError> {
@@ -237,6 +314,10 @@ async fn apply_secret(
     let secret = Box::new(Secret {
         metadata: ObjectMeta {
             name: Some(name.to_owned()),
+            labels: Some(std::collections::BTreeMap::from([(
+                "app.kubernetes.io/managed-by".to_owned(),
+                MANAGED_BY.to_owned(),
+            )])),
             ..ObjectMeta::default()
         },
         type_: type_.map(ToOwned::to_owned),
@@ -263,8 +344,103 @@ fn should_write(exists: bool, force: bool) -> bool {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::should_write;
+    use std::collections::BTreeMap;
+
+    use super::{MANAGED_BY, ServingCert, foreign_manager, serving_needs_issue, should_write};
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn secrets_bootstrap_wrote_are_ours_to_replace() {
+        let ours = map(&[("app.kubernetes.io/managed-by", MANAGED_BY)]);
+        assert_eq!(foreign_manager(Some(&ours), None), None, "stamped by bootstrap");
+        assert_eq!(
+            foreign_manager(None, None),
+            None,
+            "unlabelled: written before the label existed"
+        );
+    }
+
+    #[test]
+    fn secrets_another_manager_owns_are_refused() {
+        let helm = map(&[("app.kubernetes.io/managed-by", "Helm")]);
+        assert_eq!(
+            foreign_manager(Some(&helm), None).as_deref(),
+            Some("app.kubernetes.io/managed-by=Helm")
+        );
+        let issued = map(&[("cert-manager.io/certificate-name", "enrollment")]);
+        assert_eq!(foreign_manager(None, Some(&issued)).as_deref(), Some("cert-manager"));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// A serving cert for `sans`, signed by a fresh CA.
+    fn serving_pem(sans: &[&str]) -> ServingCert {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_dns_only_cert(&ca, "grid-ca", &names(sans)).expect("leaf");
+        ServingCert::Pem(leaf.cert_pem)
+    }
+
+    #[test]
+    fn serving_cert_is_kept_when_every_requested_name_is_present() {
+        let requested = names(&["enroll.grid.svc", "enroll.apps.example.com"]);
+        let current = serving_pem(&["enroll.grid.svc", "enroll.apps.example.com"]);
+        assert!(
+            !serving_needs_issue(false, &current, &requested),
+            "unchanged values keep the cert"
+        );
+    }
+
+    #[test]
+    fn extra_names_on_the_cert_do_not_reissue() {
+        let current = serving_pem(&["enroll.grid.svc", "old.apps.example.com"]);
+        assert!(!serving_needs_issue(false, &current, &names(&["enroll.grid.svc"])));
+    }
+
+    #[test]
+    fn a_missing_name_reissues() {
+        let current = serving_pem(&["enroll.grid.svc"]);
+        let requested = names(&["enroll.grid.svc", "enroll.apps.example.com"]);
+        assert!(
+            serving_needs_issue(false, &current, &requested),
+            "a new route.host is added"
+        );
+    }
+
+    #[test]
+    fn names_compare_without_case_or_trailing_dot() {
+        let current = serving_pem(&["enroll.apps.example.com"]);
+        assert!(!serving_needs_issue(
+            false,
+            &current,
+            &names(&["Enroll.Apps.Example.COM."])
+        ));
+    }
+
+    #[test]
+    fn force_absent_unusable_and_unparseable_reissue() {
+        let requested = names(&["enroll.grid.svc"]);
+        assert!(
+            serving_needs_issue(true, &serving_pem(&["enroll.grid.svc"]), &requested),
+            "forced"
+        );
+        assert!(serving_needs_issue(false, &ServingCert::Absent, &requested), "absent");
+        assert!(
+            serving_needs_issue(false, &ServingCert::Unusable, &requested),
+            "no tls.crt"
+        );
+        let garbage = ServingCert::Pem("not a certificate".to_owned());
+        assert!(serving_needs_issue(false, &garbage, &requested), "unparseable");
+    }
 
     #[test]
     fn writes_only_when_absent_or_forced() {

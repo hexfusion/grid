@@ -137,6 +137,36 @@ pub fn canonical_fingerprint(cert_pem: &str) -> Result<String, VerifyError> {
         .collect())
 }
 
+/// The DNS SANs on a certificate, as encoded. Case is not normalized, so the
+/// caller owns any case-insensitive comparison.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_dns_sans(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
+    if cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
+    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
+    let Some(san) = cert.subject_alternative_name().ok().flatten() else {
+        return Ok(Vec::new());
+    };
+    let names = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| {
+            if let GeneralName::DNSName(dns) = name {
+                Some((*dns).to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(names)
+}
+
 /// The public key a certificate request carries, as `SubjectPublicKeyInfo` DER.
 ///
 /// An enrollee proves it is the one that made a request by signing with the key
@@ -199,6 +229,22 @@ mod tests {
 
         let spki = verify_site_cert(&ca.cert_pem, &issued.cert_pem, "site-d").expect("should verify");
         assert!(!spki.is_empty(), "the public key should come back for signature checks");
+    }
+
+    #[test]
+    fn cert_dns_sans_lists_the_dns_names_as_encoded() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let names = vec!["a.grid.svc".to_owned(), "B.Apps.Example.com".to_owned()];
+        let leaf = crate::generate::generate_dns_only_cert(&ca, "grid-ca", &names).expect("leaf");
+        let sans = cert_dns_sans(&leaf.cert_pem).expect("sans");
+        assert!(
+            names.iter().all(|name| sans.contains(name)),
+            "every requested name, case kept: {sans:?}"
+        );
+        assert!(
+            cert_dns_sans("not a certificate").is_err(),
+            "garbage is an error, not empty"
+        );
     }
 
     /// The claim being checked: a certificate cannot vouch for a name it does not carry.

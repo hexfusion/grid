@@ -30,7 +30,9 @@ pub use generate::{
 #[cfg(feature = "verifier")]
 pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
-pub use verify::{MAX_CERT_PEM_BYTES, VerifyError, canonical_fingerprint, csr_public_key, verify_site_cert};
+pub use verify::{
+    MAX_CERT_PEM_BYTES, VerifyError, canonical_fingerprint, cert_dns_sans, csr_public_key, verify_site_cert,
+};
 
 /// SHA-256 through the active backend: the sha2 crate by default, system openssl
 /// under `fips`. A caller hashing an identity value (a token, a public key) reuses
