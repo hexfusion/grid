@@ -179,7 +179,7 @@ async fn ensure_serving(
     args: &BootstrapArgs,
 ) -> Result<(), BoxError> {
     let (current, foreign) = load_serving_cert(secrets, &args.serving_secret).await?;
-    if serving_needs_issue(args.force_regenerate, &current, &args.serving_dns) {
+    if serving_needs_issue(args.force_regenerate, &current, &args.serving_dns, &ca.cert_pem) {
         if let Some(owner) = foreign {
             return Err(format!(
                 "serving Secret {} is managed by {owner}; refusing to replace it. Set serving.existingSecretRef to use it, \
@@ -188,20 +188,44 @@ async fn ensure_serving(
             )
             .into());
         }
+        warn_if_unchained(&args.serving_secret, &current, &ca.cert_pem);
         let serving = certs::generate_dns_only_cert(ca, &args.common_name, &args.serving_dns)?;
         write_tls_secret(secrets, &args.serving_secret, &serving.cert_pem, &serving.key_pem, true).await?;
     }
     Ok(())
 }
 
-/// Whether to issue the serving certificate: forced, absent, unusable, or missing a
-/// requested DNS name.
-fn serving_needs_issue(force: bool, current: &ServingCert, requested: &[String]) -> bool {
+/// Whether to issue the serving certificate: forced, absent, unusable, missing a
+/// requested DNS name, or not a currently valid leaf of the current CA (the CA was
+/// regenerated, or the leaf expired).
+fn serving_needs_issue(force: bool, current: &ServingCert, requested: &[String], ca_cert_pem: &str) -> bool {
     force
         || match current {
             ServingCert::Absent | ServingCert::Unusable => true,
-            ServingCert::Pem(cert_pem) => serving_sans_missing(cert_pem, requested),
+            ServingCert::Pem(cert_pem) => {
+                serving_sans_missing(cert_pem, requested) || certs::verify_issued_by(ca_cert_pem, cert_pem).is_err()
+            },
         }
+}
+
+/// Warn when an existing leaf is replaced because it does not verify against the
+/// current CA, so an unexpected CA regeneration is visible. Logs names and dates only.
+fn warn_if_unchained(secret: &str, current: &ServingCert, ca_cert_pem: &str) {
+    let ServingCert::Pem(cert_pem) = current else {
+        return;
+    };
+    let Err(reason) = certs::verify_issued_by(ca_cert_pem, cert_pem) else {
+        return;
+    };
+    let (issuer, not_after) = certs::cert_issuer_and_expiry(cert_pem)
+        .unwrap_or_else(|_unparseable| ("unparseable".to_owned(), "unknown".to_owned()));
+    tracing::warn!(
+        secret,
+        %reason,
+        old_issuer = %issuer,
+        old_not_after = %not_after,
+        "re-issuing a serving certificate that does not verify against the current grid CA"
+    );
 }
 
 /// Whether the serving cert lacks any requested DNS name, or cannot be parsed. A
@@ -220,26 +244,33 @@ fn serving_sans_missing(cert_pem: &str, requested: &[String]) -> bool {
     }
 }
 
-/// Issue the Postgres serving certificate when it is absent or a regenerate is forced.
+/// Issue the Postgres serving certificate when needed; see [`serving_needs_issue`].
 ///
 /// The service connects with sslmode=verify-full, so builtin Postgres needs a
-/// grid-CA-issued leaf whose SANs cover the DB Service names in `--db-dns`.
+/// leaf of the current grid CA whose SANs cover the DB Service names in `--db-dns`.
 async fn ensure_db_serving(
     secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
     ca: &certs::CaCert,
     args: &BootstrapArgs,
 ) -> Result<(), BoxError> {
-    if should_write(
-        secret_exists(secrets, &args.db_serving_secret).await?,
-        args.force_regenerate,
-    ) {
+    let (current, foreign) = load_serving_cert(secrets, &args.db_serving_secret).await?;
+    if serving_needs_issue(args.force_regenerate, &current, &args.db_dns, &ca.cert_pem) {
+        if let Some(owner) = foreign {
+            return Err(format!(
+                "DB serving Secret {} is managed by {owner}; refusing to replace it. Remove that label or \
+                 annotation, or delete the Secret, so bootstrap can issue it",
+                args.db_serving_secret
+            )
+            .into());
+        }
+        warn_if_unchained(&args.db_serving_secret, &current, &ca.cert_pem);
         let serving = certs::generate_dns_only_cert(ca, "grid-enrollment-db", &args.db_dns)?;
         write_tls_secret(
             secrets,
             &args.db_serving_secret,
             &serving.cert_pem,
             &serving.key_pem,
-            args.force_regenerate,
+            true,
         )
         .await?;
     }
@@ -261,15 +292,6 @@ async fn load_tls_material(
         String::from_utf8(cert.0.clone())?,
         String::from_utf8(key.0.clone())?,
     )))
-}
-
-/// Whether a Secret exists, by metadata only, so the full object never lands on
-/// the stack.
-async fn secret_exists(
-    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
-    name: &str,
-) -> Result<bool, BoxError> {
-    Ok(secrets.get_metadata_opt(name).await?.is_some())
 }
 
 /// Create or replace a `kubernetes.io/tls` Secret with a certificate and key.
@@ -341,21 +363,14 @@ async fn apply_secret(
     Ok(())
 }
 
-/// Whether to generate and write material: only when it is absent, or a
-/// regenerate is forced. This is the idempotency invariant, so a re-run keeps the
-/// existing CA and certificates rather than reissuing them.
-fn should_write(exists: bool, force: bool) -> bool {
-    force || !exists
-}
-
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::LazyLock};
 
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
-    use super::{MANAGED_BY, ServingCert, foreign_manager, serving_needs_issue, should_write};
+    use super::{MANAGED_BY, ServingCert, foreign_manager, serving_needs_issue};
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -413,11 +428,18 @@ mod tests {
         list.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    /// A serving cert for `sans`, signed by a fresh CA.
+    /// The current grid CA the tests issue under.
+    static CA: LazyLock<certs::CaCert> = LazyLock::new(|| certs::generate_ca("grid-ca").expect("ca"));
+
+    /// A serving cert for `sans`, signed by [`CA`].
     fn serving_pem(sans: &[&str]) -> ServingCert {
-        let ca = certs::generate_ca("grid-ca").expect("ca");
-        let leaf = certs::generate_dns_only_cert(&ca, "grid-ca", &names(sans)).expect("leaf");
+        let leaf = certs::generate_dns_only_cert(&CA, "grid-ca", &names(sans)).expect("leaf");
         ServingCert::Pem(leaf.cert_pem)
+    }
+
+    /// Whether `current` needs issuing for `requested` under [`CA`].
+    fn needs_issue(force: bool, current: &ServingCert, requested: &[String]) -> bool {
+        serving_needs_issue(force, current, requested, &CA.cert_pem)
     }
 
     #[test]
@@ -425,7 +447,7 @@ mod tests {
         let requested = names(&["enroll.grid.svc", "enroll.apps.example.com"]);
         let current = serving_pem(&["enroll.grid.svc", "enroll.apps.example.com"]);
         assert!(
-            !serving_needs_issue(false, &current, &requested),
+            !needs_issue(false, &current, &requested),
             "unchanged values keep the cert"
         );
     }
@@ -433,50 +455,42 @@ mod tests {
     #[test]
     fn extra_names_on_the_cert_do_not_reissue() {
         let current = serving_pem(&["enroll.grid.svc", "old.apps.example.com"]);
-        assert!(!serving_needs_issue(false, &current, &names(&["enroll.grid.svc"])));
+        assert!(!needs_issue(false, &current, &names(&["enroll.grid.svc"])));
     }
 
     #[test]
     fn a_missing_name_reissues() {
         let current = serving_pem(&["enroll.grid.svc"]);
         let requested = names(&["enroll.grid.svc", "enroll.apps.example.com"]);
-        assert!(
-            serving_needs_issue(false, &current, &requested),
-            "a new route.host is added"
-        );
+        assert!(needs_issue(false, &current, &requested), "a new route.host is added");
     }
 
     #[test]
     fn names_compare_without_case_or_trailing_dot() {
         let current = serving_pem(&["enroll.apps.example.com"]);
-        assert!(!serving_needs_issue(
-            false,
-            &current,
-            &names(&["Enroll.Apps.Example.COM."])
-        ));
+        assert!(!needs_issue(false, &current, &names(&["Enroll.Apps.Example.COM."])));
     }
 
     #[test]
     fn force_absent_unusable_and_unparseable_reissue() {
         let requested = names(&["enroll.grid.svc"]);
         assert!(
-            serving_needs_issue(true, &serving_pem(&["enroll.grid.svc"]), &requested),
+            needs_issue(true, &serving_pem(&["enroll.grid.svc"]), &requested),
             "forced"
         );
-        assert!(serving_needs_issue(false, &ServingCert::Absent, &requested), "absent");
-        assert!(
-            serving_needs_issue(false, &ServingCert::Unusable, &requested),
-            "no tls.crt"
-        );
+        assert!(needs_issue(false, &ServingCert::Absent, &requested), "absent");
+        assert!(needs_issue(false, &ServingCert::Unusable, &requested), "no tls.crt");
         let garbage = ServingCert::Pem("not a certificate".to_owned());
-        assert!(serving_needs_issue(false, &garbage, &requested), "unparseable");
+        assert!(needs_issue(false, &garbage, &requested), "unparseable");
     }
 
     #[test]
-    fn writes_only_when_absent_or_forced() {
-        assert!(!should_write(true, false), "an existing secret is kept, not reissued");
-        assert!(should_write(false, false), "an absent secret is created");
-        assert!(should_write(true, true), "a forced regenerate overwrites");
-        assert!(should_write(false, true), "a forced regenerate creates when absent");
+    fn a_leaf_of_another_ca_reissues() {
+        let old_ca = certs::generate_ca("grid-ca").expect("old ca");
+        let leaf = certs::generate_dns_only_cert(&old_ca, "grid-ca", &names(&["enroll.grid.svc"])).expect("leaf");
+        assert!(
+            needs_issue(false, &ServingCert::Pem(leaf.cert_pem), &names(&["enroll.grid.svc"])),
+            "a leaf the regenerated CA did not sign is re-issued"
+        );
     }
 }

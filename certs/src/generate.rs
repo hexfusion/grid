@@ -417,15 +417,15 @@ pub(crate) fn site_identity_with_org(site_name: &str, dns_san: &str, organizatio
 
 /// Validity window for a generated leaf certificate.
 ///
-/// Backdated slightly so a verifier whose clock runs behind does not refuse a
-/// certificate issued moments ago.
+/// Backdated an hour so a node whose clock runs behind does not refuse, or
+/// bootstrap re-issue, a certificate issued moments ago.
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "now +/- a fixed span cannot overflow OffsetDateTime"
 )]
 fn default_leaf_validity() -> (OffsetDateTime, OffsetDateTime) {
     let now = OffsetDateTime::now_utc();
-    (now - Duration::minutes(5), now + Duration::days(365))
+    (now - Duration::hours(1), now + Duration::days(365))
 }
 
 /// Validity window for a generated CA certificate.
@@ -435,7 +435,7 @@ fn default_leaf_validity() -> (OffsetDateTime, OffsetDateTime) {
 )]
 fn default_ca_validity() -> (OffsetDateTime, OffsetDateTime) {
     let now = OffsetDateTime::now_utc();
-    (now - Duration::minutes(5), now + Duration::days(3650))
+    (now - Duration::hours(1), now + Duration::days(3650))
 }
 
 // ---------------------------------------------------------------------------

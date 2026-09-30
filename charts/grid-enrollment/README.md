@@ -81,6 +81,9 @@ generated CA, and the service refuses a plaintext DB. A provided CA
 Provided-CA installs must therefore use an external DB (`db.type=external`) whose
 URL sets `sslmode` (verify-full for FIPS).
 
+Postgres reads its serving cert at pod start. After a CA regeneration or a DB
+leaf re-issue, restart the enrollment DB pod so it serves the new cert.
+
 ## Security
 
 This Helm-Secret path is the dev and interim posture. Key separation, secretRef

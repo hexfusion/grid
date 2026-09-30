@@ -139,7 +139,8 @@ db:
     # bootstrap Job; the enrollment client connects sslmode=verify-full against
     # the grid CA bundle. The enrollment binary refuses a plaintext DB, so this
     # is not optional on the builtin path. Requires the generated CA
-    # (ca.method=builtin); with a provided CA, use an external DB.
+    # (ca.method=builtin); with a provided CA, use an external DB. After a CA
+    # regeneration or a DB leaf re-issue, restart the enrollment DB pod.
     tls:
       servingSecretName: grid-db-serving-tls
   external:

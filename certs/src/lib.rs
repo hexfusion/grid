@@ -31,7 +31,8 @@ pub use generate::{
 pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
 pub use verify::{
-    MAX_CERT_PEM_BYTES, VerifyError, canonical_fingerprint, cert_dns_sans, csr_public_key, verify_site_cert,
+    MAX_CERT_PEM_BYTES, VerifyError, canonical_fingerprint, cert_dns_sans, cert_issuer_and_expiry, csr_public_key,
+    verify_issued_by, verify_site_cert,
 };
 
 /// SHA-256 through the active backend: the sha2 crate by default, system openssl
