@@ -20,6 +20,10 @@ use crate::auth::GridAdmins;
 #[cfg(feature = "sar")]
 const ENROLLMENTS_GROUP: &str = "grid.praxis-proxy.io";
 
+/// The pod's namespace, as the kubelet mounts it with the service account token.
+#[cfg(feature = "sar")]
+const SERVICE_ACCOUNT_NAMESPACE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+
 /// Audience a grid-admin token must be bound to unless configured otherwise.
 #[cfg(feature = "sar")]
 pub const DEFAULT_TOKEN_AUDIENCE: &str = "grid-enrollment";
@@ -120,22 +124,41 @@ pub struct KubeAuthorizer {
     /// Audience the bearer must be bound to, so a token minted for another
     /// service cannot be replayed here.
     audience: String,
+    /// Namespace the review is scoped to, so a `Role` there can grant access.
+    namespace: String,
 }
 
 #[cfg(feature = "sar")]
 impl KubeAuthorizer {
     /// Connect using in-cluster config (the auth-delegator `ServiceAccount`) or,
     /// out of cluster, the ambient kubeconfig. Bearers must be bound to
-    /// `audience`.
+    /// `audience`. Reviews are scoped to `POD_NAMESPACE`, else the pod's
+    /// service account namespace; a kubeconfig context namespace is never used.
     ///
     /// # Errors
     ///
-    /// Returns an error for a blank audience, or the client error if no usable
-    /// configuration is found.
+    /// Returns an error for a rejected audience, no resolvable namespace, or the
+    /// client error if no usable configuration is found.
     pub async fn connect(audience: String) -> Result<Self, String> {
         check_audience(&audience)?;
         let client = kube::Client::try_default().await.map_err(|error| error.to_string())?;
-        Ok(Self { client, audience })
+        let namespace = std::env::var("POD_NAMESPACE")
+            .ok()
+            .or_else(|| std::fs::read_to_string(SERVICE_ACCOUNT_NAMESPACE).ok())
+            .map(|namespace| namespace.trim().to_owned())
+            .filter(|namespace| !namespace.is_empty())
+            .ok_or("set POD_NAMESPACE to the enrollment namespace the grid-admin review is scoped to")?;
+        Ok(Self {
+            client,
+            audience,
+            namespace,
+        })
+    }
+
+    /// The namespace grid-admin reviews are scoped to.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 
     /// Authenticate the bearer, then authorize the operation. The recorded
@@ -185,20 +208,14 @@ impl KubeAuthorizer {
     /// Ask Kubernetes RBAC whether `user`/`groups` may perform `operation` on its
     /// resource.
     async fn authorize(&self, user: &str, groups: &[String], operation: Operation) -> Result<bool, AuthzError> {
-        use k8s_openapi::api::authorization::v1::{ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec};
+        use k8s_openapi::api::authorization::v1::{SubjectAccessReview, SubjectAccessReviewSpec};
         use kube::api::{Api, PostParams};
 
         let review = SubjectAccessReview {
             spec: SubjectAccessReviewSpec {
                 user: Some(user.to_owned()),
                 groups: Some(groups.to_vec()),
-                resource_attributes: Some(ResourceAttributes {
-                    group: Some(ENROLLMENTS_GROUP.to_owned()),
-                    resource: Some(operation.resource.to_owned()),
-                    subresource: operation.subresource.map(str::to_owned),
-                    verb: Some(operation.verb.to_owned()),
-                    ..Default::default()
-                }),
+                resource_attributes: Some(resource_attributes(&self.namespace, operation)),
                 ..Default::default()
             },
             ..Default::default()
@@ -210,6 +227,23 @@ impl KubeAuthorizer {
             .map_err(|error| AuthzError::Backend(error.to_string()))?;
 
         Ok(reviewed.status.is_some_and(|status| status.allowed))
+    }
+}
+
+/// The resource a grid-admin acts on, in the enrollment service's namespace, so
+/// a `Role` bound there grants it and a `ClusterRole` still does cluster-wide.
+#[cfg(feature = "sar")]
+fn resource_attributes(
+    namespace: &str,
+    operation: Operation,
+) -> k8s_openapi::api::authorization::v1::ResourceAttributes {
+    k8s_openapi::api::authorization::v1::ResourceAttributes {
+        namespace: Some(namespace.to_owned()),
+        group: Some(ENROLLMENTS_GROUP.to_owned()),
+        resource: Some(operation.resource.to_owned()),
+        subresource: operation.subresource.map(str::to_owned),
+        verb: Some(operation.verb.to_owned()),
+        ..Default::default()
     }
 }
 
@@ -282,7 +316,9 @@ fn reviewed_identity(
 mod tests {
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
 
-    use super::{AuthzError, MAX_BEARER_LEN, check_audience, is_jwt_shaped, reviewed_identity};
+    use super::{
+        AuthzError, MAX_BEARER_LEN, Operation, check_audience, is_jwt_shaped, resource_attributes, reviewed_identity,
+    };
 
     fn status(authenticated: bool, audiences: Option<&[&str]>) -> TokenReviewStatus {
         TokenReviewStatus {
@@ -365,5 +401,19 @@ mod tests {
             check_audience("grid-enrollment").is_ok(),
             "a dedicated audience is accepted"
         );
+    }
+
+    #[test]
+    fn the_review_is_scoped_to_the_enrollment_namespace() {
+        let operation = Operation {
+            resource: "enrollmenttokens",
+            verb: "create",
+            subresource: None,
+        };
+        let attributes = resource_attributes("grid", operation);
+        assert_eq!(attributes.namespace.as_deref(), Some("grid"), "namespace");
+        assert_eq!(attributes.group.as_deref(), Some("grid.praxis-proxy.io"), "group");
+        assert_eq!(attributes.resource.as_deref(), Some("enrollmenttokens"), "resource");
+        assert_eq!(attributes.verb.as_deref(), Some("create"), "verb");
     }
 }

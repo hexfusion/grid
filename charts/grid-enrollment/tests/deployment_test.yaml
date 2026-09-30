@@ -100,3 +100,9 @@ tests:
       enrollment.tokenAudience: " grid-enrollment"
     asserts:
       - failedTemplate: {}
+
+  - it: passes its namespace to scope the access review under authz=kube
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[?(@.name=="POD_NAMESPACE")].valueFrom.fieldRef.fieldPath
+          value: metadata.namespace
