@@ -13,6 +13,7 @@ image:
   # `enrollment bootstrap` Job (built with --features sar,bootstrap).
   repository: quay.io/praxis-proxy/grid-enrollment
   tag: ""            # defaults to .Chart.AppVersion
+  digest: ""         # sha256:<64 hex>; when set, tag is ignored
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 

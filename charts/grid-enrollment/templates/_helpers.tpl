@@ -132,3 +132,14 @@ Secret holding DB_CONNECTION_URL. External ref wins; builtin uses the generated 
 DB_CONNECTION_URL
 {{- end }}
 {{- end }}
+
+{{/*
+Enrollment image: repository@digest when image.digest is set, else repository:tag.
+*/}}
+{{- define "grid-enrollment.image" -}}
+{{- if .Values.image.digest }}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest }}
+{{- else }}
+{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
+{{- end }}
+{{- end }}
