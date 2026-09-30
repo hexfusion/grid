@@ -10,9 +10,13 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
 
+# sar: enables ENROLLMENT_AUTHZ=kube (the chart's default); bootstrap: the chart's CA bootstrap Job.
+ARG CARGO_FEATURES="sar,bootstrap"
+
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p enrollment --bin enrollment \
+        --features "${CARGO_FEATURES}" \
     && cp target/release/enrollment /usr/local/bin/enrollment
 
 FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:fac0bde5012de6a8475bb5dc18db968cdc90b12d9dc2ffaddb4a4975d0b8a04f
