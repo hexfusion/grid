@@ -53,8 +53,8 @@ serving:
 # Route: enrollment is a cross-peer front door, so a Route ships by default on
 # OpenShift. Passthrough keeps the grid-CA serving cert end-to-end; the site validates
 # it with the out-of-band grid-CA bundle (--cacert). When a Route renders, route.host
-# is required for passthrough and is auto-added to the serving cert SAN. Edge/reencrypt
-# is the opt-out for a trusted edge cert.
+# is required for passthrough and is auto-added to the serving cert SAN. Reencrypt
+# is the opt-out for a trusted router cert. Edge is rejected.
 # ------------------------------------------------------------------------------
 route:
   # -- auto renders the Route when the cluster serves route.openshift.io/v1; true or

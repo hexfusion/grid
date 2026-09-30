@@ -62,6 +62,7 @@ On the site, create a key and CSR, then redeem the token:
 ```bash
 openssl ecparam -genkey -name prime256v1 -noout -out site.key
 openssl req -new -key site.key -subj "/CN=east2" -out site.csr
+read -rs SITE_TOKEN  # paste the token from the grid admin
 (umask 077 && printf 'Authorization: Bearer %s\n' "$SITE_TOKEN" > site.hdr)
 
 jq -n --rawfile csr site.csr '{csr: $csr}' \
