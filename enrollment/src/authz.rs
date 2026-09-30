@@ -142,12 +142,10 @@ impl KubeAuthorizer {
     pub async fn connect(audience: String) -> Result<Self, String> {
         check_audience(&audience)?;
         let client = kube::Client::try_default().await.map_err(|error| error.to_string())?;
-        let namespace = std::env::var("POD_NAMESPACE")
-            .ok()
-            .or_else(|| std::fs::read_to_string(SERVICE_ACCOUNT_NAMESPACE).ok())
-            .map(|namespace| namespace.trim().to_owned())
-            .filter(|namespace| !namespace.is_empty())
-            .ok_or("set POD_NAMESPACE to the enrollment namespace the grid-admin review is scoped to")?;
+        let namespace = review_namespace(std::env::var("POD_NAMESPACE").ok(), || {
+            std::fs::read_to_string(SERVICE_ACCOUNT_NAMESPACE).ok()
+        })
+        .ok_or("set POD_NAMESPACE to the enrollment namespace the grid-admin review is scoped to")?;
         Ok(Self {
             client,
             audience,
@@ -241,6 +239,15 @@ fn resource_attributes(
         verb: Some(operation.verb.to_owned()),
         ..Default::default()
     }
+}
+
+/// `pod_namespace` if non-blank, else the service account namespace.
+#[cfg(feature = "sar")]
+fn review_namespace(pod_namespace: Option<String>, service_account: impl FnOnce() -> Option<String>) -> Option<String> {
+    let non_blank = |namespace: String| Some(namespace.trim().to_owned()).filter(|trimmed| !trimmed.is_empty());
+    pod_namespace
+        .and_then(non_blank)
+        .or_else(|| service_account().and_then(non_blank))
 }
 
 /// Refuse a blank audience or one every API token already carries.
@@ -341,7 +348,7 @@ mod tests {
 
     use super::{
         AuthzError, MAX_BEARER_LEN, Operation, access_review, check_audience, is_jwt_shaped, resource_attributes,
-        reviewed_identity,
+        review_namespace, reviewed_identity,
     };
 
     fn status(authenticated: bool, audiences: Option<&[&str]>) -> TokenReviewStatus {
@@ -355,6 +362,18 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn blank_pod_namespace_falls_back_to_the_service_account() {
+        let sa = || Some("grid-system\n".to_owned());
+        assert_eq!(
+            review_namespace(Some("  ".to_owned()), sa).as_deref(),
+            Some("grid-system")
+        );
+        assert_eq!(review_namespace(None, sa).as_deref(), Some("grid-system"));
+        assert_eq!(review_namespace(Some(" edge ".to_owned()), sa).as_deref(), Some("edge"));
+        assert_eq!(review_namespace(Some(String::new()), || Some(" ".to_owned())), None);
     }
 
     #[test]

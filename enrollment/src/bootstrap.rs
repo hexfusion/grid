@@ -507,7 +507,6 @@ mod tests {
             ..ObjectMeta::default()
         };
         assert_eq!(foreign_manager(&issued).as_deref(), Some("cert-manager"));
-        // An owner reference wins even over our own label.
         let synced = ObjectMeta {
             labels: Some(map(&[("app.kubernetes.io/managed-by", MANAGED_BY)])),
             owner_references: Some(vec![OwnerReference {
@@ -519,7 +518,8 @@ mod tests {
         };
         assert_eq!(
             foreign_manager(&synced).as_deref(),
-            Some("its owner ExternalSecret enrollment-serving")
+            Some("its owner ExternalSecret enrollment-serving"),
+            "an owner reference wins even over our own label"
         );
     }
 
