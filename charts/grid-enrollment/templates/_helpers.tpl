@@ -158,3 +158,14 @@ would hit a SAN mismatch.
 {{- fail "route.tls.insecureEdgeTerminationPolicy=Allow is refused: it would serve the one-time enrollment token over plaintext. Use Redirect or None." }}
 {{- end }}
 {{- end }}
+
+{{/*
+Fail closed: local authz reads grid-admin tokens from a Secret the chart generates or
+the user provides; with neither, the pod would mount a Secret that does not exist.
+*/}}
+{{- define "grid-enrollment.validateAuthz" -}}
+{{- $tokens := .Values.enrollment.gridAdminTokens }}
+{{- if and (eq .Values.enrollment.authz "local") (not $tokens.generate) (not $tokens.existingSecretRef) }}
+{{- fail "enrollment.authz=local needs grid-admin tokens: set enrollment.gridAdminTokens.generate=true or enrollment.gridAdminTokens.existingSecretRef" }}
+{{- end }}
+{{- end }}

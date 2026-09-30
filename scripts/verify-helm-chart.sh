@@ -1294,6 +1294,8 @@ try_reject "$ENROLL_DIR" "wildcard route.host" --namespace grid-system "${OCP[@]
 try_reject "$ENROLL_DIR" "route.host label over 63 characters" --namespace grid-system "${OCP[@]}" \
   --set "route.host=$(printf 'a%.0s' $(seq 64)).example.com"
 try_reject "$ENROLL_DIR" "route.host not DNS-1123" --namespace grid-system "${OCP[@]}" --set route.host=Enroll.Example.com
+try_reject "$ENROLL_DIR" "local authz with no grid-admin tokens" --namespace grid-system \
+  --set enrollment.authz=local --set enrollment.gridAdminTokens.generate=false
 try_reject "$ENROLL_DIR" "route.enabled not true, false, or auto" --namespace grid-system --set route.enabled=maybe
 
 echo ""
