@@ -173,16 +173,16 @@ impl KubeAuthorizer {
         if !is_jwt_shaped(bearer) {
             return Err(AuthzError::Unauthenticated);
         }
-        let (user, groups) = self.authenticate(bearer).await?;
-        if self.authorize(&user, &groups, operation).await? {
-            Ok(user)
+        let user = self.authenticate(bearer).await?;
+        if self.authorize(&user, operation).await? {
+            Ok(user.username.unwrap_or_default())
         } else {
             Err(AuthzError::Forbidden(operation.verb.to_owned()))
         }
     }
 
     /// Resolve the bearer to a Kubernetes identity via `TokenReview`.
-    async fn authenticate(&self, bearer: &str) -> Result<(String, Vec<String>), AuthzError> {
+    async fn authenticate(&self, bearer: &str) -> Result<k8s_openapi::api::authentication::v1::UserInfo, AuthzError> {
         use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
         use kube::api::{Api, PostParams};
 
@@ -205,21 +205,17 @@ impl KubeAuthorizer {
         reviewed_identity(status, &self.audience)
     }
 
-    /// Ask Kubernetes RBAC whether `user`/`groups` may perform `operation` on its
-    /// resource.
-    async fn authorize(&self, user: &str, groups: &[String], operation: Operation) -> Result<bool, AuthzError> {
-        use k8s_openapi::api::authorization::v1::{SubjectAccessReview, SubjectAccessReviewSpec};
+    /// Ask Kubernetes RBAC whether the reviewed `user` may perform `operation`
+    /// on its resource.
+    async fn authorize(
+        &self,
+        user: &k8s_openapi::api::authentication::v1::UserInfo,
+        operation: Operation,
+    ) -> Result<bool, AuthzError> {
+        use k8s_openapi::api::authorization::v1::SubjectAccessReview;
         use kube::api::{Api, PostParams};
 
-        let review = SubjectAccessReview {
-            spec: SubjectAccessReviewSpec {
-                user: Some(user.to_owned()),
-                groups: Some(groups.to_vec()),
-                resource_attributes: Some(resource_attributes(&self.namespace, operation)),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let review = access_review(&self.namespace, user, operation);
         let api: Api<SubjectAccessReview> = Api::all(self.client.clone());
         let reviewed = api
             .create(&PostParams::default(), &review)
@@ -285,6 +281,31 @@ fn is_jwt_shaped(bearer: &str) -> bool {
         })
 }
 
+/// The `SubjectAccessReview` for `operation` by the reviewed `user`. It carries
+/// the token's uid and extra (for a bound service account token, the
+/// credential id and pod binding), so an authorizer or webhook keyed on them
+/// judges the same identity the `TokenReview` authenticated.
+#[cfg(feature = "sar")]
+fn access_review(
+    namespace: &str,
+    user: &k8s_openapi::api::authentication::v1::UserInfo,
+    operation: Operation,
+) -> k8s_openapi::api::authorization::v1::SubjectAccessReview {
+    use k8s_openapi::api::authorization::v1::{SubjectAccessReview, SubjectAccessReviewSpec};
+
+    SubjectAccessReview {
+        spec: SubjectAccessReviewSpec {
+            user: user.username.clone(),
+            groups: user.groups.clone(),
+            uid: user.uid.clone(),
+            extra: user.extra.clone(),
+            resource_attributes: Some(resource_attributes(namespace, operation)),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 /// The identity a `TokenReview` authenticated, provided it is bound to
 /// `audience`. The API server returns the audiences the token is valid for,
 /// and an authenticator that ignores audiences returns none, so both an empty
@@ -293,7 +314,7 @@ fn is_jwt_shaped(bearer: &str) -> bool {
 fn reviewed_identity(
     status: k8s_openapi::api::authentication::v1::TokenReviewStatus,
     audience: &str,
-) -> Result<(String, Vec<String>), AuthzError> {
+) -> Result<k8s_openapi::api::authentication::v1::UserInfo, AuthzError> {
     if !status.authenticated.unwrap_or(false) {
         return Err(AuthzError::Unauthenticated);
     }
@@ -305,19 +326,21 @@ fn reviewed_identity(
     {
         return Err(AuthzError::Unauthenticated);
     }
-    let userinfo = status.user.ok_or(AuthzError::Unauthenticated)?;
-    Ok((
-        userinfo.username.unwrap_or_default(),
-        userinfo.groups.unwrap_or_default(),
-    ))
+    status
+        .user
+        .filter(|user| user.username.as_deref().is_some_and(|name| !name.is_empty()))
+        .ok_or(AuthzError::Unauthenticated)
 }
 
 #[cfg(all(test, feature = "sar"))]
 mod tests {
+    use std::collections::BTreeMap;
+
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
 
     use super::{
-        AuthzError, MAX_BEARER_LEN, Operation, check_audience, is_jwt_shaped, resource_attributes, reviewed_identity,
+        AuthzError, MAX_BEARER_LEN, Operation, access_review, check_audience, is_jwt_shaped, resource_attributes,
+        reviewed_identity,
     };
 
     fn status(authenticated: bool, audiences: Option<&[&str]>) -> TokenReviewStatus {
@@ -337,7 +360,7 @@ mod tests {
     fn accepts_a_token_bound_to_the_audience() {
         let identity = reviewed_identity(status(true, Some(&["grid-enrollment"])), "grid-enrollment");
         assert!(
-            matches!(identity, Ok((ref user, ref groups)) if user == "alice" && groups == &["grid-admins"]),
+            matches!(identity, Ok(ref user) if user.username.as_deref() == Some("alice")),
             "got {identity:?}"
         );
     }
@@ -400,6 +423,47 @@ mod tests {
         assert!(
             check_audience("grid-enrollment").is_ok(),
             "a dedicated audience is accepted"
+        );
+    }
+
+    #[test]
+    fn refuses_a_token_with_no_username() {
+        let mut reviewed = status(true, Some(&["grid-enrollment"]));
+        if let Some(user) = reviewed.user.as_mut() {
+            user.username = Some(String::new());
+        }
+        let identity = reviewed_identity(reviewed, "grid-enrollment");
+        assert!(matches!(identity, Err(AuthzError::Unauthenticated)), "got {identity:?}");
+    }
+
+    #[test]
+    fn access_review_carries_the_token_uid_and_extra() {
+        let scopes = BTreeMap::from([(
+            "authentication.kubernetes.io/credential-id".to_owned(),
+            vec!["JTI=token-1".to_owned()],
+        )]);
+        let user = UserInfo {
+            username: Some("alice".to_owned()),
+            groups: Some(vec!["grid-admins".to_owned()]),
+            uid: Some("uid-1".to_owned()),
+            extra: Some(scopes.clone()),
+        };
+        let operation = Operation {
+            resource: "enrollmenttokens",
+            verb: "create",
+            subresource: None,
+        };
+        let spec = access_review("grid", &user, operation).spec;
+        assert_eq!(spec.user.as_deref(), Some("alice"), "user");
+        assert_eq!(spec.groups, Some(vec!["grid-admins".to_owned()]), "groups");
+        assert_eq!(spec.uid.as_deref(), Some("uid-1"), "uid");
+        assert_eq!(spec.extra, Some(scopes), "extra");
+        assert_eq!(
+            spec.resource_attributes
+                .and_then(|attributes| attributes.namespace)
+                .as_deref(),
+            Some("grid"),
+            "namespace"
         );
     }
 
