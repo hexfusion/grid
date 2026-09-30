@@ -20,6 +20,19 @@ use crate::auth::GridAdmins;
 #[cfg(feature = "sar")]
 const ENROLLMENTS_GROUP: &str = "grid.praxis-proxy.io";
 
+/// Audience a grid-admin token must be bound to unless configured otherwise.
+#[cfg(feature = "sar")]
+pub const DEFAULT_TOKEN_AUDIENCE: &str = "grid-enrollment";
+
+/// API-server audiences every general token carries; binding to one would let
+/// any API token authenticate.
+#[cfg(feature = "sar")]
+const API_SERVER_AUDIENCES: [&str; 3] = [
+    "https://kubernetes.default.svc",
+    "https://kubernetes.default.svc.cluster.local",
+    "kubernetes",
+];
+
 /// Why a grid-admin request was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthzError {
@@ -104,19 +117,25 @@ impl Authorizer {
 pub struct KubeAuthorizer {
     /// Client for the review APIs, using the auth-delegator `ServiceAccount`.
     client: kube::Client,
+    /// Audience the bearer must be bound to, so a token minted for another
+    /// service cannot be replayed here.
+    audience: String,
 }
 
 #[cfg(feature = "sar")]
 impl KubeAuthorizer {
     /// Connect using in-cluster config (the auth-delegator `ServiceAccount`) or,
-    /// out of cluster, the ambient kubeconfig.
+    /// out of cluster, the ambient kubeconfig. Bearers must be bound to
+    /// `audience`.
     ///
     /// # Errors
     ///
-    /// Returns the client error if no usable configuration is found.
-    pub async fn connect() -> Result<Self, String> {
+    /// Returns an error for a blank audience, or the client error if no usable
+    /// configuration is found.
+    pub async fn connect(audience: String) -> Result<Self, String> {
+        check_audience(&audience)?;
         let client = kube::Client::try_default().await.map_err(|error| error.to_string())?;
-        Ok(Self { client })
+        Ok(Self { client, audience })
     }
 
     /// Authenticate the bearer, then authorize the operation. The recorded
@@ -127,6 +146,10 @@ impl KubeAuthorizer {
     /// enrollment volumes, where grid-admins mint tokens, the cost is negligible,
     /// and caching an authorization decision is its own hazard.
     async fn decide(&self, bearer: &str, operation: Operation) -> Result<String, AuthzError> {
+        // Refuse junk before it costs two uncached API-server round trips.
+        if !is_jwt_shaped(bearer) {
+            return Err(AuthzError::Unauthenticated);
+        }
         let (user, groups) = self.authenticate(bearer).await?;
         if self.authorize(&user, &groups, operation).await? {
             Ok(user)
@@ -143,7 +166,7 @@ impl KubeAuthorizer {
         let review = TokenReview {
             spec: TokenReviewSpec {
                 token: Some(bearer.to_owned()),
-                audiences: None,
+                audiences: Some(vec![self.audience.clone()]),
             },
             ..Default::default()
         };
@@ -156,14 +179,7 @@ impl KubeAuthorizer {
         let status = reviewed
             .status
             .ok_or_else(|| AuthzError::Backend("TokenReview returned no status".to_owned()))?;
-        if !status.authenticated.unwrap_or(false) {
-            return Err(AuthzError::Unauthenticated);
-        }
-        let userinfo = status.user.ok_or(AuthzError::Unauthenticated)?;
-        Ok((
-            userinfo.username.unwrap_or_default(),
-            userinfo.groups.unwrap_or_default(),
-        ))
+        reviewed_identity(status, &self.audience)
     }
 
     /// Ask Kubernetes RBAC whether `user`/`groups` may perform `operation` on its
@@ -194,5 +210,160 @@ impl KubeAuthorizer {
             .map_err(|error| AuthzError::Backend(error.to_string()))?;
 
         Ok(reviewed.status.is_some_and(|status| status.allowed))
+    }
+}
+
+/// Refuse a blank audience or one every API token already carries.
+#[cfg(feature = "sar")]
+fn check_audience(audience: &str) -> Result<(), String> {
+    if audience.trim().is_empty() {
+        return Err("the grid-admin token audience must not be blank".to_owned());
+    }
+    if audience.trim() != audience {
+        return Err(format!(
+            "the grid-admin token audience {audience:?} has surrounding whitespace"
+        ));
+    }
+    if API_SERVER_AUDIENCES.contains(&audience.trim_end_matches('/')) {
+        return Err(format!(
+            "the grid-admin token audience {audience:?} is an API-server audience; use a dedicated one"
+        ));
+    }
+    Ok(())
+}
+
+/// Upper bound on a bearer worth reviewing; bound service account tokens are
+/// well under 2 KiB.
+#[cfg(feature = "sar")]
+const MAX_BEARER_LEN: usize = 8192;
+
+/// Whether `bearer` has the shape of a service account token: a bounded JWT of
+/// three non-empty base64url segments.
+#[cfg(feature = "sar")]
+fn is_jwt_shaped(bearer: &str) -> bool {
+    bearer.len() <= MAX_BEARER_LEN
+        && bearer.split('.').count() == 3
+        && bearer.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+}
+
+/// The identity a `TokenReview` authenticated, provided it is bound to
+/// `audience`. The API server returns the audiences the token is valid for,
+/// and an authenticator that ignores audiences returns none, so both an empty
+/// list and a list without `audience` are refused.
+#[cfg(feature = "sar")]
+fn reviewed_identity(
+    status: k8s_openapi::api::authentication::v1::TokenReviewStatus,
+    audience: &str,
+) -> Result<(String, Vec<String>), AuthzError> {
+    if !status.authenticated.unwrap_or(false) {
+        return Err(AuthzError::Unauthenticated);
+    }
+    if !status
+        .audiences
+        .unwrap_or_default()
+        .iter()
+        .any(|bound| bound == audience)
+    {
+        return Err(AuthzError::Unauthenticated);
+    }
+    let userinfo = status.user.ok_or(AuthzError::Unauthenticated)?;
+    Ok((
+        userinfo.username.unwrap_or_default(),
+        userinfo.groups.unwrap_or_default(),
+    ))
+}
+
+#[cfg(all(test, feature = "sar"))]
+mod tests {
+    use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
+
+    use super::{AuthzError, MAX_BEARER_LEN, check_audience, is_jwt_shaped, reviewed_identity};
+
+    fn status(authenticated: bool, audiences: Option<&[&str]>) -> TokenReviewStatus {
+        TokenReviewStatus {
+            authenticated: Some(authenticated),
+            audiences: audiences.map(|list| list.iter().map(|aud| (*aud).to_owned()).collect()),
+            user: Some(UserInfo {
+                username: Some("alice".to_owned()),
+                groups: Some(vec!["grid-admins".to_owned()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accepts_a_token_bound_to_the_audience() {
+        let identity = reviewed_identity(status(true, Some(&["grid-enrollment"])), "grid-enrollment");
+        assert!(
+            matches!(identity, Ok((ref user, ref groups)) if user == "alice" && groups == &["grid-admins"]),
+            "got {identity:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_token_without_the_audience() {
+        for audiences in [None, Some(&[][..]), Some(&["https://kubernetes.default.svc"][..])] {
+            let identity = reviewed_identity(status(true, audiences), "grid-enrollment");
+            assert!(
+                matches!(identity, Err(AuthzError::Unauthenticated)),
+                "{audiences:?}: got {identity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_an_unauthenticated_token() {
+        let identity = reviewed_identity(status(false, Some(&["grid-enrollment"])), "grid-enrollment");
+        assert!(matches!(identity, Err(AuthzError::Unauthenticated)), "got {identity:?}");
+    }
+
+    #[test]
+    fn jwt_shaped_bearers_pass_the_precheck() {
+        assert!(
+            is_jwt_shaped("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.c2ln-_x"),
+            "a JWT passes"
+        );
+    }
+
+    #[test]
+    fn junk_bearers_fail_the_precheck() {
+        let oversized = format!("a.b.{}", "c".repeat(MAX_BEARER_LEN));
+        for bearer in [
+            "",
+            "opaque",
+            "a.b",
+            "a.b.c.d",
+            "a..c",
+            "a.b.c=",
+            "a.b.c d",
+            oversized.as_str(),
+        ] {
+            assert!(!is_jwt_shaped(bearer), "{} must fail", bearer.len());
+        }
+    }
+
+    #[test]
+    fn refuses_api_server_and_blank_audiences() {
+        for audience in [
+            "",
+            " ",
+            " grid-enrollment",
+            "grid-enrollment\n",
+            "kubernetes",
+            "https://kubernetes.default.svc",
+            "https://kubernetes.default.svc/",
+        ] {
+            assert!(check_audience(audience).is_err(), "{audience:?} must be refused");
+        }
+        assert!(
+            check_audience("grid-enrollment").is_ok(),
+            "a dedicated audience is accepted"
+        );
     }
 }

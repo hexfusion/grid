@@ -61,7 +61,8 @@ tokens. `local`, the default, reads a grid-admin token table from
 `ENROLLMENT_GRID_ADMIN_TOKENS`, one `name:token` line per grid-admin, where an
 empty table admits nobody and is the safe direction. `kube` defers to Kubernetes
 RBAC through TokenReview and SubjectAccessReview on the `enrollmenttokens`
-resource and needs a build with `--features sar`. An unknown value, or a backend
+resource and needs a build with `--features sar`. Under `kube`, a bearer must be
+bound to `ENROLLMENT_TOKEN_AUDIENCE` (default `grid-enrollment`). An unknown value, or a backend
 this binary was not built with, fails closed rather than falling back to the
 token table.
 

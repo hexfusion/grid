@@ -326,10 +326,12 @@ async fn build_authorizer() -> Result<Authorizer, Box<dyn std::error::Error>> {
         Some("kube") => {
             #[cfg(feature = "sar")]
             {
-                let kube = enrollment::authz::KubeAuthorizer::connect()
+                let audience = std::env::var("ENROLLMENT_TOKEN_AUDIENCE")
+                    .unwrap_or_else(|_| enrollment::authz::DEFAULT_TOKEN_AUDIENCE.to_owned());
+                let kube = enrollment::authz::KubeAuthorizer::connect(audience.clone())
                     .await
                     .map_err(std::io::Error::other)?;
-                tracing::info!("grid-admin authorization: Kubernetes RBAC (SubjectAccessReview)");
+                tracing::info!(%audience, "grid-admin authorization: Kubernetes RBAC (SubjectAccessReview)");
                 Ok(Authorizer::Kube(kube))
             }
             #[cfg(not(feature = "sar"))]

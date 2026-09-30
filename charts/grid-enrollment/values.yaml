@@ -59,6 +59,11 @@ enrollment:
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).
   # local: the standalone grid-admin-token table, for non-kube deploys.
   authz: kube                        # kube | local
+  # Audience a grid-admin token must be bound to under authz=kube, e.g.
+  # kubectl create token <sa> --audience grid-enrollment --duration 10m.
+  # Never an API-server audience (kubernetes, https://kubernetes.default.svc,
+  # or the cluster's service account issuer): every API token carries it.
+  tokenAudience: grid-enrollment
   gridAdminTokens:
     generate: true                   # generate a grid-admin-token Secret on install
     existingSecretRef: ""            # BYO Secret with key "tokens" (name:token lines)
