@@ -64,3 +64,39 @@ tests:
           path: spec.template.spec.containers[0].env[?(@.name=="ENROLLMENT_GOSSIP_KEY")]
       - notExists:
           path: spec.template.spec.containers[0].env[?(@.name=="ENROLLMENT_GOSSIP_SEEDS")]
+
+  - it: binds grid-admin tokens to the configured audience under authz=kube
+    set:
+      enrollment.tokenAudience: grid-east
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[?(@.name=="ENROLLMENT_TOKEN_AUDIENCE")].value
+          value: grid-east
+
+  - it: omits the token audience under authz=local
+    set:
+      enrollment.authz: local
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_TOKEN_AUDIENCE
+            value: grid-enrollment
+
+  - it: rejects a blank token audience
+    set:
+      enrollment.tokenAudience: ""
+    asserts:
+      - failedTemplate: {}
+
+  - it: rejects an API-server token audience
+    set:
+      enrollment.tokenAudience: https://kubernetes.default.svc
+    asserts:
+      - failedTemplate: {}
+
+  - it: rejects a whitespace-padded token audience
+    set:
+      enrollment.tokenAudience: " grid-enrollment"
+    asserts:
+      - failedTemplate: {}

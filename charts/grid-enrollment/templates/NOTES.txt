@@ -13,6 +13,9 @@ Enrollment endpoint (TLS): {{ include "grid-enrollment.serviceDns" . }}:{{ inclu
 {{ if and (eq .Values.enrollment.authz "local") .Values.enrollment.gridAdminTokens.generate (not .Values.enrollment.gridAdminTokens.existingSecretRef) -}}
 Grid-admin token (a name:token line; the token part mints site tokens and decides enrollments):
   kubectl -n {{ .Release.Namespace }} get secret {{ include "grid-enrollment.fullname" . }}-grid-admin-tokens -o jsonpath='{.data.tokens}' | base64 -d
+{{- else if eq .Values.enrollment.authz "kube" -}}
+Grid-admin token (a short-lived ServiceAccount token bound to the enrollment audience):
+  kubectl -n {{ .Release.Namespace }} create token <grid-admin-sa> --audience {{ .Values.enrollment.tokenAudience }} --duration 10m
 {{- end }}
 
 Give a site the trust anchor and mint it a token, then it can enroll:

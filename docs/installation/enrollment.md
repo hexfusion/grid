@@ -103,7 +103,36 @@ A grid-admin mints a single-use token that pins the site name. With the
 default `enrollment.authz=kube`, `$GRID_ADMIN_TOKEN` is a Kubernetes
 ServiceAccount token for an identity RBAC authorizes against the
 `enrollmenttokens` resource, reviewed with `TokenReview` and
-`SubjectAccessReview`. Under the `enrollment.authz=local` override,
+`SubjectAccessReview`. The token must be bound to the
+`enrollment.tokenAudience` audience (default `grid-enrollment`), so mint a
+short-lived one for the call; a general API token is refused:
+
+```bash
+GRID_ADMIN_TOKEN=$(kubectl -n grid create token <grid-admin-sa> \
+  --audience grid-enrollment --duration 10m)
+```
+
+Grid-admins therefore act as that ServiceAccount. Grant the admin group only
+the right to mint its tokens, and keep `--duration` short:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grid-admin-token
+  namespace: grid
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: ["<grid-admin-sa>"]
+    verbs: ["create"]
+```
+
+The enrollment service records the ServiceAccount as the grid-admin that
+minted a site token. The human who requested the ServiceAccount token
+appears only in the API server audit log, as the `TokenRequest` event.
+
+Under the `enrollment.authz=local` override,
 `$GRID_ADMIN_TOKEN` is instead the token half of a `name:token` line in the
 grid-admin-tokens Secret, the one `enrollment.gridAdminTokens.generate`
 created or `enrollment.gridAdminTokens.existingSecretRef` pointed at. The

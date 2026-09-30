@@ -77,6 +77,10 @@ spec:
               value: {{ .Values.enrollment.listenAddr | quote }}
             - name: ENROLLMENT_AUTHZ
               value: {{ .Values.enrollment.authz | quote }}
+            {{- if eq .Values.enrollment.authz "kube" }}
+            - name: ENROLLMENT_TOKEN_AUDIENCE
+              value: {{ .Values.enrollment.tokenAudience | quote }}
+            {{- end }}
             {{- if .Values.enrollment.certLifetimeSecs }}
             - name: ENROLLMENT_CERT_LIFETIME_SECS
               value: {{ .Values.enrollment.certLifetimeSecs | quote }}
