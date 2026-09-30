@@ -12,7 +12,7 @@ up a site ready to enroll.
 
 ## Install
 
-Batteries included, no values required:
+Batteries included. Off OpenShift no values are required:
 
 ```bash
 helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace
@@ -22,6 +22,26 @@ The default install generates the Grid CA and the endpoint serving cert through 
 pre-install hook, deploys Postgres, and runs the service over TLS. Under
 `enrollment.authz=local` it also generates a grid-admin token. `helm install
 --dry-run` and the NOTES output show the endpoint and the trust anchor.
+
+## Route
+
+`route.enabled` defaults to `auto`: the chart renders a passthrough Route only when
+the cluster serves `route.openshift.io/v1`, and `true` or `false` forces it. A
+rendered passthrough Route needs `route.host`, which the bootstrap adds to the
+serving cert SAN:
+
+```bash
+helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace \
+  --set route.host=enrollment.apps.<cluster-domain>
+```
+
+The bootstrap Job's RBAC is removed once the hook finishes, whether it succeeded or
+failed, so retry a failed bootstrap with `helm upgrade`, not by re-running the Job.
+
+`helm template` sees no cluster APIs, so `auto` renders no Route there. GitOps
+renders for OpenShift pass `--api-versions route.openshift.io/v1` (Argo CD passes
+the cluster's APIs itself). `edge` and `reencrypt` terminate at the router and break
+the site's grid-CA pin, so keep `passthrough`.
 
 ## Topology
 

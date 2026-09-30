@@ -26,3 +26,9 @@ Security posture (read before using beyond dev):
     encryption provider. Enabling it is a prerequisite for holding the CA key
     this way. Verify it before production use.
   - GA gate for the CA signing key is a non-exportable KMS/HSM key, not a Secret.
+{{- if and (include "grid-enrollment.routeEnabled" .) .Values.serving.existingSecretRef }}
+
+WARNING: serving.existingSecretRef ({{ .Values.serving.existingSecretRef }}) serves the Route
+passthrough, so that certificate must carry route.host ({{ .Values.route.host }}) as a SAN.
+The chart cannot check it.
+{{- end }}
