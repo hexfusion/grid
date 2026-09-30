@@ -26,6 +26,7 @@ spec:
       labels:
         {{- include "grid-enrollment.selectorLabels" . | nindent 8 }}
     spec:
+      enableServiceLinks: false
       restartPolicy: Never
       serviceAccountName: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
