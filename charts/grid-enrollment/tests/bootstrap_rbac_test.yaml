@@ -65,3 +65,37 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].image
           value: quay.io/praxis-proxy/grid-enrollment@sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+  - it: lets bootstrap read and roll only the builtin DB Deployment
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["deployments"]
+            resourceNames: ["RELEASE-NAME-grid-enrollment-db"]
+            verbs: ["get", "patch"]
+
+  - it: grants no apps access at all with an external DB
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    set:
+      db.type: external
+      db.external.connectionUrlSecretRef: db-url
+    asserts:
+      - notMatchRegex:
+          path: rules[*].apiGroups[0]
+          pattern: ^apps$
+
+  - it: tells bootstrap which DB Deployment to roll
+    template: templates/certs/ca-bootstrap-job.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --db-deployment

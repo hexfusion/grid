@@ -1259,6 +1259,87 @@ for topo in combined-site dedicated-edge; do
   fi
 done
 
+# ======================================================================
+# Grid Enrollment Chart
+# ======================================================================
+ENROLL_DIR="charts/grid-enrollment"
+
+echo ""
+echo "======================================================================"
+echo "  Grid Enrollment Chart ($ENROLL_DIR)"
+echo "======================================================================"
+
+echo ""
+echo "=== Helm lint (enrollment) ==="
+if helm lint "$ENROLL_DIR" --strict --set route.host=enroll.example.com 2>&1; then
+  pass "helm lint --strict (enrollment)"
+else
+  fail "helm lint --strict (enrollment)"
+fi
+
+echo ""
+echo "=== Template rendering (enrollment) ==="
+# route.enabled=auto renders a Route only where route.openshift.io/v1 is served.
+OCP=(--api-versions route.openshift.io/v1)
+try_template "$ENROLL_DIR" "enrollment: passthrough with route.host (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com
+try_template "$ENROLL_DIR" "enrollment: edge without host (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.tls.termination=edge
+try_template "$ENROLL_DIR" "enrollment: route disabled (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.enabled=false
+try_template "$ENROLL_DIR" "enrollment: no Route API, no host" --namespace grid-system
+# The install gate: a rendered passthrough Route with no host must fail so an
+# ingress-generated host can never render a SAN-mismatched, unreachable Route.
+try_reject "$ENROLL_DIR" "passthrough route without host (OpenShift)" --namespace grid-system "${OCP[@]}"
+try_reject "$ENROLL_DIR" "route.enabled=true without host" --namespace grid-system --set route.enabled=true
+try_reject "$ENROLL_DIR" "insecureEdgeTerminationPolicy Allow (plaintext token)" --namespace grid-system "${OCP[@]}" --set route.host=h.example.com --set route.tls.insecureEdgeTerminationPolicy=Allow
+try_reject "$ENROLL_DIR" "reencrypt without destinationCACertificate" --namespace grid-system "${OCP[@]}" \
+  --set route.host=h.example.com --set route.tls.termination=reencrypt
+try_template "$ENROLL_DIR" "enrollment: reencrypt with a destination CA" --namespace grid-system \
+  "${OCP[@]}" --set route.host=h.example.com --set route.tls.termination=reencrypt \
+  --set-string route.tls.destinationCACertificate=placeholder-ca
+try_reject "$ENROLL_DIR" "wildcard route.host" --namespace grid-system "${OCP[@]}" --set 'route.host=*.apps.example.com'
+try_reject "$ENROLL_DIR" "route.host label over 63 characters" --namespace grid-system "${OCP[@]}" \
+  --set "route.host=$(printf 'a%.0s' $(seq 64)).example.com"
+try_reject "$ENROLL_DIR" "route.host not DNS-1123" --namespace grid-system "${OCP[@]}" --set route.host=Enroll.Example.com
+try_reject "$ENROLL_DIR" "local authz with no grid-admin tokens" --namespace grid-system \
+  --set enrollment.authz=local --set enrollment.gridAdminTokens.generate=false
+try_reject "$ENROLL_DIR" "route.enabled not true, false, or auto" --namespace grid-system --set route.enabled=maybe
+
+echo ""
+echo "=== Route + serving-cert SAN auto-wire (enrollment) ==="
+ENROLL_RENDERED=$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com 2>/dev/null)
+if echo "$ENROLL_RENDERED" | grep -q 'kind: Route'; then
+  pass "enrollment: Route renders by default on OpenShift"
+else
+  fail "enrollment: Route not rendered on OpenShift"
+fi
+if echo "$ENROLL_RENDERED" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
+  pass "enrollment: route.host auto-added to serving cert SAN"
+else
+  fail "enrollment: route.host not wired into serving cert SAN"
+fi
+if [ "$(echo "$ENROLL_RENDERED" | grep -c 'haproxy.router.openshift.io/rate-limit-connections')" = 3 ]; then
+  pass "enrollment: Route carries per-source-IP connection limits by default"
+else
+  fail "enrollment: Route should carry rate-limit-connections annotations"
+fi
+if helm template v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com \
+    --set route.rateLimit.enabled=false | grep -q 'rate-limit-connections'; then
+  fail "enrollment: route.rateLimit.enabled=false should drop the annotations"
+else
+  pass "enrollment: route.rateLimit.enabled=false drops the annotations"
+fi
+NO_ROUTE=$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system --set route.host=enroll.example.com 2>/dev/null)
+if echo "$NO_ROUTE" | grep -q 'kind: Route' || echo "$NO_ROUTE" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
+  fail "enrollment: without the Route API, no Route and no Route SAN"
+else
+  pass "enrollment: without the Route API, no Route and no Route SAN"
+fi
+if [ "$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system --show-only templates/certs/ca-bootstrap-rbac.yaml \
+    | grep -c 'hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed')" = 3 ]; then
+  pass "enrollment: bootstrap RBAC is removed after the hook succeeds or fails"
+else
+  fail "enrollment: bootstrap RBAC should carry hook-succeeded"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "=== Summary ==="

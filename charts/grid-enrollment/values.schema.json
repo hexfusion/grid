@@ -2,6 +2,37 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
+    "route": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "enum": [true, false, "true", "false", "auto"],
+          "description": "auto renders the Route when route.openshift.io/v1 is served."
+        },
+        "host": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
+          "description": "DNS-1123 subdomain, no wildcard: it becomes a serving cert SAN."
+        },
+        "rateLimit": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "concurrentTcp": { "type": "integer", "minimum": 1 },
+            "rateTcp": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "termination": { "enum": ["passthrough", "edge", "reencrypt"] },
+            "insecureEdgeTerminationPolicy": { "enum": ["None", "Redirect", "Allow", ""] }
+          }
+        }
+      }
+    },
     "image": {
       "type": "object",
       "properties": {
