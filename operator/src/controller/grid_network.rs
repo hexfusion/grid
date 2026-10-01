@@ -130,6 +130,9 @@ pub struct OperatorCtx {
     /// How consumer Praxis config is rendered, from operator deployment settings.
     pub(crate) consumer: ConsumerSettings,
 
+    /// Whether a missing grid CA and site certificate may be minted, a dev-only shortcut.
+    pub(crate) dev_self_signed_ca: bool,
+
     /// Whether membership-derived writes may run, cleared while SWIM converges.
     membership_ready: std::sync::atomic::AtomicBool,
 }
@@ -203,6 +206,7 @@ impl OperatorCtx {
             serving_writes: WriteGate::default(),
             peer_settings: PeerSettings::default(),
             consumer: ConsumerSettings::default(),
+            dev_self_signed_ca: false,
             membership_ready: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -254,6 +258,13 @@ impl OperatorCtx {
     #[must_use]
     pub fn with_consumer_settings(mut self, settings: ConsumerSettings) -> Self {
         self.consumer = settings;
+        self
+    }
+
+    /// Allow minting a self-signed grid CA when both referenced Secrets are absent.
+    #[must_use]
+    pub const fn with_dev_self_signed_ca(mut self, enabled: bool) -> Self {
+        self.dev_self_signed_ca = enabled;
         self
     }
 
@@ -596,11 +607,13 @@ async fn reject_network(
     let generation = network.metadata.generation.unwrap_or(0);
     let conditions = condition::refresh(
         Some(previous),
-        condition::network_conditions(&phase, Some(rejection), &[]),
+        condition::network_conditions(&phase, Some(rejection), None, &[]),
         generation,
     );
     let object_ref = network.object_ref(&());
-    super::publish_rejection(client, "grid-network-controller", &object_ref, previous, rejection).await;
+    if !rejection.reported_on(previous, condition::ACCEPTED) {
+        super::publish_rejection(client, "grid-network-controller", &object_ref, rejection).await;
+    }
     if previous != conditions.as_slice() {
         let patch = serde_json::json!({ "status": { "conditions": conditions, "observedGeneration": generation } });
         Api::<GridNetwork>::all(client.clone())
@@ -664,7 +677,20 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     }
 
     let client = &ctx.client;
-    ensure_tls_secrets(&network, client).await?;
+    let trust_problem = Box::pin(ensure_tls_secrets(&network, client, ctx.dev_self_signed_ca)).await?;
+    if let Some(problem) = trust_problem.as_ref() {
+        let previous = network.status.as_ref().map_or(&[][..], |s| s.conditions.as_slice());
+        let object_ref = network.object_ref(&());
+        if !problem.reported_on(previous, condition::READY) {
+            Box::pin(super::publish_rejection(
+                client,
+                "grid-network-controller",
+                &object_ref,
+                problem,
+            ))
+            .await;
+        }
+    }
 
     if let Some(swim) = ctx.swim() {
         // When a GridNetwork configures a SWIM key Secret, resolve and apply it
@@ -894,6 +920,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         overlay_statuses,
         budget_statuses,
         &discovery_conflicts,
+        trust_problem.as_ref(),
     )
     .await?;
 
@@ -1230,71 +1257,118 @@ fn crd_seed_decision(resolution: &SeedResolution, previous: &[SocketAddr]) -> Cr
 // TLS Secrets
 // ---------------------------------------------------------------------------
 
-/// Ensure CA and site certificate secrets exist.
+/// What reconcile does about the grid CA and site certificate Secrets.
+#[derive(Debug, Eq, PartialEq)]
+enum TlsSecretPlan {
+    /// Both exist; use them.
+    Ready,
+    /// Neither exists, dev minting is on, and both live in the operator namespace.
+    Generate,
+    /// Report the gap; never overwrite or mint over it.
+    Missing(Rejection),
+}
+
+/// Decide from what exists; an existing Secret is never replaced.
+fn tls_secret_plan(
+    ca: (&crate::crd::grid_network::SecretRef, bool),
+    site: (&crate::crd::grid_network::SecretRef, bool),
+    dev_self_signed_ca: bool,
+    operator_namespace: &str,
+) -> TlsSecretPlan {
+    let ((ca_ref, ca_exists), (site_ref, site_exists)) = (ca, site);
+    let named = |r: &crate::crd::grid_network::SecretRef| format!("{}/{}", r.namespace, r.name);
+    let missing = |message: String| TlsSecretPlan::Missing(Rejection::new("TrustMaterialMissing", message));
+    match (ca_exists, site_exists) {
+        (true, true) => TlsSecretPlan::Ready,
+        (false, false) if !dev_self_signed_ca => missing(format!(
+            "Secrets {} and {} not found; provision the grid identity, or set the chart value devSelfSignedCa (GRID_DEV_SELF_SIGNED_CA) for a dev CA",
+            named(ca_ref),
+            named(site_ref)
+        )),
+        (false, false) if ca_ref.namespace != operator_namespace || site_ref.namespace != operator_namespace => {
+            missing(format!(
+                "a dev CA is written only to the operator namespace {operator_namespace}; {} and {} are outside it",
+                named(ca_ref),
+                named(site_ref)
+            ))
+        },
+        (false, false) => TlsSecretPlan::Generate,
+        (true, false) => missing(format!(
+            "Secret {} not found; it must be signed by {}",
+            named(site_ref),
+            named(ca_ref)
+        )),
+        (false, true) => missing(format!(
+            "Secret {} not found; refusing to mint a CA for an existing site",
+            named(ca_ref)
+        )),
+    }
+}
+
+/// Check the grid CA and site Secrets, minting a dev pair only when [`tls_secret_plan`] allows.
 ///
-/// Generates both together so the CA is available for
-/// signing the site certificate without needing to
-/// reconstruct it from PEM.
-#[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
-async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
+/// Returns the gap to report as `Ready=False`, never an error for a missing Secret.
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    reason = "async future with kube API types; linear plan then act"
+)]
+async fn ensure_tls_secrets(
+    network: &GridNetwork,
+    client: &Client,
+    dev_self_signed_ca: bool,
+) -> Result<Option<Rejection>, OperatorError> {
     let tls = &network.spec.tls;
     let (Some(ca_ref), Some(site_ref)) = (&tls.ca_secret_ref, &tls.site_secret_ref) else {
-        return Ok(());
+        return Ok(None);
     };
 
     let ca_api: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(client.clone(), &ca_ref.namespace);
     let site_api: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(client.clone(), &site_ref.namespace);
-
     let ca_exists = ca_api.get_opt(&ca_ref.name).await?.is_some();
     let site_exists = site_api.get_opt(&site_ref.name).await?.is_some();
 
-    if ca_exists && site_exists {
-        return Ok(());
+    match tls_secret_plan(
+        (ca_ref, ca_exists),
+        (site_ref, site_exists),
+        dev_self_signed_ca,
+        client.default_namespace(),
+    ) {
+        TlsSecretPlan::Ready => Ok(None),
+        TlsSecretPlan::Missing(problem) => Ok(Some(problem)),
+        TlsSecretPlan::Generate => {
+            let ca = certs::generate_ca("grid-ca")?;
+            let site_cert = certs::generate_site_cert(&ca, &network_site_name(network))?;
+            create_secret(
+                &ca_api,
+                secret::build(&ca_ref.name, &ca_ref.namespace, secret::ca_secret_data(&ca)),
+            )
+            .await?;
+            create_secret(
+                &site_api,
+                secret::build(
+                    &site_ref.name,
+                    &site_ref.namespace,
+                    secret::site_cert_secret_data(&site_cert),
+                ),
+            )
+            .await?;
+            tracing::warn!("minted a self-signed dev grid CA (GRID_DEV_SELF_SIGNED_CA)");
+            Ok(None)
+        },
     }
-
-    let site_name = network_site_name(network);
-    let ca = certs::generate_ca("grid-ca")?;
-    let site_cert = certs::generate_site_cert(&ca, &site_name)?;
-
-    apply_ca_secret(&ca_api, ca_ref, &ca).await?;
-    apply_site_secret(&site_api, site_ref, &site_cert).await?;
-
-    info!("created grid TLS secrets");
-    Ok(())
 }
 
-/// Apply the CA secret via server-side apply.
-async fn apply_ca_secret(
+/// Create `secret`, leaving one a concurrent writer created first untouched.
+async fn create_secret(
     api: &Api<k8s_openapi::api::core::v1::Secret>,
-    ca_ref: &crate::crd::grid_network::SecretRef,
-    ca: &certs::CaCert,
+    secret: k8s_openapi::api::core::v1::Secret,
 ) -> Result<(), OperatorError> {
-    let data = secret::ca_secret_data(ca);
-    let s = secret::build(&ca_ref.name, &ca_ref.namespace, data);
-    api.patch(
-        &ca_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Apply the site certificate secret via server-side apply.
-async fn apply_site_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    site_ref: &crate::crd::grid_network::SecretRef,
-    site_cert: &certs::SiteCertOutput,
-) -> Result<(), OperatorError> {
-    let data = secret::site_cert_secret_data(site_cert);
-    let s = secret::build(&site_ref.name, &site_ref.namespace, data);
-    api.patch(
-        &site_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
-    )
-    .await?;
-    Ok(())
+    match api.create(&PostParams::default(), &secret).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2507,6 +2581,7 @@ async fn update_status(
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
     discovery_conflicts: &[String],
+    trust_problem: Option<&Rejection>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
@@ -2516,7 +2591,7 @@ async fn update_status(
     let observed_generation = network.metadata.generation.unwrap_or(0);
     let conditions = condition::refresh(
         network.status.as_ref().map(|s| s.conditions.as_slice()),
-        condition::network_conditions(phase, None, discovery_conflicts),
+        condition::network_conditions(phase, None, trust_problem, discovery_conflicts),
         observed_generation,
     );
     let status = GridNetworkStatus {
@@ -3617,6 +3692,56 @@ mod tests {
             !provider_accepted(&provider),
             "an Accepted verdict on an older spec admits nothing"
         );
+    }
+
+    fn secret_ref(namespace: &str, name: &str) -> crate::crd::grid_network::SecretRef {
+        serde_json::from_value(serde_json::json!({ "name": name, "namespace": namespace }))
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn existing_tls_secrets_are_used_as_is() {
+        let (ca, site) = (secret_ref("grid", "ca"), secret_ref("grid", "site"));
+        for dev in [false, true] {
+            assert_eq!(
+                tls_secret_plan((&ca, true), (&site, true), dev, "grid"),
+                TlsSecretPlan::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn a_dev_ca_is_minted_only_when_asked_and_both_are_absent_in_the_operator_namespace() {
+        let (ca, site) = (secret_ref("grid", "ca"), secret_ref("grid", "site"));
+        assert_eq!(
+            tls_secret_plan((&ca, false), (&site, false), true, "grid"),
+            TlsSecretPlan::Generate
+        );
+        let TlsSecretPlan::Missing(off) = tls_secret_plan((&ca, false), (&site, false), false, "grid") else {
+            std::process::abort()
+        };
+        assert_eq!(off.reason, "TrustMaterialMissing");
+        assert!(off.message.contains("devSelfSignedCa (GRID_DEV_SELF_SIGNED_CA)"));
+        let foreign = secret_ref("kube-system", "ca");
+        assert!(matches!(
+            tls_secret_plan((&foreign, false), (&site, false), true, "grid"),
+            TlsSecretPlan::Missing(_)
+        ));
+    }
+
+    #[test]
+    fn a_lone_secret_is_never_overwritten_by_a_new_ca() {
+        let (ca, site) = (secret_ref("grid", "ca"), secret_ref("grid", "site"));
+        for dev in [false, true] {
+            assert!(matches!(
+                tls_secret_plan((&ca, true), (&site, false), dev, "grid"),
+                TlsSecretPlan::Missing(_)
+            ));
+            assert!(matches!(
+                tls_secret_plan((&ca, false), (&site, true), dev, "grid"),
+                TlsSecretPlan::Missing(_)
+            ));
+        }
     }
 
     #[test]

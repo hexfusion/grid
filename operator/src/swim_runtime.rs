@@ -874,9 +874,12 @@ impl SwimHandle {
         let state_rx = self.state_rx.clone();
         let runtime_rx = self.runtime_tx.subscribe();
         let previous = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
+        let next_allowed = tokio::time::Instant::now();
         stream::unfold(
-            (membership_rx, state_rx, runtime_rx, previous),
-            |(mut membership_rx, mut state_rx, mut runtime_rx, mut previous)| async move {
+            (membership_rx, state_rx, runtime_rx, previous, next_allowed),
+            |(mut membership_rx, mut state_rx, mut runtime_rx, mut previous, next_allowed)| async move {
+                // Changes inside the window coalesce into the one event after it.
+                tokio::time::sleep_until(next_allowed).await;
                 loop {
                     tokio::select! {
                         result = membership_rx.changed() => result.ok()?,
@@ -887,7 +890,8 @@ impl SwimHandle {
                         reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
                     if current != previous {
                         previous = current;
-                        return Some(((), (membership_rx, state_rx, runtime_rx, previous)));
+                        let window_end = tokio::time::Instant::now() + RECONCILE_SPACING;
+                        return Some(((), (membership_rx, state_rx, runtime_rx, previous, window_end)));
                     }
                 }
             },
@@ -1004,6 +1008,9 @@ struct ReconciliationMember {
     /// Peer signals address.
     signals_address: Option<String>,
 }
+
+/// Least time between gossip-driven reconciles: the first change reconciles at once, a burst after it once.
+pub(crate) const RECONCILE_SPACING: Duration = Duration::from_secs(2);
 
 /// Build the deduplicated view used by [`SwimHandle::reconciliation_events`].
 fn reconciliation_view(
@@ -1187,6 +1194,7 @@ async fn run_loop(
     let mut seed_addrs = config.seeds.clone();
     let mut next_seed_announce_at = Instant::now() + Duration::from_secs(5);
     let mut gateway_address = config.gateway_address.clone();
+    let mut ever_advertised = is_advertised(gateway_address.as_deref());
     let Some(mut gateway_address_revision) = revisions.take() else {
         tracing::error!("SWIM revision lease exhausted during startup");
         return;
@@ -1269,7 +1277,11 @@ async fn run_loop(
                         // latest gateway address attached to already-known members.
                         publish_members(&channels.snapshot_tx, &tracked, Instant::now(), &node);
                         let now = Instant::now();
-                        let advertises = gateway_address.is_some() || config.signals_address.is_some();
+                        let advertises = republishes_addresses(
+                            gateway_address.as_deref(),
+                            config.signals_address.as_deref(),
+                            ever_advertised,
+                        );
                         if advertises && now >= next_gateway_republish_at {
                             let Some(revision) = revisions.take() else {
                                 tracing::warn!("SWIM revisions exhausted; address republish waits for renewal");
@@ -1456,6 +1468,7 @@ async fn run_loop(
             }
             Ok(()) = gateway_loop_rx.changed() => {
                 gateway_address.clone_from(&gateway_loop_rx.borrow_and_update());
+                ever_advertised |= is_advertised(gateway_address.as_deref());
                 if let Some(addr) = gateway_address.as_deref() {
                     let Some(revision) = revisions.take() else {
                         tracing::warn!("SWIM revisions exhausted; the address change waits for renewal");
@@ -1493,6 +1506,24 @@ fn canonical_state_payload(broadcast: &swim::StateBroadcast) -> Result<Vec<u8>, 
     let mut canonical = broadcast.clone();
     canonical.revision = 0;
     canonical.encode().map_err(|error| error.to_string())
+}
+
+/// Whether the periodic address republish has anything to say.
+///
+/// A withdrawal (empty gateway) republishes like any address once one was advertised, so lossy gossip
+/// and late joiners still converge; a site that never advertised one stays quiet.
+fn republishes_addresses(gateway_address: Option<&str>, signals_address: Option<&str>, ever_advertised: bool) -> bool {
+    let gateway = match gateway_address {
+        Some("") => ever_advertised,
+        Some(_) => true,
+        None => false,
+    };
+    gateway || signals_address.is_some()
+}
+
+/// Whether `gateway_address` names a real address rather than a withdrawal.
+fn is_advertised(gateway_address: Option<&str>) -> bool {
+    gateway_address.is_some_and(|addr| !addr.is_empty())
 }
 
 /// Queue a broadcast of this site's gateway and signals addresses, without `grid_id`.
@@ -1750,6 +1781,26 @@ mod tests {
     use futures::StreamExt as _;
 
     use super::*;
+
+    #[test]
+    fn a_withdrawn_gateway_keeps_republishing_once_advertised() {
+        assert!(!republishes_addresses(None, None, false));
+        assert!(
+            !republishes_addresses(Some(""), None, false),
+            "nothing was ever advertised, so there is nothing to withdraw"
+        );
+        assert!(
+            republishes_addresses(Some(""), None, true),
+            "a withdrawal republishes so lossy gossip and late joiners drop the stale address"
+        );
+        assert!(republishes_addresses(Some("10.0.0.9:8443"), None, true));
+        assert!(
+            republishes_addresses(Some(""), Some("10.0.0.9:9091"), false),
+            "signals keep the round going"
+        );
+        assert!(!is_advertised(Some("")));
+        assert!(is_advertised(Some("10.0.0.9:8443")));
+    }
 
     #[test]
     fn a_pending_key_holds_both_directions() {
@@ -2312,7 +2363,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_gossip_changes_reconciles_at_most_once_per_window() {
+        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let mut events = Box::pin(handle.reconciliation_events());
+        let at = |age: u64| MembershipSnapshot {
+            members: vec![reconciliation_member(MemberStatus::Suspect, age)],
+        };
+
+        drop(snapshot_tx.send(at(0)));
+        assert!(events.next().await.is_some(), "the first change reconciles at once");
+        let started = tokio::time::Instant::now();
+        for bucket in 1..=10 {
+            drop(snapshot_tx.send(at(bucket * 5)));
+        }
+        assert!(events.next().await.is_some(), "the burst coalesces into one event");
+        assert!(started.elapsed() >= RECONCILE_SPACING, "not before the window closes");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.next())
+                .await
+                .is_err(),
+            "nothing left over from the burst"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     #[expect(
         clippy::too_many_lines,
         reason = "one ordered test proves deduplication across membership, health, and provider-state changes"
@@ -2334,7 +2409,7 @@ mod tests {
         };
         drop(snapshot_tx.send(alive.clone()));
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), events.next())
+            tokio::time::timeout(RECONCILE_SPACING + Duration::from_secs(1), events.next())
                 .await
                 .is_ok_and(|event| event.is_some()),
             "a new member must trigger reconciliation"
@@ -2356,7 +2431,7 @@ mod tests {
         };
         drop(snapshot_tx.send(suspect));
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), events.next())
+            tokio::time::timeout(RECONCILE_SPACING + Duration::from_secs(1), events.next())
                 .await
                 .is_ok_and(|event| event.is_some()),
             "a health-state change must trigger reconciliation"
@@ -2378,7 +2453,7 @@ mod tests {
         };
         drop(snapshot_tx.send(suspect_next_age_bucket));
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), events.next())
+            tokio::time::timeout(RECONCILE_SPACING + Duration::from_secs(1), events.next())
                 .await
                 .is_ok_and(|event| event.is_some()),
             "crossing a suspect age bucket must trigger stale-policy reconciliation"
@@ -2402,7 +2477,7 @@ mod tests {
         });
         drop(state_tx.send(provider_state.clone()));
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), events.next())
+            tokio::time::timeout(RECONCILE_SPACING + Duration::from_secs(1), events.next())
                 .await
                 .is_ok_and(|event| event.is_some()),
             "a distributed provider-state change must trigger reconciliation"
@@ -2418,7 +2493,7 @@ mod tests {
 
         handle.runtime_tx.send_replace(false);
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), events.next())
+            tokio::time::timeout(RECONCILE_SPACING + Duration::from_secs(1), events.next())
                 .await
                 .is_ok_and(|event| event.is_some()),
             "runtime termination must trigger reconciliation"

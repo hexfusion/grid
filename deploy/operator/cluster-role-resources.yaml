@@ -22,13 +22,12 @@ rules:
   # rotation is detected by bounded requeue (60s for TLS-configured
   # providers).
   #
-  # All writes use server-side apply (patch).  SSA on a non-existent
-  # resource requires create permission, so both create and patch are
-  # granted.  The namespace for each Secret is declared in the CRD
-  # spec (SecretRef.namespace).
+  # Writes only create: auto-enroll stores the site identity, and the
+  # dev CA path (GRID_DEV_SELF_SIGNED_CA) creates absent Secrets. The
+  # operator never patches an existing Secret.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "create", "patch"]
+    verbs: ["get", "create"]
 
   # ── Services (namespaced) ───────────────────────────────────────────
   #

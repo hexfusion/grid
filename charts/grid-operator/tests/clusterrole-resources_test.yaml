@@ -9,4 +9,4 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["get", "create", "patch"]
+            verbs: ["get", "create"]

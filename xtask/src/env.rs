@@ -5800,9 +5800,10 @@ fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
         ("patch", "inferenceproviders.grid.praxis-proxy.io/status", None),
         ("get", "secrets", Some("default")),
         ("create", "secrets", Some("default")),
-        ("patch", "secrets", Some("default")),
         ("create", "configmaps", Some("default")),
         ("patch", "configmaps", Some("default")),
+        ("get", "services/consumer-gateway", Some("default")),
+        ("get", "services/other-gateway", Some("default")),
     ];
     for (verb, resource, ns) in checks {
         let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
@@ -5822,6 +5823,7 @@ fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let checks: &[(&str, &str, Option<&str>)] = &[
         ("list", "secrets", Some("default")),
+        ("patch", "secrets", Some("default")),
         ("delete", "secrets", Some("default")),
         ("create", "pods", Some("default")),
         ("get", "pods", Some("default")),
@@ -5829,6 +5831,8 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
         ("delete", "gridnetworks.grid.praxis-proxy.io", None),
         ("get", "secrets", Some("kube-system")),
         ("patch", "configmaps", Some("kube-system")),
+        ("list", "services", Some("default")),
+        ("watch", "services", Some("default")),
     ];
     for (verb, resource, ns) in checks {
         let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
@@ -6003,7 +6007,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     eprintln!(
         "verify-operator-install-rbac: PASS — install manifests apply cleanly; \
          positive RBAC checks pass; negative RBAC checks (including namespace-scoped) pass; \
-         in-cluster operator reconcile succeeds; Secret patch and ConfigMap patch verified"
+         in-cluster operator reconcile succeeds; Secret create and existence checks and ConfigMap patch verified"
     );
     Ok(())
 }

@@ -47,8 +47,6 @@ The AGN Operator will create:
 
 - `ConfigMap/grid-overlay-example-consumer-gateway` - routing overlay for
   Praxis AI
-- `Secret/grid-ca-cert` - Grid CA certificate (auto-generated)  
-- `Secret/grid-site-cert` - site certificate for this cluster (auto-generated)
 
 ## What This Proves
 

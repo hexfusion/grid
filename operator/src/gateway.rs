@@ -133,8 +133,8 @@ async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration, confi
             Ok(discovery) => {
                 log_discovery(&discovery, config, is_new(last.as_ref(), &discovery));
                 // Re-announce even if unchanged: a peer may have joined since.
-                if let Discovery::Found(addr) = &discovery
-                    && let Err(e) = swim.set_gateway_address(Some(addr.clone()))
+                if let Some(advertised) = advertisement(last.as_ref(), &discovery)
+                    && let Err(e) = swim.set_gateway_address(Some(advertised))
                 {
                     tracing::warn!(error = %e, "failed to update gateway address on SWIM handle");
                 }
@@ -175,6 +175,17 @@ async fn discover_from_service(client: &Client, config: &Config) -> Result<Disco
         Some(svc) => extract_lb_address(&svc, config.port).map_or(Discovery::NoAddress, Discovery::Found),
         None => Discovery::NoService,
     })
+}
+
+/// What to gossip after `next`: the found address every poll, or an empty one when the outcome changes.
+///
+/// Peers read an empty gateway address as withdrawn, so a lost Service stops drawing traffic, including one
+/// an earlier operator run advertised before a restart.
+fn advertisement(last: Option<&Discovery>, next: &Discovery) -> Option<String> {
+    match next {
+        Discovery::Found(addr) => Some(addr.clone()),
+        Discovery::NoAddress | Discovery::NoService => is_new(last, next).then(String::new),
+    }
 }
 
 /// Whether `next` differs from the `last` outcome, so a steady state logs once.
@@ -291,6 +302,32 @@ mod tests {
         }
         Cli::try_parse_from(std::iter::once("test").chain(args.iter().copied())).map(|c| c.gateway)
     }
+
+    #[test]
+    fn a_missing_address_is_withdrawn_once_per_change() {
+        let found = Discovery::Found("10.0.0.9:8443".to_owned());
+        assert_eq!(advertisement(None, &found).as_deref(), Some("10.0.0.9:8443"));
+        assert_eq!(
+            advertisement(Some(&found), &found).as_deref(),
+            Some("10.0.0.9:8443"),
+            "re-announced"
+        );
+        for lost in [Discovery::NoAddress, Discovery::NoService] {
+            assert_eq!(advertisement(Some(&found), &lost).as_deref(), Some(""), "withdrawn");
+            assert_eq!(
+                advertisement(None, &lost).as_deref(),
+                Some(""),
+                "withdrawn after a restart too"
+            );
+            assert_eq!(advertisement(Some(&lost), &lost), None, "nothing new to say");
+        }
+        assert_eq!(
+            advertisement(Some(&Discovery::NoAddress), &Discovery::NoService).as_deref(),
+            Some(""),
+            "a changed outcome re-announces the withdrawal"
+        );
+    }
+
 
     #[test]
     fn steady_discovery_outcome_logs_once() {

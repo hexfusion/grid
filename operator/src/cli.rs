@@ -29,6 +29,14 @@ pub struct Cli {
     /// Consumer Praxis config rendering options.
     #[command(flatten)]
     pub consumer: ConsumerArgs,
+
+    /// Mint a self-signed grid CA and site certificate when both referenced Secrets are absent; dev only.
+    #[arg(
+        long = "dev-self-signed-ca",
+        env = "GRID_DEV_SELF_SIGNED_CA",
+        default_value_t = false
+    )]
+    pub dev_self_signed_ca: bool,
 }
 
 /// How the operator renders consumer Praxis config, deployment settings rather than grid intent.

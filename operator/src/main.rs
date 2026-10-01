@@ -146,6 +146,7 @@ async fn main() {
                 tls_cert_mount_path: config.consumer.tls_cert_mount_path.clone(),
                 listener_port: config.consumer.listener_port,
             })
+            .with_dev_self_signed_ca(config.dev_self_signed_ca)
             .hold_membership(),
     );
 

@@ -205,7 +205,7 @@ granted for `secrets` and `configmaps`.  `delete` and
 
 | Resource | Verbs | Why |
 |---|---|---|
-| `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
+| `secrets` | `get`, `create` | Read TLS certs, SWIM key, credential refs. Create the enrolled site identity, and a dev CA only with `GRID_DEV_SELF_SIGNED_CA`. Never patch an existing `Secret` |
 | `configmaps` | `create`, `patch` | SSA-create routing overlay and consumer config `ConfigMaps` |
 
 The `grid-operator-resources` `ClusterRole` is never bound
@@ -371,12 +371,15 @@ spec:
 ```
 
 The GridNetwork controller:
-1. Generates a grid CA via `certs`
-2. Generates this site's certificate (DNS SAN:
-   `{site-name}.grid.internal`, dual EKU for mTLS)
-3. Stores both in Kubernetes Secrets
-4. Starts the SWIM runtime with seed peers
-5. Sets `status.phase: Initializing`
+1. Reads both Secrets. If either is missing, it reports `Ready=False` with
+   reason `TrustMaterialMissing` and a Warning event, and generates nothing.
+2. Only when the operator runs with `GRID_DEV_SELF_SIGNED_CA=true` (chart value
+   `devSelfSignedCa`), both Secrets are absent, and both are in the operator
+   namespace, it creates a self-signed dev CA and this site's certificate (DNS
+   SAN `{site-name}.grid.internal`, dual EKU for mTLS). It never overwrites a
+   `Secret` that exists.
+3. Starts the SWIM runtime with seed peers
+4. Sets `status.phase: Initializing`
 
 ### CRD-driven seeds
 
@@ -897,6 +900,10 @@ GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
 - When absent or empty and no LoadBalancer Service exists: auto-discovered
   `GridSite` records have no egress address and stay in `Discovered`
   phase until the Service appears
+- When the Service is missing or has no LoadBalancer address, including right
+  after an operator restart, the operator gossips an empty address once per
+  change, and peers clear `status.discovered.egressAddress` instead of probing
+  an old one
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
   and the data-plane gateway address are distinct
 

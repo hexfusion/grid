@@ -133,6 +133,11 @@ gateway:
   # GRID_GATEWAY_PORT.
   port: ""
 
+# -- Mint a self-signed grid CA and site certificate when a GridNetwork names
+# TLS Secrets that do not exist. Dev only: production Secrets come from
+# enrollment or your own CA. Maps to GRID_DEV_SELF_SIGNED_CA.
+devSelfSignedCa: false
+
 # -- How the operator renders consumer and serving Praxis config for gateways.
 consumer:
   # -- Directory the consumer pod mounts credential Secrets under. Maps to

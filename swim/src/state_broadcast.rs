@@ -2485,6 +2485,26 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_gateway_address_replaces_the_last_one_as_a_withdrawal() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("local".to_owned(), 8);
+        let gateway = |revision: u64, addr: &str| {
+            StateBroadcast::new(
+                "a".to_owned(),
+                revision,
+                GridStateSnapshot::new("a".to_owned()),
+                Some(addr.to_owned()),
+            )
+        };
+        drop(receive(&mut handler, &gateway(1, "gw:8080")));
+        drop(receive(&mut handler, &gateway(2, "")));
+        assert_eq!(
+            handler.gateway_addrs().get("a").map(String::as_str),
+            Some(""),
+            "an empty address at a higher revision replaces the held address"
+        );
+    }
+
+    #[test]
     fn an_unchanged_republish_wakes_no_reader() {
         let (mut handler, _control) = StateBroadcastHandler::with_capacity("local".to_owned(), 8);
         let mut gateway = handler.subscribe_gateway_addrs();

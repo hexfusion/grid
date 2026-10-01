@@ -283,6 +283,7 @@
         }
       }
     },
+    "devSelfSignedCa": { "type": "boolean" },
     "consumer": {
       "type": "object",
       "additionalProperties": false,

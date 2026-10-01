@@ -1,0 +1,21 @@
+suite: dev self-signed CA
+templates:
+  - templates/deployment.yaml
+tests:
+  - it: leaves dev CA minting off by default
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_DEV_SELF_SIGNED_CA
+            value: "false"
+
+  - it: turns dev CA minting on only when asked
+    set:
+      devSelfSignedCa: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_DEV_SELF_SIGNED_CA
+            value: "true"

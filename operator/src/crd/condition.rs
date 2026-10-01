@@ -135,11 +135,17 @@ impl Rejection {
         }
     }
 
-    /// Whether `previous` already reports this rejection, so no new event is due.
+    /// Whether `previous` already reports this rejection on `Accepted`, so no new event is due.
     #[must_use]
     pub fn already_reported(&self, previous: &[Condition]) -> bool {
-        find(previous, ACCEPTED)
-            .is_some_and(|accepted| accepted.status == ConditionStatus::False && accepted.reason == self.reason)
+        self.reported_on(previous, ACCEPTED)
+    }
+
+    /// Whether `previous` already reports this as condition `type_` being `False`.
+    #[must_use]
+    pub fn reported_on(&self, previous: &[Condition], type_: &str) -> bool {
+        find(previous, type_)
+            .is_some_and(|condition| condition.status == ConditionStatus::False && condition.reason == self.reason)
     }
 }
 
@@ -238,11 +244,13 @@ pub fn site_conditions(phase: &super::grid_site::GridSitePhase, reason: &str) ->
 
 /// `Accepted`, `Ready`, and `DiscoveryConflict` for a network in `phase`.
 ///
-/// `Accepted` reflects only the network's own spec; `conflicts` name discovered members it could not adopt.
+/// `Accepted` reflects only the network's own spec, `unready` holds `Ready` false whatever the phase,
+/// and `conflicts` name discovered members it could not adopt.
 #[must_use]
 pub fn network_conditions(
     phase: &super::grid_network::GridNetworkPhase,
     rejection: Option<&Rejection>,
+    unready: Option<&Rejection>,
     conflicts: &[String],
 ) -> Vec<Observed> {
     use super::grid_network::GridNetworkPhase;
@@ -253,6 +261,9 @@ pub fn network_conditions(
         GridNetworkPhase::Initializing => Observed::new(READY, ConditionStatus::Unknown, "Initializing"),
         GridNetworkPhase::Degraded => Observed::new(READY, ConditionStatus::False, "Degraded"),
     };
+    let ready = unready.map_or(ready, |unready| {
+        Observed::new(READY, ConditionStatus::False, unready.reason).with_message(unready.message.clone())
+    });
     let accepted = rejection.map_or_else(
         || Observed::new(ACCEPTED, ConditionStatus::True, "Valid"),
         |rejection| {
@@ -394,15 +405,18 @@ mod tests {
     fn network_ready_follows_the_phase() {
         use crate::crd::grid_network::GridNetworkPhase;
         assert_eq!(
-            status_of(&network_conditions(&GridNetworkPhase::Active, None, &[]), READY),
+            status_of(&network_conditions(&GridNetworkPhase::Active, None, None, &[]), READY),
             ConditionStatus::True
         );
         assert_eq!(
-            status_of(&network_conditions(&GridNetworkPhase::Degraded, None, &[]), READY),
+            status_of(&network_conditions(&GridNetworkPhase::Degraded, None, None, &[]), READY),
             ConditionStatus::False
         );
         assert_eq!(
-            status_of(&network_conditions(&GridNetworkPhase::Initializing, None, &[]), READY),
+            status_of(
+                &network_conditions(&GridNetworkPhase::Initializing, None, None, &[]),
+                READY
+            ),
             ConditionStatus::Unknown
         );
     }
@@ -411,7 +425,7 @@ mod tests {
     fn a_discovery_name_collision_is_a_discovery_conflict_not_a_rejection() {
         use crate::crd::grid_network::GridNetworkPhase;
         let conflicts = vec!["SWIM member east not adopted: GridSite east belongs to network other".to_owned()];
-        let observed = network_conditions(&GridNetworkPhase::Active, None, &conflicts);
+        let observed = network_conditions(&GridNetworkPhase::Active, None, None, &conflicts);
         let conflict = observed
             .iter()
             .find(|o| o.type_ == DISCOVERY_CONFLICT)
@@ -432,9 +446,29 @@ mod tests {
     }
 
     #[test]
+    fn missing_trust_material_holds_network_ready_false_whatever_the_phase() {
+        use crate::crd::grid_network::GridNetworkPhase;
+        let missing = Rejection::new("TrustMaterialMissing", "Secret grid/site not found");
+        let observed = network_conditions(&GridNetworkPhase::Active, None, Some(&missing), &[]);
+        let ready = observed
+            .iter()
+            .find(|o| o.type_ == READY)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            (ready.status, ready.reason.as_str()),
+            (ConditionStatus::False, "TrustMaterialMissing")
+        );
+        assert_eq!(
+            status_of(&observed, ACCEPTED),
+            ConditionStatus::True,
+            "the spec itself is valid"
+        );
+    }
+
+    #[test]
     fn a_network_without_conflicts_reports_discovery_conflict_false() {
         use crate::crd::grid_network::GridNetworkPhase;
-        let observed = network_conditions(&GridNetworkPhase::Active, None, &[]);
+        let observed = network_conditions(&GridNetworkPhase::Active, None, None, &[]);
         assert_eq!(status_of(&observed, DISCOVERY_CONFLICT), ConditionStatus::False);
     }
 
@@ -442,7 +476,7 @@ mod tests {
     fn a_network_rejection_and_conflicts_report_separately() {
         use crate::crd::grid_network::GridNetworkPhase;
         let rejection = Rejection::new("BudgetPolicyInvalid", "duplicate tenantId a");
-        let observed = network_conditions(&GridNetworkPhase::Pending, Some(&rejection), &["c".to_owned()]);
+        let observed = network_conditions(&GridNetworkPhase::Pending, Some(&rejection), None, &["c".to_owned()]);
         let accepted = observed
             .iter()
             .find(|o| o.type_ == ACCEPTED)

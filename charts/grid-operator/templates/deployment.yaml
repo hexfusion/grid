@@ -107,6 +107,8 @@ spec:
               value: {{ .Values.consumer.tlsCertMountPath | quote }}
             - name: GRID_CONSUMER_LISTENER_PORT
               value: {{ .Values.consumer.listenerPort | quote }}
+            - name: GRID_DEV_SELF_SIGNED_CA
+              value: {{ .Values.devSelfSignedCa | quote }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}
             - name: RUST_LOG

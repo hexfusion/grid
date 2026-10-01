@@ -28,8 +28,8 @@ spec:
         # Cluster endpoints populated by gateway deployment or platform automation
         clusterEndpoints: []
 
-  # TLS configuration (operator will generate if absent)
+  # TLS Secrets from enrollment or your own CA; null runs without grid TLS
   tls:
-    caSecretRef: null      # Auto-generated
-    siteSecretRef: null    # Auto-generated
+    caSecretRef: null
+    siteSecretRef: null
     swimKeyRef: null       # Unencrypted SWIM for this example

@@ -128,14 +128,15 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) ->
     if let Some(rejection) = validate_provider_config(&provider) {
         let previous = provider.status.as_ref().map_or(&[][..], |s| s.conditions.as_slice());
         let object_ref = provider.object_ref(&());
-        Box::pin(super::publish_rejection(
-            &client,
-            "inference-provider-controller",
-            &object_ref,
-            previous,
-            &rejection,
-        ))
-        .await;
+        if !rejection.reported_on(previous, condition::ACCEPTED) {
+            Box::pin(super::publish_rejection(
+                &client,
+                "inference-provider-controller",
+                &object_ref,
+                &rejection,
+            ))
+            .await;
+        }
     }
     let (phase, matching_sites, reason) = Box::pin(resolve_phase_and_sites(&provider, &client)).await?;
     let generation = provider.metadata.generation.unwrap_or(0);

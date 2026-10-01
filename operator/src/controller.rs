@@ -26,19 +26,15 @@ use kube::{
     runtime::events::{Event, EventType, Recorder, Reporter},
 };
 
-use crate::crd::condition::{Condition, Rejection};
+use crate::crd::condition::Rejection;
 
-/// Publish a Warning event for `rejection` unless `previous` conditions already report it.
+/// Publish a Warning event for `rejection`; callers skip one their conditions already report.
 pub(crate) async fn publish_rejection(
     client: &Client,
     controller: &str,
     object_ref: &ObjectReference,
-    previous: &[Condition],
     rejection: &Rejection,
 ) {
-    if rejection.already_reported(previous) {
-        return;
-    }
     tracing::warn!(reason = rejection.reason, message = %rejection.message, "spec rejected");
     let reporter = Reporter {
         controller: controller.to_owned(),
