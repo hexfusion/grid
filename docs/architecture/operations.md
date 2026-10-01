@@ -25,6 +25,8 @@ To grant resource access to additional namespaces:
 ```console
 helm upgrade grid-operator \
   oci://ghcr.io/praxis-proxy/charts/grid-operator \
+  --version <version> \
+  --reuse-values \
   --set "resourceNamespaces={app-ns,data-ns}" \
   --namespace grid-system
 ```
@@ -33,10 +35,20 @@ The chart installs and upgrades the CRDs. A platform that owns them sets
 `crds.enabled: false`. The chart README covers adopting CRDs that an older
 release installed.
 
-Uninstalling the chart removes namespaced resources but retains CRDs.
+Uninstalling the chart removes namespaced resources. It retains the CRDs while
+`crds.keep` is true, which is the default.
 Custom resources created by other chart releases (e.g., grid-site) are
 not affected. See the [chart README](../../charts/grid-operator/README.md)
 for the full values reference.
+
+`enrollment.enabled`, `signals.enabled`, and the SWIM Service default to off.
+Turning on enrollment also turns on a LoadBalancer SWIM Service and sets
+`gateway.serviceName` to `grid-gateway`. Signals need `swim.service.enabled`
+and, on a LoadBalancer, the `Local` external traffic policy. With enrollment,
+the `grid-enrollment` chart runs the service that issues site identity, and its
+bootstrap Job creates the database credentials Secret. See
+[Hub and Site Install](../../examples/helm/hub-site/README.md) for the full
+flow.
 
 **Option 2: Kustomize**
 
@@ -46,16 +58,6 @@ kubectl apply -k deploy/
 
 # Or step-by-step:
 kubectl apply -k deploy/crds/
-kubectl apply -k deploy/operator/
-```
-
-**Option 2: Direct YAML**
-
-```console
-# Apply CRDs first
-kubectl apply -k deploy/crds/
-
-# Apply operator resources with Kustomize
 kubectl apply -k deploy/operator/
 ```
 
@@ -102,11 +104,14 @@ The install package creates:
 | `ClusterRoleBinding` | `grid-operator-crd` | cluster |
 | `ClusterRole` | `grid-operator-resources` | cluster (verb definitions only) |
 | `RoleBinding` | `grid-operator-resources` | `default` namespace |
+| `RoleBinding` | `grid-operator-resources` | `grid-system` namespace |
 | `Deployment` | `grid-operator` | `grid-system` |
 
 The operator runs as a single binary with multiple
-controllers (one per CRD type) in the same process.  No
-SWIM runtime starts until a `GridNetwork` resource exists.
+controllers (one per CRD type) in the same process. The SWIM
+runtime starts with the process when `GRID_SWIM_BIND_ADDR` is set. With
+`GRID_SWIM_REQUIRE_KEY`, it holds all traffic until a `GridNetwork` loads its
+key or declares none.
 
 **Important**: AGN deploys only the operator and CRDs. Cluster lifecycle,
 Praxis AI gateways, inference runtimes, load-balancer integrations, and DNS
@@ -119,7 +124,7 @@ Praxis AI gateway deployment is separate and requires:
 
 ### Operator image
 
-The intended project-owned operator image path is:
+The project-owned operator image path is:
 
 ```
 ghcr.io/praxis-proxy/grid-operator
@@ -132,8 +137,8 @@ versioned images with SBOM and provenance attestations.
 
 | Tag | Mutability | When pushed |
 |---|---|---|
-| `sha-<7-char-commit>` | Immutable | Used once publishing is enabled |
-| `v<version>` | Immutable release tag | Used once releases are cut |
+| `sha-<7-char-commit>` | Immutable | Pushed for every commit to `main` |
+| `v<version>` | Immutable release tag | Pushed for each release tag |
 
 Deployments should pin an immutable digest:
 
@@ -161,8 +166,8 @@ after the tagged source passes release gates.
 **Security:** the operator image contains only the
 statically linked operator binary.  No secrets, tokens,
 SWIM encryption keys, or credentials are baked into the
-image. Production publication requires an SBOM and image
-signing in the release pipeline.
+image. Release images carry an SBOM and provenance attestations.
+Images are not signed yet.
 
 ### RBAC permissions
 
@@ -174,23 +179,27 @@ RBAC is split into two `ClusterRoles`:
    `ConfigMap` access, bound via per-namespace
    `RoleBindings`.
 
-The default install includes a `RoleBinding` in the
-`default` namespace only.  All mutations use server-side
-apply (`patch`).  SSA on a non-existent resource requires
-`create` permission, so both `create` and `patch` are
-granted for `secrets` and `configmaps`.  `delete` and
-`update` are not granted.
+The Kustomize install includes a `RoleBinding` in each of the `default` and
+`grid-system` namespaces. The Helm chart binds the release namespace plus each
+entry in `resourceNamespaces`. Generated `ConfigMaps` use server-side
+apply (`patch`). SSA on a non-existent resource requires `create` permission,
+so both `create` and `patch` are granted for `configmaps`. The SWIM revision
+`ConfigMap` is read with `get` and written with `replace`, which needs
+`update`. `Secrets` are only created, never patched. `delete` is granted only
+on `gridsites`.
 
 **AGN CRDs (cluster-scoped, `grid-operator-crd`):**
 
 | Resource | Verbs | Why |
 |---|---|---|
-| `gridnetworks` | `get`, `list`, `watch`, `patch` | Controller watch loop; SSA spec/status writes |
-| `gridnetworks/status` | `get`, `patch` | Phase, connectedSites, distributedProviderCount |
-| `gridsites` | `get`, `list`, `watch`, `patch` | Controller watch; auto-creation from SWIM Alive members |
-| `gridsites/status` | `get`, `patch` | Phase, reason, conditions, discovered, observedGeneration |
-| `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch; site-selector matching |
-| `inferenceproviders/status` | `get`, `patch` | Phase, matchingSites, observedGeneration |
+| `gridnetworks` | `get`, `list`, `watch`, `patch` | Controller watch loop. The operator never writes a `GridNetwork` spec |
+| `gridnetworks/status` | `get`, `patch` | Phase, conditions, connectedSites, distributedProviderCount |
+| `gridsites` | `get`, `list`, `watch`, `patch`, `create`, `update`, `delete` | Controller watch, `siteDiscovery.mode: auto` creation from SWIM Alive members, and collection of stale auto-created sites |
+| `gridsites/status` | `get`, `patch` | Phase, conditions, discovered, observedGeneration |
+| `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch and `hostSelector` matching |
+| `inferenceproviders/status` | `get`, `patch` | Phase, conditions, matchingSites, observedGeneration |
+| `agenttoolproviders` | `get`, `list`, `watch`, `patch` | Controller watch |
+| `agenttoolproviders/status` | `get`, `patch` | Status writes |
 
 **Events (`events.k8s.io`, `grid-operator-resources`):**
 
@@ -206,7 +215,8 @@ granted for `secrets` and `configmaps`.  `delete` and
 | Resource | Verbs | Why |
 |---|---|---|
 | `secrets` | `get`, `create` | Read TLS certs, SWIM key, credential refs. Create the enrolled site identity, and a dev CA only with `GRID_DEV_SELF_SIGNED_CA`. Never patch an existing `Secret` |
-| `configmaps` | `create`, `patch` | SSA-create routing overlay and consumer config `ConfigMaps` |
+| `configmaps` | `get`, `create`, `patch`, `update` | SSA-create routing overlay, serving config, and consumer config `ConfigMaps`. Read and replace the SWIM revision `ConfigMap` |
+| `services` | `get` | Read the gateway and SWIM `Services` for address discovery, and each `gatewayRef` Service for the consumer listener port |
 
 The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
@@ -220,15 +230,13 @@ across namespaces or list `Secrets`.
 
 | Secret path | Keys read | Keys written |
 |---|---|---|
-| `spec.tls.siteSecretRef` | `tls.crt`, `tls.key` (client cert + private key for mTLS gateway probes; key bytes wrapped in `Zeroizing`) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
-| `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt`, `ca.key` (create-if-absent via SSA patch) |
+| `spec.tls.siteSecretRef` | `tls.crt`, `tls.key` (client cert + private key for mTLS gateway probes, with key bytes wrapped in `Zeroizing`) | `tls.crt`, `tls.key` (created only by enrollment or the dev CA path) |
+| `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt` (created by enrollment), or `ca.crt` and `ca.key` (created by the dev CA path) |
 | `spec.tls.swimKeyRef` | `key` (or custom key field) | — |
 | `spec.auth.secretRef` | existence + UTF-8 validation | — |
 
-Secret writes use SSA `patch` with field manager
-`grid-operator`.  SSA on a non-existent resource requires
-both `create` and `patch` permission in the target
-namespace.
+Secret writes use `create` and never replace an existing `Secret`. Without
+enrollment or `GRID_DEV_SELF_SIGNED_CA`, the operator writes no `Secret`.
 
 Credential token bytes are never written to `ConfigMaps`,
 overlays, status fields, or logs.
@@ -239,6 +247,10 @@ overlays, status fields, or logs.
 |---|---|---|---|
 | Routing overlay | `grid-overlay-{network}-{gateway}` | `routing-overlay.json`, `routing-config.json` | `GatewayRef.namespace` |
 | Consumer config | `grid-consumer-<network>-<gateway>` | `praxis.yaml` | `GatewayRef.namespace` |
+| Serving config | `grid-serving-{network}-{gateway}` | `serving-config.json` | `GatewayRef.namespace` |
+| SWIM revision high-water mark | `grid-swim-revision-hwm-<site>` | Revision and node generation | Operator namespace |
+
+The operator writes the serving config only when `signalTransport` is `poll`.
 
 The consumer config listener port comes from a `get` on the gateway Service
 `GatewayRef.name` in `GatewayRef.namespace`. The resources `ClusterRole` grants
@@ -251,17 +263,19 @@ Neither `ClusterRole` grants:
 - `pods`, `pods/exec`, `pods/log`, `pods/portforward`
 - `deployments`, `ingresses`
 - `services` `list` or `watch`, or any `services` write
-- `secrets` `delete`, `list`, `watch`
-- `configmaps` `get`, `delete`, `list`, `watch`
-- Any `update` verb (all mutations use SSA `patch`)
+- `secrets` `patch`, `update`, `delete`, `list`, `watch`
+- `configmaps` `delete`, `list`, `watch`
+- `update` on anything except `configmaps` and `gridsites`
+- `delete` on anything except `gridsites`
 
 ### Adding namespaces
 
-The default install grants `Secret` and `ConfigMap` access
-only in the `default` namespace.  To grant access in
+The Kustomize install grants `Secret` and `ConfigMap` access
+only in the `default` and `grid-system` namespaces. The Helm chart grants it in
+the release namespace and each entry in `resourceNamespaces`. To grant access in
 additional namespaces (e.g. the gateway namespace
 referenced by `GatewayRef`, or the namespace holding TLS
-`Secrets`), create a `RoleBinding` in each:
+`Secrets`) with Kustomize, create a `RoleBinding` in each:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -286,8 +300,11 @@ and `auth.secretRef.namespace` in your CRD specs.
 
 ### Deployment configuration
 
-The `Deployment` in `deploy/operator/deployment.yaml`
-exposes SWIM configuration through environment variables:
+The operator binary reads the environment variables below. The `Deployment` in
+`deploy/operator/deployment.yaml` sets only the SWIM bind and advertise
+addresses, the advertise fallback, the gateway namespace and port, and the
+metrics address. The Helm
+chart sets more from its values.
 
 SWIM endpoint values accept all of these forms:
 
@@ -307,7 +324,7 @@ unrelated address.
 | Variable | Purpose |
 |---|---|
 | `GRID_SWIM_BIND_ADDR` | UDP address to bind the SWIM listener |
-| `GRID_SWIM_ADVERTISE_ADDR` | Advertised SWIM endpoint; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` and defaults to `$(POD_IP):7946` |
+| `GRID_SWIM_ADVERTISE_ADDR` | Advertised SWIM endpoint. Accepts `ip:port`, `[ipv6]:port`, or `hostname:port`. Unset, the operator advertises the bind address and refuses to start if that address is unspecified. The Kustomize `Deployment` sets it to `$(POD_IP):7946` |
 | `GRID_SWIM_SERVICE_NAME` | SWIM Service in the operator namespace, which must be type LoadBalancer. The operator advertises its LoadBalancer address, waiting for it without a fallback and reporting not ready until then. Controllers run during the wait, and writes derived from membership wait for a first peer or a 15 second grace. When three polls in a row no longer list the advertised hostname or IP, the operator leaves the cluster and exits, so the restarted pod advertises the new one |
 | `GRID_SWIM_ADVERTISE_FALLBACK` | Marks a `GRID_SWIM_ADVERTISE_ADDR` equal to it as the Pod IP default. The operator then builds the Pod IP endpoint itself, bracketing IPv6, or discovers the LoadBalancer address when `GRID_SWIM_SERVICE_NAME` names a Service. An older operator ignores it and advertises the Pod IP |
 | `GRID_SWIM_REQUIRE_KEY` | Hold all SWIM traffic until the `GridNetwork` key loads or the network declares none. Defaults to `true`. With `false`, SWIM is plaintext while no network exists |
@@ -322,6 +339,23 @@ unrelated address.
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
 | `GRID_GATEWAY_PORT` | Port appended to discovered address (default: `8080`) |
 | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
+| `GRID_METRICS_ADDR` | Address serving `/metrics`, `/healthz`, and `/readyz` (default: `0.0.0.0:9090`) |
+| `GRID_SIGNALS_LOCAL_ADDR` | This site's own signals endpoint, passed to its gateway in the serving config. Blank leaves it unset |
+| `GRID_ENROLL_ENABLED` | Enroll on startup when the site identity Secret is absent |
+| `GRID_ENROLL_URL` | Enrollment service base URL, which must be https |
+| `GRID_ENROLL_CA_FILE` | PEM bundle pinning the enrollment server |
+| `GRID_ENROLL_GRID_CA_FILE` | Grid CA anchors the returned CA must match. Defaults to `GRID_ENROLL_CA_FILE` |
+| `GRID_ENROLL_SITE_NAME` | Site name the token pins |
+| `GRID_ENROLL_TOKEN_SECRET` | Secret in the operator namespace holding the site token |
+| `GRID_ENROLL_TOKEN_SECRET_KEY` | Key of the token within that Secret (default: `token`) |
+| `GRID_DEV_SELF_SIGNED_CA` | Mint a self-signed grid CA and site certificate when both referenced Secrets are absent and in the operator namespace. Dev only (default: `false`, chart value `devSelfSignedCa`) |
+| `GRID_CONSUMER_LISTENER_PORT` | Consumer config listener port when the gateway Service cannot be read (default: `8080`, chart value `consumer.listenerPort`) |
+| `GRID_CONSUMER_CREDENTIAL_MOUNT_BASE` | Directory the consumer pod mounts credential Secrets under (default: `/run/secrets/grid-credentials`, chart value `consumer.credentialMountBase`) |
+| `GRID_CONSUMER_TLS_CERT_MOUNT_PATH` | Directory the consumer pod mounts its grid TLS Secret at (default: `/etc/praxis/tls`, chart value `consumer.tlsCertMountPath`) |
+
+The signals listener and peer poller run only when `signalTransport` is `poll`.
+The operator reads `signalTransport` and `peerTrust` once at startup, so a
+change needs an operator restart.
 
 The signals listener caps handshakes per client source address. Behind a
 LoadBalancer, set `externalTrafficPolicy: Local` on the Service that carries
@@ -356,6 +390,8 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
+  siteDiscovery:
+    mode: auto
   seeds:
     - "10.0.0.5:7946"
   gatewayRefs:
@@ -371,15 +407,17 @@ spec:
 ```
 
 The GridNetwork controller:
-1. Reads both Secrets. If either is missing, it reports `Ready=False` with
-   reason `TrustMaterialMissing` and a Warning event, and generates nothing.
+1. Reads both Secrets. If either is missing and step 2 does not apply, it
+   reports `Ready=False` with reason `TrustMaterialMissing` and a Warning event,
+   and generates nothing.
 2. Only when the operator runs with `GRID_DEV_SELF_SIGNED_CA=true` (chart value
    `devSelfSignedCa`), both Secrets are absent, and both are in the operator
    namespace, it creates a self-signed dev CA and this site's certificate (DNS
    SAN `{site-name}.grid.internal`, dual EKU for mTLS). It never overwrites a
    `Secret` that exists.
-3. Starts the SWIM runtime with seed peers
-4. Sets `status.phase: Initializing`
+3. Announces the seeds to the SWIM runtime
+4. Sets `status.phase: Initializing`. With `caSecretRef` set and no seeds, a
+   running SWIM runtime reports `Active` instead
 
 ### CRD-driven seeds
 
@@ -406,7 +444,9 @@ reconcile, so dynamically added addresses take effect without an operator restar
 | Seeds unchanged | Re-announced idempotently; no side effects |
 
 Adding a seed requires no operator restart.  The new address is SWIM-joined within
-one reconcile cycle (~300 s default requeue, or sooner if a watch event fires).
+one reconcile cycle. The requeue interval is 300 s by default, 60 s when a provider
+uses metrics TLS, or `spec.metricsRefreshInterval` when set (capped at 60 s with
+metrics TLS). A watch event triggers one sooner.
 
 Removing a seed does not disconnect the peer.  The removed peer remains in SWIM
 membership until it stops responding to probes and is declared `Suspect` then
@@ -414,10 +454,11 @@ membership until it stops responding to probes and is declared `Suspect` then
 
 **Global-runtime semantics**
 
-The SWIM runtime is process-global — one UDP listener per operator process,
-shared across all `GridNetwork` reconciles.  Seeds from any
-`GridNetwork.spec.seeds` are announced to the same SWIM membership node.
-This is site-membership bootstrap, not per-network membership isolation.
+The operator supports one `GridNetwork` per cluster. If more than one exists at
+startup, it logs an error and exits. The SWIM runtime is process-global, with
+one UDP listener per operator process. Seeds in `GridNetwork.spec.seeds` are
+announced to that membership node. This is site-membership bootstrap, not
+per-network membership isolation.
 CRDT provider records remain network-scoped separately.
 
 Each membership identity carries a restart-scale `u64` generation. A
@@ -433,7 +474,7 @@ unqualified rolling update.
 SWIM is the AGN control-plane membership and state broadcast channel. When
 `spec.tls.swimKeyRef` is configured and the referenced Secret resolves to a
 valid 32-byte key, reconcile applies the key before announcing CRD seeds or
-publishing certificate/provider state.  From that point, outgoing SWIM UDP
+publishing provider state. From that point, outgoing SWIM UDP
 packets are encrypted and authenticated with AES-256-GCM.  Incoming packets
 that fail authentication are silently dropped; the foca membership state
 machine never sees them.
@@ -443,16 +484,16 @@ When `swimKeyRef` is absent, SWIM traffic is sent and received as cleartext
 
 If `swimKeyRef` is configured but the Secret is missing, unreadable, or not a
 valid 32-byte key, the reconcile fails before CRD seed announcement and
-certificate/provider broadcasts for that `GridNetwork`.  The SWIM runtime is
+provider broadcasts for that `GridNetwork`.  The SWIM runtime is
 process-global, so a previously loaded key remains active until restart; the
 operator does not switch to plaintext for that configured reconcile.
 
 `GRID_SWIM_ENCRYPT_KEY` is the local and Kind validation path for startup-time
 enforcement because it is available before the UDP socket starts.  It is
 process environment material and should not be treated as the production Secret
-delivery mechanism.  With CRD-backed `swimKeyRef`, the key is applied at
-`GridNetwork` reconcile time; use the environment key as well when startup-time
-plaintext acceptance must be avoided before CRD preload support exists.
+delivery mechanism. With CRD-backed `swimKeyRef` and no environment key, the
+operator reads the key from the declared Secret at startup and holds SWIM
+traffic until it loads.
 
 **SWIM encryption protects:** gossip membership packets, gateway address
 broadcasts, public certificate PEM broadcasts, and CRDT provider state broadcasts.
@@ -471,7 +512,7 @@ is verified separately. Both layers are required for production deployments.
 
 If the seed announce channel is full (capacity 16 batches), the announce is
 skipped for the current reconcile and retried on the next
-(`REQUEUE_INTERVAL = 300 s`).  Seeds are not guaranteed to be applied
+(300 s by default, as above). Seeds are not guaranteed to be applied
 immediately under heavy broadcast load.
 
 **Seed format**
@@ -486,8 +527,9 @@ non-empty list does not replace a working last-known-good set.
 
 *New seed not joining:*
 - Verify the address is a valid `IP:port`, `[IPv6]:port`, or `hostname:port`.
-- Check the operator log for `announcing CRD seeds to SWIM runtime` or
-  `new CRD seeds added` — if absent, the reconcile may not have fired yet.
+- Check the operator log for `new CRD seeds added` at `info` or
+  `announcing CRD seeds to SWIM runtime` at `debug`. If both are absent, the
+  reconcile may not have fired yet.
 - Check for `failed to queue CRD seeds for SWIM announcement` at `warn` level,
   indicating a channel-full retry.
 - Verify the remote operator is running with `GRID_SWIM_BIND_ADDR` set to the
@@ -497,7 +539,7 @@ non-empty list does not replace a working last-known-good set.
 - Expected behavior.  SWIM does not actively disconnect on seed removal.
 - Wait for the WAN probe and suspicion window. The runtime probes every five
   seconds, allows three seconds for a direct response before indirect probes,
-  and retains a suspect member for at least three probe periods before
+  and retains a suspect member for 30 seconds before
   declaring it `Dead`. `GridNetwork.status.connectedSites` then decreases.
 - If the remote operator is still running, it will rejoin as `Alive` again because
   SWIM membership is peer-to-peer and periodically announces to live and down
@@ -506,7 +548,8 @@ non-empty list does not replace a working last-known-good set.
 **Phase progression:** `GridNetwork Active` is set when
 the SWIM runtime reports at least one `Alive` peer in
 its `MembershipSnapshot`.  `Degraded` is set when peers
-are known but all are `Suspect` or `Dead`.
+are known but all are `Suspect` or `Dead`, or when the SWIM runtime has
+stopped.
 `connectedSites` reflects the live SWIM `Alive` peer
 count; `distributedProviderCount` reflects remote
 `InferenceProvider` records received via SWIM CRDT
@@ -518,19 +561,43 @@ is started without `GRID_SWIM_BIND_ADDR`).
 
 ## 3. Sites Discover Each Other
 
-When the SWIM runtime contacts a seed peer:
+Each site takes its `gridId` from `spec.gridId`, then `status.gridId`, and
+otherwise generates a UUIDv4. Sites do not negotiate it. Set the same
+`spec.gridId` on every site, or each site generates its own.
 
-**Grid ID negotiation**:
-- Neither site has a `gridId`: deterministic tie-break
-  (lexicographic site name), winner generates UUID,
-  other adopts it
-- Remote has a `gridId`, local doesn't: local adopts it
-- Both have the same `gridId`: normal join
-- Both have different `gridIds`: connection rejected
-  (separate grids)
+Each site has one `GridSite`, named by its bare site name. When SWIM
+reports a peer Alive, the `GridNetwork` controller fills that peer's `GridSite`
+`status.discovered` and moves it from `Pending` to `Discovered`. It never
+writes the spec of an existing `GridSite`. `spec.siteDiscovery.mode` decides
+what happens when no `GridSite` exists for the peer:
 
-The operator creates a `GridSite` resource for the
-discovered peer.
+- `manual`, the default: the operator creates none. Declare each peer, for
+  example with `peers` in the grid-site chart.
+- `auto`: the operator creates one with only `gridNetworkRef` and the label
+  `grid.praxis.fast/auto-discovered: "true"`, up to 256 per network. Only one
+  auto-mode `GridNetwork` runs discovery per operator.
+
+A `GridSite` without `spec.egress` probes with `siteDiscovery.defaultEgressTls`,
+`mutualTls` by default. Members the operator cannot adopt are reported on the
+`GridNetwork` `DiscoveryConflict` condition, never as a spec rejection:
+
+| Reason | Meaning |
+|---|---|
+| `SiteIdInvalid` | The member's site ID is not a DNS-1123 label |
+| `SiteIdDuplicated` | Two live addresses claim the site ID. Its gossiped egress address is withdrawn |
+| `FieldConflict` | A `GridSite` of that name belongs to another network |
+| `StaleAutoDiscoveredEgress` | An auto-created `GridSite` carries `spec.egress`, which overrides gossip |
+| `AutoDiscoveryCapReached` | The 256 auto-created `GridSites` limit is reached |
+| `UnadoptableMembers` | The conflicts have more than one reason. The message lists each |
+
+A second auto-mode `GridNetwork` reports `Accepted=False` with reason
+`AutoDiscoveryClaimed`.
+
+In `auto` mode the operator records `status.discovered.absentSince` when gossip
+loses a member and clears it when the member returns. When
+`spec.staleCandidateTtlSeconds` is set, it deletes an auto-created `GridSite`
+absent longer than that whose spec nobody edited, under a uid and
+resourceVersion precondition. Unset, it deletes none.
 
 `GridSite` status: `phase: Discovered`
 
@@ -549,23 +616,26 @@ The trust bootstrap for a remote site progresses through these steps:
 2. **Gateway address known** — the remote operator advertises its resolved gateway
    address via SWIM state broadcast.  The address is resolved by the self-discovery
    poller (Service LoadBalancer lookup) or from the `GRID_GATEWAY_ADDRESS` override.
-   The local operator stores it in `GridSite.status.discovered.egressAddress`.
-   Phase: `Connecting`.  No trust established.
+   The local operator stores it in `GridSite.status.discovered.egressAddress`
+   and probes it only when it is a literal, dialable `IP:port`. A hostname, or
+   an address such as loopback or link-local, needs `spec.egress.address`
+   instead. Phase: `Connecting`. No trust established.
 
-3. **Public cert material received** — the remote operator broadcasts its public site
-   certificate PEM.  The operator validates the PEM structure (rejects private-key markers;
-   checks for `CERTIFICATE` header) and stores it in `GridSite.status.discovered.advertisedCertPem`.
+3. **Identity policy configured**: set `spec.egress.tls.serverName` to the
+   expected DNS SAN, or leave it to default to `<site>.grid.internal`, the
+   name enrollment issues. Under the default `pin` peer trust, set
+   `spec.trust.canonicalFingerprints` to one or two independently verified
+   DER-certificate SHA-256 pins. Configure `GridNetwork.spec.tls.caSecretRef`
+   and `siteSecretRef` for server and client authentication. Under
+   `GridNetwork.spec.peerTrust.mode: spiffe`, the probe verifies the peer's
+   exact SPIFFE ID instead, and a `GridSite` that sets pins reports
+   `Accepted=False` with reason `TrustConflictsWithPeerTrust`. The provider
+   gateway's `gatewayConfig.peerTrust.mode` must match the network.
 
-4. **Identity policy configured** — set `spec.egress.tls.serverName` to the
-   expected DNS SAN and set `spec.trust.canonicalFingerprints` to one or two
-   independently verified DER-certificate SHA-256 pins. Configure
-   `GridNetwork.spec.tls.caSecretRef` and `siteSecretRef` for server and client
-   authentication.
-
-5. **Identity-aware gateway probe passes** — the `GridSite` controller performs
+4. **Identity-aware gateway probe passes**: the `GridSite` controller performs
    a bounded mTLS handshake. It verifies the CA chain, DNS SAN, client
-   authentication, and the canonical pin against the live leaf certificate.
-   Success promotes the site to `Active` with reason `TlsVerified`.
+   authentication, and the canonical pin or SPIFFE ID against the live leaf
+   certificate. Success promotes the site to `Active` with reason `TlsVerified`.
 
    ```yaml
    spec:
@@ -581,7 +651,7 @@ The trust bootstrap for a remote site progresses through these steps:
 
    See [Authentication and Access Policy](auth.md) for the trust contract.
 
-6. **Data-plane mTLS enforced** — a provider Praxis gateway validates peer
+5. **Data-plane mTLS enforced**: a provider Praxis gateway validates peer
    identity over mTLS on every request, independent of the control-plane
    phase. Deployment acceptance requires positive and negative runtime probes;
    manifest inspection alone is not evidence.
@@ -600,14 +670,11 @@ it gossiped successfully.
 
 - SWIM membership is discovery, not authorization.
 - TCP reachability proves an address accepts connections, not identity.
-- `advertisedCertPem` present means the PEM structure is valid and no private-key markers
-  were detected.  It does not prove the cert is signed by a trusted CA or that
-  the peer is authorized.
+- Gossip carries no certificate. Identity comes only from the live handshake.
 - Private keys, credential tokens, and Secret data must never be written to
   `GridSite` status, `GridNetwork` status, overlays, generated ConfigMaps, or logs.
 - The operator does not copy Kubernetes Secrets across clusters as part of site discovery.
-- The provider gateway still enforces peer identity on every request with mTLS,
-  independently of `advertisedCertPem` status.
+- The provider gateway still enforces peer identity on every request with mTLS.
 
 ### Routing eligibility
 
@@ -621,7 +688,7 @@ gateway health probe succeeded. It does not prove that Praxis loaded the latest
 routing config or authorized a particular request.
 
 Setting `Active` in Mutual mode requires the configured CA, client identity,
-server name, canonical pin, and live gateway certificate to agree. A provider
+server name, canonical pin or SPIFFE ID, and live gateway certificate to agree. A provider
 gateway independently authorizes peer identity on every data-plane request.
 `Active` alone is not evidence that request authorization succeeded.
 
@@ -630,10 +697,15 @@ gateway independently authorizes peer identity on every data-plane request.
 The `GridSite` controller verifies gateway reachability and identity against
 `spec.egress.address`, or `status.discovered.egressAddress` when the spec sets none.
 
-| Condition | Current check |
-|-----------|---------------|
-| `SWIMReachable` | SWIM membership reports the peer Alive |
-| `GatewayAddressKnown` | `spec.egress.address` or `status.discovered.egressAddress` is non-empty |
+The `GridSite` controller reports the reason of its last probe on the
+`Connected` condition, and on `Ready` while the site is not `Active`.
+
+| Reason | Current check |
+|--------|---------------|
+| `AwaitingDiscovery` | The site is `Pending` until SWIM reports the peer Alive and the `GridNetwork` controller moves it to `Discovered` |
+| `GatewayAddressMissing` | No egress address yet, so the site stays `Discovered` |
+| `GossipedAddressRefused` | The only address is a gossiped one that is not a dialable literal `IP:port`, so the site stays `Discovered`. Set `spec.egress.address` |
+| `GatewayAddressKnown` | `spec.egress.address` or a dialable `status.discovered.egressAddress` is non-empty, and the site moves to `Connecting` |
 | `TlsVerified` | Mutual TLS handshake, chain, SAN, and live-leaf pin all verify |
 | `PlaintextIneligible` | Egress is plaintext, so `Connected=False` whether or not TCP connects. Set by `spec.egress.tls.mode` or the GridNetwork `siteDiscovery.defaultEgressTls` (default `mutualTls`) |
 
@@ -653,7 +725,7 @@ satisfied.
 
 ## 7. Register Providers
 
-Users or auto-discovery create provider resources.
+Users create provider resources.
 See the [CRDs doc](crds.md) for full specs.
 
 Example — an API provider:
@@ -793,9 +865,15 @@ metrics become visible
   + Praxis file-watch reload
 ```
 
-Use `overlay.sidecar.enabled=false` for the direct ConfigMap projection
-fallback. Do not use that mode when a demo or production SLO assumes prompt
-metrics-driven route changes.
+The sidecar is off by default. Set `overlay.enabled=true` and
+`overlay.sidecar.enabled=true` to use it. With `overlay.sidecar.enabled=false`,
+the chart projects the ConfigMap directly. Do not use that mode when a demo or
+production SLO assumes prompt metrics-driven route changes.
+
+`grid-gateway` reads the file named by `GRID_SERVING_CONFIG` once at start, so
+a changed serving config takes effect after a pod restart. The
+`grid.praxis.fast/serving-digest` annotation on the `grid-serving-*`
+ConfigMap changes when the rendered content does.
 
 ## 9. Workloads Consume Providers
 
@@ -828,60 +906,51 @@ call. AGN carries the reference needed for routing and
 configuration; it does not copy Secret values between
 clusters.
 
-The native path requires a Praxis AI image that includes the
-`credential_inject` filter. AGN can render the
-file-backed filter config today, but runtime deployments must
-use an AI image with that filter merged and published.
+The native path requires Praxis AI v0.4.1 or later, which includes the
+`credential_inject` filter. The `grid-gateway` image links v0.4.1.
 
 See [Auth & Policy](auth.md) for workload access
 patterns and authentication strategies.
 
 ## GridSite trust bootstrap
 
-### Public certificate exchange
+### Peer identity
 
-When a `GridNetwork` has `spec.tls.siteSecretRef` configured, the operator reads
-the public site certificate (`tls.crt`) from that Secret on each reconcile and
-broadcasts it to SWIM peers.  Remote peers store the received certificate in
-`GridSite.status.discovered.advertisedCertPem`.
-
-To verify that a remote site's public certificate has been received:
+Gossip carries no certificate. Under `pin` peer trust, take the peer's pin from
+the peer itself, through a channel you trust. On the peer cluster, the pin is
+the SHA-256 of its site certificate's DER bytes:
 
 ```console
-kubectl get gridsite <site-name> -o jsonpath='{.status.discovered.advertisedCertPem}'
+kubectl -n <namespace> get secret grid-site-identity -o jsonpath='{.data.tls\.crt}' \
+  | base64 -d | openssl x509 -outform DER | openssl dgst -sha256 -r | cut -d' ' -f1
 ```
 
-A non-empty value means the remote operator is advertising structurally valid
-public certificate material. To advance a Mutual TLS site to `Active`, configure
-the CA and local client identity on the `GridNetwork`, then configure the
-expected `serverName` and `canonicalFingerprints` on the `GridSite`.
+To advance a Mutual TLS site to `Active`, configure
+the CA and local client identity on the `GridNetwork`, then configure
+`canonicalFingerprints`, and `serverName` when it is not `<site>.grid.internal`,
+on the `GridSite`. Under `peerTrust.mode: spiffe` the probe verifies the peer's
+SPIFFE ID and the `GridSite` sets no pins. The gateway `peerTrust.mode` must
+match the network.
 
 A site in `TrustMaterialMissing` lacks at least one required CA, client
-certificate, client key, server name, or canonical pin. Configure
-`spec.tls.siteSecretRef` on the remote `GridNetwork` to enable certificate
-advertisement, but do not derive trust solely from the advertised value.
+certificate, client key, or, under `pin` peer trust, canonical pin.
 
 ### Security rules
 
-The public certificate recorded in `status.discovered.advertisedCertPem` is **not** automatically
-trusted.  The control plane records received trust material for operator visibility.
-The provider gateway enforces mTLS peer identity and certificate validation on every
-request — the control plane record does not bypass that check.
-
-Private keys are never included in SWIM broadcasts.  The operator reads only the
-public certificate (`tls.crt`) from the site Secret, not the private key (`tls.key`).
+SWIM broadcasts carry no certificates and no keys. The provider gateway enforces
+mTLS peer identity and certificate validation on every request.
 
 ## GridSite gateway address configuration
 
 The operator resolves and advertises its data-plane gateway address to SWIM
 peers. This address is propagated through SWIM state broadcasts and used by
-receiving operators to populate `GridSite.status.discovered.egressAddress` for
-auto-discovered sites.
+receiving operators to populate `GridSite.status.discovered.egressAddress` on
+the peer's `GridSite`.
 
 **Self-discovery (default):** A background poller periodically looks up the
 `provider-gateway` LoadBalancer Service and extracts its external IP.  The
-poller retries every 5 seconds (configurable via
-`GRID_GATEWAY_DISCOVERY_INTERVAL_MS`) until the address appears, then
+poller runs only when the SWIM runtime does. It retries every 5 seconds
+(configurable via `GRID_GATEWAY_DISCOVERY_INTERVAL_MS`) until the address appears, then
 continues watching for changes.  Discovered addresses are pushed to the SWIM
 runtime via a watch channel.
 
@@ -890,44 +959,50 @@ poller entirely.
 
 ```bash
 # Self-discovery (default): operator discovers from provider-gateway Service
-GRID_GATEWAY_SERVICE_NAME=provider-gateway ./operator
+GRID_SWIM_BIND_ADDR=10.0.0.4:7946 GRID_GATEWAY_SERVICE_NAME=provider-gateway ./operator
 
 # Explicit override: skip discovery poller
-GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
+GRID_SWIM_BIND_ADDR=10.0.0.4:7946 GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
 ```
 
+The binary looks for the Service in namespace `grid-system`. The Helm chart
+uses the release namespace instead, and with enrollment it sets the Service
+name to `grid-gateway`.
+
 **Requirements:**
-- Format: `host:port` or `IP:port` (any non-empty string is accepted; the remote
-  operator stores it verbatim in `GridSite.status.discovered.egressAddress`)
-- When absent or empty and no LoadBalancer Service exists: auto-discovered
-  `GridSite` records have no egress address and stay in `Discovered`
+- Format: `host:port` or `IP:port`. The remote operator stores it verbatim in
+  `GridSite.status.discovered.egressAddress`, but probes it only when it is a
+  literal, dialable `IP:port`. Otherwise the site stays `Discovered` with reason
+  `GossipedAddressRefused` until `spec.egress.address` is set
+- When absent or empty and no LoadBalancer Service exists: peer `GridSite`
+  records have no egress address and stay in `Discovered`
   phase until the Service appears
 - When the Service is missing or has no LoadBalancer address, including right
   after an operator restart, the operator gossips an empty address once per
   change, and peers clear `status.discovered.egressAddress` instead of probing
   an old one
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
-  and the data-plane gateway address are distinct
+  and the data-plane gateway address are distinct. The signals endpoint is a
+  third address. It is gossiped from the SWIM LoadBalancer Service
+  (`grid-operator-swim`) unless `GRID_SIGNALS_ADVERTISE_ADDR` is set
 
-The current first-ingress, configured-port discovery contract is appropriate
-for the local MetalLB environment. A production endpoint is represented and
-validated by host, named port, protocol, SNI, address scope, and generation;
-arbitrary or ambiguous advertised strings do not become routable endpoints.
+Discovery takes the first LoadBalancer ingress entry's IP, or its hostname when
+it has no IP, and appends `GRID_GATEWAY_PORT`. A hostname ingress therefore
+needs `spec.egress.address` on each peer's `GridSite`.
 
 **Probe behavior:** In Mutual mode, the `GridSite` controller performs a bounded
 mTLS connection to the egress address. It verifies the configured CA,
-`serverName`, and the canonical live-certificate pin. A successful probe reports
-`reason: TlsVerified`. Connection failures move an Active site to `Unreachable`;
-identity or trust failures move it to `Connecting`.
+`serverName`, and the canonical live-certificate pin, or the SPIFFE ID under
+`spiffe` peer trust. A successful probe reports reason `TlsVerified` on the
+`Connected` condition. Connection failures move an Active site to `Unreachable`.
+Identity or trust failures move it to `Connecting`.
 
-A SWIM-advertised certificate that does not match a configured pin is recorded
-as `reason: AdvertisedCertMismatch` and does not change the phase: it arrives
-over gossip and is not trust material. Trust comes from the handshake above,
-where a pin mismatch on the live leaf is `PinMismatch` and still demotes.
+A pin mismatch on the live leaf is `PinMismatch` and demotes the site.
 
-Explicit `Plaintext` mode performs only a bounded TCP connection for
-diagnostics. It never promotes a site to `Active` and is never selected as a
-fallback when Mutual TLS configuration is incomplete or invalid.
+Explicit `plaintext` mode performs only a bounded TCP connection for
+diagnostics. It reports reason `PlaintextIneligible` with `Connected=False`,
+never promotes a site to `Active`, and is never selected as a fallback when
+Mutual TLS configuration is incomplete or invalid.
 
 ## GridSite Lifecycle Diagnostics
 
@@ -941,7 +1016,7 @@ Example output:
 
 ```
 NAME                              PHASE        NETWORK
-op-e2e-sjd-net-grid-site-b       Connecting   op-e2e-sjd-net
+grid-site-b       Connecting   op-e2e-sjd-net
 ```
 
 To see the reason and diagnostic message:
@@ -958,8 +1033,11 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.conditions[?(@
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
 | Discovered | Connecting | `GridSite` controller: egress address known |
 | Connecting | Active | `GridSite` controller: configured Mutual TLS identity probe succeeds |
-| Active | Connecting | TLS identity or trust verification fails, or the endpoint is changed to plaintext |
-| Active | Unreachable | Gateway address is missing, times out, or refuses the connection |
+| Active | Connecting | TLS identity or trust verification fails, a TLS handshake times out, or the endpoint is changed to plaintext and its TCP probe succeeds |
+| Active | Unreachable | Gateway address is missing, the TCP connect times out or fails, or the plaintext TCP probe fails |
+| Unreachable | Active | The configured identity probe succeeds |
+| Unreachable | Connecting | Trust verification fails, as for Active to Connecting |
+| Active or Unreachable | Connecting | The spec is rejected (`Accepted=False`), for example `TrustConflictsWithPeerTrust` or `ServerNameInvalid` |
 
 Security invariant: a SWIM peer must never become routable solely because it
 gossiped successfully.  Discovery, authentication, and authorization are
@@ -979,21 +1057,26 @@ separate steps.
   `provider-gateway` LoadBalancer Service exists and has an external IP assigned,
   or set `GRID_GATEWAY_ADDRESS` as an explicit override.  The self-discovery poller
   will propagate the address through SWIM once discovered.
-- Reason will be `GatewayAddressMissing`.
+- Reason will be `GatewayAddressMissing`. With reason `GossipedAddressRefused`,
+  the gossiped address is a hostname or not dialable. Set `spec.egress.address`.
 
 **Phase stays Connecting**
 
 - Check the `Connected` condition reason:
   - `TrustMaterialMissing`: configure the CA Secret, local client identity,
-    `serverName`, and canonical pin policy.
+    and, under `pin` peer trust, canonical pin policy.
+  - `PlaintextIneligible`: the egress mode is `plaintext`, which never routes.
+    Set `spec.egress.tls.mode` or `siteDiscovery.defaultEgressTls` to
+    `mutualTls`.
+  - `TrustConflictsWithPeerTrust`, `ServerNameForbidden`, or
+    `ServerNameInvalid`: the spec is rejected and `Accepted` is `False`. Fix the
+    spec. A rejected site is not probed.
   - `TrustMaterialInvalid`: trust material is malformed or oversized.
   - `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, or
     `CertificateNotYetValid`: inspect the live gateway certificate and
     configured CA/server name.
   - `PinMismatch`: the live leaf certificate does not match either configured
     canonical pin.
-  - `AdvertisedCertMismatch`: the gossiped certificate copy does not match a
-    configured pin. Diagnostic, the site stays Active.
   - `HandshakeTimeout` or `TlsProtocolError`: the TCP endpoint answered but did
     not complete the expected TLS protocol.
 
@@ -1007,15 +1090,17 @@ separate steps.
 
 The `GridSite` and `GridNetwork` controllers both write to `GridSite` status.
 The `grid-operator-crd` `ClusterRole` in `deploy/operator/cluster-role-crd.yaml`
-includes `gridsites/status` with verbs `get` and `patch`.
+(`<fullname>-crd` in the Helm chart) includes `gridsites/status` with verbs
+`get` and `patch`.
 
 ## Consumer Config
 
 When `GatewayRef.consumerConfig.enabled: true`, the AGN Operator applies a
 `ConfigMap` in the gateway's namespace on every reconcile.  The
 `grid-operator-resources` `ClusterRole` includes `configmaps` with verbs
-`create` and `patch`.  A `RoleBinding` in the gateway's namespace is required
-for the operator `ServiceAccount` to write the `ConfigMap` there.
+`get`, `create`, `patch`, and `update`. A `RoleBinding` in the gateway's
+namespace is required for the operator `ServiceAccount` to write the `ConfigMap`
+there. The Helm chart creates one for each entry in `resourceNamespaces`.
 
 Every `clusterEndpoints[]` entry must declare explicit transport intent via the
 `transport` field.  Remote/provider-gateway clusters should use
@@ -1028,8 +1113,10 @@ provider certificate SAN.  Local dev-only clusters may use
 ### Credential Secret access
 
 The generated `ConfigMap` references credential Secrets by name, namespace, and
-key — it does not read Secret values.  The operator does NOT require `get` access
-to credential Secrets in the gateway namespace for config generation.
+key and does not contain Secret values. Provider admission reads each
+credential Secret to check that it exists, the key is present, and the value is
+UTF-8. The operator therefore needs `get` on it through a `RoleBinding` in the
+Secret's namespace.
 
 The final-hop gateway or provider-side component making the final backend call
 needs the credential Secret mounted.  Secret provisioning in that cluster is
@@ -1054,23 +1141,27 @@ indirect probes. Remote provider records are treated as degraded when the peer
 is `Suspect` or `Dead`, and stale-candidate retention follows the configured
 overlay TTL policy.
 
-The current operator does not delete the `GridSite`, garbage-collect the CRDT
-record, or automatically complete a `Left` transition on process shutdown.
-Departure therefore preserves control-plane evidence and requires explicit
+The current operator does not garbage-collect the CRDT record or complete a
+`Left` transition on process shutdown. It deletes a `GridSite` only when
+`siteDiscovery.mode` is `auto`, the operator created it, nobody edited its
+spec, and the member stayed absent past `spec.staleCandidateTtlSeconds`.
+Departure otherwise preserves control-plane evidence and requires explicit
 site lifecycle cleanup by the deployment owner.
 
 ## Adding a New Site to an Existing AI Grid Network
 
 1. Deploy the AGN Operator on the new cluster
-2. Create a `GridNetwork` with any existing cluster
-   as a seed
+2. Create a `GridNetwork` with any existing cluster as a seed, and either
+   declare a `GridSite` for each peer or set `spec.siteDiscovery.mode: auto`
 3. SWIM discovers the existing cluster, which shares
    the membership list of all other sites
 4. The new site automatically discovers all grid
    members within seconds
-5. SWIM propagates public certificate material; the operator
-   verifies the explicitly configured fingerprint and advances matching sites
-   to `Active`
+5. Under `pin` peer trust, an auto-discovered `GridSite` has no pins, so it stops at
+   `TrustMaterialMissing`. Set `spec.trust.canonicalFingerprints` on it, or
+   declare the peer before it joins with `peers.<name>.address` and `digest`
+   in the grid-site chart. The operator then verifies the fingerprint and
+   advances matching sites to `Active`
 6. Once `Active`, the new site's providers are visible
    to all other sites through the routing overlay
 
@@ -1120,9 +1211,11 @@ desired revision
   -> Praxis accepted/serving revision
 ```
 
-`GridNetwork.status.consumerConfigStatus=Rendered` reports successful desired
-config rendering and apply. It does not report that the gateway loaded the
-overlay. The production contract requires gateway status for the accepted
+`GridNetwork.status.consumerConfigStatus` is a per-gateway list, and an entry
+with `phase: Rendered` reports successful desired config rendering and apply.
+It does not report that the gateway loaded the overlay. `status.overlayStatus`
+already reports the rendered and distributed revisions for each gateway. The
+production contract requires gateway status for the accepted
 revision, digest, acceptance time, age, and last rejection reason. That
 contract is not satisfied by compatibility profiles that expose only
 `Rendered` status.
@@ -1300,7 +1393,9 @@ status reconciliation reflects remote provider state in
 | `routing_cluster` | `spec.routingClusterRef` or `metadata.name` |
 | `models` | `spec.models[*].name` |
 | `backend_kind` | `spec.backendKind` |
+| `capacity_weight` | `spec.capacityWeight` |
 | `phase` | `status.phase` (including `Unavailable`) |
+| `access_policy` | `spec.accessPolicy` |
 | `metrics` | `metricsConfig` scrape results, or defaults |
 | `revision` | `metadata.resourceVersion`, falling back to `metadata.generation` |
 | `writer_id` | local SWIM site identity |
@@ -1383,13 +1478,10 @@ repository (tracked in
 [`ai#716`](https://github.com/praxis-proxy/ai/issues/716)), so
 `build-gateway-images --ai-repo <path>` cannot currently produce
 either of the first two images. That gap blocks only the
-generic-harness path — concretely, `verify-failover-under-lost-peer`
-today — not any of the three named demos above. It is itself
-soft-blocked on the in-flight, other-team-owned
-[`ai#334`](https://github.com/praxis-proxy/ai/pull/334)
-(`ext_proc` compatibility moving into the AI repository), which is
-deliberately paused pending a release-timeline decision rather than
-abandoned.
+generic-harness path, concretely `verify-failover-under-lost-peer`
+today, and not any of the three named demos above.
+[`ai#334`](https://github.com/praxis-proxy/ai/pull/334) moved `ext_proc`
+compatibility into the AI repository and merged on 2026-08-24.
 
 Use `build-gateway-images --ai-repo <path>` to build the first two images from
 the AI repository source tree. Build `grid-mock-providers:latest` separately
@@ -1434,7 +1526,7 @@ file format is:
 ```json
 {
   "network": "<grid-network-name>",
-  "local_site": "<consumer-site-name>",
+  "local_site": "<gateway-local-site-name>",
   "candidates": [
     {
       "kind": "inference_model",
@@ -1447,8 +1539,8 @@ file format is:
 }
 ```
 
-When an overlay is supplied, `intelligent_route.local_site`
-and candidates come from the overlay.  The
+When an overlay is supplied, the candidates come from the overlay.
+`intelligent_route.local_site` is always the consumer site. The
 `load_balancer` section is still generated from the
 provider endpoints in the environment config.
 

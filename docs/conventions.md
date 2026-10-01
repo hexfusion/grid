@@ -79,17 +79,16 @@ between doctests and unit/integration tests is fine.
 
 #### Coverage Floor
 
-`make coverage-check` enforces a hard floor: **90% line
-coverage and 80% region coverage** across the workspace.
-Region coverage counts every branch of every condition,
-so untested error arms and edge cases fail the gate even
-when the happy path executes every line. New code should
-land at or above the floor; the floor only ratchets up,
-never down.
+`make coverage-check` enforces a hard floor of **80% line
+coverage** across the workspace, and CI runs it. The
+convention target is 90%. New code should land at or
+above the target, and the floor only ratchets up, never
+down.
 
-Binary entrypoints (`src/main.rs`) are excluded from
-coverage. Keep them to wiring; all logic belongs in the
-library crate where it is testable and counted.
+The `xtask` crate and `tests/` directories are excluded
+from coverage. Keep binary entrypoints (`src/main.rs`)
+to wiring. All logic belongs in the library crate where
+it is testable.
 
 **`xtask` commands that generate Kubernetes or Praxis
 config** should include unit tests asserting the shape
@@ -117,7 +116,7 @@ above.
 #### Mutation Testing
 
 Coverage proves code executed; mutation testing
-(`make mutants`, weekly in CI) proves the assertions
+(`make mutants`) proves the assertions
 would notice if the code were wrong. cargo-mutants
 rewrites function bodies (return defaults, flip
 operators) and fails if the test suite still passes.
@@ -149,15 +148,17 @@ of.
 Integration tests that need external infrastructure
 (a cluster, a network endpoint) are gated behind a
 crate feature named `integration` and marked
-`#[ignore]`. They run via
-`make dev-integration`, which is equivalent to:
+`#[ignore]`. No crate defines that feature yet, so
+`make dev-integration`, which runs the command below,
+has nothing to select:
 
 ```console
 cargo test --features integration -- --ignored
 ```
 
-This keeps `make test` fast and hermetic while keeping
-end-to-end proof one command away.
+This keeps `make test` fast and hermetic. Kind-based
+end-to-end runs use the `xtask` and script flows in
+[CI Kind E2E](architecture/ci-kind-e2e.md).
 
 Prefer assertion messages over inline comments. Put the
 explanation in the assertion's message argument so it
@@ -651,25 +652,23 @@ type(scope): summary
 
 ### Pull Request Conventions
 
-Reviewability is enforced by CI
-(`.github/workflows/pr-conventions.yaml`). A PR that is
-hard to review is a defect regardless of the quality of
-its code. The gates:
+Reviewers enforce reviewability. CI
+(`.github/workflows/conventions.yaml`) checks the DCO
+trailer. A PR that is hard to review is a defect
+regardless of the quality of its code. The gates:
 
 - **Size**: at most 750 added lines of production code.
   `Cargo.toml`/`Cargo.lock`, tests, docs, examples, and
   benchmarks do not count toward the limit. Split larger
-  changes into a stack of reviewable PRs. Override label:
-  `skip/pr-conventions` (reviewers only).
+  changes into a stack of reviewable PRs.
 - **Description**: every PR must explain what it does and
   why.
 - **Commit format**: subjects follow the conventional
   commit format above.
 - **DCO**: every commit carries a `Signed-off-by`
-  trailer.
+  trailer. Override label: `skip/signoff`.
 - **Signed commits**: every commit must be
-  cryptographically signed (GPG or SSH). Override label:
-  `skip/commit-signing`.
+  cryptographically signed (GPG or SSH).
 - **Human authorship**: commits claiming they were authored,
   co-authored, or signed-off by AI tools are rejected, per
   the policy above. Human's are responsible for the code they

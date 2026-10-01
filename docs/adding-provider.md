@@ -135,8 +135,14 @@ inferenceProviders:
 ```
 
 Required fields: `name`, `gridNetworkRef`, `providerKind`,
-`backendKind`, `endpoint`. Optional: `models`, `auth`, `healthCheck`,
-`metricsConfig`, `cost`, `accessPolicy`.
+`backendKind`, `endpoint`. Optional: `hostSelector`, `models`, `auth`,
+`healthCheck`, `metricsConfig`, `cost`, `accessPolicy`, `capacityWeight`,
+`routingClusterRef`, `gatewayRef`, `trafficPolicy`.
+
+Set `hostSelector` on every entry of this list. An omitted `hostSelector`
+matches no site, and the provider reports `HostSelectorMissing`. `{}` matches
+every site. The keyed `inferenceProviders` form, described in the grid-site
+chart `values.yaml`, fills it with this site's provider-site label.
 
 ### 4. Update provider Praxis config template
 
@@ -290,9 +296,10 @@ fullnameOverride: consumer-gateway
 ```
 
 This produces Service names `provider-gateway` and `consumer-gateway`.
-Without `fullnameOverride`, Helm generates names like
-`{release-name}-praxis-gateway` (e.g. `provider-gateway-praxis-gateway`),
-which couples consumer and provider configs to Helm release names.
+Without `fullnameOverride`, a consumer without site backends gets a name like
+`{release-name}-praxis-gateway` (for example `consumer-gateway-praxis-gateway`),
+which couples consumer and provider configs to Helm release names. A provider
+gateway, or a consumer with site backends, takes its release name.
 
 Existing installations that omit `fullnameOverride` work correctly but
 use release-generated names. Adding `fullnameOverride` to an existing
@@ -338,6 +345,9 @@ directly to the external endpoint over HTTPS.
      providerKind: openAi
      backendKind: apiProvider
      endpoint: "https://api.openai.com"
+     hostSelector:
+       matchLabels:
+         grid.praxis.fast/provider-site: east1
      models:
        - name: gpt-4o-mini
          capabilities: [text_generation]

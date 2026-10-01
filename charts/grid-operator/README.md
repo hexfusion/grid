@@ -134,7 +134,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 |-----|------|---------|-------------|
 | `crds.enabled` | bool | `true` | Install and upgrade the Grid CRDs. `false` when a platform owns them. |
 | `crds.keep` | bool | `true` | Keep the CRDs on `helm uninstall` and an Argo CD delete or prune. |
-| `rbac.enrollmentNamespace` | string | `""` | The grid-enrollment namespace. The render fails if the operator would get Secret access there. |
+| `rbac.enrollmentNamespace` | string | `""` | The grid-enrollment namespace. The render fails if the operator would get Secret access there. Defaults to `grid-enrollment` with enrollment on. |
 | `replicaCount` | int | `1` | Operator replicas. Must be 1 (schema-enforced). |
 | `image.repository` | string | `ghcr.io/praxis-proxy/grid-operator` | Image repository. |
 | `image.tag` | string | `""` | Image tag. Defaults to chart appVersion. |
@@ -159,10 +159,10 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `swim.bindAddress` | string | `0.0.0.0:7946` | SWIM protocol bind address. |
 | `swim.advertiseAddress` | string | `""` | Externally reachable SWIM address. Defaults to the SWIM Service LoadBalancer address, else Pod IP. |
 | `swim.requireKey` | bool | `true` | Hold SWIM traffic until the GridNetwork key loads or the network declares none. |
-| `swim.siteName` | string | `""` | Bootstrap SWIM site name. |
+| `swim.siteName` | string | `""` | Bootstrap SWIM site name. Defaults to `enrollment.siteName` with enrollment on. |
 | `swim.seeds` | string | `""` | Bootstrap SWIM seed endpoints (comma-separated `ip:port`, `[ipv6]:port`, or `hostname:port`). |
-| `swim.service.enabled` | bool | `false` | Create a SWIM Service. |
-| `swim.service.type` | string | `ClusterIP` | SWIM Service type. |
+| `swim.service.enabled` | bool | unset | Create a SWIM Service. Unset, it is on with enrollment, else off. |
+| `swim.service.type` | string | unset | SWIM Service type. Unset, `LoadBalancer` when enrollment turns the Service on, else `ClusterIP`. |
 | `swim.service.port` | int | `7946` | SWIM Service port. |
 | `swim.service.annotations` | object | `{}` | SWIM Service annotations. |
 | `swim.service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. Deprecated in Kubernetes, so prefer `metallb.io/loadBalancerIPs`. |
@@ -172,10 +172,14 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `signals.port` | int | `9091` | Signals port on the SWIM Service. Peers learn the LoadBalancer address and this port over gossip. |
 | `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
 | `gateway.address` | string | `""` | Advertised gateway address override. Maps to `GRID_GATEWAY_ADDRESS`. |
-| `gateway.serviceName` | string | `""` | Provider gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
+| `gateway.serviceName` | string | `""` | Provider gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. Empty uses `grid-gateway` with enrollment on, else the binary default `provider-gateway`. |
 | `gateway.namespace` | string | `""` | Namespace of the provider gateway Service. Empty uses the release namespace. Outside the resource namespaces, the operator gets only `get` on that one Service there. Maps to `GRID_GATEWAY_NAMESPACE`. |
 | `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
 | `gateway.port` | string | `""` | Provider gateway Service port advertised to remote sites. Empty uses 8080. Maps to `GRID_GATEWAY_PORT`. |
+| `devSelfSignedCa` | bool | `false` | Mint a self-signed grid CA and site certificate when a GridNetwork names TLS Secrets that do not exist. Dev only. Maps to `GRID_DEV_SELF_SIGNED_CA`. |
+| `consumer.credentialMountBase` | string | `/run/secrets/grid-credentials` | Directory the consumer pod mounts credential Secrets under. Maps to `GRID_CONSUMER_CREDENTIAL_MOUNT_BASE`. |
+| `consumer.tlsCertMountPath` | string | `/etc/praxis/tls` | Directory the gateway pod mounts its grid TLS Secret at. Maps to `GRID_CONSUMER_TLS_CERT_MOUNT_PATH`. |
+| `consumer.listenerPort` | int | `8080` | Consumer listener port when the gateway Service has no numeric `targetPort` the operator can read. Maps to `GRID_CONSUMER_LISTENER_PORT`. |
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
 | `health.readiness.initialDelaySeconds` | int | `5` | Readiness probe initial delay. |
@@ -192,26 +196,27 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
 | `enrollment.enabled` | bool | `false` | Enroll on startup when the GridNetwork's `siteSecretRef` Secret is absent. |
-| `enrollment.url` | string | `""` | Enrollment service base URL (https). |
-| `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters. |
-| `enrollment.caBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | CA bundle that pins the enrollment server, from exactly one of `configMap` and `secret`. |
+| `enrollment.url` | string | `""` | Enrollment service base URL (https). Defaults to the in-cluster grid-enrollment Service in `rbac.enrollmentNamespace`. |
+| `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters. Defaults to `swim.siteName`. |
+| `enrollment.caBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | CA bundle that pins the enrollment server, from at most one of `configMap` and `secret`. With neither set, Secret `grid-ca-bundle`. |
 | `enrollment.gridCaBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | Grid CA the returned CA must match, from at most one source. Defaults to `caBundle`. |
-| `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | Secret in the release namespace holding the one-time site token. |
+| `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | Secret in the release namespace holding the one-time site token. The name defaults to `grid-invite-<siteName>`. |
 
 ## Auto-enroll
 
-With `enrollment.enabled`, the operator enrolls on startup when the GridNetwork's `spec.tls.siteSecretRef` Secret is absent, and reports ready after it enrolls. That Secret and `caSecretRef` must be in the release namespace. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
+With `enrollment.enabled`, the operator enrolls on startup when the GridNetwork's `spec.tls.siteSecretRef` Secret is absent, and reports ready after it enrolls. That Secret and `caSecretRef` must be in the release namespace. With `rbac.create=false`, grant the operator get and create on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
 
 ## RBAC and namespace access
 
 The chart creates two ClusterRoles:
 
-1. **CRD access** (`<release>-crd`): cluster-wide get/list/watch/patch on
-   GridNetworks and InferenceProviders; get/list/watch/patch/create/update on
-   GridSites; get/patch on all three status subresources.
-2. **Resource access** (`<release>-resources`): get/create/patch on Secrets;
-   get on Services; create/patch on Events (`events.k8s.io`);
-   get/create/patch/update on ConfigMaps.
+1. **CRD access** (`<release>-crd`): cluster-wide get, list, watch, and patch
+   on AgentToolProviders, GridNetworks, and InferenceProviders. GridSites also
+   get create, update, and delete. Get and patch on all four status
+   subresources.
+2. **Resource access** (`<release>-resources`): get and create on Secrets,
+   with no patch. Get on Services, with no list or watch. Create and patch on
+   Events (`events.k8s.io`). Get, create, patch, and update on ConfigMaps.
 
 Resource access is bound via RoleBindings. The release namespace always gets
 a RoleBinding. Additional namespaces are added through `resourceNamespaces`:

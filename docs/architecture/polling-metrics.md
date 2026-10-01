@@ -28,17 +28,16 @@ another.
 
 ## When a Gateway Polls
 
-A gateway polls its peers only while its own endpoint is actively serving.
+A gateway polls only when the operator gives it a grid serving config. The
+`grid-gateway` binary reads `GRID_SERVING_CONFIG` once at start, starts one
+poller per peer the config lists, and keeps them running for the life of the
+process. The praxis-gateway chart sets that variable with `gridServing.enabled`.
+A gateway without a serving config holds no peer connections and adds no scrape
+load to its peers.
 
-Cross-site routing is a decision this gateway makes when it receives a request
-it can place elsewhere. A gateway that is not serving receives no such requests.
-It has no routing decision to inform, so it holds no mutual-TLS connections to
-its peers and adds no scrape load to them. Polling follows serving. It starts
-when the gateway begins serving and stops when it drains.
-
-The number of live peer connections is then proportional to the serving
-gateways, not to the size of the grid. A drained or standby gateway is silent on
-the peer signal endpoints.
+The pollers do not follow the gateway's own serving state. A gateway that is
+draining keeps polling until its process stops. A change to the peer list takes
+effect at the next gateway start, since the serving config is read only once.
 
 ## From Poll to Route
 

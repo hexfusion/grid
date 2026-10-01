@@ -51,7 +51,7 @@ The most important distinction is:
 | Prefer the provider with more free KV-cache capacity | `scoringPolicy.strategy: kvCachePressure` + usually `routingPolicy: scoreFirst` | Changes provider ranking based on provider-level KV-cache pressure. |
 | Stop new sessions going to a pressured provider | Stabilized admission plus a pressure signal | Moves pressured providers to `existing_only`; requires an active scoring strategy and matching provider metric signal. |
 | Keep an existing session on the same provider | Praxis AI `session_affinity` | Reuses the bound provider before running a new selection. |
-| Change routing without restarting Praxis | AGN overlay publication + Praxis overlay hot reload | Atomically replaces the accepted routing snapshot. |
+| Change routing without restarting Praxis | AGN overlay publication + Praxis overlay hot reload, with a gateway config that sets `intelligent_route.overlay_file` | Atomically replaces the accepted routing snapshot. The praxis-gateway chart's rendered config uses static candidates and does not reload. |
 
 For the low-level overlay, revision, delivery, credential, and provider-hop contracts, see [Routing Architecture and Overlay Contract](architecture/routing.md).
 
@@ -66,10 +66,9 @@ site, trust, and authentication settings for your deployment. See the
 If `selectionPolicy` is omitted, Praxis uses deterministic selection. Set it
 explicitly when you want traffic sharing; `noMetrics` alone does not enable
 round robin or weighted selection.
-The `grid-site` Helm chart explicitly sets `roundRobin` for a new network
-unless configured otherwise; it preserves an existing network's selection
-policy on upgrade. Check the rendered resource when comparing Helm and direct
-CR installations.
+The `grid-site` Helm chart sets `roundRobin` unless you set
+`gridNetwork.selectionPolicy` to `null`, which leaves the deterministic default.
+Check the rendered resource when comparing Helm and direct CR installations.
 
 ---
 
@@ -812,6 +811,14 @@ Use this when the need is:
 AGN publishes a new content-addressed overlay when provider state, configuration, metrics, or remote site state changes.
 
 Praxis validates the new overlay and atomically swaps the accepted in-memory snapshot.
+
+This needs a gateway config that sets `intelligent_route.overlay_file`, shown
+below, with the overlay ConfigMap mounted directly or through overlay-sync. The
+praxis-gateway chart's rendered config does not set it. Without `gridServing`
+it routes on the static candidates the chart lists. With `gridServing` it reads
+the operator's serving config once at start and reorders those candidates only
+by the peer load it polls. Neither reloads the overlay, so the hub-site install
+picks up candidate changes only when the gateway restarts.
 
 ```mermaid
 flowchart LR

@@ -42,6 +42,10 @@ When `scoringPolicy` is present, `strategy` is required. Omit the entire
 using the removed `profile`/`weights` shape fail admission instead of silently
 falling back to another strategy.
 
+Under `signalTransport.mode: poll` the operator scores with `noMetrics` whatever
+this field says, and the gateway orders candidates from the signals it polls.
+See [Signal propagation](signals.md).
+
 ### No metrics (default)
 
 ```yaml

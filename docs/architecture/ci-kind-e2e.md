@@ -43,6 +43,17 @@ positive and negative security probes before it can report success.
 Topology and execution details are maintained in the
 [single-cluster topology README](../../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md).
 
+## Hub and site install coverage
+
+[`scripts/e2e-hub-site.sh`](../../scripts/e2e-hub-site.sh) runs the
+[hub-site install](../../examples/helm/hub-site/README.md) commands with
+test-only overrides. Forge creates a hub and a site Kind cluster from the
+[hub-site topology](../../tests/e2e/topologies/grid-hub-site/README.md). The
+script asserts enrollment, membership, serving, peer trust, and log health for
+each peer trust mode in `MODES`, `pin` and `spiffe` by default. The Helm
+workflow's `kind-hub-site` job runs it once per mode on prebuilt images
+whenever a change touches more than docs and READMEs.
+
 ## Multi-cluster coverage set
 
 | Validation | Behavior proven |

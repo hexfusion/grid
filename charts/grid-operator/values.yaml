@@ -146,8 +146,8 @@ consumer:
   # -- Directory the gateway pod mounts its grid TLS Secret at. Maps to
   # GRID_CONSUMER_TLS_CERT_MOUNT_PATH.
   tlsCertMountPath: /etc/praxis/tls
-  # -- Consumer listener port when the gateway Service cannot be read. Maps to
-  # GRID_CONSUMER_LISTENER_PORT.
+  # -- Consumer listener port when the gateway Service has no numeric targetPort
+  # to read. Maps to GRID_CONSUMER_LISTENER_PORT.
   listenerPort: 8080
 
 # -- Probe timing configuration.

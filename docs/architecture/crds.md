@@ -3,10 +3,10 @@
 API group: `grid.praxis.fast/v1beta1`
 
 The AI Grid Network (AGN) Operator defines these resources to describe sites,
-provider capacity, and routing policy. The established API identities remain
-unchanged by the project-name update.
+provider capacity, and routing policy.
 
-All CRDs are cluster-scoped.
+All CRDs are cluster-scoped and in the `grid` category, so `kubectl get grid`
+lists them.
 
 ## GridNetwork
 
@@ -20,7 +20,7 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  gridId: ""                    # auto-generated on first join
+  gridId: ""                    # empty: the operator generates one into status.gridId, immutable once set
   seeds:
     - "10.0.0.5:7946"
   gatewayRefs:
@@ -73,9 +73,9 @@ behavior, see the [AGN Routing Guide](../routing.md).
 |---|---|---|
 | `routingPolicy` | `geographyFirst`, `scoreFirst` | `geographyFirst`. Controls candidate ordering and selection-group boundaries. |
 | `scoringPolicy.strategy` | `noMetrics`, `queueDepth`, `kvCachePressure` | `noMetrics`; when `scoringPolicy` is present, `strategy` is required. |
-| `selectionPolicy.mode` | `deterministic`, `roundRobin`, `random`, `weightedRandom` | Omitted from the overlay when unset; Praxis then uses deterministic selection. |
+| `selectionPolicy.mode` | `deterministic`, `roundRobin`, `random`, `weightedRandom` | Omitted from the overlay when unset, and Praxis then uses deterministic selection. The grid-site chart sets `roundRobin`. |
 | `placementPolicy.strategy` | `static` | Required if and only if selection mode is `weightedRandom`; rejected with other modes. |
-| `admissionPolicy.mode` | `instantaneous`, `stabilized` | `instantaneous`; stabilized behavior requires repeated pressure/recovery observations. |
+| `admissionPolicy.mode` | `instantaneous`, `stabilized` | With `admissionPolicy` omitted, admission is instantaneous. The grid-site chart sets `stabilized` with the default `pressure` values and `missingMetrics: existingOnly`. Stabilized behavior requires repeated pressure/recovery observations. |
 | `admissionPolicy.missingMetrics` | `existingOnly`, `excluded` | `existingOnly` when admission policy is configured. Applies when an active scoring strategy and provider signal are configured but the signal is missing or expired; it does not activate metrics observation. |
 | `admissionPolicy.pressure` | Six fields: `enterThreshold`, `exitThreshold`, `failureThreshold`, `successThreshold`, `minimumStateDuration`, `recoveryHoldDown` | When `pressure` is omitted, defaults are `0.85`, `0.70`, `2`, `3`, `10s`, and `30s`, respectively. When supplied, all six fields are required. Exit must be lower than enter; durations must be positive whole seconds (for example, `10s`). |
 | `metricsRefreshInterval` | Seconds or milliseconds, at least one second | `300s`. TLS-protected metrics cap the effective interval at `60s`. Controls metric refresh/re-ranking, not request-time selection. The operator ignores a value it cannot parse and uses the default. |
@@ -84,10 +84,35 @@ behavior, see the [AGN Routing Guide](../routing.md).
 Explicit grouping fields such as `selectionPolicy.grouping.localityScope` are
 not part of this CRD.
 
+### Discovery and trust fields
+
+| Field | Supported values | Default and interaction |
+|---|---|---|
+| `siteDiscovery.mode` | `manual`, `auto` | `manual`. Gossip fills declared GridSites in both modes. `auto` also creates a GridSite for each undeclared member. See [Field ownership](#field-ownership). |
+| `siteDiscovery.defaultEgressTls` | `mutualTls`, `plaintext` | `mutualTls`. The egress TLS mode of a GridSite with no `spec.egress`. A `plaintext` site never becomes routing-eligible. |
+| `peerTrust.mode` | `pin`, `spiffe` | `pin`. Read at operator start, so a change needs an operator restart. |
+| `signalTransport.mode` | `gossip`, `poll` | `gossip`. Read at operator start, so a change needs an operator restart. |
+
 **Phases**: Pending → Initializing → Active → Degraded
 
-**Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`, `budgetStatus[]`
+**Status fields**: `conditions`, `gridId`, `connectedSites`, `distributedProviderCount`,
+`observedGeneration`, `phase`, `consumerConfigStatus[]`, `overlayStatus[]`, `budgetStatus[]`
+
+Each `overlayStatus[]` entry reports one gateway's routing overlay:
+
+| Phase | Reason | Meaning |
+|---|---|---|
+| `Distributed` | _(empty)_ | The overlay `ConfigMap` holds the current render. |
+| `Pending` | `EmptyCandidates` | The gateway has no routing candidate yet, so no overlay or serving config is written. Normal on a grid with no providers. |
+| `Retained` | `EmptyCandidates`, `OverlayApplyFailed`, `OverlayRenderFailed` | The last distributed overlay stays in place. |
+| `Error` | `OverlayApplyFailed`, `OverlayRenderFailed` | No overlay was ever distributed and the latest attempt failed. |
+
+When `spec.tls` names both `caSecretRef` and `siteSecretRef` and either Secret is
+missing, the network reports `Ready=False` with reason `TrustMaterialMissing`. The
+operator mints a self-signed dev CA and site certificate only with
+`GRID_DEV_SELF_SIGNED_CA` (grid-operator chart value `devSelfSignedCa`). Even then,
+both Secrets must be missing and both must live in the operator namespace. It
+creates them and never replaces an existing Secret.
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
@@ -131,8 +156,8 @@ options under consideration if per-tenant confidentiality is required.
 | `gatewayName` | string | Name of the gateway reference |
 | `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
 | `configMapName` | string | Operator-owned name of the generated `ConfigMap`, `grid-consumer-<network>-<gateway>` |
-| `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
-| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
+| `phase` | enum | `Rendered` \| `Pending` \| `Error` \| `Disabled` |
+| `reason` | string | Machine-readable reason. `Pending`: `EmptyCandidates`, while the gateway has no routing candidate. `Error`: `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`, `PlaintextWithSni`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`, or `ConsumerConfigError`. `Rendered`: empty, or the warning `RoutedAddressMismatch` or `ListenerPortUnresolved`, which outranks it. `Disabled`: `ConsumerConfigDisabled` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
 
@@ -202,6 +227,8 @@ with exactly 32 bytes.  If the Secret is absent, unreadable, or has the wrong
 length, the reconcile fails before CRD seed announcement and state broadcast.
 The process-global SWIM runtime keeps any previously loaded key until restart;
 it does not switch to plaintext for that configured reconcile.
+With `GRID_SWIM_REQUIRE_KEY` (default `true`), the operator holds all SWIM
+traffic until a `GridNetwork` loads the key or declares none.
 
 For local development and testing, the `GRID_SWIM_ENCRYPT_KEY` environment
 variable (64-character hex) provides an alternative key injection path without
@@ -277,8 +304,9 @@ When `enabled: false` or `consumerConfig` is absent, this gateway behaves as bef
 
 ## GridSite
 
-Represents another site in the grid. Created manually
-for seed peers or automatically by SWIM discovery.
+Represents another site in the grid. Declared by the user, for example one per
+`peers` entry in the grid-site chart, or created by SWIM discovery when
+`siteDiscovery.mode` is `auto`.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1beta1
@@ -305,7 +333,7 @@ spec:
 **Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
 
 **Status fields**: `conditions`, `phase`, `observedGeneration`, `discovered`
-(`egressAddress`, `advertisedCertPem`, `advertisedCertError`), `capabilities`
+(`egressAddress`, `absentSince`), `capabilities`
 (inference, agentTools, agentToAgent), and `lastProbeTime`. The reason and
 message for the current phase live on the `Connected` condition.
 
@@ -355,10 +383,13 @@ label (`SiteIdInvalid`), and an auto-created GridSite that carries
 it can only come from re-applying an old export. Two live SWIM addresses claiming
 one ID past a five-minute restart grace report `SiteIdDuplicated`, and discovery
 clears that site's gossiped egress. Mixed problems report
-`UnadoptableMembers`. Only the oldest GridNetwork with
-`siteDiscovery.mode: auto` runs discovery on an operator. Another one reports
-`Accepted=False` with reason `AutoDiscoveryClaimed`. `Accepted` stays about the network's own spec, and `Ready` does
-not change, because the network still serves every site it did adopt.
+`UnadoptableMembers`. None of these changes `Accepted`, which stays about the
+network's own spec, or `Ready`, because the network still serves every site it
+did adopt.
+
+Only the oldest GridNetwork with `siteDiscovery.mode: auto` runs discovery on an
+operator. Another one reports `Accepted=False` with reason `AutoDiscoveryClaimed`
+and is not reconciled until its spec changes.
 
 With Argo CD, ignore operator-written state:
 
@@ -393,7 +424,7 @@ when the condition's status changes.
 |---|---|
 | GridNetwork | `Accepted`, `Ready`, `DiscoveryConflict` |
 | GridSite | `Accepted`, `Discovered`, `Connected`, `Ready` |
-| InferenceProvider | `Accepted`, `Available` |
+| InferenceProvider | `Accepted`, `Available`, and `MetricsSignals` when `metricsConfig` is set |
 | AgentToolProvider | `Accepted`, `Available` |
 
 ### GridSite lifecycle
@@ -410,33 +441,32 @@ A discovered SWIM peer is not automatically authorized for routing.
 
 | Phase | How entered | Transition driver |
 |---|---|---|
-| `Pending` | Resource created (manually or by auto-discovery) | Initial default |
-| `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
+| `Pending` | Resource created (declared or by auto-discovery) | Initial default |
+| `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation. The `Discovered` condition reason is `MemberKnown` from here on |
 | `Connecting` | Gateway address known (`spec.egress.address` or `status.discovered.egressAddress`) | `GridSite` controller advances from Discovered and runs an identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
-| `Left` | Set on graceful site departure | Preserved by operator once set |
+| `Left` | No operator path enters it | Preserved by operator once set |
 
 **Reason codes** (the `Connected` condition reason):
 
 | Reason | Phase | Meaning |
 |---|---|---|
 | `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
-| `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
-| `GatewayAddressMissing` | Discovered | No gateway address known; see `GRID_GATEWAY_ADDRESS` |
+| `GatewayAddressMissing` | Discovered | No gateway address known. The remote operator advertises one from `GRID_GATEWAY_ADDRESS` or its gateway Service LoadBalancer |
+| `GossipedAddressRefused` | Discovered | The only address is a gossiped one that is not a dialable literal `IP:port`. Set `spec.egress.address` |
 | `EgressMissing` | Connecting or Unreachable | A previously probed site has no egress address |
-| `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
+| `TlsVerified` | Active | The handshake verified the chain to the Grid CA and the identity. The message names it: the SPIFFE ID under `spiffe`, the pinned leaf digest under `pin` |
 | `PlaintextIneligible` | Connecting or Unreachable | Egress is plaintext, which never routes. `Connected=False`, and the message says whether TCP reached |
 | `ConnectTimeout` / `ConnectionFailed` | Connecting or Unreachable | TCP connection timed out or failed |
 | `HandshakeTimeout` / `TlsProtocolError` | Connecting | TLS handshake timed out or failed |
 | `UntrustedIssuer` | Connecting | Server certificate does not chain to the configured AGN trust root |
-| `IdentityMismatch` | Connecting | Server SAN does not match configured `serverName` |
+| `IdentityMismatch` | Connecting | Server SAN does not match the `serverName`, or, under `spiffe`, the leaf lacks the expected SPIFFE ID |
 | `CertificateExpired` / `CertificateNotYetValid` | Connecting | Server certificate is outside its validity period |
-| `PinMismatch` | Connecting | Canonical fingerprint does not match a configured pin |
-| `AdvertisedCertMismatch` | Active | SWIM-advertised certificate does not match a configured pin; recorded only, since the live leaf verified |
+| `PinMismatch` | Connecting | Under `pin`, the live leaf digest matches no configured pin |
 | `TrustMaterialMissing` | Connecting | CA, client certificate, key, or pin policy is absent. An empty `serverName` defaults to `<name>.grid.internal` |
-| `TrustMaterialInvalid` | Connecting | The probe found malformed or oversized trust material |
+| `TrustMaterialInvalid` | Connecting | The probe found malformed or oversized trust material in the grid Secrets. Reported on `Connected` and `Ready`, like `TrustMaterialMissing`, not on `Accepted` |
 | `TrustConflictsWithPeerTrust` | Held, never Active | `spec.trust` sets pins while the GridNetwork `peerTrust.mode` is `spiffe` |
 | `ServerNameForbidden` | Held, never Active | Declared `spec.egress` uses `plaintext` with a `serverName` |
 | `ServerNameInvalid` | Held, never Active | `spec.egress.tls.serverName` is not a valid DNS name |
@@ -446,11 +476,12 @@ A discovered SWIM peer is not automatically authorized for routing.
 - Pending → Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
   peer is first observed as Alive, in either `siteDiscovery.mode`.
 - Discovered → Connecting: the `GridSite` controller advances automatically when
-  `spec.egress.address` or `status.discovered.egressAddress` is non-empty. The discovered
-  address comes from the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM
-  state broadcast.
-  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
-  and the site stays Discovered with reason `GatewayAddressMissing`.
+  `spec.egress.address` or a dialable `status.discovered.egressAddress` is non-empty. The
+  discovered address comes from the remote operator, propagated via SWIM state broadcast. That
+  operator advertises `GRID_GATEWAY_ADDRESS` when set, and otherwise the LoadBalancer address of
+  its gateway Service (`GRID_GATEWAY_SERVICE_NAME` in `GRID_GATEWAY_NAMESPACE`) with
+  `GRID_GATEWAY_PORT`. With no address, the site stays Discovered with reason
+  `GatewayAddressMissing`.
 - Connecting: the `GridSite` controller probes the egress gateway on each reconcile.  For
   `mutualTls` mode, the probe performs a bounded TLS handshake verifying the CA chain and the
   `serverName` SAN. It then checks the leaf against the `canonicalFingerprints` pins when the
@@ -466,27 +497,17 @@ A discovered SWIM peer is not automatically authorized for routing.
   reachable but unverified endpoint from an unreachable endpoint.
 
 **Egress address source:** `spec.egress.address` is an override. When it is empty, the probe
-uses `status.discovered.egressAddress`, which the remote operator's `GRID_GATEWAY_ADDRESS`
-environment variable sets through the SWIM state broadcast. With neither set, the site stays
+uses `status.discovered.egressAddress`, which the remote operator advertises through the SWIM
+state broadcast. With neither set, the site stays
 Discovered. `spec.egress.tls` applies to either address, so a GridSite can pin `serverName`
 without pinning the address. With no `spec.egress`, the TLS mode is the GridNetwork's
 `spec.siteDiscovery.defaultEgressTls` (`mutualTls` by default, or `plaintext`), which auto-created
 GridSites inherit. To change one discovered site, declare its GridSite with `spec.egress.tls.mode`. `Active` proves the address the probe
 dialed, not the consumer `clusterEndpoints` a gateway routes to.
 
-**`status.discovered.advertisedCertPem`:** The public site certificate PEM received from the remote site via
-SWIM state broadcast.  Before storage, the operator performs a structural check:
-private-key markers (`PRIVATE KEY`) cause the input to be discarded entirely and an error
-logged.  Non-certificate PEM triggers `TrustMaterialInvalid` status.  A valid `CERTIFICATE`
-header passes the structural check.
-
-This field contains only the public certificate — never a private key.  A non-empty
-`advertisedCertPem` means the remote site has shared its public identity material and the
-structural check passed.  It does **not** mean:
-
-- The certificate has been chain-verified against a trusted CA.
-- The peer is authenticated or authorized for routing.
-- The content has been parsed as X.509.
+Gossip carries no certificate. Trust comes only from the live handshake: the
+pins under `peerTrust.mode: pin`, or the CA chain and the exact SPIFFE ID under
+`spiffe`.
 
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
@@ -545,7 +566,7 @@ status:
     - type: Connected
       status: "True"
       reason: TlsVerified
-      message: "TLS handshake succeeded; certificate chain, identity, and pin verified"
+      message: "TLS handshake verified: chain to the Grid CA and pinned leaf digest 3f2a91c0d4e7"
       observedGeneration: 5
       lastTransitionTime: "2026-07-30T11:55:00Z"
 ```
@@ -586,8 +607,8 @@ reason appears. A rejected spec never fails a reconcile or restarts the operator
 |---|---|---|
 | GridNetwork | `BudgetPolicyInvalid`, `AutoDiscoveryClaimed` | The operator stops reconciling the network until the spec changes. |
 | GridSite | `TrustConflictsWithPeerTrust`, `ServerNameForbidden`, `ServerNameInvalid` | The site is not probed and never holds `Active`. |
-| InferenceProvider | `EndpointInvalid`, `MetricsEndpointInvalid`, `ModelNameInvalid` | The provider is `Unavailable`. |
-| AgentToolProvider | `EndpointInvalid`, `GridNetworkRefInvalid` | The provider is `Unavailable`. |
+| InferenceProvider | `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`, `EndpointInvalid`, `MetricsEndpointInvalid`, `ModelNameInvalid` | The provider is `Unavailable`. |
+| AgentToolProvider | `EndpointInvalid`, `GridNetworkRefInvalid`, `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid` | The provider is `Unavailable`. |
 
 A consumer cluster endpoint with a missing transport or a wrong SNI fails only
 its own gateway. That gateway's `consumerConfigStatus` entry reports `Error`
@@ -601,7 +622,8 @@ name fails at apply time as well. The GridNetwork controller routes and scrapes
 an InferenceProvider only once its `Accepted` condition is `True`.
 
 The CRD schema stays structural: types, required fields, enums, lengths, ranges,
-and the two existing cross-field CEL rules on GridNetwork. A GitOps apply
+and three CEL rules on GridNetwork: `exitThreshold` below `enterThreshold`,
+`placementPolicy` set only with `weightedRandom`, and `gridId` immutable once set. A GitOps apply
 therefore succeeds even when a business rule fails, and the failure shows in
 `status.conditions` and events, not at apply time.
 
@@ -661,6 +683,10 @@ credential projection can become available.
 
 **Phases**: Pending → Available → Degraded → Unavailable
 
+**Status fields**: `conditions`, `phase`, `matchingSites`, `metricsSignals`,
+`modelDiscoveryUrl`, `modelDiscoveryError`, `observedGeneration`. The reason for
+the current phase is on the `Available` condition.
+
 `spec.capacityWeight` is an optional positive relative provider capacity from
 `1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
 weightedRandom` and `placementPolicy.strategy: static`. If omitted, the
@@ -688,10 +714,8 @@ The value influences scoring and routing policy. It does not require a specific
 transport implementation; for example, a `cloudManaged` backend can still be
 fronted by Praxis.
 
-The current CRD schema represents `backendKind` as a string rather than an
-enum. The four values above are the categories AGN recognizes for routing and
-scoring conversion; an unrecognized value is not converted into a normal
-scoring candidate. Use a listed value unless the implementation is extended.
+The CRD schema enumerates these four values, so the API server rejects any
+other `backendKind`.
 
 ### Credential projection
 
@@ -843,8 +867,9 @@ metricsConfig:
 
 #### Queue depth normalization
 
-AGN does not normalize raw queue counts. Exporters should publish
-`queueDepth` as a normalized `0.0`–`1.0` gauge before the operator scrapes it.
+Without `queueCapacity`, AGN does not normalize raw queue counts, and exporters
+should publish `queueDepth` as a normalized gauge from `0.0` to `1.0`. With it, the
+operator divides the raw value by `queueCapacity` and clamps the result.
 
 ### Model discovery
 
@@ -939,10 +964,10 @@ fails outright (`Unavailable`), mirroring `phase_and_reason_from_probe`'s and
 `phase_from_matching`'s explicit design (both are tested to never emit
 `Degraded`).
 
-**Status fields**: `discoveredTools` (auto-populated
+**Status fields**: `conditions`, `phase`, `discoveredTools` (auto-populated
 from MCP `tools/list`; a failed probe preserves the previous list rather than
-clearing it), `matchingSites`, `reason` (machine-readable; see reason codes
-below), `observedGeneration`
+clearing it), `matchingSites`, `observedGeneration`. The reason for the current
+phase is on the `Available` condition.
 
 #### AgentToolProvider reason codes
 
@@ -952,8 +977,13 @@ These are `Available` condition reasons.
 |---|---|---|
 | `EndpointInvalid` | Unavailable | `spec.endpoint` is not an http or https URL with a host. Reported as `Accepted=False`. |
 | `GridNetworkRefInvalid` | Unavailable | `spec.gridNetworkRef` is blank. Reported as `Accepted=False`. |
-| `GridNetworkNotFound` | Unavailable | `spec.gridNetworkRef` does not resolve to an existing `GridNetwork`. |
+| `GridNetworkNotFound` | Pending | `spec.gridNetworkRef` does not resolve to an existing `GridNetwork` yet. `Available` stays `Unknown`, since this is often just apply order. |
+| `HostSelectorMissing` | Pending | `spec.hostSelector` is omitted, which places the provider on no site. |
+| `UnsupportedAuthStrategy` | Unavailable | `spec.auth.strategy` is not one the controller supports yet. Reported as `Accepted=False`. |
+| `CredentialSecretRefInvalid` | Unavailable | `spec.auth.secretRef` is absent or has a blank field. Reported as `Accepted=False`. |
 | `CredentialSecretMissing` | Unavailable | `spec.auth.secretRef` does not resolve to an accessible Secret. |
+| `CredentialSecretKeyMissing` | Unavailable | The referenced key is absent from the Secret. |
+| `CredentialSecretValueInvalid` | Unavailable | The Secret value is not valid UTF-8. |
 | `McpEndpointUnreachable` | Unavailable | The MCP endpoint could not be reached: transport failure, DNS error, timeout, or a blocked (SSRF-sensitive) address. |
 | `McpToolsListInvalidResponse` | Unavailable | The endpoint was reached but the `tools/list` exchange failed or returned an unparseable response. |
 | `McpAuthRejected` | Unavailable | The MCP server rejected the configured `spec.auth` credentials (HTTP 401/403). |
@@ -991,5 +1021,8 @@ spec:
       matchLabels:
         grid.praxis.fast/site: cluster-a
 ```
+
+The operator defines this type but runs no controller for it, and neither the
+grid-operator chart nor `deploy/crds` installs its CRD.
 
 **Phases**: Pending → Available → Degraded → Unavailable

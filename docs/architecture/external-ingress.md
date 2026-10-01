@@ -252,10 +252,12 @@ Provider or edge failover applies to later requests, not an active stream.
 ## Overlay Contract
 
 The production acceptance contract uses a versioned, bounded envelope. The
-current repository emits the subset listed under `Repository Implementation`;
-revision, digest, expiry, and serving-status fields remain release gates until
-their implementation is present across AGN generation, distribution, and
-Praxis acceptance.
+example below is that target shape, not the current wire format. The operator
+emits a schema `1.0.0` `routing-overlay.json` envelope with a content revision,
+a SHA-256 content digest, its scope, and provenance, and reports the rendered
+and distributed revisions in `GridNetwork.status.overlayStatus[]`. Expiry and
+serving-status fields remain release gates until their implementation is
+present across AGN generation, distribution, and Praxis acceptance.
 
 ```json
 {
@@ -329,9 +331,11 @@ The AGN and Praxis integration provides:
 - explicit `mutualTls` or `plaintext` endpoint transport in generated
   consumer config;
 - SWIM membership and CRDT provider propagation;
-- provider Service address discovery and remote `GridSite` materialization;
+- provider Service address discovery, filling declared remote `GridSite`
+  objects from SWIM, and creating them under `siteDiscovery.mode: auto`,
 - Kubernetes-native provider gateway address discovery;
-- edge-local overlay ConfigMaps projected directly into Praxis pods; and
+- edge-local overlay ConfigMaps that a gateway can mount, directly or through
+  the overlay-sync sidecar, and
 - independently rendered overlays for each edge `GatewayRef`.
 
 Praxis core implements the generic primitives used by the completed path:
@@ -341,7 +345,10 @@ load balancing, health checks, configuration reload, and connection handling.
 Praxis AI owns `intelligent_route`, provider credential injection, AI request
 parsing, `provider_route`, and the generic request-time routing contract.
 A compatible Praxis AI build provides overlay-file reload and the configured
-session-affinity behavior.
+session-affinity behavior. Overlay-file reload applies only when the gateway
+config sets `intelligent_route.overlay_file`. The praxis-gateway chart's own
+rendered config and the operator-generated consumer config both use static
+candidates and do not hot-reload.
 
 The deployment contract treats a ConfigMap write and process liveness as
 control-plane observations, not serving proof. Operators use gateway status,

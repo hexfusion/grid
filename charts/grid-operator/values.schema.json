@@ -266,7 +266,7 @@
         "serviceName": {
           "type": "string",
           "pattern": "^([a-z]([-a-z0-9]{0,61}[a-z0-9])?)?$",
-          "description": "Gateway Kubernetes Service name for discovery; empty uses provider-gateway."
+          "description": "Gateway Kubernetes Service name for discovery. Empty uses grid-gateway with enrollment on, else provider-gateway."
         },
         "namespace": {
           "type": "string",
@@ -290,7 +290,7 @@
       "properties": {
         "credentialMountBase": { "type": "string", "pattern": "^/.*\\S", "description": "Directory the consumer pod mounts credential Secrets under." },
         "tlsCertMountPath": { "type": "string", "pattern": "^/.*\\S", "description": "Directory the gateway pod mounts its grid TLS Secret at." },
-        "listenerPort": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Consumer listener port when the gateway Service cannot be read." }
+        "listenerPort": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Consumer listener port when the gateway Service has no numeric targetPort to read." }
       }
     },
     "health": {

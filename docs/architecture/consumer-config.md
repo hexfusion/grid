@@ -58,10 +58,12 @@ consumer-cluster replica, overlay JSON, and all logs.
 
 The generated config is a complete, runnable Praxis config containing:
 
-- `listeners:`: one public listener at `0.0.0.0:{port}`, where `port` comes from the gateway's own Service (`gatewayRefs[].name` in `gatewayRefs[].namespace`): the numeric `targetPort` (or `port`, when `targetPort` is unset) of its only port, or of the port named `http`. `consumer.listenerPort` (default 8080) applies only when that Service cannot be read or names its `targetPort`
+- `listeners:`: one public listener at `0.0.0.0:{port}`, where `port` comes from the gateway's own Service (`gatewayRefs[].name` in `gatewayRefs[].namespace`): the numeric `targetPort` (or `port`, when `targetPort` is unset) of its only port, or of the port named `http`. `consumer.listenerPort` (default 8080) applies only when that Service cannot be read, has neither a single port nor a port named `http`, or names its `targetPort`
 - `filter_chains:` — the consumer filter chain:
-  - `intelligent_route` candidates from the overlay (with `credential.secretRef` for
-    credential-bearing candidates)
+  - `json_body_field`, which copies the request body `model` into the `X-Model` header
+  - `intelligent_route` with static candidates from the overlay (with
+    `credential.secretRef` for credential-bearing candidates) and the overlay
+    selection policy. It does not set `overlay_file`
   - `credential_inject` entries using `file:` sources when credential-bearing
     candidates are present — token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
@@ -137,7 +139,8 @@ Example failure output:
 | Reason | Phase | Meaning |
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
-| `ListenerPortUnresolved` | `Rendered` | The gateway Service could not be read, so the listener uses the `consumer.listenerPort` fallback |
+| `ListenerPortUnresolved` | `Rendered` | The gateway Service could not be read or gave no numeric pod port, so the listener uses the `consumer.listenerPort` fallback |
+| `EmptyCandidates` | `Pending` | The gateway has no routing candidate yet. An empty config cannot load, so the operator writes it once a candidate exists |
 | `RoutedAddressMismatch` | `Rendered` | A remote route differs from the address its GridSite probe verified. `ListenerPortUnresolved` takes the reason when both apply, and the message names both |
 | `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
@@ -146,6 +149,7 @@ Example failure output:
 | `ConsumerConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
 | `ConsumerConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
 | `ConsumerConfigError` | `Error` | Other error during render or apply |
+| `ConsumerConfigDisabled` | `Disabled` | `consumerConfig.enabled` is `false`, so no `ConfigMap` is generated. A gateway without a `consumerConfig` block has no entry |
 
 ### Troubleshooting
 
@@ -199,16 +203,19 @@ from the endpoint.
 Praxis gateways do not automatically reload the complete generated Praxis
 configuration from a changed `ConfigMap` volume mount. A pod restart, rollout,
 or explicit gateway reload is required after the operator updates that static
-configuration. The versioned routing overlay is a separate projected file that
-`intelligent_route` can validate and hot-reload in process. See
+configuration. The generated config renders its candidates inline, and
+`intelligent_route` never reloads static candidates, so candidate changes also
+need a restart. Overlay-file hot reload applies only to a gateway config that
+sets `intelligent_route.overlay_file` to the mounted routing overlay. See
 [Reload and rollout](#reload-and-rollout) below.
 
 ## Edge-ingress deployments
 
-External edge-ingress gateways reuse the same consumer config contract: the
+External edge-ingress gateways can reuse the same consumer config contract. The
 operator renders a `ConfigMap` with static endpoint topology and `intelligent_route`
 candidates, and the edge gateway consumes it the same way a cluster-local
-consumer gateway does.
+consumer gateway does. That generated config routes on static candidates and
+does not hot-reload.
 
 The key distinction for edge deployments is that the routing overlay data
 (candidate membership, ordering, freshness) changes more frequently than
@@ -217,7 +224,8 @@ static endpoint/TLS topology.  The intended architecture separates these:
 - **Static topology** (listener config, endpoint addresses, TLS material,
   filter chain structure): changes require a gateway reload or restart.
 - **Dynamic overlay** (`routing-overlay.json` envelope): changes are consumable
-  without a full restart through `intelligent_route` overlay-file hot reload.
+  without a full restart through `intelligent_route` overlay-file hot reload,
+  in a gateway config the deployment owns that sets `overlay_file`.
 
 Praxis AI validates each projected envelope before atomically replacing the
 in-memory route snapshot. A malformed replacement retains the same-process
@@ -241,7 +249,8 @@ To apply updated config to a running consumer pod, restart the `Deployment`:
 kubectl rollout restart deployment/praxis-consumer -n <namespace>
 ```
 
-The dynamic routing overlay can reload independently as described above.
+A gateway config that sets `overlay_file` reloads the routing overlay
+independently, as described above. The generated consumer config does not.
 Deployment owners remain responsible for restarting or explicitly reloading
 the gateway when static listener, filter-pipeline, endpoint/TLS topology, or
 mounted Secret content changes.

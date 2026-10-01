@@ -54,13 +54,16 @@ deployments must use a Praxis AI image that includes `credential_inject`.
 
 | Strategy | Status | Request-time behavior |
 |----------|--------|-----------------------|
-| `bearer_token` | Implemented native path | Praxis AI reads a mounted Secret file and injects `Authorization: Bearer <token>` on the outbound provider request. |
-| `api_key` | Extension point | Static Secret-backed header injection when implemented. |
+| `bearerToken` | Implemented native path | Praxis AI reads a mounted Secret file and injects `Authorization: Bearer <token>` on the outbound provider request. |
+| `apiKey` | Extension point | Static Secret-backed header injection when implemented. |
 | `custom` | Extension point | User-configured Secret-backed injection when implemented. |
-| `service_account` | Extension point | Kubernetes service-account token injection when implemented. |
+| `serviceAccount` | Extension point | Kubernetes service-account token injection when implemented. |
 | `sigv4` | Extension point | Per-request signing when implemented. |
 | `oauth2` | Extension point | Refresh-on-expiry token handling when implemented. |
-| `mtls_only` | Extension point | No HTTP credential injection; authentication is certificate-based. |
+| `mtlsOnly` | Accepted | No HTTP credential injection. Authentication is certificate-based. |
+
+The controller reports an extension-point strategy as `UnsupportedAuthStrategy`
+and marks the provider `Unavailable`, unless `spec.auth.manual` is `true`.
 
 ## Implemented request path
 
@@ -223,7 +226,7 @@ per-request injection is a metadata lookup plus header injection.  There is no
 Kubernetes API call and no per-request file read.  Secret rotation requires a
 Praxis AI config reload or pod restart; automatic rotation is not yet supported.
 
-Static `api_key` and `custom` strategies use the same file-backed injection
+Static `apiKey` and `custom` strategies use the same file-backed injection
 seam when implemented.
 
 Dynamic strategies (`sigv4`, `oauth2`) are extension points and need explicit
@@ -236,21 +239,9 @@ ownership decisions before implementation:
 
 ## Access Policy
 
-Two layers of access control:
-
-### Network Policy (site-to-site)
-
-Defined on `GridNetwork`. Controls which sites can
-establish data-plane connections at all. Default:
-all sites in the same `GridNetwork` can connect.
-
-```yaml
-spec:
-  networkPolicy:
-    defaultAllow: true
-    deny:
-      - site: untrusted-partner
-```
+`GridNetwork` has no site-to-site network policy field. Peer trust decides
+which sites may connect, and each provider's `accessPolicy` decides which
+consumer sites may use it.
 
 ### Provider Access Policy (per-provider)
 
@@ -265,11 +256,20 @@ spec:
         grid.praxis.fast/site: cluster-a
 ```
 
-Empty `matchLabels` = all sites in the grid.
+Empty `matchLabels` = all sites in the grid. A non-empty selector matches the
+labels on the consumer site's GridSite.
+
+`accessPolicy` is separate from `hostSelector`, which places the provider on
+the GridSites it matches. An omitted `hostSelector` places it on no site, and
+`{}` places it on every site.
 
 ## Workload Access Patterns
 
-How workloads discover and consume grid providers:
+These patterns are design direction, and neither the operator nor the gateway
+charts implement them yet. Today a workload sends an OpenAI-style request to
+the consumer gateway, which routes on the request's `model`.
+
+How workloads could discover and consume grid providers:
 
 ### 1. SNI-based (default)
 
@@ -445,39 +445,18 @@ through gossip must not become routable solely because it is alive.  The control
 plane can record discovered sites and trust material, but the provider gateway
 still enforces peer identity on every request.
 
-### Public certificate exchange
+### No certificate over gossip
 
-The AGN Operator propagates a site's public certificate PEM to peers via SWIM
-state broadcasts when the local `GridNetwork` has `spec.tls.siteSecretRef`
-configured.  Before storage, the receiving operator runs a structural check:
-
-- Input containing `PRIVATE KEY` markers is discarded and logged at error level.
-  Private key material must never enter status fields or SWIM broadcasts.
-- Input without a `-----BEGIN CERTIFICATE-----` header is rejected and recorded
-  in `GridSite.status.discovered.advertisedCertError`, without the PEM.
-- Input with a valid `CERTIFICATE` header passes the structural check and is
-  stored in `GridSite.status.discovered.advertisedCertPem`.
-
-This structural check is **not** cryptographic verification.  It does not parse
-DER bytes as X.509, check the issuer or validity period, or validate the signature
-against a CA.
-
-A non-empty `advertisedCertPem` with no private-key rejection indicates:
-- The remote site shared a PEM with a `CERTIFICATE` header.
-- No private-key markers were detected.
-- The structural check passed.
-
-`advertisedCertPem` does **not** indicate:
-- The certificate has been chain-verified against a trusted CA.
-- The remote site is authenticated or authorized for routing.
-- The mTLS handshake has succeeded.
+SWIM carries no certificate. A site's identity is checked only on the live mTLS
+handshake, so nothing a peer gossips can vouch for it.
 
 **Identity-aware gateway verification:** For `spec.egress.tls.mode: mutualTls`,
 the operator performs an mTLS handshake with the advertised gateway. It verifies
 the server chain against `GridNetwork.spec.tls.caSecretRef`, verifies the DNS SAN
 against `spec.egress.tls.serverName`, proves possession of the server private key
 through the handshake, and checks the live leaf certificate against
-`spec.trust.canonicalFingerprints`.
+`spec.trust.canonicalFingerprints`. Under `peerTrust.mode: spiffe` it reads no
+pins and checks the leaf for the exact SPIFFE ID `spiffe://grid.internal/site/<name>`.
 
 GridSite Active is a control-plane eligibility signal. It means AGN has enough
 site and gateway identity information to consider the site for overlay
@@ -504,7 +483,7 @@ DER-based digest.
 
 **Certificate rotation:** `canonicalFingerprints` accepts one current pin and
 one next pin. Add the next pin before deploying the new gateway certificate,
-wait for the live and SWIM-advertised certificate state to converge, then remove
+wait until the probe reports `TlsVerified` against the new certificate, then remove
 the old pin. An unexpected third identity is rejected. Trust failures demote an
 Active site to `Connecting`, while connection failures demote it to
 `Unreachable`; both phases exclude its CRDT providers from routing.
@@ -528,7 +507,7 @@ provider-side authorization, which are enforced separately by the data plane.
 
 | Who | What |
 |-----|------|
-| **AGN Operator** | Validates provider credential `secretRef`; projects credential references (never token values) into routing overlays; can render opt-in consumer Praxis `ConfigMap`; generates local CA and site cert Secrets; marks `GridSite.status.phase = Active` after the configured identity-aware gateway probe succeeds. |
+| **AGN Operator** | Validates provider credential `secretRef`. Projects credential references (never token values) into routing overlays. Can render opt-in consumer Praxis `ConfigMap`. Mints a self-signed dev CA and site cert Secrets only with `devSelfSignedCa`. Marks `GridSite.status.phase = Active` after the configured identity-aware gateway probe succeeds. |
 | **Gateway filters** | `intelligent_route` selects candidates and writes credential metadata; `credential_inject` reads a mounted Secret file and injects credentials per request; `peer_identity_trust` verifies peer certificate identity on provider gateways. |
 | **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`; distributes the Grid CA cert to remote clusters where gateways need to verify peer identity; configures the provider gateway's peer identity filter; manages gateway rollout when trust material changes. |
 | **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials. |

@@ -50,9 +50,10 @@ gridSite:
   providerSiteLabel: ""
   egress: {}
 
-# -- Remote sites this site trusts, keyed by site name, one GridSite <network>-<name>
-# each, the name the operator gives a peer it discovers. Listing peers also turns on
-# site discovery and the TLS Secrets the operator writes, unless those are set.
+# -- Remote sites this site trusts, keyed by site name. Each peer renders a GridSite
+# named by its bare site name, which manual site discovery fills from SWIM. Listing peers
+# sets no discovery mode, and turns on the TLS Secrets the operator writes unless
+# gridNetwork.tls is set.
 # address is the peer gateway the operator probes, verifying serverName (default
 # <name>.grid.internal). digest pins the peer's leaf. To rotate, set nextDigest to the
 # new digest, then move it to digest once the peer is Active.

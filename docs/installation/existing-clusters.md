@@ -55,8 +55,9 @@ before parsing the inventory. Install guidance:
 - `jq`: https://jqlang.github.io/jq/download/
 - `python3`: https://www.python.org/downloads/ or your OS package manager
 
-Before running the installer, prepare the following in each cluster's
-`grid-system` namespace.
+The installer scripts install every release into the `grid-system`
+namespace. Before running the installer, prepare the following in each
+cluster's `grid-system` namespace.
 
 | Resource | Ownership | Purpose |
 |----------|-----------|---------|
@@ -73,9 +74,9 @@ inference backends are now managed by the `grid-site` and
 The routing overlay ConfigMap is created automatically by the AGN
 Operator once SWIM membership converges. Its name follows the pattern
 `grid-overlay-{network}-{gateway}`, where `{network}` is the
-GridNetwork CR name and `{gateway}` is the consumer gateway Service
-name (set by `fullnameOverride` in the gateway values or derived from
-the Helm release name).
+GridNetwork CR name and `{gateway}` is the GridNetwork `gatewayRefs[].name`,
+which names the consumer gateway Service (set by `fullnameOverride` in the
+gateway values or derived from the Helm release name).
 
 ## Usage
 
@@ -144,7 +145,9 @@ examples/helm/existing-clusters/scripts/install.sh inventory.yaml \
 Format: `SITE:ROLE:PATH` where:
 
 - **SITE** matches a key in `inventory.yaml` `.sites`
-- **ROLE** is `operator`, `site`, `mock`, `consumer`, or `provider`
+- **ROLE** is `operator`, `site`, `mock`, `consumer`, `provider`,
+  `provider-config`, or `consumer-config`. The two config roles supply the
+  provider or consumer Praxis config file in place of the example one.
 - **PATH** is a readable YAML file
 
 The installer validates all overrides before modifying any cluster:
@@ -288,7 +291,8 @@ openssl x509 -req -in provider.csr \
 The consumer gateway's `provider_hop_clusters` and `load_balancer.clusters`
 must include an entry for every provider cluster that the overlay might
 route requests to. Each InferenceProvider CR creates an overlay candidate
-with a `cluster` field set to the CR name.
+with a `cluster` field set to the CR name, or to `spec.routingClusterRef`
+when set.
 
 If a request is routed to an overlay candidate whose cluster is not
 configured in the consumer's load_balancer, the consumer returns
@@ -743,10 +747,12 @@ affinity:
 
 ### Security Context
 
-The charts enforce restricted security defaults. To set a fixed UID
-without weakening isolation:
+The charts enforce restricted security defaults. The grid-operator chart sets
+its security context in the template. To set a fixed UID on a
+`praxis-gateway` pod without weakening isolation:
 
 ```yaml
+# gateway overrides
 podSecurityContext:
   runAsUser: 1000
   runAsGroup: 1000
@@ -810,12 +816,14 @@ serviceMonitor:
 
 ### CRD Retention
 
-Helm does not remove CRDs on uninstall. To remove them:
+The grid-operator chart keeps its CRDs on `helm uninstall` while
+`crds.keep` is true, the default. To remove them:
 
 ```bash
 kubectl delete crd gridnetworks.grid.praxis.fast \
   gridsites.grid.praxis.fast \
-  inferenceproviders.grid.praxis.fast
+  inferenceproviders.grid.praxis.fast \
+  agenttoolproviders.grid.praxis.fast
 ```
 
 ## Troubleshooting
@@ -826,7 +834,9 @@ kubectl delete crd gridnetworks.grid.praxis.fast \
 Service.
 
 **Cause:** Helm's fullname template produces `{release}-praxis-gateway`
-by default. If the operator's `gateway.serviceName` expects
+by default, unless the release name contains `praxis-gateway`. A grid
+gateway, a provider or a consumer with site backends, takes its release
+name instead. If the operator's `gateway.serviceName` expects
 `consumer-gateway`, the names don't match.
 
 **Fix:** Set `fullnameOverride: consumer-gateway` in the consumer

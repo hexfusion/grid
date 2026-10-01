@@ -15,7 +15,7 @@ up a site ready to enroll.
 Batteries included. Off OpenShift no values are required:
 
 ```bash
-helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace
+helm install grid-enrollment charts/grid-enrollment --namespace grid-enrollment --create-namespace
 ```
 
 The default install generates the Grid CA, the endpoint serving cert, and the
@@ -30,6 +30,11 @@ is the default `route.host`, and makes the enrollment Service a LoadBalancer whe
 Route renders. `invites` takes sites keyed by name, for example
 `--set invites.east2.network=grid`.
 
+The release name and namespace above match the grid-operator chart's enrollment
+defaults, which reach the in-cluster Service `grid-enrollment` in namespace
+`grid-enrollment`. See the
+[hub-site example](../../examples/helm/hub-site/README.md#hub).
+
 ## Route
 
 `route.enabled` defaults to `auto`: the chart renders a passthrough Route only when
@@ -38,7 +43,7 @@ rendered passthrough Route needs `route.host`, which the bootstrap adds to the
 serving cert SAN:
 
 ```bash
-helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace \
+helm install grid-enrollment charts/grid-enrollment --namespace grid-enrollment --create-namespace \
   --set route.host=enrollment.apps.<cluster-domain>
 ```
 
@@ -83,7 +88,7 @@ Each override takes a Secret reference, so no key material is inlined in values.
 
 ## Site invites
 
-Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
+Each `invites` entry, keyed by site name with `network` (default `grid`) and optional `expiresInSecs` up to 604800, has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
 
 ## Limitations
 

@@ -92,6 +92,12 @@ provider metrics / Kubernetes state / remote AGN state changes
               next request uses the new ordering
 ```
 
+The last three steps apply only to a gateway whose config sets
+`intelligent_route.overlay_file` to the mounted overlay. The praxis-gateway
+chart's rendered config and the operator-generated consumer config route on
+static candidates, so they pick up a new ordering only when the gateway
+restarts.
+
 ### What causes a reconcile
 
 The operator has two kinds of triggers:
@@ -101,7 +107,7 @@ The operator has two kinds of triggers:
 | `InferenceProvider` change | Provider health, endpoint, model, metrics, or configuration changes can enqueue the owning `GridNetwork`. | Immediate watch event |
 | `GridSite` change | Site labels, geography, membership, or site status changes can enqueue the owning `GridNetwork`. | Immediate watch event |
 | `GridNetwork` change | A change to the network or gateway references enqueues that network. | Immediate watch event |
-| Remote SWIM/CRDT state observed | Remote provider and site state is consumed during reconciliation. | On the next reconcile/event-driven enqueue |
+| Remote SWIM/CRDT state observed | A change to membership, gateway or signals address metadata, or gossiped provider state reconciles every `GridNetwork`. | First change immediately, then at most once per 2 seconds |
 | Periodic requeue | The operator periodically re-scrapes metrics and re-renders overlays. | **300 seconds by default** |
 | TLS metrics configuration | A network with any TLS-protected metrics provider uses a shorter bounded requeue so certificate rotation is noticed without a Secret watch. | **60 seconds** |
 
@@ -432,9 +438,10 @@ instantaneous behavior:
 
 | Condition | State |
 |-----------|-------|
-| No metrics available | `new_and_existing` |
-| `healthy = false` | `none` (excluded; current AGN omits the candidate from its overlay) |
-| `queue_depth > 0.85` or `kv_cache_utilization > 0.90` | `existing_only` |
+| `noMetrics`, or the provider has no signal name for the selected strategy | `new_and_existing` |
+| Signal configured but no usable sample | `existing_only` |
+| Fresh sample with `healthy = false` | `none` (excluded, and current AGN omits the candidate from its overlay) |
+| The selected strategy's signal (`queue_depth` or `kv_cache_utilization`) at or above 0.85 | `existing_only` |
 | Otherwise | `new_and_existing` |
 
 New installations from the `grid-site` Helm chart render stabilized admission
@@ -542,6 +549,10 @@ candidates and `Available` remote candidates are always retained.
 The controller also defensively treats an internally observed `0` as absent, so
 malformed data cannot accidentally trigger immediate eviction outside the normal
 Kubernetes API validation path.
+
+Under `siteDiscovery.mode: auto` the same TTL also bounds auto-created
+`GridSite` objects. One whose member is absent or `Dead` this long, and whose
+spec nobody edited, is deleted, which frees its slot under the per-network cap.
 
 **Recommended starting value:** `3600` (one hour) — allows short outages to
 recover without overlay churn while bounding accumulation of truly dead peers.
@@ -732,9 +743,11 @@ the operator looks for a `GridSite` resource whose Kubernetes name equals `S`
 (site IDs must be DNS-1123 labels) and whose
 `spec.gridNetworkRef == N` and `status.phase == Active`.
 
-`Active` indicates control-plane eligibility: the operator has verified the remote
-site's certificate fingerprint against the configured trust policy and confirmed TCP
-connectivity to the gateway. This allows the site's providers to appear in routing
+`Active` indicates control-plane eligibility. The operator has probed the remote
+site's gateway over TLS and verified its certificate under the grid's
+`peerTrust.mode`: a pinned digest under `pin`, or the site's exact SPIFFE ID
+under `spiffe`. A site with plaintext egress never becomes `Active` and reports
+`PlaintextIneligible`. This allows the site's providers to appear in routing
 overlays for consideration by consumer gateways.
 
 GridSite Active is a control-plane eligibility signal. It means AGN has enough
@@ -746,12 +759,15 @@ traffic. Data-plane readiness is enforced separately at request time.
 See [Authentication and Access Policy](auth.md) for the trust contract.
 
 **Local providers** (from `InferenceProvider` resources in the same cluster) are
-always eligible.  They are not filtered by `GridSite.status.phase`.
+not filtered by `GridSite.status.phase`. They reach the overlay only when their
+`Accepted` condition is `True` at their current generation and their
+`hostSelector` matches a `GridSite`. An omitted `hostSelector` matches no site,
+and `{}` matches every site.
 
-**Claim**: SWIM membership + TCP reachability + public cert material alone are not
+**Claim**: SWIM membership and TCP reachability alone are not
 sufficient for a remote provider to become routable.  `Active` is the explicit
-routing eligibility gate; the operator only sets it after the configured
-fingerprint trust policy matches.
+routing eligibility gate. The operator only sets it after the peer
+passes the configured trust check.
 
 **Validation**: `verify-swim-mesh-three-node` proves the eligibility gate in a
 three-node mesh (A→B→C topology).  It asserts that C's provider is absent from
@@ -954,6 +970,7 @@ The overlay `ConfigMap` is regenerated by the AGN Operator whenever the owning
 | `GridNetwork` created or updated | Immediate reconcile; overlays regenerated |
 | `InferenceProvider` created, updated, or deleted | Owning `GridNetwork` reconcile triggered; overlays regenerated |
 | `GridSite` created, updated, or deleted | Owning `GridNetwork` reconcile triggered; overlays regenerated |
+| SWIM membership or gossiped state changes | Every `GridNetwork` reconciles, the first change immediately and then at most once per 2 seconds |
 | Periodic requeue | Every 300 seconds by default; overlays regenerated |
 
 During each render pass, the operator uses the current local CRDs, current
@@ -968,7 +985,10 @@ Rendering or distributing a new `ConfigMap` does not mean the gateway accepted
 it. The recommended deployment uses `grid-overlay-sync` to watch the named
 `ConfigMap` through the Kubernetes API, validate each content-addressed
 envelope, and atomically write accepted revisions into a shared `emptyDir`.
-Praxis watches that file and installs the new snapshot without a pod restart.
+A gateway whose config sets `intelligent_route.overlay_file` to that file
+installs the new snapshot without a pod restart. The praxis-gateway chart's
+rendered config does not set it, so this path needs a gateway config the
+deployment owns.
 
 This avoids depending on kubelet's eventual projected-ConfigMap refresh loop,
 which can leave the gateway serving an older route after the operator has

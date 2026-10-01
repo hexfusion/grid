@@ -63,8 +63,10 @@ Holds SWIM seeds, TLS settings, and gateway
 references.
 
 **GridSite** - represents one participating cluster
-or location. Created automatically from SWIM
-discovery or manually for seed peers.
+or location. You declare one per site, and SWIM
+discovery fills its status. With `siteDiscovery.mode:
+auto`, the operator also creates one per undeclared
+member.
 
 **InferenceProvider** - declares model capacity at a
 site: model name, backend kind (self-hosted,
@@ -74,7 +76,12 @@ auth strategy.
 **Routing overlay** - a versioned ConfigMap that AGN
 writes for each gateway. Contains scored candidates,
 cluster definitions with mTLS config, and credential
-references. Praxis hot-reloads this without restarts.
+references. A gateway whose own config sets
+`intelligent_route.overlay_file` to the mounted overlay
+hot-reloads it without restarts. The config the
+`praxis-gateway` chart renders does not read the
+overlay. It routes on static candidates, or on the
+operator's serving config, read at start.
 
 **Scoring** - AGN applies one provider-level strategy before
 writing the overlay. `noMetrics` is the generic default for
@@ -105,7 +112,7 @@ client request
 ```
 
 AGN is never in the request path. All routing
-decisions use a pre-computed local overlay file.
+decisions use pre-computed local config.
 
 ## Install
 
@@ -117,7 +124,8 @@ helm install grid-operator \
   --create-namespace
 ```
 
-See the
+The namespace is your choice. The hub-site example
+uses `grid`. See the
 [chart documentation](charts/grid-operator/README.md)
 for values, RBAC, CRD upgrades, and SWIM service
 exposure. Install a compatible
@@ -128,6 +136,8 @@ For Kustomize or raw manifests, see
 [deploy/](deploy/README.md).
 
 ## Getting Started
+
+New here? Read the [getting-started guide](docs/getting-started.md).
 
 [Praxis demos](https://github.com/praxis-proxy/demos): deployable demonstrations
 with automated runtime
@@ -147,6 +157,9 @@ AGN and Praxis on running Kubernetes clusters with Helm.
 | `swim` | foca SWIM wrapper and encryption |
 | `crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
 | `overlay-sync` | Sidecar for fast ConfigMap-to-file delivery |
+| `enrollment` | Site-token enrollment service and grid CA bootstrap |
+| `signals` | Grid signal primitives |
+| `signals-client` | Grid signal poller, the mTLS scrape transport |
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
 | `forge` | Generic development-environment orchestrator for Kubernetes |
 | `xtask` | Dev task runner for multi-cluster test environments |

@@ -242,7 +242,7 @@ Praxis AI image; these values may advance independently.
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |
 | `overlay.items` | list | routing-config.json, routing-overlay.json | Items to project. |
 | `overlay.sidecar.enabled` | bool | `false` | Deliver validated overlays through an API-watch sidecar instead of kubelet ConfigMap projection. |
-| `overlay.sidecar.image.repository` | string | `grid-overlay-sync` | Overlay-sync image repository. Use a published or locally built image appropriate to the deployment. |
+| `overlay.sidecar.image.repository` | string | `ghcr.io/praxis-proxy/grid-overlay-sync` | Overlay-sync image repository. Use a published or locally built image appropriate to the deployment. |
 | `overlay.sidecar.image.tag` | string | `v0.1.4` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
@@ -348,12 +348,12 @@ does not publish a replacement AI rollup.
 AGN runs this chart in two roles with different values:
 
 **Edge gateway:**
-- Listens on port 8080 (HTTP)
-- Mounts an overlay ConfigMap from the AGN Operator
+- Listens on `port.containerPort`, 8080 by default (HTTP)
+- Optionally mounts an overlay ConfigMap from the AGN Operator
 - Mounts a TLS Secret for upstream connections
 
 **Provider gateway:**
-- Listens on port 8443 (mTLS)
+- Listens on `port.containerPort`, 8080 by default, with mutual TLS
 - Mounts a TLS Secret for client authentication
 - Mounts credential Secrets for backend provider access
 - Helm release name must match the mock-providers
@@ -363,17 +363,20 @@ AGN runs this chart in two roles with different values:
 ### Resource names for the AGN Operator
 
 The chart's fullname template produces `{release}-praxis-gateway` by
-default (e.g., release `consumer-gateway` → Service name
-`consumer-gateway-praxis-gateway`). Set `fullnameOverride` to control
-the exact Service name:
+default. For example, release `consumer-gateway` gets the Service name
+`consumer-gateway-praxis-gateway`. A grid gateway, a provider or a consumer
+with site backends, takes its release name instead. Set `fullnameOverride` to
+control the exact Service name:
 
 ```yaml
 fullnameOverride: consumer-gateway   # Service name = consumer-gateway
 ```
 
-The AGN Operator's `gateway.serviceName` must match the consumer
-gateway's Service name. When using `fullnameOverride`, set
-`gateway.serviceName` to the same value in the operator Helm values.
+The grid-operator chart's `gateway.serviceName` must match the provider
+gateway's Service name, which the operator resolves and advertises to remote
+sites. A GridNetwork `gatewayRefs` entry must name the consumer gateway's
+Service, since the operator reads the consumer listener port from that
+Service's numeric `targetPort`, the chart's `port.containerPort`.
 
 ### Cross-site routing in AGN
 
@@ -401,7 +404,12 @@ Known limits:
 
 ### Routing overlay delivery
 
-Praxis can hot-reload a routing overlay as soon as its file changes. A normal
+Praxis can hot-reload a routing overlay as soon as its file changes, when its
+config points `intelligent_route` at the overlay file. Only a BYO config
+(`config.existingConfigMap`) can do that. The config this chart renders does
+not read the overlay: it routes on static `intelligent_route` candidates from
+`gatewayConfig.backends`, or on `grid_site_route` with `gridServing`, which
+reads its serving config only at start. A normal
 ConfigMap volume, however, is updated by the kubelet on an eventual refresh
 cycle. That delay can be longer than a temporary provider-pressure event, so a
 gateway may continue serving an old preference even though AGN has already

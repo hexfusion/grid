@@ -44,8 +44,8 @@ Security is enforced at every stage of development.
 the `make audit` target. The `deny.toml` config bans
 wildcard version requirements, unknown registries, and
 unknown git sources. Multiple versions of the same crate
-produce a warning. All crates enforce
-`#![deny(unsafe_code)]` and Clippy runs with
+produce a warning. The workspace lints forbid
+`unsafe_code` and Clippy runs with
 `-D warnings` (zero tolerance).
 
 ### Formatting
@@ -96,6 +96,23 @@ the CRDs.
 
 CI runs `make crds-check` and fails the pull request when
 the committed manifests are out of date.
+
+### Hub and Site E2E
+
+`scripts/e2e-hub-site.sh` builds the operator, gateway, and enrollment
+images, creates a hub and a site Kind cluster with Forge, runs the
+[hub-site install](../examples/helm/hub-site/README.md) commands, and
+asserts on the result for each peer trust mode.
+
+```console
+./scripts/e2e-hub-site.sh          # up, test, then down
+KEEP=1 ./scripts/e2e-hub-site.sh   # keep the clusters for inspection
+MODES=pin ./scripts/e2e-hub-site.sh
+```
+
+The script header lists its other settings, such as `SKIP_BUILD` and
+`CONTAINER_TOOL`. See [CI Kind E2E](architecture/ci-kind-e2e.md) for how CI
+runs it.
 
 ### Coverage
 

@@ -67,9 +67,11 @@ kubectl logs -n grid-system deployment/grid-operator
 The operator uses a split RBAC model:
 
 - **Cluster-scoped**: CRD access via ClusterRole `grid-operator-crd`
-- **Namespace-scoped**: Secret/ConfigMap access via ClusterRole `grid-operator-resources` bound to specific namespaces
+- **Namespace-scoped**: Secret, ConfigMap, Service, and Event access via ClusterRole `grid-operator-resources` bound to specific namespaces
 
-By default, the operator can access Secrets and ConfigMaps in the `default` namespace. To grant access to additional namespaces:
+The Secrets rule allows get and create, never patch. The Services rule allows get, with no list or watch.
+
+By default, RoleBindings grant that access in the `grid-system` and `default` namespaces. To grant access to additional namespaces:
 
 ```bash
 kubectl create rolebinding grid-operator-resources \
@@ -126,7 +128,7 @@ in this directory are retained for development and raw-manifest users.
 ```bash
 helm install grid-operator \
   oci://ghcr.io/praxis-proxy/charts/grid-operator \
-  --version 0.1.1 \
+  --version <version> \
   --namespace grid-system \
   --create-namespace
 ```

@@ -47,6 +47,8 @@ The AGN Operator will create:
 
 - `ConfigMap/grid-overlay-example-consumer-gateway` - routing overlay for
   Praxis AI
+- `ConfigMap/grid-consumer-example-consumer-gateway` - consumer Praxis config,
+  since the gateway ref sets `consumerConfig.enabled`
 
 ## What This Proves
 

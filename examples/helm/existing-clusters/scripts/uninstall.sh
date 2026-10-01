@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Uninstall Grid components from existing clusters.
-# Removes Helm releases and the grid-system namespace.
-# Does NOT delete clusters, CRDs, or persistent volumes.
+# Removes the Helm releases, installer-created ConfigMaps, and test Jobs in grid-system.
+# Does NOT delete clusters, CRDs, persistent volumes, or the grid-system namespace.
 #
 # Usage: ./uninstall.sh <inventory.yaml>
 #

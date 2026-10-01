@@ -227,7 +227,7 @@ matches and live-probes the endpoint's MCP `tools/list` contract, but does not
 yet distribute discovered tools across sites via SWIM/CRDT, score them, or
 render a routed data-plane path — those remain grid-local only.
 `AgentToAgentProvider`'s resource type exists, but the operator does not yet
-run a controller for it at all.  Inference is the mature reconciled path
+run a controller for it at all, and the charts do not install its CRD.  Inference is the mature reconciled path
 today.
 
 See [CRDs](crds.md) for field-level details.
@@ -457,6 +457,12 @@ AGN does not copy Secret values across clusters.
 Rendering a new `ConfigMap` is not enough by itself.  Kubernetes can project the
 new file into a pod, but the running gateway still has to consume it.
 
+This handoff applies to a gateway whose own config enables the
+`intelligent_route` overlay file. The config that the praxis-gateway chart
+renders does not read the overlay. It routes on the static candidates listed in
+the chart values, or, with `gridServing`, on the operator serving config, which
+the gateway reads only at start.
+
 The recommended production handoff uses the `grid-overlay-sync` container:
 
 ```text
@@ -530,22 +536,25 @@ must ensure the gateway reloads that configuration.
 
 ## Trust and Readiness
 
-AGN manages control-plane trust material and can generate a site CA and site
-certificates. It also records public trust material and fingerprint policy for
-discovered sites.
+A site gets its Grid CA and site certificate from enrollment, or from Secrets
+the deployment provisions. The operator
+mints a self-signed dev CA and site certificate only when the grid-operator
+chart sets `devSelfSignedCa`. It also records public trust material and
+fingerprint policy for discovered sites.
 
 `GridSite.status.phase == Active` currently means control-plane eligibility:
 
 ```text
-the configured fingerprint matched
-+ the TCP probe passed
+the operator's probe completed a mutual TLS handshake with the peer gateway
++ the leaf chains to the Grid CA and matches serverName
++ the leaf matches a pin, or the exact SPIFFE ID under peerTrust spiffe
 = AGN has enough information to consider the site for overlay generation
 ```
 
-It does not prove that a Praxis gateway has completed an mTLS handshake,
-accepted client identity, loaded the newest overlay, or authorized provider-side
-traffic.  Those are data-plane readiness concerns and need richer status
-conditions over time.
+It does not prove that a consumer gateway completed its own handshake. It does
+not prove that the gateway loaded the newest overlay, or that the provider
+gateway authorized its traffic. Those are data-plane readiness concerns and
+need richer status conditions over time.
 
 Over time, readiness should distinguish states such as:
 

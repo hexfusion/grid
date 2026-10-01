@@ -12,13 +12,13 @@ A site enrolls with a grid by redeeming a one-time token at the enrollment servi
 
 ```bash
 helm install grid-enrollment ./charts/grid-enrollment \
-  --namespace grid --create-namespace \
+  --namespace grid-enrollment --create-namespace \
   --set route.host=enrollment.apps.example.com \
   --set db.type=external \
   --set db.external.connectionUrlSecretRef=grid-enrollment-db
 ```
 
-On OpenShift the chart renders a passthrough Route for `route.host`, so remote sites can reach enrollment. `route.enabled` defaults to `auto`, which renders the Route only when the cluster serves `route.openshift.io/v1`. `true` or `false` forces it. Elsewhere, omit `route.host` and front the Service with your own ingress. For GitOps renders with `helm template`, pass `--api-versions route.openshift.io/v1` on OpenShift, or `auto` renders no Route.
+On OpenShift the chart renders a passthrough Route for `route.host`, so remote sites can reach enrollment. `route.enabled` defaults to `auto`, which renders the Route only when the cluster serves `route.openshift.io/v1`. `true` or `false` forces it. Elsewhere, set `host`, which makes the enrollment Service a LoadBalancer when no Route renders, or front the Service with your own ingress. For GitOps renders with `helm template`, pass `--api-versions route.openshift.io/v1` on OpenShift, or `auto` renders no Route.
 
 A pre-install Job runs `enrollment bootstrap` to create the grid CA and the serving certificates for enrollment and its database. It is idempotent: on upgrade it keeps the CA and re-issues a serving certificate when a requested name, such as a new `route.host`, is missing, or when fewer than 30 days remain. `ca.forceRegenerate` replaces the CA and invalidates every certificate it signed.
 
@@ -57,7 +57,7 @@ Deliver `grid-invite-<siteName>` and the grid CA bundle (`ca.crt` from Secret `g
 Treat invite Secrets as credentials:
 
 - Anyone who can get Secrets in the release namespace can read them, the same users who can read the CA signing key.
-- Removing an entry from `invites` or deleting its Secret does not revoke the token. Revoke it as a grid-admin with `DELETE /v1alpha1/enrollmenttokens/<id>`, using the id in the Secret's `grid.praxis.fast/token-id` annotation. The chart's `<release>-grid-enrollment-grid-admin` Role grants that.
+- Removing an entry from `invites` or deleting its Secret does not revoke the token. Revoke it as a grid-admin with `DELETE /v1alpha1/enrollmenttokens/<id>`, using the id in the Secret's `grid.praxis.fast/token-id` annotation. The chart's `<fullname>-grid-admin` Role grants that, `grid-enrollment-grid-admin` for release `grid-enrollment`.
 - `helm uninstall` leaves invite Secrets behind. Delete them by hand.
 
 ### Enroll on the site
@@ -66,7 +66,7 @@ Enable enrollment in the grid-operator chart:
 
 ```bash
 helm install grid-operator ./charts/grid-operator \
-  --namespace grid-system \
+  --namespace grid --create-namespace \
   --set swim.siteName=east2 \
   --set enrollment.enabled=true \
   --set enrollment.url=https://enrollment.apps.example.com
