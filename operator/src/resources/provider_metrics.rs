@@ -596,8 +596,8 @@ async fn resolve_tls_config(
 /// # Returns
 ///
 /// - `Ok(None)` — TLS material is accessible and valid (or no TLS configured).
-/// - `Ok(Some(reason_string))` — failure; the provider should be marked [`Degraded`] with the returned reason in
-///   `status.reason`.
+/// - `Ok(Some(reason_string))` — failure; the provider should be marked [`Degraded`] with the returned reason in the
+///   `Available` condition reason.
 ///
 /// [`Degraded`]: crate::crd::inference_provider::ProviderPhase::Degraded
 ///
@@ -620,7 +620,7 @@ pub(crate) async fn verify_metrics_tls_accessible(
 /// bounded log-level reason string.
 ///
 /// These categories are used for structured logging only — they do not
-/// appear in `InferenceProvider.status.reason`.  Status reasons are
+/// appear in the `InferenceProvider` `Available` condition reason.  Status reasons are
 /// reserved for material/configuration failures that the controller
 /// can observe during reconciliation (see [`endpoint_tls::TlsFailureReason`](super::endpoint_tls::TlsFailureReason)).
 pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -> &'static str {
@@ -696,6 +696,7 @@ mod tests {
     fn provider_fixture(name: &str, endpoint: &str, mc: Option<MetricsConfig>) -> InferenceProvider {
         let mut spec = serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
@@ -948,7 +949,7 @@ mod tests {
             "kind": "InferenceProvider",
             "metadata": {"name": "prov-a"},
             "spec": {
-                "gridNetworkRef": "net",
+                "gridNetworkRef": "net", "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": base_url,

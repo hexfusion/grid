@@ -100,7 +100,7 @@ The `InferenceProvider` controller validates credentials during every reconcile:
   `Unavailable` before any API call.
 - Verifies the referenced Kubernetes Secret exists, contains the declared key,
   and the key value is valid UTF-8.
-- All credential failures surface in `status.reason` as one of:
+- All credential failures surface as the `Available` condition reason, one of:
   `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`,
   `CredentialSecretMissing`, `CredentialSecretKeyMissing`,
   `CredentialSecretValueInvalid`.
@@ -454,7 +454,7 @@ configured.  Before storage, the receiving operator runs a structural check:
 - Input containing `PRIVATE KEY` markers is discarded and logged at error level.
   Private key material must never enter status fields or SWIM broadcasts.
 - Input without a `-----BEGIN CERTIFICATE-----` header is rejected and recorded
-  as `TrustMaterialInvalid` in `GridSite.status.reason`.
+  in `GridSite.status.discovered.advertisedCertError`, without the PEM.
 - Input with a valid `CERTIFICATE` header passes the structural check and is
   stored in `GridSite.status.discovered.advertisedCertPem`.
 

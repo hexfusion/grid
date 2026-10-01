@@ -567,6 +567,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://provider",

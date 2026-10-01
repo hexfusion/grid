@@ -5,6 +5,8 @@ metadata:
 spec:
   group: grid.praxis-proxy.io
   names:
+    categories:
+      - grid
     kind: GridSite
     plural: gridsites
     shortNames:
@@ -185,8 +187,8 @@ spec:
                   description: What SWIM gossip reports about this site; observed, never authored.
                   nullable: true
                   properties:
-                    advertisedCertPem:
-                      description: Certificate PEM the remote operator advertised; never a trust anchor on its own.
+                    absentSince:
+                      description: When gossip lost this member (absent or `Dead`), RFC 3339; cleared when it returns.
                       nullable: true
                       type: string
                     egressAddress:
@@ -201,18 +203,6 @@ spec:
                     This is not a liveness heartbeat; it may remain unchanged when a probe
                     produces no status changes.
                   nullable: true
-                  type: string
-                lastTransitionTime:
-                  description: Timestamp of the last phase transition.
-                  nullable: true
-                  type: string
-                message:
-                  default: ""
-                  description: |-
-                    Human-readable diagnostic for the current phase.
-
-                    Never contains credential token bytes.  Populated on every reconcile;
-                    empty when the operator has no additional context.
                   type: string
                 observedGeneration:
                   default: 0
@@ -229,14 +219,6 @@ spec:
                     - Active
                     - Unreachable
                     - Left
-                  type: string
-                reason:
-                  default: ""
-                  description: |-
-                    Machine-readable reason for the current phase.
-
-                    Examples: `"AwaitingDiscovery"`, `"GatewayAddressKnown"`,
-                    `"TlsVerified"`, and `"IdentityVerificationRequired"`.
                   type: string
               type: object
           required:

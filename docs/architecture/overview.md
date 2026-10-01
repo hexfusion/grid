@@ -222,7 +222,7 @@ The implemented inference path uses three cluster-scoped CRDs:
 | `InferenceProvider` | Declares model capacity: model name, backend kind, endpoint, health config, auth strategy, access policy, and provider status. |
 
 `AgentToolProvider` and `AgentToAgentProvider` are schema direction for MCP and
-A2A.  `AgentToolProvider` has a running reconciler that resolves `siteSelector`
+A2A.  `AgentToolProvider` has a running reconciler that resolves `hostSelector`
 matches and live-probes the endpoint's MCP `tools/list` contract, but does not
 yet distribute discovered tools across sites via SWIM/CRDT, score them, or
 render a routed data-plane path — those remain grid-local only.

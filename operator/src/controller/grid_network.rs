@@ -8,10 +8,10 @@
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 use k8s_openapi::{
@@ -20,7 +20,7 @@ use k8s_openapi::{
 };
 use kube::{
     Client, Resource as _,
-    api::{Api, ListParams, Patch, PatchParams, PostParams},
+    api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{controller::Action, reflector::ObjectRef},
 };
 use tokio::{sync::Mutex, time::Duration};
@@ -31,9 +31,9 @@ use crate::{
         condition::{self, Rejection},
         grid_network::{
             ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus,
-            OverlayPhase, OverlayRevisionStatus, SignalMode, SiteDiscoveryMode, TenantBudgetStatus, TlsMode,
+            OverlayPhase, OverlayRevisionStatus, SignalMode, SiteDiscoveryMode, TenantBudgetStatus,
         },
-        grid_site::{GridSite, GridSitePhase, GridSiteStatus},
+        grid_site::{GridSite, GridSitePhase, GridSiteSpec, GridSiteStatus},
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
@@ -42,7 +42,6 @@ use crate::{
         overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
-        trust_bundle::{self, CertPemStatus},
     },
     served_models, signals,
     swim::{MemberStatus, MembershipSnapshot},
@@ -594,6 +593,29 @@ pub(crate) fn network_spec_rejection(network: &GridNetwork) -> Option<Rejection>
         .map(|error| Rejection::new("BudgetPolicyInvalid", format!("budgetPolicy: {error}")))
 }
 
+/// The auto-mode `GridNetwork` that drives discovery here: the oldest, then by name.
+fn auto_discovery_owner(networks: &[GridNetwork]) -> Option<&str> {
+    networks
+        .iter()
+        .filter(|network| network.spec.site_discovery.mode == SiteDiscoveryMode::Auto)
+        .min_by(|a, b| {
+            (a.metadata.creation_timestamp.as_ref().map(|t| t.0), &a.metadata.name)
+                .cmp(&(b.metadata.creation_timestamp.as_ref().map(|t| t.0), &b.metadata.name))
+        })
+        .and_then(|network| network.metadata.name.as_deref())
+}
+
+/// A rejection for an auto-mode network `name` when another one already owns discovery on this operator.
+fn auto_discovery_rejection(name: &str, networks: &[GridNetwork]) -> Option<Rejection> {
+    let owner = auto_discovery_owner(networks)?;
+    (owner != name).then(|| {
+        Rejection::new(
+            "AutoDiscoveryClaimed",
+            format!("GridNetwork {owner} already runs siteDiscovery.mode auto here; set this one to manual"),
+        )
+    })
+}
+
 /// Report `rejection` in status and as an event, then wait for a spec change instead of reconciling.
 #[expect(clippy::large_stack_frames, reason = "async future over Kubernetes API types")]
 async fn reject_network(
@@ -646,6 +668,14 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let name = grid_network_name(&network)?;
     if let Some(rejection) = network_spec_rejection(&network) {
         return Box::pin(reject_network(&network, &ctx.client, &rejection)).await;
+    }
+    if network.spec.site_discovery.mode == SiteDiscoveryMode::Auto {
+        let networks = Api::<GridNetwork>::all(ctx.client.clone())
+            .list(&ListParams::default())
+            .await?;
+        if let Some(rejection) = auto_discovery_rejection(name, &networks.items) {
+            return Box::pin(reject_network(&network, &ctx.client, &rejection)).await;
+        }
     }
 
     info!(name, "reconciling GridNetwork");
@@ -705,23 +735,6 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         // Re-announcing on each reconcile is idempotent (foca ignores existing members).
         // diff_seed_sets tracks additions/removals for diagnostic logging.
         announce_crd_seeds(&network, swim, &ctx.last_seeds).await;
-
-        // Broadcast the local site's public certificate PEM so remote peers can
-        // populate GridSite.status.discovered.advertisedCertPem.  Only the public cert is read —
-        // the private key (tls.key) is never accessed by this code path.
-        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await
-        {
-            let cert_broadcast = swim::StateBroadcast::new(
-                swim.site_name().to_owned(),
-                cert_broadcast_revision(),
-                crdt::GridStateSnapshot::new(swim.site_name().to_owned()),
-                None,
-            )
-            .with_cert(Some(cert_pem));
-            if let Err(e) = swim.publish_state_broadcast(cert_broadcast) {
-                tracing::warn!(network = name, error = %e, "failed to publish site cert broadcast");
-            }
-        }
     }
 
     // Rendering before membership converges would drop remote entries.
@@ -900,13 +913,28 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     if let (Some(swim), Some(snapshot)) = (ctx.swim(), membership.as_ref()) {
         reconcile_local_site(name, swim.site_name(), client).await?;
         discovery_conflicts = Box::pin(reconcile_discovered_sites(
+            &network,
             name,
             swim.site_name(),
             snapshot,
             client,
-            network.spec.site_discovery.mode,
         ))
         .await?;
+    }
+
+    let previous_conflict = network
+        .status
+        .as_ref()
+        .and_then(|s| condition::find(&s.conditions, condition::DISCOVERY_CONFLICT))
+        .filter(|c| c.status == condition::ConditionStatus::True)
+        .map(|c| c.message.as_str());
+    let message = discovery_conflicts
+        .iter()
+        .map(|c| c.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !discovery_conflicts.is_empty() && previous_conflict != Some(message.as_str()) {
+        tracing::warn!(network = name, %message, "discovered members not adopted");
     }
 
     update_status(
@@ -937,10 +965,6 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 /// its local `GridSite` declaratively, this controller must still hand it to the
 /// `GridSite` controller for gateway probing. The status write is idempotent and
 /// only applies while the site is still pending.
-#[expect(
-    clippy::too_many_lines,
-    reason = "status patch keeps the local-site transition explicit"
-)]
 async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Client) -> Result<(), OperatorError> {
     let api: Api<GridSite> = Api::all(client.clone());
     let Ok(site) = api.get(local_site).await else {
@@ -956,22 +980,7 @@ async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Cli
     if !pending {
         return Ok(());
     }
-    let status_doc = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1beta1",
-        "kind": "GridSite",
-        "status": {
-            "phase": "Discovered",
-            "reason": "SWIMDiscovered",
-            "message": "local site configured and ready for gateway probing"
-        }
-    });
-    api.patch_status(
-        local_site,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&status_doc),
-    )
-    .await?;
-    Ok(())
+    mark_discovered(&api, local_site, site.metadata.resource_version.as_deref()).await
 }
 
 /// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
@@ -1042,17 +1051,6 @@ fn rfc3339_now() -> Option<String> {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok()
-}
-
-/// Cert rotation updates the Kubernetes Secret, not necessarily the `GridNetwork`
-/// generation.  Use wall-clock nanoseconds so a reconcile after rotation is not
-/// suppressed as a duplicate metadata broadcast.
-fn cert_broadcast_revision() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 /// Error policy for the [`GridNetwork`] controller.
@@ -1544,6 +1542,19 @@ async fn reconcile_routing_overlay_inner(
                 EMPTY_CANDIDATES,
                 "no candidates available",
             ));
+            match gw_ref.consumer_config.as_ref().map(|cc| cc.enabled) {
+                Some(true) => consumer_statuses.push(consumer_config_status_pending(
+                    gw_ref,
+                    network_name,
+                    observed_generation,
+                )),
+                Some(false) => consumer_statuses.push(consumer_config_status_disabled(
+                    gw_ref,
+                    network_name,
+                    observed_generation,
+                )),
+                None => {},
+            }
             continue;
         }
         let resource_version = match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await
@@ -1602,7 +1613,16 @@ async fn reconcile_routing_overlay_inner(
         // Gateways without a consumerConfig block are omitted from status.
         if gw_ref.consumer_config.as_ref().is_some_and(|cc| cc.enabled) {
             consumer_statuses.push(
-                reconcile_consumer_config(&overlay, network_name, gw_ref, consumer, client, observed_generation).await,
+                reconcile_consumer_config(
+                    &overlay,
+                    network_name,
+                    gw_ref,
+                    &sites,
+                    consumer,
+                    client,
+                    observed_generation,
+                )
+                .await,
             );
         } else if gw_ref.consumer_config.as_ref().is_some_and(|cc| !cc.enabled) {
             consumer_statuses.push(consumer_config_status_disabled(
@@ -1845,18 +1865,24 @@ fn retained_overlay_status(
     status.namespace.clone_from(&gw_ref.namespace);
     status.observed_generation = observed_generation;
     reason.clone_into(&mut status.reason);
-    status.phase = if has_prior {
-        OverlayPhase::Retained
-    } else {
-        OverlayPhase::Error
-    };
-    status.message = if has_prior {
-        format!("{failure_message}; previous valid overlay retained")
-    } else {
-        format!("{failure_message}; no valid overlay has been distributed")
+    (status.phase, status.message) = match (has_prior, reason) {
+        (true, _) => (
+            OverlayPhase::Retained,
+            format!("{failure_message}; previous valid overlay retained"),
+        ),
+        // A grid with no providers yet is waiting, not failing.
+        (false, EMPTY_CANDIDATES) => (OverlayPhase::Pending, NO_CANDIDATES_YET.to_owned()),
+        (false, _) => (
+            OverlayPhase::Error,
+            format!("{failure_message}; no valid overlay has been distributed"),
+        ),
     };
     status
 }
+
+/// Overlay status message while a gateway has never had a candidate.
+const NO_CANDIDATES_YET: &str =
+    "no routing candidates yet; the overlay and serving config are written once a candidate exists";
 
 /// List all [`InferenceProvider`] resources cluster-wide.
 async fn list_all_inference_providers(client: &Client) -> Result<Vec<InferenceProvider>, OperatorError> {
@@ -1899,6 +1925,7 @@ async fn reconcile_consumer_config(
     overlay: &routing_overlay::RoutingOverlay,
     network_name: &str,
     gw_ref: &GatewayRef,
+    sites: &[GridSite],
     settings: &ConsumerSettings,
     client: &Client,
     observed_generation: i64,
@@ -1910,7 +1937,8 @@ async fn reconcile_consumer_config(
     };
     match apply_consumer_config_for_gateway(overlay, network_name, gw_ref, &settings, client).await {
         Ok(()) => {
-            let status = consumer_config_status_rendered(gw_ref, network_name, observed_generation);
+            let mismatch = routed_address_mismatch(overlay, network_name, gw_ref, sites);
+            let status = consumer_config_status_rendered(gw_ref, network_name, observed_generation, mismatch);
             match resolved {
                 Ok(_) => status,
                 Err(detail) => consumer_config_status_listener_fallback(status, settings.listener_port, &detail),
@@ -1995,6 +2023,34 @@ async fn apply_consumer_config_for_gateway(
         "applied consumer Praxis config ConfigMap"
     );
     Ok(())
+}
+
+/// A remote route of `gw_ref` that differs from its site's probed address, logged when present.
+fn routed_address_mismatch(
+    overlay: &routing_overlay::RoutingOverlay,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    sites: &[GridSite],
+) -> Option<String> {
+    let endpoints = gw_ref
+        .consumer_config
+        .as_ref()
+        .map_or(&[][..], |cc| cc.cluster_endpoints.as_slice());
+    let mismatch = consumer_config::routed_address_mismatch(overlay, endpoints, |site| {
+        probed_site_address(network_name, sites, site)
+    });
+    if let Some(message) = &mismatch {
+        tracing::warn!(network = network_name, gateway = %gw_ref.name, %message, "routed address differs from the probed address");
+    }
+    mismatch
+}
+
+/// The egress address the `GridSite` probe for `site` verifies.
+fn probed_site_address<'site>(network_name: &str, sites: &'site [GridSite], site: &str) -> Option<&'site str> {
+    sites
+        .iter()
+        .find(|s| s.metadata.name.as_deref() == Some(site) && s.spec.grid_network_ref == network_name)
+        .and_then(super::grid_site::egress_address)
 }
 
 /// Result of applying one routing overlay `ConfigMap` for a single gateway.
@@ -2580,7 +2636,7 @@ async fn update_status(
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
-    discovery_conflicts: &[String],
+    discovery_conflicts: &[Rejection],
     trust_problem: Option<&Rejection>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
@@ -2631,23 +2687,31 @@ fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired
 // Consumer config status builders
 // ---------------------------------------------------------------------------
 
-/// Build a `Rendered` [`ConsumerConfigStatus`] for a successfully applied consumer config.
+/// Build a `Rendered` [`ConsumerConfigStatus`], warning with `RoutedAddressMismatch` when `mismatch` is set.
 pub(crate) fn consumer_config_status_rendered(
     gw_ref: &GatewayRef,
     network_name: &str,
     observed_generation: i64,
+    mismatch: Option<String>,
 ) -> ConsumerConfigStatus {
     let config_map_name = consumer_config::consumer_config_map_name(network_name, &gw_ref.name);
+    let (reason, message) = match mismatch {
+        Some(message) => (consumer_config::ROUTED_ADDRESS_MISMATCH.to_owned(), message),
+        None => (
+            String::new(),
+            format!(
+                "consumer config rendered and applied to {}/{config_map_name}",
+                gw_ref.namespace
+            ),
+        ),
+    };
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
         namespace: gw_ref.namespace.clone(),
-        message: format!(
-            "consumer config rendered and applied to {}/{config_map_name}",
-            gw_ref.namespace
-        ),
         config_map_name,
         phase: ConsumerConfigPhase::Rendered,
-        reason: String::new(),
+        reason,
+        message,
         observed_generation,
     }
 }
@@ -2656,16 +2720,25 @@ pub(crate) fn consumer_config_status_rendered(
 const LISTENER_PORT_UNRESOLVED: &str = "ListenerPortUnresolved";
 
 /// Mark a rendered consumer status as using the fallback listener port.
+///
+/// `ListenerPortUnresolved` outranks `RoutedAddressMismatch`, since the config may not serve at all; the message keeps
+/// both.
 fn consumer_config_status_listener_fallback(
     mut status: ConsumerConfigStatus,
     listener_port: u16,
     detail: &str,
 ) -> ConsumerConfigStatus {
+    let fallback = format!("listener on fallback port {listener_port}: {detail}");
+    status.message = if status.reason == consumer_config::ROUTED_ADDRESS_MISMATCH {
+        format!(
+            "{fallback}; also {}: {}",
+            consumer_config::ROUTED_ADDRESS_MISMATCH,
+            status.message
+        )
+    } else {
+        format!("{}; {fallback}", status.message)
+    };
     LISTENER_PORT_UNRESOLVED.clone_into(&mut status.reason);
-    status.message = format!(
-        "{}; listener on fallback port {listener_port}: {detail}",
-        status.message
-    );
     status
 }
 
@@ -2683,6 +2756,23 @@ pub(crate) fn consumer_config_status_disabled(
         phase: ConsumerConfigPhase::Disabled,
         reason: "ConsumerConfigDisabled".to_owned(),
         message: "consumerConfig.enabled is false; no ConfigMap generated".to_owned(),
+        observed_generation,
+    }
+}
+
+/// A `Pending` [`ConsumerConfigStatus`] while the gateway has no routing candidate, since an empty config cannot load.
+pub(crate) fn consumer_config_status_pending(
+    gw_ref: &GatewayRef,
+    network_name: &str,
+    observed_generation: i64,
+) -> ConsumerConfigStatus {
+    ConsumerConfigStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        config_map_name: consumer_config::consumer_config_map_name(network_name, &gw_ref.name),
+        phase: ConsumerConfigPhase::Pending,
+        reason: EMPTY_CANDIDATES.to_owned(),
+        message: "waiting for a routing candidate; the consumer config is written once one exists".to_owned(),
         observed_generation,
     }
 }
@@ -2810,18 +2900,8 @@ pub(crate) struct DiscoveredSite {
     pub name: String,
     /// The `GridNetwork` this site belongs to.
     pub grid_network_ref: String,
-    /// Data-plane gateway address for egress connectivity.
-    ///
-    /// When the remote peer advertises a gateway address via a SWIM state broadcast,
-    /// this field carries that address.  Otherwise it is empty and the `egress`
-    /// section should be omitted from the `GridSite` spec to allow the `GridSite`
-    /// controller to hold the site in `Discovered` until a gateway address arrives.
-    pub egress_address: String,
-    /// Public site certificate PEM received from this peer via SWIM broadcast.
-    ///
-    /// Contains only the public certificate — never a private key.
-    /// `None` when the remote peer has not yet broadcast its certificate.
-    pub site_cert_pem: Option<String>,
+    /// Gossiped gateway address: `None` not yet learned, empty when the peer withdrew it.
+    pub egress_address: Option<String>,
 }
 
 /// Derive the set of remote [`GridSite`]s the operator should maintain from the SWIM snapshot.
@@ -2840,18 +2920,74 @@ pub(crate) fn discovered_sites_from_swim(
     local_site: &str,
     snapshot: &MembershipSnapshot,
 ) -> Vec<DiscoveredSite> {
-    snapshot
-        .members
-        .iter()
-        .filter(|m| m.status == MemberStatus::Alive && m.site_id != local_site)
-        .filter(|m| is_dns1123_label(&m.site_id))
+    remote_alive(local_site, snapshot)
+        .filter(|m| is_dns1123_label(&m.site_id) && m.duplicate_endpoints.is_empty())
         .map(|m| DiscoveredSite {
             name: m.site_id.clone(),
             grid_network_ref: network_name.to_owned(),
-            egress_address: m.gateway_address.clone().unwrap_or_default(),
-            site_cert_pem: m.site_cert_pem.clone(),
+            egress_address: m.gateway_address.clone(),
         })
         .collect()
+}
+
+/// Remote Alive members of `snapshot`.
+fn remote_alive<'snap>(
+    local_site: &'snap str,
+    snapshot: &'snap MembershipSnapshot,
+) -> impl Iterator<Item = &'snap crate::swim::MemberRecord> {
+    snapshot
+        .members
+        .iter()
+        .filter(move |m| m.status == MemberStatus::Alive && m.site_id != local_site)
+}
+
+/// Alive members discovery cannot name a `GridSite` after, as `DiscoveryConflict` entries.
+fn unadoptable_members(local_site: &str, snapshot: &MembershipSnapshot) -> Vec<Rejection> {
+    let invalid = remote_alive(local_site, snapshot)
+        .filter(|m| !is_dns1123_label(&m.site_id))
+        .map(|m| m.site_id.chars().take(64).collect::<String>())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| {
+            Rejection::new(
+                "SiteIdInvalid",
+                format!("SWIM member {id:?} not adopted: not a DNS-1123 label"),
+            )
+        });
+    let duplicated = duplicated_members(local_site, snapshot).map(|m| {
+        Rejection::new(
+            "SiteIdDuplicated",
+            format!(
+                "SWIM member {} not adopted: claimed from {}",
+                m.site_id,
+                m.duplicate_endpoints.join(", ")
+            ),
+        )
+    });
+    invalid.chain(duplicated).collect()
+}
+
+/// Remote Alive members with a valid ID that two live addresses claim.
+fn duplicated_members<'snap>(
+    local_site: &'snap str,
+    snapshot: &'snap MembershipSnapshot,
+) -> impl Iterator<Item = &'snap crate::swim::MemberRecord> {
+    remote_alive(local_site, snapshot).filter(|m| is_dns1123_label(&m.site_id) && !m.duplicate_endpoints.is_empty())
+}
+
+/// Clear the gossiped egress of this network's `GridSite` for a duplicated ID, so neither claimant is routed to.
+async fn withdraw_ambiguous_egress(api: &Api<GridSite>, network_name: &str, name: &str) -> Result<(), OperatorError> {
+    let Some(site) = api.get_opt(name).await? else {
+        return Ok(());
+    };
+    if site.spec.grid_network_ref != network_name {
+        return Ok(());
+    }
+    if let Some(patch) = discovered_egress_patch(site.status.as_ref(), Some("")) {
+        api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Whether a SWIM site ID is already a DNS-1123 label, the only IDs discovery names a `GridSite` after.
@@ -2866,198 +3002,6 @@ pub(crate) fn is_dns1123_label(site_id: &str) -> bool {
         && !site_id.ends_with('-')
 }
 
-/// Whether auto-discovered remote `GridSite` egress should use plaintext.
-///
-/// Explicit `gatewayRefs[].consumerConfig.clusterEndpoints[].transport.mode`
-/// declarations are the source of truth when present.  If any endpoint is
-/// declared plaintext, auto-discovered `GridSite` egress is plaintext for this
-/// network.  This supports local/dev GLB demos where provider gateways are
-/// intentionally plain HTTP.
-///
-/// When no explicit plaintext endpoint exists, fall back to the top-level grid
-/// TLS references: a network with no CA or site certificate refs is treated as
-/// plaintext, while a network with either TLS ref keeps mutual TLS.
-pub(crate) fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
-    let has_plaintext_endpoint = network.spec.gateway_refs.iter().any(|gw| {
-        gw.consumer_config.as_ref().is_some_and(|cc| {
-            cc.cluster_endpoints.iter().any(|ep| {
-                ep.transport
-                    .as_ref()
-                    .is_some_and(|transport| transport.mode == TlsMode::Plaintext)
-            })
-        })
-    });
-
-    has_plaintext_endpoint || (network.spec.tls.ca_secret_ref.is_none() && network.spec.tls.site_secret_ref.is_none())
-}
-
-/// `GridSite.status.reason` recorded for every cert-PEM validation failure.
-///
-/// Single source of truth for both [`decide_cert_pem_write`]'s write (via
-/// [`reconcile_site_cert_pem`]) and [`already_recorded_invalid`]'s read, so
-/// the two can never drift apart the way a hand-duplicated literal could.
-const REASON_TRUST_MATERIAL_INVALID: &str = "TrustMaterialInvalid";
-
-/// Diagnostic message for [`CertPemStatus::ContainsPrivateKey`].
-const CERT_PEM_MSG_CONTAINS_PRIVATE_KEY: &str =
-    "received trust material from remote site contained private-key markers; discarded";
-
-/// Diagnostic message for [`CertPemStatus::NotACertificate`].
-const CERT_PEM_MSG_NOT_A_CERTIFICATE: &str = "received cert PEM from remote site is not a valid certificate; check \
-                                               GRID_TLS_SITE_SECRET_REF configuration on the remote operator";
-
-/// Diagnostic message for [`CertPemStatus::TooLarge`].
-const CERT_PEM_MSG_TOO_LARGE: &str = "received cert PEM from remote site exceeds the configured size bound";
-
-/// What (if anything) [`reconcile_site_cert_pem`] should write to `GridSite`
-/// status for a received site cert PEM.
-///
-/// Produced by the pure [`decide_cert_pem_write`] so the branching logic is
-/// unit-testable without a live Kubernetes API — see grid#42, where writing
-/// unconditionally on every branch turned a stable, unchanged site into an
-/// infinite reconcile hot-loop.
-#[derive(Debug, Eq, PartialEq)]
-enum CertPemWrite {
-    /// `existing_status` already reflects this outcome; nothing to do.
-    NoOp,
-    /// Store the structurally-valid cert PEM.
-    StoreValid,
-    /// Reject with `TrustMaterialInvalid`, recording this diagnostic message.
-    RejectInvalid {
-        /// Diagnostic message to record in `status.message`.
-        message: &'static str,
-        /// Selects `error!` (private-key leak) vs `warn!` (malformed or
-        /// oversized) logging in the caller.
-        security_violation: bool,
-    },
-}
-
-/// Pure decision: given the current `GridSite` status and a freshly-checked
-/// [`CertPemStatus`], decide what (if anything) to write.
-///
-/// Never itself touches the Kubernetes API — see [`CertPemWrite`].
-fn decide_cert_pem_write(
-    existing_status: Option<&GridSiteStatus>,
-    cert_pem: &str,
-    check: &CertPemStatus,
-) -> CertPemWrite {
-    match check {
-        CertPemStatus::ValidStructure => {
-            if advertised_cert_pem(existing_status) == Some(cert_pem) {
-                CertPemWrite::NoOp
-            } else {
-                CertPemWrite::StoreValid
-            }
-        },
-        CertPemStatus::ContainsPrivateKey => {
-            decide_reject_invalid(existing_status, CERT_PEM_MSG_CONTAINS_PRIVATE_KEY, true)
-        },
-        CertPemStatus::NotACertificate => decide_reject_invalid(existing_status, CERT_PEM_MSG_NOT_A_CERTIFICATE, false),
-        CertPemStatus::TooLarge => decide_reject_invalid(existing_status, CERT_PEM_MSG_TOO_LARGE, false),
-    }
-}
-
-/// Shared decision logic for the three invalid-cert-PEM outcomes: skip when
-/// `existing_status` already records this exact `message`, otherwise reject.
-fn decide_reject_invalid(
-    existing_status: Option<&GridSiteStatus>,
-    message: &'static str,
-    security_violation: bool,
-) -> CertPemWrite {
-    if already_recorded_invalid(existing_status, message) {
-        CertPemWrite::NoOp
-    } else {
-        CertPemWrite::RejectInvalid {
-            message,
-            security_violation,
-        }
-    }
-}
-
-/// The advertised certificate already recorded in `status.discovered`.
-fn advertised_cert_pem(status: Option<&GridSiteStatus>) -> Option<&str> {
-    status
-        .and_then(|s| s.discovered.as_ref())
-        .and_then(|d| d.advertised_cert_pem.as_deref())
-}
-
-/// True when `existing` already records the given invalid-cert `message` with
-/// no stored `advertisedCertPem`, meaning a re-patch with the same content would
-/// be a redundant write.
-fn already_recorded_invalid(existing: Option<&GridSiteStatus>, message: &str) -> bool {
-    existing.is_some_and(|s| {
-        advertised_cert_pem(Some(s)).is_none() && s.reason == REASON_TRUST_MATERIAL_INVALID && s.message == message
-    })
-}
-
-/// Validate a received site cert PEM and store (or reject) it in `GridSite`
-/// status, per [`decide_cert_pem_write`]. Purely an imperative shell around
-/// that pure decision: no branching logic lives here, only I/O and logging.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "three sequential match arms, each a distinct security invariant (store/reject/security-log); splitting further would fragment cohesive I/O steps rather than reduce complexity"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "three JSON-patch-plus-log branches read clearer inline than split further"
-)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "async future over Kubernetes API types with serde_json values"
-)]
-async fn reconcile_site_cert_pem(
-    api: &Api<GridSite>,
-    site_name: &str,
-    existing_status: Option<&GridSiteStatus>,
-    cert_pem: &str,
-) -> Result<(), OperatorError> {
-    match decide_cert_pem_write(existing_status, cert_pem, &trust_bundle::check_cert_pem(cert_pem)) {
-        CertPemWrite::NoOp => {
-            tracing::debug!(name = %site_name, "cert PEM status already up to date; skipping no-op status patch");
-        },
-        CertPemWrite::StoreValid => {
-            // Use strategic merge patch (not SSA) so only advertisedCertPem is
-            // updated; SSA with a partial payload would clear other status
-            // fields managed by "grid-operator" (e.g., reason, message).
-            let cert_merge = serde_json::json!({ "status": { "discovered": { "advertisedCertPem": cert_pem } } });
-            api.patch_status(site_name, &PatchParams::default(), &Patch::Merge(&cert_merge))
-                .await?;
-            tracing::info!(
-                name = %site_name,
-                "received and stored public site certificate PEM (structure valid; not chain-verified)"
-            );
-        },
-        CertPemWrite::RejectInvalid {
-            message,
-            security_violation,
-        } => {
-            // Write a status marker so operators can see the invalid material.
-            // Do not store the raw PEM; record only the invalid status.
-            let invalid_status_doc = serde_json::json!({
-                "apiVersion": "grid.praxis-proxy.io/v1beta1",
-                "kind": "GridSite",
-                "status": {
-                    "discovered": { "advertisedCertPem": null },
-                    "reason": REASON_TRUST_MATERIAL_INVALID,
-                    "message": message
-                }
-            });
-            api.patch_status(site_name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
-                .await?;
-            if security_violation {
-                tracing::error!(
-                    name = %site_name,
-                    "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
-                     discarding — private keys must never appear in SWIM broadcasts"
-                );
-            } else {
-                tracing::warn!(name = %site_name, %message, "rejected invalid cert PEM from remote site");
-            }
-        },
-    }
-    Ok(())
-}
-
 /// What discovery does with a SWIM member's `GridSite` name.
 #[derive(Debug, Eq, PartialEq)]
 enum Adoption {
@@ -3068,16 +3012,19 @@ enum Adoption {
     /// None exists and the mode is manual; leave it.
     Skip,
     /// The name belongs to another network's `GridSite`; leave that object untouched.
-    Conflict(String),
+    Conflict(Rejection),
 }
 
 /// Decide how discovery treats `name` given the object already holding it, if any.
 fn adoption(network_name: &str, mode: SiteDiscoveryMode, name: &str, existing: Option<&GridSite>) -> Adoption {
     match existing {
         Some(site) if site.spec.grid_network_ref == network_name => Adoption::Adopt,
-        Some(site) => Adoption::Conflict(format!(
-            "SWIM member {name} not adopted: GridSite {name} belongs to network {}",
-            site.spec.grid_network_ref
+        Some(site) => Adoption::Conflict(Rejection::new(
+            condition::FIELD_CONFLICT,
+            format!(
+                "SWIM member {name} not adopted: GridSite {name} belongs to network {}",
+                site.spec.grid_network_ref
+            ),
         )),
         None if mode == SiteDiscoveryMode::Auto => Adoption::Create,
         None => Adoption::Skip,
@@ -3088,14 +3035,162 @@ fn adoption(network_name: &str, mode: SiteDiscoveryMode, name: &str, existing: O
 const MAX_AUTO_CREATED_SITES: usize = 256;
 
 /// Auto-created `GridSite` objects that already belong to `network_name`.
-async fn count_auto_created_sites(api: &Api<GridSite>, network_name: &str) -> Result<usize, OperatorError> {
+async fn list_auto_created_sites(api: &Api<GridSite>, network_name: &str) -> Result<Vec<GridSite>, OperatorError> {
     let params = ListParams::default().labels(&format!("{LABEL_AUTO_DISCOVERED}=true"));
-    let sites = api.list(&params).await?;
-    Ok(sites
-        .items
+    let mut sites = api.list(&params).await?.items;
+    sites.retain(|site| site.spec.grid_network_ref == network_name);
+    Ok(sites)
+}
+
+/// Whether `site` carries the auto-discovered label.
+fn is_auto_created(site: &GridSite) -> bool {
+    site.metadata
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.get(LABEL_AUTO_DISCOVERED).is_some_and(|v| v == "true"))
+}
+
+/// Whether `site`'s spec is exactly what [`auto_created_site`] writes, so no user edited it.
+fn holds_only_auto_spec(site: &GridSite, network_name: &str) -> bool {
+    let GridSiteSpec {
+        grid_network_ref,
+        egress,
+        region,
+        sovereignty_zone,
+        zone,
+        trust,
+    } = &site.spec;
+    grid_network_ref == network_name
+        && egress.is_none()
+        && region.is_none()
+        && sovereignty_zone.is_none()
+        && zone.is_none()
+        && trust.is_none()
+}
+
+/// What the collection pass does with one auto-created `GridSite`.
+#[derive(Debug, Eq, PartialEq)]
+enum SiteGc {
+    /// Nothing to write.
+    Keep,
+    /// The member just went missing or `Dead`; start the clock.
+    MarkAbsent,
+    /// The member is back; stop the clock.
+    ClearAbsent,
+    /// Gone past the TTL and never edited; delete it.
+    Collect,
+}
+
+/// Decide what to do with `site` given whether gossip still knows its member.
+fn site_gc(
+    site: &GridSite,
+    network_name: &str,
+    present: bool,
+    ttl: Option<Duration>,
+    now: time::OffsetDateTime,
+) -> SiteGc {
+    let absent_since = site
+        .status
+        .as_ref()
+        .and_then(|s| s.discovered.as_ref())
+        .and_then(|d| d.absent_since.as_deref());
+    match (present, absent_since) {
+        (true, None) => SiteGc::Keep,
+        (true, Some(_)) => SiteGc::ClearAbsent,
+        (false, None) => SiteGc::MarkAbsent,
+        (false, Some(since)) => {
+            let Ok(since) = time::OffsetDateTime::parse(since, &time::format_description::well_known::Rfc3339) else {
+                return SiteGc::MarkAbsent;
+            };
+            let expired = ttl.is_some_and(|ttl| now - since >= ttl);
+            if expired && is_auto_created(site) && holds_only_auto_spec(site, network_name) {
+                SiteGc::Collect
+            } else {
+                SiteGc::Keep
+            }
+        },
+    }
+}
+
+/// Site IDs gossip still vouches for: every member not `Dead`.
+fn known_members(snapshot: &MembershipSnapshot) -> HashSet<&str> {
+    snapshot
+        .members
         .iter()
-        .filter(|site| site.spec.grid_network_ref == network_name)
-        .count())
+        .filter(|m| m.status != MemberStatus::Dead)
+        .map(|m| m.site_id.as_str())
+        .collect()
+}
+
+/// Merge patch setting or clearing `status.discovered.absentSince`.
+fn absent_since_patch(since: Option<&str>) -> serde_json::Value {
+    serde_json::json!({ "status": { "discovered": { "absentSince": since } } })
+}
+
+/// Collect stale auto-created `sites` and track absence on the rest; returns how many remain.
+///
+/// Absence lives in status, not memory, so an operator restart does not reset the clock;
+/// `Connected` follows the gateway probe, not SWIM membership, so it cannot stand in.
+async fn collect_stale_auto_sites(
+    api: &Api<GridSite>,
+    network: &GridNetwork,
+    network_name: &str,
+    snapshot: &MembershipSnapshot,
+    sites: &[GridSite],
+) -> Result<usize, OperatorError> {
+    let present = known_members(snapshot);
+    let ttl = routing_overlay::stale_policy_from_spec(network.spec.stale_candidate_ttl_seconds)
+        .dead_member_ttl_secs
+        .map(Duration::from_secs);
+    let now = time::OffsetDateTime::now_utc();
+    let mut remaining = sites.len();
+    for site in sites {
+        let Some(name) = site.metadata.name.as_deref() else {
+            continue;
+        };
+        let patch = match site_gc(site, network_name, present.contains(name), ttl, now) {
+            SiteGc::Keep => continue,
+            SiteGc::MarkAbsent => absent_since_patch(Some(&condition::now_rfc3339())),
+            SiteGc::ClearAbsent => absent_since_patch(None),
+            SiteGc::Collect => {
+                if delete_unchanged_site(api, site, name).await? {
+                    remaining -= 1;
+                    tracing::info!(name, network = network_name, "collected stale auto-created GridSite");
+                }
+                continue;
+            },
+        };
+        api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+    }
+    Ok(remaining)
+}
+
+/// Delete `site` only if it is still the object that was judged, so a concurrent edit or re-create survives.
+async fn delete_unchanged_site(api: &Api<GridSite>, site: &GridSite, name: &str) -> Result<bool, OperatorError> {
+    let params = DeleteParams::default().preconditions(Preconditions {
+        resource_version: site.metadata.resource_version.clone(),
+        uid: site.metadata.uid.clone(),
+    });
+    match api.delete(name, &params).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(true),
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// An auto-created `GridSite` that carries `spec.egress`, which this operator never writes, so a stale import.
+fn stale_auto_discovered_egress(site: &GridSite) -> Option<Rejection> {
+    let name = site.metadata.name.as_deref().unwrap_or_default();
+    (is_auto_created(site) && site.spec.egress.is_some()).then(|| {
+        Rejection::new(
+            "StaleAutoDiscoveredEgress",
+            format!(
+                "auto-discovered GridSite {name} carries spec.egress, which overrides gossip; delete or declare it"
+            ),
+        )
+    })
 }
 
 /// The `GridSite` the operator creates for an undeclared member: network ref and label only.
@@ -3115,45 +3210,72 @@ fn auto_created_site(name: &str, network_name: &str) -> serde_json::Value {
 }
 
 /// Merge patch recording the gossiped egress address, clearing it once withdrawn; `None` when status agrees.
-fn discovered_egress_patch(existing: Option<&GridSiteStatus>, address: &str) -> Option<serde_json::Value> {
+///
+/// An address not yet learned (after a restart or an eviction) writes nothing, so status keeps the last one.
+fn discovered_egress_patch(existing: Option<&GridSiteStatus>, gossiped: Option<&str>) -> Option<serde_json::Value> {
+    let gossiped = gossiped?;
     let current = existing
         .and_then(|s| s.discovered.as_ref())
         .and_then(|d| d.egress_address.as_deref());
-    let advertised = Some(address).filter(|addr| !addr.trim().is_empty());
+    let advertised = Some(gossiped).filter(|addr| !addr.trim().is_empty());
     (current != advertised).then(|| serde_json::json!({ "status": { "discovered": { "egressAddress": advertised } } }))
+}
+
+/// Merge patch moving a site to `Discovered`, guarded by `resource_version` so a newer phase wins.
+fn discovered_phase_patch(resource_version: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": { "resourceVersion": resource_version },
+        "status": { "phase": "Discovered" }
+    })
+}
+
+/// Move `name` from `Pending` to `Discovered`; a conflict means another writer moved it first.
+async fn mark_discovered(api: &Api<GridSite>, name: &str, resource_version: Option<&str>) -> Result<(), OperatorError> {
+    match api
+        .patch_status(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(&discovered_phase_patch(resource_version)),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Fill `status.discovered` on each remote Alive member's `GridSite`, creating it first in auto mode.
 ///
-/// Never writes an existing object's spec; returns one message per member whose name another network holds.
+/// Never writes an existing object's spec; returns one entry per member it could not adopt.
 /// Phase ownership: Pending to Discovered here, everything after in the `GridSite` controller.
 #[expect(
-    clippy::cognitive_complexity,
     clippy::large_stack_frames,
     clippy::too_many_lines,
     reason = "flat per-member loop; tracing macros and API futures inflate the scores"
 )]
 async fn reconcile_discovered_sites(
+    network: &GridNetwork,
     network_name: &str,
     local_site: &str,
     snapshot: &MembershipSnapshot,
     client: &Client,
-    mode: SiteDiscoveryMode,
-) -> Result<Vec<String>, OperatorError> {
+) -> Result<Vec<Rejection>, OperatorError> {
     let api: Api<GridSite> = Api::all(client.clone());
-    let mut conflicts = Vec::new();
-    let mut auto_created = if mode == SiteDiscoveryMode::Auto {
-        count_auto_created_sites(&api, network_name).await?
-    } else {
-        0
-    };
+    let mode = network.spec.site_discovery.mode;
+    let mut conflicts = unadoptable_members(local_site, snapshot);
+    let mut auto_created = prepare_discovery(&api, network, network_name, local_site, snapshot).await?;
+    let mut capped = 0_usize;
 
     for site in discovered_sites_from_swim(network_name, local_site, snapshot) {
         let found = api.get_opt(&site.name).await?;
         let existing = match adoption(network_name, mode, &site.name, found.as_ref()) {
-            Adoption::Adopt => found,
+            Adoption::Adopt => {
+                conflicts.extend(found.as_ref().and_then(stale_auto_discovered_egress));
+                found
+            },
             Adoption::Create if auto_created >= MAX_AUTO_CREATED_SITES => {
-                tracing::warn!(name = %site.name, network = %network_name, "auto-created GridSite limit reached; declare the site");
+                capped += 1;
                 continue;
             },
             Adoption::Create => {
@@ -3164,24 +3286,55 @@ async fn reconcile_discovered_sites(
                 tracing::debug!(name = %site.name, network = %network_name, "no declared GridSite for SWIM member");
                 continue;
             },
-            Adoption::Conflict(message) => {
-                tracing::warn!(network = %network_name, %message, "discovered site name conflict");
-                conflicts.push(message);
+            Adoption::Conflict(conflict) => {
+                conflicts.push(conflict);
                 continue;
             },
         };
         let Some(existing) = existing else { continue };
-        record_discovery(&api, &site, existing.status.as_ref()).await?;
+        record_discovery(&api, &site, &existing).await?;
         tracing::info!(
             name = %site.name,
             network = %network_name,
-            egress = %site.egress_address,
-            cert = site.site_cert_pem.is_some(),
+            egress = ?site.egress_address,
             "reconciled discovered GridSite from SWIM Alive member"
         );
     }
 
+    conflicts.extend(cap_reached(capped));
     Ok(conflicts)
+}
+
+/// Clear gossiped egress of duplicated IDs and, in auto mode, collect stale auto sites; returns the auto-created count.
+#[expect(clippy::large_stack_frames, reason = "async future over Kubernetes API types")]
+async fn prepare_discovery(
+    api: &Api<GridSite>,
+    network: &GridNetwork,
+    network_name: &str,
+    local_site: &str,
+    snapshot: &MembershipSnapshot,
+) -> Result<usize, OperatorError> {
+    for member in duplicated_members(local_site, snapshot) {
+        withdraw_ambiguous_egress(api, network_name, &member.site_id).await?;
+    }
+    if network.spec.site_discovery.mode != SiteDiscoveryMode::Auto {
+        return Ok(0);
+    }
+    let sites = list_auto_created_sites(api, network_name).await?;
+    collect_stale_auto_sites(api, network, network_name, snapshot, &sites).await
+}
+
+/// The `DiscoveryConflict` entry for `capped` members left out by [`MAX_AUTO_CREATED_SITES`].
+fn cap_reached(capped: usize) -> Option<Rejection> {
+    (capped > 0).then(|| {
+        Rejection::new(
+            "AutoDiscoveryCapReached",
+            format!(
+                "{capped} SWIM member(s) not adopted: {MAX_AUTO_CREATED_SITES} auto-created GridSites reached; \
+                 declare them or set staleCandidateTtlSeconds"
+            ),
+        )
+    })
 }
 
 /// Create the operator-owned `GridSite` for `name`, or `None` when a concurrent writer created it first.
@@ -3200,42 +3353,16 @@ async fn create_discovered_site(
 }
 
 /// Write gossip-derived state to one adopted `GridSite`, skipping writes `existing` already reflects (grid#42).
-#[expect(
-    clippy::large_stack_frames,
-    reason = "async future over Kubernetes API types with serde_json values"
-)]
-async fn record_discovery(
-    api: &Api<GridSite>,
-    site: &DiscoveredSite,
-    existing: Option<&GridSiteStatus>,
-) -> Result<(), OperatorError> {
-    if let Some(patch) = discovered_egress_patch(existing, &site.egress_address) {
+async fn record_discovery(api: &Api<GridSite>, site: &DiscoveredSite, object: &GridSite) -> Result<(), OperatorError> {
+    let existing = object.status.as_ref();
+    // Never regress a site the GridSite controller already advanced; the version guard covers a race.
+    if matches!(existing.map(|s| &s.phase), None | Some(GridSitePhase::Pending)) {
+        mark_discovered(api, &site.name, object.metadata.resource_version.as_deref()).await?;
+    }
+
+    if let Some(patch) = discovered_egress_patch(existing, site.egress_address.as_deref()) {
         api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
-    }
-
-    // Never regress a site the GridSite controller already advanced.
-    if matches!(existing.map(|s| &s.phase), None | Some(GridSitePhase::Pending)) {
-        let status_doc = serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
-            "kind": "GridSite",
-            "status": {
-                "phase": "Discovered",
-                "reason": "SWIMDiscovered",
-                "message": "site observed as Alive SWIM member"
-            }
-        });
-        api.patch_status(
-            &site.name,
-            &PatchParams::apply(FIELD_MANAGER).force(),
-            &Patch::Apply(&status_doc),
-        )
-        .await?;
-    }
-
-    // Private keys and malformed PEM are rejected as TrustMaterialInvalid, never stored.
-    if let Some(cert_pem) = &site.site_cert_pem {
-        reconcile_site_cert_pem(api, &site.name, existing, cert_pem).await?;
     }
     Ok(())
 }
@@ -3383,6 +3510,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network_ref,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -3744,6 +3872,32 @@ mod tests {
         }
     }
 
+    fn auto_network(name: &str, created_secs: i64) -> GridNetwork {
+        let mut network = base_network();
+        network.metadata.name = Some(name.to_owned());
+        network.metadata.creation_timestamp =
+            serde_json::from_value(serde_json::json!(format!("1970-01-01T00:00:{created_secs:02}Z"))).ok();
+        network.spec.site_discovery.mode = SiteDiscoveryMode::Auto;
+        network
+    }
+
+    #[test]
+    fn only_the_oldest_auto_network_runs_discovery() {
+        let mut manual = auto_network("aaa-manual", 1);
+        manual.spec.site_discovery.mode = SiteDiscoveryMode::Manual;
+        let networks = [manual, auto_network("newer", 20), auto_network("older", 10)];
+        assert!(auto_discovery_rejection("older", &networks).is_none());
+        let rejected = auto_discovery_rejection("newer", &networks).unwrap_or_else(|| std::process::abort());
+        assert_eq!(rejected.reason, "AutoDiscoveryClaimed");
+        assert!(rejected.message.contains("older"));
+    }
+
+    #[test]
+    fn auto_discovery_ties_break_by_name() {
+        let networks = [auto_network("b", 5), auto_network("a", 5)];
+        assert_eq!(auto_discovery_owner(&networks), Some("a"));
+    }
+
     #[test]
     fn a_valid_network_spec_is_accepted() {
         assert!(network_spec_rejection(&base_network()).is_none());
@@ -3759,8 +3913,8 @@ mod tests {
                     status: MemberStatus::Alive,
                     age_secs: 0,
                     gateway_address: None,
-                    site_cert_pem: None,
                     signals_address: None,
+                    duplicate_endpoints: Vec::new(),
                 })
                 .collect(),
         }
@@ -3775,8 +3929,8 @@ mod tests {
                 status: MemberStatus::Suspect,
                 age_secs: 5,
                 gateway_address: None,
-                site_cert_pem: None,
                 signals_address: None,
+                duplicate_endpoints: Vec::new(),
             }],
         }
     }
@@ -4069,6 +4223,7 @@ mod tests {
             "metadata": { "name": name, "generation": generation },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8080",
@@ -4085,6 +4240,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
@@ -4102,6 +4258,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
@@ -4154,6 +4311,7 @@ mod tests {
             "metadata": {},
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
@@ -4263,6 +4421,7 @@ mod tests {
             "metadata": { "name": "prov-no-gen" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
@@ -4304,8 +4463,8 @@ mod tests {
                 status,
                 age_secs: 0,
                 gateway_address: None,
-                site_cert_pem: None,
                 signals_address: None,
+                duplicate_endpoints: Vec::new(),
             }],
         }
     }
@@ -4434,8 +4593,8 @@ mod tests {
                     status: MemberStatus::Dead,
                     age_secs: 0,
                     gateway_address: None,
-                    site_cert_pem: None,
                     signals_address: None,
+                    duplicate_endpoints: Vec::new(),
                 },
                 MemberRecord {
                     site_id: "site-east".to_owned(),
@@ -4444,8 +4603,8 @@ mod tests {
                     status: MemberStatus::Alive,
                     age_secs: 0,
                     gateway_address: None,
-                    site_cert_pem: None,
                     signals_address: None,
+                    duplicate_endpoints: Vec::new(),
                 },
             ],
         };
@@ -4571,8 +4730,8 @@ mod tests {
             status,
             age_secs: 0,
             gateway_address: None,
-            site_cert_pem: None,
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }
     }
 
@@ -4595,8 +4754,8 @@ mod tests {
             "grid_network_ref must match the network name"
         );
         assert!(
-            site.egress_address.is_empty(),
-            "egress_address must be empty when member has no gateway_address"
+            site.egress_address.is_none(),
+            "egress_address must be unknown when member has no gateway_address"
         );
     }
 
@@ -4646,14 +4805,15 @@ mod tests {
             status: MemberStatus::Alive,
             age_secs: 0,
             gateway_address: Some("10.0.0.2:19080".to_owned()),
-            site_cert_pem: None,
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert_eq!(sites.len(), 1, "exactly one remote Alive member");
         let site = sites.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(
-            site.egress_address, "10.0.0.2:19080",
+            site.egress_address.as_deref(),
+            Some("10.0.0.2:19080"),
             "egress_address must use gateway_address when present"
         );
     }
@@ -4667,84 +4827,60 @@ mod tests {
             status: MemberStatus::Alive,
             age_secs: 0,
             gateway_address: None,
-            site_cert_pem: None,
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert_eq!(sites.len(), 1, "exactly one remote Alive member");
         let site = sites.first().unwrap_or_else(|| std::process::abort());
         assert!(
-            site.egress_address.is_empty(),
-            "egress_address must be empty when no gateway_address is set"
+            site.egress_address.is_none(),
+            "egress_address must be unknown when no gateway_address is set"
         );
     }
 
     #[test]
-    fn discovered_site_carries_site_cert_pem_when_present() {
-        let sentinel_cert = "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9\n-----END CERTIFICATE-----\n";
-        let snap = make_snapshot(vec![MemberRecord {
-            site_id: "remote".to_owned(),
-            endpoint: "10.0.0.2:7946".to_owned(),
-            incarnation: 0,
-            status: MemberStatus::Alive,
-            age_secs: 0,
-            gateway_address: Some("10.0.0.2:8080".to_owned()),
-            site_cert_pem: Some(sentinel_cert.to_owned()),
-            signals_address: None,
-        }]);
-        let sites = discovered_sites_from_swim("net", "local", &snap);
-        let site = sites.first().unwrap_or_else(|| std::process::abort());
-        assert_eq!(
-            site.site_cert_pem.as_deref(),
-            Some(sentinel_cert),
-            "site_cert_pem must propagate from MemberRecord to DiscoveredSite"
-        );
-    }
-
-    #[test]
-    fn discovered_site_cert_pem_none_when_not_received() {
-        let snap = make_snapshot(vec![MemberRecord {
-            site_id: "remote".to_owned(),
-            endpoint: "10.0.0.2:7946".to_owned(),
-            incarnation: 0,
-            status: MemberStatus::Alive,
-            age_secs: 0,
-            gateway_address: None,
-            site_cert_pem: None,
-            signals_address: None,
-        }]);
-        let sites = discovered_sites_from_swim("net", "local", &snap);
-        let site = sites.first().unwrap_or_else(|| std::process::abort());
-        assert!(
-            site.site_cert_pem.is_none(),
-            "site_cert_pem must be None when member has no cert"
-        );
-    }
-
-    #[test]
-    fn discovered_site_cert_does_not_contain_private_key_marker() {
-        // Defensive: prove that whatever appears in site_cert_pem does not
-        // look like a PEM private key.  This is a code-level invariant proof,
-        // not an exhaustive crypto check.
-        let sentinel_cert = "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9\n-----END CERTIFICATE-----\n";
-        let snap = make_snapshot(vec![MemberRecord {
-            site_id: "remote".to_owned(),
-            endpoint: "10.0.0.2:7946".to_owned(),
-            incarnation: 0,
-            status: MemberStatus::Alive,
-            age_secs: 0,
-            gateway_address: Some("10.0.0.2:8080".to_owned()),
-            site_cert_pem: Some(sentinel_cert.to_owned()),
-            signals_address: None,
-        }]);
-        let sites = discovered_sites_from_swim("net", "local", &snap);
-        let site = sites.first().unwrap_or_else(|| std::process::abort());
-        if let Some(pem) = &site.site_cert_pem {
-            assert!(
-                !pem.contains("BEGIN RSA PRIVATE KEY") && !pem.contains("BEGIN PRIVATE KEY"),
-                "site_cert_pem must never contain private key material"
-            );
+    fn unadoptable_members_are_reported() {
+        let mut snap = alive_snapshot(3);
+        for (member, id) in snap.members.iter_mut().zip(["Site_West", "north", "east"]) {
+            id.clone_into(&mut member.site_id);
         }
+        if let Some(east) = snap.members.last_mut() {
+            east.duplicate_endpoints = vec!["10.0.0.1:7946".to_owned(), "10.0.0.2:7946".to_owned()];
+        }
+        let names: Vec<String> = discovered_sites_from_swim("net", "local", &snap)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["north"], "a duplicated id is not adopted");
+        let problems = unadoptable_members("local", &snap);
+        let reasons: Vec<&str> = problems.iter().map(|p| p.reason).collect();
+        assert_eq!(reasons, ["SiteIdInvalid", "SiteIdDuplicated"]);
+        let duplicated = problems.last().map_or("", |p| p.message.as_str());
+        assert!(
+            duplicated.contains("east") && duplicated.contains("10.0.0.1:7946") && duplicated.contains("10.0.0.2:7946"),
+            "{duplicated}"
+        );
+    }
+
+
+    #[test]
+    fn an_auto_created_site_with_spec_egress_is_reported_as_a_stale_import() {
+        let mut site = declared_site("west", "net", None);
+        assert!(
+            stale_auto_discovered_egress(&site).is_none(),
+            "a declared site may set egress"
+        );
+        site.metadata.labels = Some([(LABEL_AUTO_DISCOVERED.to_owned(), "true".to_owned())].into());
+        assert!(
+            stale_auto_discovered_egress(&site).is_none(),
+            "an auto-created site without egress is fine"
+        );
+        site.spec.egress = serde_json::from_value(serde_json::json!({ "address": "10.0.0.1:8443" })).ok();
+        assert_eq!(
+            stale_auto_discovered_egress(&site).map(|r| r.reason),
+            Some("StaleAutoDiscoveredEgress")
+        );
     }
 
     #[test]
@@ -4809,10 +4945,11 @@ mod tests {
     fn a_name_held_by_another_network_is_a_conflict_never_an_overwrite() {
         let other = declared_site("west", "other", None);
         for mode in [SiteDiscoveryMode::Manual, SiteDiscoveryMode::Auto] {
-            let Adoption::Conflict(message) = adoption("net", mode, "west", Some(&other)) else {
+            let Adoption::Conflict(conflict) = adoption("net", mode, "west", Some(&other)) else {
                 std::process::abort()
             };
-            assert!(message.contains("network other"), "{message}");
+            assert_eq!(conflict.reason, "FieldConflict");
+            assert!(conflict.message.contains("network other"), "{}", conflict.message);
         }
     }
 
@@ -4833,7 +4970,7 @@ mod tests {
 
     #[test]
     fn a_gossiped_address_lands_in_status_discovered_once() {
-        let patch = discovered_egress_patch(None, "10.0.0.9:8443").unwrap_or_else(|| std::process::abort());
+        let patch = discovered_egress_patch(None, Some("10.0.0.9:8443")).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             patch,
             serde_json::json!({ "status": { "discovered": { "egressAddress": "10.0.0.9:8443" } } })
@@ -4846,25 +4983,236 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            discovered_egress_patch(Some(&recorded), "10.0.0.9:8443").is_none(),
+            discovered_egress_patch(Some(&recorded), Some("10.0.0.9:8443")).is_none(),
             "no-op write"
         );
         assert_eq!(
-            discovered_egress_patch(Some(&recorded), ""),
+            discovered_egress_patch(Some(&recorded), Some("")),
             Some(serde_json::json!({ "status": { "discovered": { "egressAddress": null } } })),
             "a withdrawn address is cleared"
         );
         assert!(
-            discovered_egress_patch(None, "").is_none(),
+            discovered_egress_patch(None, Some("")).is_none(),
             "nothing recorded, nothing to clear"
         );
-        assert!(discovered_egress_patch(Some(&recorded), "10.0.0.10:8443").is_some());
+        assert!(discovered_egress_patch(Some(&recorded), Some("10.0.0.10:8443")).is_some());
+        assert!(
+            discovered_egress_patch(Some(&recorded), None).is_none(),
+            "an address not yet learned after a restart keeps the recorded one"
+        );
+    }
+
+    #[test]
+    fn the_discovered_phase_write_is_guarded_by_the_resource_version() {
+        assert_eq!(
+            discovered_phase_patch(Some("42")),
+            serde_json::json!({ "metadata": { "resourceVersion": "42" }, "status": { "phase": "Discovered" } })
+        );
     }
 
     #[test]
     fn a_declared_site_spec_is_untouched_by_discovery_writes() {
-        let patch = discovered_egress_patch(None, "10.0.0.9:8443").unwrap_or_else(|| std::process::abort());
+        let patch = discovered_egress_patch(None, Some("10.0.0.9:8443")).unwrap_or_else(|| std::process::abort());
         assert!(patch.get("spec").is_none(), "discovery writes status only");
+    }
+
+    const GC_NOW: &str = "2026-10-01T12:00:00Z";
+    const GC_TTL: Duration = Duration::from_secs(3600);
+
+    fn gc_now() -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(GC_NOW, &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn auto_site(name: &str, absent_since: Option<&str>) -> GridSite {
+        let mut site: GridSite =
+            serde_json::from_value(auto_created_site(name, "net")).unwrap_or_else(|_| std::process::abort());
+        site.metadata.uid = Some(format!("uid-{name}"));
+        site.metadata.resource_version = Some("7".to_owned());
+        site.status = absent_since.map(|since| GridSiteStatus {
+            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                absent_since: Some(since.to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        site
+    }
+
+    #[test]
+    fn gc_collects_an_auto_site_gone_past_the_ttl() {
+        let stale = auto_site("west", Some("2026-10-01T10:00:00Z"));
+        assert_eq!(site_gc(&stale, "net", false, Some(GC_TTL), gc_now()), SiteGc::Collect);
+        assert_eq!(
+            site_gc(&stale, "net", false, None, gc_now()),
+            SiteGc::Keep,
+            "no TTL keeps it forever"
+        );
+    }
+
+    #[test]
+    fn gc_keeps_a_recently_seen_auto_site() {
+        let recent = auto_site("west", Some("2026-10-01T11:59:00Z"));
+        assert_eq!(site_gc(&recent, "net", false, Some(GC_TTL), gc_now()), SiteGc::Keep);
+        assert_eq!(
+            site_gc(&recent, "net", true, Some(GC_TTL), gc_now()),
+            SiteGc::ClearAbsent,
+            "a returning member stops the clock"
+        );
+        let unstamped = auto_site("west", None);
+        assert_eq!(
+            site_gc(&unstamped, "net", false, Some(GC_TTL), gc_now()),
+            SiteGc::MarkAbsent
+        );
+        assert_eq!(site_gc(&unstamped, "net", true, Some(GC_TTL), gc_now()), SiteGc::Keep);
+        let garbled = auto_site("west", Some("yesterday"));
+        assert_eq!(
+            site_gc(&garbled, "net", false, Some(GC_TTL), gc_now()),
+            SiteGc::MarkAbsent,
+            "an unreadable stamp restarts the clock"
+        );
+    }
+
+    #[test]
+    fn gc_never_collects_a_declared_site() {
+        let mut declared = auto_site("west", Some("2026-09-01T00:00:00Z"));
+        declared.metadata.labels = None;
+        assert_eq!(site_gc(&declared, "net", false, Some(GC_TTL), gc_now()), SiteGc::Keep);
+    }
+
+    #[test]
+    fn gc_never_collects_an_auto_site_a_user_edited() {
+        let edits: [fn(&mut GridSite); 4] = [
+            |site| site.spec.region = Some("us-east-1".to_owned()),
+            |site| site.spec.zone = Some("a".to_owned()),
+            |site| site.spec.trust = Some(crate::crd::grid_site::GridSiteTrustPolicy::default()),
+            |site| site.spec.grid_network_ref = "other".to_owned(),
+        ];
+        for edit in edits {
+            let mut site = auto_site("west", Some("2026-09-01T00:00:00Z"));
+            edit(&mut site);
+            assert_eq!(site_gc(&site, "net", false, Some(GC_TTL), gc_now()), SiteGc::Keep);
+        }
+        let mut egress = auto_site("west", Some("2026-09-01T00:00:00Z"));
+        egress.spec.egress = serde_json::from_value(serde_json::json!({ "address": "10.0.0.1:8443" })).ok();
+        assert_eq!(site_gc(&egress, "net", false, Some(GC_TTL), gc_now()), SiteGc::Keep);
+    }
+
+    type Requests = Arc<std::sync::Mutex<Vec<(http::Method, String, serde_json::Value)>>>;
+
+    fn json_response(status: u16, body: &serde_json::Value) -> http::Response<kube::client::Body> {
+        http::Response::builder()
+            .status(status)
+            .body(kube::client::Body::from(
+                serde_json::to_vec(body).unwrap_or_else(|_| std::process::abort()),
+            ))
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// How the mock `GridSite` API answers `method` on `name`.
+    fn grid_site_response(
+        method: &http::Method,
+        name: &str,
+        body: &serde_json::Value,
+        sites: &[GridSite],
+    ) -> http::Response<kube::client::Body> {
+        let found = sites.iter().find(|s| s.metadata.name.as_deref() == Some(name));
+        match (method, found) {
+            (&http::Method::GET, _) if name == "gridsites" => json_response(
+                200,
+                &serde_json::json!({ "apiVersion": "v1", "kind": "List", "metadata": {}, "items": sites }),
+            ),
+            (&http::Method::POST, _) => json_response(201, body),
+            (&http::Method::PATCH, None) => {
+                json_response(200, &serde_json::to_value(auto_site(name, None)).unwrap_or_default())
+            },
+            (_, Some(site)) => json_response(200, &serde_json::to_value(site).unwrap_or_default()),
+            (_, None) => json_response(
+                404,
+                &serde_json::json!({ "kind": "Status", "code": 404, "reason": "NotFound" }),
+            ),
+        }
+    }
+
+    /// A `GridSite` API holding `sites`, recording each request; unknown names are 404.
+    fn mock_grid_site_api(sites: Vec<GridSite>, requests: Requests) -> Client {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let (sites, requests) = (sites.clone(), Arc::clone(&requests));
+            async move {
+                let (method, path) = (req.method().clone(), req.uri().path().to_owned());
+                let bytes = req.into_body().collect_bytes().await.unwrap_or_default();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let name = path.trim_end_matches("/status").rsplit('/').next().unwrap_or_default();
+                let response = grid_site_response(&method, name, &body, &sites);
+                requests
+                    .lock()
+                    .unwrap_or_else(|_| std::process::abort())
+                    .push((method, path, body));
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        Client::new(service, "default")
+    }
+
+    async fn discover_into_full_cap(
+        ttl: Option<u32>,
+    ) -> (Vec<Rejection>, Vec<(http::Method, String, serde_json::Value)>) {
+        let mut sites: Vec<GridSite> = (1..MAX_AUTO_CREATED_SITES)
+            .map(|i| auto_site(&format!("live-{i}"), None))
+            .collect();
+        sites.push(auto_site("gone", Some("2026-01-01T00:00:00Z")));
+        let mut members: Vec<MemberRecord> = (1..MAX_AUTO_CREATED_SITES)
+            .map(|i| make_member(&format!("live-{i}"), "10.0.0.2:7946", MemberStatus::Alive))
+            .collect();
+        members.push(make_member("fresh", "10.0.0.3:7946", MemberStatus::Alive));
+        let mut network = auto_network("net", 1);
+        network.spec.stale_candidate_ttl_seconds = ttl;
+        let requests = Requests::default();
+        let client = mock_grid_site_api(sites, Arc::clone(&requests));
+        let conflicts = Box::pin(reconcile_discovered_sites(
+            &network,
+            "net",
+            "local",
+            &make_snapshot(members),
+            &client,
+        ))
+        .await
+        .unwrap_or_else(|_| std::process::abort());
+        let requests = requests.lock().unwrap_or_else(|_| std::process::abort()).clone();
+        (conflicts, requests)
+    }
+
+    #[tokio::test]
+    async fn a_collected_slot_frees_the_cap() {
+        let (conflicts, requests) = Box::pin(discover_into_full_cap(Some(3600))).await;
+        let (_, _, precondition) = requests
+            .iter()
+            .find(|(method, path, _)| method == http::Method::DELETE && path.ends_with("/gridsites/gone"))
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            precondition.get("preconditions"),
+            Some(&serde_json::json!({ "resourceVersion": "7", "uid": "uid-gone" })),
+            "the delete is pinned to the judged object"
+        );
+        assert!(
+            requests.iter().any(|(method, _, body)| method == http::Method::POST
+                && body.pointer("/metadata/name") == Some(&serde_json::json!("fresh"))),
+            "the freed slot adopts the new member"
+        );
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+
+    #[tokio::test]
+    async fn a_full_cap_without_ttl_is_reported() {
+        let (conflicts, requests) = Box::pin(discover_into_full_cap(None)).await;
+        assert!(
+            !requests
+                .iter()
+                .any(|(method, ..)| method == http::Method::DELETE || method == http::Method::POST),
+            "nothing collected, nothing created"
+        );
+        let reasons: Vec<_> = conflicts.iter().map(|c| c.reason).collect();
+        assert_eq!(reasons, ["AutoDiscoveryCapReached"]);
     }
 
     fn network_with_endpoint_transport(mode: &str, sni: Option<&str>) -> GridNetwork {
@@ -4900,102 +5248,9 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
-    #[test]
-    fn network_uses_plaintext_egress_when_endpoint_transport_plaintext() {
-        let network = network_with_endpoint_transport("plaintext", None);
-        assert!(
-            network_uses_plaintext_egress(&network),
-            "explicit plaintext endpoint transport must drive discovered GridSite egress"
-        );
-    }
-
-    #[test]
-    fn network_uses_mutual_egress_when_endpoint_transport_mtls() {
-        let network = network_with_endpoint_transport("mutualTls", Some("provider.example.com"));
-        assert!(
-            !network_uses_plaintext_egress(&network),
-            "mTLS endpoint transport plus TLS refs must keep discovered GridSite egress mutual"
-        );
-    }
-
-    #[test]
-    fn network_uses_plaintext_egress_when_no_tls_refs_present() {
-        let network = base_network();
-        assert!(
-            network_uses_plaintext_egress(&network),
-            "network with no CA/site TLS refs should fall back to plaintext"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // already_recorded_invalid — grid#42 reconcile-hot-loop regression guard
     // -----------------------------------------------------------------------
-
-    fn invalid_cert_status(message: &str) -> GridSiteStatus {
-        GridSiteStatus {
-            discovered: None,
-            reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
-            message: message.to_owned(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn already_recorded_invalid_true_when_reason_message_and_absence_all_match() {
-        let existing = Some(invalid_cert_status("private key detected"));
-        assert!(
-            already_recorded_invalid(existing.as_ref(), "private key detected"),
-            "identical reason/message/absent-cert must be recognized as already recorded"
-        );
-    }
-
-    #[test]
-    fn already_recorded_invalid_false_when_status_is_none() {
-        assert!(
-            !already_recorded_invalid(None, "private key detected"),
-            "a GridSite with no status yet has nothing recorded"
-        );
-    }
-
-    #[test]
-    fn already_recorded_invalid_false_when_message_differs() {
-        let existing = Some(invalid_cert_status("private key detected"));
-        assert!(
-            !already_recorded_invalid(existing.as_ref(), "cert exceeds size bound"),
-            "a different rejection reason must not be treated as already recorded"
-        );
-    }
-
-    #[test]
-    fn already_recorded_invalid_false_when_reason_is_not_trust_material_invalid() {
-        let existing = Some(GridSiteStatus {
-            discovered: None,
-            reason: "AwaitingDiscovery".to_owned(),
-            message: "private key detected".to_owned(),
-            ..Default::default()
-        });
-        assert!(
-            !already_recorded_invalid(existing.as_ref(), "private key detected"),
-            "a status recorded for an unrelated reason must not suppress the write"
-        );
-    }
-
-    #[test]
-    fn already_recorded_invalid_false_when_advertised_cert_pem_still_present() {
-        let existing = Some(GridSiteStatus {
-            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
-                advertised_cert_pem: Some("stale cert".to_owned()),
-                ..Default::default()
-            }),
-            reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
-            message: "private key detected".to_owned(),
-            ..Default::default()
-        });
-        assert!(
-            !already_recorded_invalid(existing.as_ref(), "private key detected"),
-            "a leftover advertisedCertPem means the invalid status was never actually applied yet"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // decide_cert_pem_write — grid#42 acceptance criterion:
@@ -5008,117 +5263,6 @@ mod tests {
     //    business-level property directly, across all four outcomes, rather
     //    than only exercising the internal `already_recorded_invalid` guard.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn decide_cert_pem_write_is_noop_for_every_outcome_when_site_is_already_stable() {
-        // ValidStructure: advertisedCertPem already stored verbatim.
-        let stored = Some(GridSiteStatus {
-            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
-                advertised_cert_pem: Some("cert-a".to_owned()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        assert_eq!(
-            decide_cert_pem_write(stored.as_ref(), "cert-a", &CertPemStatus::ValidStructure),
-            CertPemWrite::NoOp,
-            "an unchanged valid cert must never be re-patched (grid#42)"
-        );
-
-        // Every invalid outcome: already recorded with its exact message.
-        for (check, message) in [
-            (CertPemStatus::ContainsPrivateKey, CERT_PEM_MSG_CONTAINS_PRIVATE_KEY),
-            (CertPemStatus::NotACertificate, CERT_PEM_MSG_NOT_A_CERTIFICATE),
-            (CertPemStatus::TooLarge, CERT_PEM_MSG_TOO_LARGE),
-        ] {
-            let recorded = Some(invalid_cert_status(message));
-            assert_eq!(
-                decide_cert_pem_write(recorded.as_ref(), "irrelevant-pem", &check),
-                CertPemWrite::NoOp,
-                "an unchanged rejection ({check:?}) must never be re-patched (grid#42)"
-            );
-        }
-    }
-
-    #[test]
-    fn decide_cert_pem_write_stores_valid_cert_on_first_sight() {
-        assert_eq!(
-            decide_cert_pem_write(None, "cert-a", &CertPemStatus::ValidStructure),
-            CertPemWrite::StoreValid,
-            "a GridSite with no prior status must store the first valid cert seen"
-        );
-    }
-
-    #[test]
-    fn decide_cert_pem_write_stores_valid_cert_when_it_rotates() {
-        let stale = Some(GridSiteStatus {
-            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
-                advertised_cert_pem: Some("cert-old".to_owned()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        assert_eq!(
-            decide_cert_pem_write(stale.as_ref(), "cert-new", &CertPemStatus::ValidStructure),
-            CertPemWrite::StoreValid,
-            "a rotated cert (different from what's stored) must still be written"
-        );
-    }
-
-    #[test]
-    fn decide_cert_pem_write_rejects_private_key_as_security_violation() {
-        assert_eq!(
-            decide_cert_pem_write(None, "leaked-key", &CertPemStatus::ContainsPrivateKey),
-            CertPemWrite::RejectInvalid {
-                message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
-                security_violation: true
-            },
-            "private-key leakage must be flagged as a security violation, not a routine rejection"
-        );
-    }
-
-    #[test]
-    fn decide_cert_pem_write_rejects_malformed_cert_as_non_security() {
-        assert_eq!(
-            decide_cert_pem_write(None, "garbage", &CertPemStatus::NotACertificate),
-            CertPemWrite::RejectInvalid {
-                message: CERT_PEM_MSG_NOT_A_CERTIFICATE,
-                security_violation: false
-            },
-            "a malformed cert is an operator misconfiguration, not a security violation"
-        );
-    }
-
-    #[test]
-    fn decide_cert_pem_write_rejects_oversized_cert_as_non_security() {
-        assert_eq!(
-            decide_cert_pem_write(None, "huge", &CertPemStatus::TooLarge),
-            CertPemWrite::RejectInvalid {
-                message: CERT_PEM_MSG_TOO_LARGE,
-                security_violation: false
-            },
-            "an oversized cert is a bound violation, not a security violation"
-        );
-    }
-
-    #[test]
-    fn decide_cert_pem_write_re_rejects_when_recorded_reason_no_longer_matches() {
-        // Status shows a *different* rejection (or none) — must not be
-        // mistaken for "already handled".
-        let recorded_other_reason = Some(invalid_cert_status(CERT_PEM_MSG_TOO_LARGE));
-        assert_eq!(
-            decide_cert_pem_write(
-                recorded_other_reason.as_ref(),
-                "leaked-key",
-                &CertPemStatus::ContainsPrivateKey
-            ),
-            CertPemWrite::RejectInvalid {
-                message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
-                security_violation: true
-            },
-            "a newly-observed private-key leak must be recorded even if a different rejection was previously stored"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // overlay_configmap_matches — grid#42 no-op write guard
@@ -5416,6 +5560,21 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_grid_with_no_candidates_says_so_plainly() {
+        let status = retained_overlay_status(
+            &base_network(),
+            &make_gw_ref("gw", "ns"),
+            1,
+            None,
+            EMPTY_CANDIDATES,
+            "x",
+        );
+        assert_eq!(status.phase, OverlayPhase::Pending);
+        assert_eq!(status.reason, EMPTY_CANDIDATES);
+        assert_eq!(status.message, NO_CANDIDATES_YET);
+    }
+
+    #[test]
     fn retained_overlay_status_reports_error_without_prior_revision() {
         let gw = make_gw_ref("gw", "grid-system");
         let network = base_network();
@@ -5440,7 +5599,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_overlay_status_does_not_retain_an_error_without_revision() {
+    fn empty_candidates_after_a_failed_first_attempt_waits_as_pending() {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
@@ -5465,7 +5624,7 @@ mod tests {
 
         let status = retained_overlay_status(&network, &gw, 2, None, "EmptyCandidates", "no candidates available");
 
-        assert_eq!(status.phase, OverlayPhase::Error);
+        assert_eq!(status.phase, OverlayPhase::Pending, "waiting, not an error");
         assert!(status.rendered_revision.is_empty());
         assert!(status.distributed_revision.is_empty());
         assert_eq!(status.reason, "EmptyCandidates");
@@ -5544,7 +5703,7 @@ mod tests {
         let next = retained_overlay_status(&network, &gw, 1, Some(&next_render), EMPTY_CANDIDATES, "no candidates");
         let desired = desired_with_overlay(&network, next);
 
-        assert_eq!(only_overlay(&desired).phase, OverlayPhase::Error);
+        assert_eq!(only_overlay(&desired).phase, OverlayPhase::Pending);
         assert!(!grid_network_status_needs_update(network.status.as_ref(), &desired));
     }
 
@@ -5781,7 +5940,7 @@ mod tests {
     #[test]
     fn consumer_config_status_rendered_has_rendered_phase() {
         let gw = make_gw_ref("inference-gw", "praxis-system");
-        let status = consumer_config_status_rendered(&gw, "net", 5);
+        let status = consumer_config_status_rendered(&gw, "net", 5, None);
         assert_eq!(
             status.phase,
             ConsumerConfigPhase::Rendered,
@@ -5805,6 +5964,32 @@ mod tests {
             status.message.contains("grid-consumer-net-inference-gw"),
             "message must name the ConfigMap"
         );
+    }
+
+    #[test]
+    fn listener_port_unresolved_outranks_routed_address_mismatch() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let mismatch = "routes lb.site-b.example:8443, Active proves 10.0.0.2:8443".to_owned();
+        let rendered = consumer_config_status_rendered(&gw, "net", 5, Some(mismatch.clone()));
+        let status = consumer_config_status_listener_fallback(rendered, 9999, "Service gw not found");
+        assert_eq!(status.phase, ConsumerConfigPhase::Rendered);
+        assert_eq!(status.reason, LISTENER_PORT_UNRESOLVED, "the listener fallback wins");
+        assert!(status.message.contains("fallback port 9999"), "{}", status.message);
+        assert!(
+            status.message.contains(consumer_config::ROUTED_ADDRESS_MISMATCH) && status.message.contains(&mismatch),
+            "the mismatch survives in the message: {}",
+            status.message
+        );
+    }
+
+    #[test]
+    fn routed_address_mismatch_warns_on_a_rendered_status() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let message = "routes lb.site-b.example:8443, Active proves 10.0.0.2:8443".to_owned();
+        let status = consumer_config_status_rendered(&gw, "net", 5, Some(message.clone()));
+        assert_eq!(status.phase, ConsumerConfigPhase::Rendered, "a mismatch still renders");
+        assert_eq!(status.reason, consumer_config::ROUTED_ADDRESS_MISMATCH);
+        assert_eq!(status.message, message);
     }
 
     #[test]
@@ -5928,6 +6113,16 @@ mod tests {
     }
 
     #[test]
+    fn no_candidates_leaves_the_consumer_config_pending_not_in_error() {
+        let gw = make_gw_ref("gw", "ns");
+        let status = consumer_config_status_pending(&gw, "net", 3);
+        assert_eq!(status.phase, ConsumerConfigPhase::Pending);
+        assert_eq!(status.reason, EMPTY_CANDIDATES);
+        assert!(status.message.contains("once one exists"), "{}", status.message);
+        assert_eq!(status.observed_generation, 3);
+    }
+
+    #[test]
     fn consumer_config_status_disabled_message_does_not_contain_sentinel_token() {
         let sentinel = "sk-super-secret-token-must-not-appear";
         let gw = make_gw_ref("gw", "ns");
@@ -5989,8 +6184,8 @@ mod tests {
     fn consumer_config_status_multiple_gateways_produce_separate_entries() {
         let gw_a = make_gw_ref("gw-a", "ns-a");
         let gw_b = make_gw_ref("gw-b", "ns-b");
-        let status_a = consumer_config_status_rendered(&gw_a, "net", 1);
-        let status_b = consumer_config_status_rendered(&gw_b, "net", 1);
+        let status_a = consumer_config_status_rendered(&gw_a, "net", 1, None);
+        let status_b = consumer_config_status_rendered(&gw_b, "net", 1, None);
         assert_eq!(status_a.gateway_name, "gw-a");
         assert_eq!(status_b.gateway_name, "gw-b");
         assert_eq!(status_a.config_map_name, "grid-consumer-net-gw-a");
@@ -6069,7 +6264,7 @@ mod tests {
             listener_port: 9999,
             ..ConsumerSettings::default()
         };
-        let status = reconcile_consumer_config(&overlay, "net", &gw, &settings, &client, 1).await;
+        let status = reconcile_consumer_config(&overlay, "net", &gw, &[], &settings, &client, 1).await;
         let praxis_yaml = applied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6190,6 +6385,35 @@ mod tests {
             "status": { "phase": phase }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn declared_egress_is_the_probed_address() {
+        let mut site: GridSite = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "kind": "GridSite",
+            "metadata": { "name": "site-b" },
+            "spec": { "gridNetworkRef": "net", "egress": { "address": "lb.site-b.example:8443" } },
+            "status": { "phase": "Active", "discovered": { "egressAddress": "10.0.0.2:8443" } }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let sites = vec![site.clone()];
+        assert_eq!(
+            probed_site_address("net", &sites, "site-b"),
+            Some("lb.site-b.example:8443")
+        );
+        assert_eq!(
+            probed_site_address("other", &sites, "site-b"),
+            None,
+            "another network's site"
+        );
+
+        site.spec.egress = None;
+        let discovered_only = vec![site];
+        assert_eq!(
+            probed_site_address("net", &discovered_only, "site-b"),
+            Some("10.0.0.2:8443")
+        );
     }
 
     #[test]
@@ -6324,6 +6548,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network_ref,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -6346,6 +6571,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network_ref,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",

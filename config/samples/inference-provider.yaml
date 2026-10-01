@@ -25,7 +25,7 @@ spec:
       key: token
 
   # Site selector (matches all sites)
-  siteSelector:
+  hostSelector:
     matchLabels: {}
 
   # Access policy (allow all sites)

@@ -48,7 +48,7 @@ use crate::{
 
 /// Machine-readable reason for a credential validation failure.
 ///
-/// Surfaced in [`InferenceProvider`] `status.reason` so administrators can
+/// Surfaced in the [`InferenceProvider`] `Available` condition reason so administrators can
 /// diagnose configuration errors without inspecting operator logs.
 /// Values are stable across releases and safe for automation to parse.
 ///
@@ -70,7 +70,7 @@ pub enum CredentialFailureReason {
 }
 
 impl CredentialFailureReason {
-    /// Machine-readable string used in `InferenceProvider.status.reason`.
+    /// Machine-readable string used in the `InferenceProvider` `Available` condition reason.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -305,7 +305,7 @@ pub fn credential_plan_from_auth(auth: Option<&AuthConfig>) -> Result<Credential
 /// Derive the [`CredentialFailureReason`] for a failed [`credential_plan_from_auth`] call.
 ///
 /// Call this only after [`credential_plan_from_auth`] has returned `Err`.
-/// Returns the machine-readable reason for surfacing in `status.reason`.
+/// Returns the machine-readable `Available` condition reason.
 ///
 /// Pure function — no I/O.
 pub fn credential_failure_reason_for_auth(auth: Option<&AuthConfig>) -> CredentialFailureReason {
@@ -374,7 +374,7 @@ fn bearer_token_ref_from_secret_ref(secret_ref: &SecretRef) -> Result<BearerToke
 ///
 /// - `Ok(None)` — credential is accessible and valid.
 /// - `Ok(Some(reason))` — credential-specific failure; the provider should be marked [`Unavailable`] with the returned
-///   reason in `status.reason`.
+///   reason as the `Available` condition reason.
 ///
 /// [`Unavailable`]: crate::crd::inference_provider::ProviderPhase::Unavailable
 ///

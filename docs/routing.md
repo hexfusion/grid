@@ -392,6 +392,7 @@ metadata:
   name: provider-a
 spec:
   gridNetworkRef: weighted-grid
+  hostSelector: {}
   capacityWeight: 50
 ```
 
@@ -748,6 +749,7 @@ metadata:
   name: queue-aware-provider
 spec:
   gridNetworkRef: stabilized-admission
+  hostSelector: {}
   providerKind: openAi
   backendKind: local
   endpoint: http://inference.example.svc:8080

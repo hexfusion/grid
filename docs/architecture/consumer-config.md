@@ -90,6 +90,10 @@ field reference.
 After enabling `consumerConfig.enabled: true` for a gateway, the `GridNetwork`
 status reports the outcome under `status.consumerConfigStatus[]`.
 
+A `GridSite` in `Active` proves only the address its probe dialed. When a remote
+candidate's `clusterEndpoints` address differs from it, the config still renders
+with reason `RoutedAddressMismatch`.
+
 ### Reading consumer config status
 
 ```console
@@ -134,6 +138,7 @@ Example failure output:
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
 | `ListenerPortUnresolved` | `Rendered` | The gateway Service could not be read, so the listener uses the `consumer.listenerPort` fallback |
+| `RoutedAddressMismatch` | `Rendered` | A remote route differs from the address its GridSite probe verified. `ListenerPortUnresolved` takes the reason when both apply, and the message names both |
 | `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
 | `MissingSni` | `Error` | A `mutualTls` cluster endpoint has no (or blank) `sni` — mTLS requires a server name |

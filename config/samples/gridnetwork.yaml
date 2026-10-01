@@ -4,7 +4,7 @@ metadata:
   name: example
 spec:
   # Basic single-site configuration
-  gridId: ""  # Auto-generated on first join
+  gridId: ""  # Empty gives each site its own UUID; set the same gridId on every site
   region: us-west-2
   zone: us-west-2a
 

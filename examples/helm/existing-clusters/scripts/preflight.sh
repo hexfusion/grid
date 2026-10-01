@@ -242,7 +242,7 @@ for SITE in $SITE_NAMES; do
         if [[ -n "$GRIDSITE_WITH_LABEL" ]]; then
           echo "  PASS  GridSite has provider-site label"
         else
-          echo "  FAIL  no GridSite with grid.praxis-proxy.io/provider-site label — InferenceProvider siteSelector will not match" >&2
+          echo "  FAIL  no GridSite with grid.praxis-proxy.io/provider-site label — InferenceProvider hostSelector will not match" >&2
           ERRORS=$((ERRORS + 1))
         fi
       fi

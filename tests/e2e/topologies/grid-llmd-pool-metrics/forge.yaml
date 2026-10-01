@@ -267,7 +267,7 @@ spec:
                 providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
-                siteSelector:
+                hostSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: pool-a
                 accessPolicy:
@@ -344,7 +344,7 @@ spec:
                 providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
-                siteSelector:
+                hostSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: pool-b
                 accessPolicy:

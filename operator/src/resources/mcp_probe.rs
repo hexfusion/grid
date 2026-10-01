@@ -55,14 +55,14 @@ use crate::{
 /// space, not the link-local range.
 pub(crate) const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
-/// Stable `status.reason` for any of `attach_tls_client_identity`'s three
+/// Stable `Available` condition reason for any of `attach_tls_client_identity`'s three
 /// client-identity failure modes (unparseable cert, unparseable key, or a
 /// cert/key pair `reqwest::Identity` itself refuses to build from).
 ///
 /// A single shared reason rather than three variants: none of the three are
 /// distinguishable in a way that would change what an operator does next
 /// (fix the referenced client certificate/key Secret), so splitting them
-/// would add `status.reason` cardinality without adding diagnostic value.
+/// would add `Available` condition reason cardinality without adding diagnostic value.
 const ENDPOINT_TLS_IDENTITY_MISMATCH: &str = "EndpointTlsIdentityMismatch";
 
 /// Maximum number of tool names persisted to `status.discoveredTools` from
@@ -113,7 +113,7 @@ pub(crate) enum McpProbeOutcome {
     AuthConfigInvalid,
 
     /// `spec.tls`'s referenced Secret material could not be resolved into a
-    /// usable client certificate/CA bundle. Carries the stable status.reason
+    /// usable client certificate/CA bundle. Carries the stable Available condition reason
     /// string (`EndpointTls*`) rather than a fixed variant, since the exact
     /// failure (missing Secret, missing key, unparseable PEM) is only known
     /// once [`endpoint_tls::read_secret_bytes_for_tls`](crate::resources::endpoint_tls::read_secret_bytes_for_tls)
@@ -122,7 +122,7 @@ pub(crate) enum McpProbeOutcome {
 }
 
 /// Map a [`McpProbeOutcome`] to the resulting [`ProviderPhase`] and, for
-/// failure outcomes, the stable `status.reason` string documented on
+/// failure outcomes, the stable `Available` condition reason string documented on
 /// [`AgentToolProviderStatus`](crate::crd::agent_tool_provider::AgentToolProviderStatus).
 ///
 /// Business rule: a successful probe always yields `Available` with no
@@ -547,7 +547,7 @@ async fn attach_tls_material(
 
 /// Read one piece of TLS material (CA cert, client cert, or client key)
 /// from a Secret, mapping a resolution failure to the stable
-/// `EndpointTls*` `status.reason` family.
+/// `EndpointTls*` `Available` condition reason family.
 ///
 /// Shared by [`attach_tls_ca`] and [`attach_tls_client_identity`] so the
 /// Secret-read-plus-reason-mapping logic exists exactly once rather than
@@ -822,7 +822,7 @@ mod tests {
         );
         assert!(
             reason.is_none(),
-            "a successful probe must clear any prior status.reason"
+            "a successful probe must clear any prior diagnostic reason"
         );
     }
 

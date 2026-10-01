@@ -71,6 +71,10 @@ pub const MAX_CLOCK_SKEW_AHEAD_MS: u64 = 30_000;
 
 /// Broadcast envelope carrying one CRDT grid-state snapshot.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "the legacy certificate slot is wire-only, never set by callers"
+)]
 pub struct StateBroadcast {
     /// Wire-format version.
     pub version: u16,
@@ -91,13 +95,9 @@ pub struct StateBroadcast {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_address: Option<String>,
 
-    /// Public site certificate PEM advertised by this site.
-    ///
-    /// Contains only the public certificate (never a private key).  Used to
-    /// populate `GridSite.status.discovered.advertisedCertPem` on the receiving operator.
-    /// `None` when the originating operator has no TLS certificate configured.
+    /// Certificate PEM an older peer still gossips; kept only so its signature verifies, never stored.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub site_cert_pem: Option<String>,
+    legacy_cert_pem: Option<String>,
 
     /// ECDSA P-256 signature (ASN.1 DER) over [`signable_bytes`](Self::signable_bytes).
     ///
@@ -214,7 +214,7 @@ struct StateBroadcastV1 {
 struct BroadcastExtension {
     /// Optional data-plane gateway address.
     gateway_address: Option<String>,
-    /// Optional public site certificate PEM — never a private key.
+    /// Wire slot for the certificate older peers gossiped; new peers leave it empty.
     site_cert_pem: Option<String>,
     /// Optional ECDSA P-256 signature over the base payload plus the other
     /// extension fields. Absent on older peers and pre-rollout broadcasts.
@@ -239,7 +239,7 @@ struct BroadcastExtension {
 struct PreCapacityBroadcastExtension {
     /// Optional data-plane gateway address.
     gateway_address: Option<String>,
-    /// Optional public site certificate PEM.
+    /// Wire slot for the certificate older peers gossiped; new peers leave it empty.
     site_cert_pem: Option<String>,
     /// Optional ECDSA P-256 signature.
     signature: Option<Vec<u8>>,
@@ -263,7 +263,7 @@ struct PreCapacityBroadcastExtension {
 struct PreTimestampBroadcastExtension {
     /// Optional data-plane gateway address.
     gateway_address: Option<String>,
-    /// Optional public site certificate PEM — never a private key.
+    /// Wire slot for the certificate older peers gossiped; new peers leave it empty.
     site_cert_pem: Option<String>,
     /// Optional ECDSA P-256 signature over the base payload plus the other
     /// extension fields. Absent on older peers and pre-rollout broadcasts.
@@ -284,7 +284,7 @@ struct PreTimestampBroadcastExtension {
 struct PreSignatureBroadcastExtension {
     /// Optional data-plane gateway address.
     gateway_address: Option<String>,
-    /// Optional public site certificate PEM — never a private key.
+    /// Wire slot for the certificate older peers gossiped; new peers leave it empty.
     site_cert_pem: Option<String>,
 }
 
@@ -307,7 +307,7 @@ impl StateBroadcast {
             revision,
             snapshot,
             gateway_address,
-            site_cert_pem: None,
+            legacy_cert_pem: None,
             signature: None,
             signed_at_ms: None,
             grid_id: None,
@@ -319,15 +319,6 @@ impl StateBroadcast {
     #[must_use]
     pub fn with_signals_address(mut self, signals_address: Option<String>) -> Self {
         self.signals_address = signals_address;
-        self
-    }
-
-    /// Create a broadcast that also carries a public site certificate PEM.
-    ///
-    /// The certificate must be the public certificate only — never a private key.
-    #[must_use]
-    pub fn with_cert(mut self, site_cert_pem: Option<String>) -> Self {
-        self.site_cert_pem = site_cert_pem;
         self
     }
 
@@ -435,14 +426,14 @@ impl StateBroadcast {
     #[must_use]
     fn is_address_only(&self) -> bool {
         (self.gateway_address.is_some() || self.signals_address.is_some())
-            && self.site_cert_pem.is_none()
+            && self.legacy_cert_pem.is_none()
             && self.is_metadata_only()
     }
 
-    /// Return true when this payload only carries site certificate PEM.
+    /// Return true when this payload only carries an older peer's certificate, which nothing reads.
     #[must_use]
     fn is_cert_only(&self) -> bool {
-        self.site_cert_pem.is_some()
+        self.legacy_cert_pem.is_some()
             && self.gateway_address.is_none()
             && self.signals_address.is_none()
             && self.is_metadata_only()
@@ -451,9 +442,7 @@ impl StateBroadcast {
     /// Return the foca invalidation key kind for this payload.
     #[must_use]
     fn key_kind(&self) -> StateBroadcastKeyKind {
-        if self.is_cert_only() {
-            StateBroadcastKeyKind::Cert
-        } else if self.is_address_only() {
+        if self.is_address_only() {
             StateBroadcastKeyKind::GatewayAddress
         } else if self.is_metadata_only() {
             StateBroadcastKeyKind::Metadata
@@ -491,7 +480,7 @@ impl StateBroadcast {
             .map(|provider| (provider_capacity_key(provider), provider.capacity_weight))
             .collect::<BTreeMap<_, _>>();
         let carries_extension = self.gateway_address.is_some()
-            || self.site_cert_pem.is_some()
+            || self.legacy_cert_pem.is_some()
             || self.signature.is_some()
             || self.signed_at_ms.is_some()
             || self.grid_id.is_some()
@@ -501,7 +490,7 @@ impl StateBroadcast {
             // Borrowed fields in `BroadcastExtension` order, so nothing is cloned.
             let ext = (
                 &self.gateway_address,
-                &self.site_cert_pem,
+                &self.legacy_cert_pem,
                 &self.signature,
                 &self.signed_at_ms,
                 &self.grid_id,
@@ -559,7 +548,7 @@ impl StateBroadcast {
             revision: v1.revision,
             snapshot: v1.snapshot,
             gateway_address: ext.gateway_address,
-            site_cert_pem: ext.site_cert_pem,
+            legacy_cert_pem: ext.site_cert_pem,
             signature: ext.signature,
             signed_at_ms: ext.signed_at_ms,
             grid_id: ext.grid_id,
@@ -669,12 +658,6 @@ enum StateBroadcastKeyKind {
     /// Gateway-address-only side-channel update.
     GatewayAddress,
 
-    /// Public site certificate PEM side-channel update.
-    ///
-    /// Cert broadcasts must not invalidate provider/capability state or
-    /// gateway-address broadcasts from the same origin.
-    Cert,
-
     /// Combined side-channel metadata update.
     ///
     /// Combined metadata broadcasts must not invalidate provider/capability
@@ -757,10 +740,6 @@ struct RetainedOrigins {
     gateway_addrs: BTreeMap<String, String>,
     /// Highest gateway-address revision received from each origin.
     latest_gateway_revision_by_origin: BTreeMap<String, u64>,
-    /// Public site certificate PEMs received from each origin site.
-    cert_pems: BTreeMap<String, String>,
-    /// Highest certificate revision received from each origin.
-    latest_cert_revision_by_origin: BTreeMap<String, u64>,
     /// Signals addresses received from each origin site.
     signals_addrs: BTreeMap<String, String>,
     /// Highest signals-address revision received from each origin.
@@ -772,8 +751,6 @@ struct RetainedOrigins {
 enum Lane {
     /// Data-plane gateway address.
     Gateway,
-    /// Public site certificate PEM.
-    Cert,
     /// Signals address.
     Signals,
 }
@@ -788,12 +765,9 @@ pub fn max_leased_revision(now_ms: u64) -> u64 {
     now_ms.saturating_add(REVISION_LEASE_SPAN).saturating_add(skew)
 }
 
-/// Highest revision `lane` accepts at `now`, leased milliseconds for addresses and nanoseconds for certificates.
-fn max_metadata_revision(lane: Lane, now: Duration) -> u64 {
-    match lane {
-        Lane::Gateway | Lane::Signals => max_leased_revision(u64::try_from(now.as_millis()).unwrap_or(u64::MAX)),
-        Lane::Cert => u64::try_from(now.saturating_add(MAX_LEASE_SKEW).as_nanos()).unwrap_or(u64::MAX),
-    }
+/// Highest revision an address lane accepts at `now`, in leased milliseconds.
+fn max_metadata_revision(_lane: Lane, now: Duration) -> u64 {
+    max_leased_revision(u64::try_from(now.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Whether a `held` revision outranks `incoming`, a held one past `cap` yielding to any within it.
@@ -816,7 +790,6 @@ impl RetainedOrigins {
     fn lane_mut(&mut self, lane: Lane) -> (&mut BTreeMap<String, String>, &mut BTreeMap<String, u64>) {
         match lane {
             Lane::Gateway => (&mut self.gateway_addrs, &mut self.latest_gateway_revision_by_origin),
-            Lane::Cert => (&mut self.cert_pems, &mut self.latest_cert_revision_by_origin),
             Lane::Signals => (&mut self.signals_addrs, &mut self.latest_signals_revision_by_origin),
         }
     }
@@ -827,8 +800,6 @@ impl RetainedOrigins {
             .keys()
             .chain(self.gateway_addrs.keys())
             .chain(self.latest_gateway_revision_by_origin.keys())
-            .chain(self.cert_pems.keys())
-            .chain(self.latest_cert_revision_by_origin.keys())
             .chain(self.signals_addrs.keys())
             .chain(self.latest_signals_revision_by_origin.keys())
             .cloned()
@@ -840,8 +811,6 @@ impl RetainedOrigins {
         self.latest_by_origin.remove(origin);
         self.gateway_addrs.remove(origin);
         self.latest_gateway_revision_by_origin.remove(origin);
-        self.cert_pems.remove(origin);
-        self.latest_cert_revision_by_origin.remove(origin);
         self.signals_addrs.remove(origin);
         self.latest_signals_revision_by_origin.remove(origin);
     }
@@ -859,8 +828,6 @@ pub(crate) struct OriginStateHandle {
     state_tx: watch::Sender<GridStateSnapshot>,
     /// Gateway-address publisher.
     gateway_addrs_tx: watch::Sender<BTreeMap<String, String>>,
-    /// Public-certificate publisher.
-    cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
     /// Signals-address publisher.
     signals_addrs_tx: watch::Sender<BTreeMap<String, String>>,
 }
@@ -900,9 +867,6 @@ impl OriginStateHandle {
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
-        self.cert_pems_tx.send_modify(|certs| {
-            certs.remove(origin);
-        });
         self.signals_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
@@ -926,9 +890,6 @@ pub struct StateBroadcastHandler {
     /// Updated whenever a broadcast with a gateway address extension is received.
     /// Subscribers observe the full map keyed by origin site name.
     gateway_addrs_tx: watch::Sender<BTreeMap<String, String>>,
-
-    /// Watch channel for broadcasting public cert PEM updates to observers.
-    cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
 
     /// Watch channel for signals address updates, keyed by origin site.
     signals_addrs_tx: watch::Sender<BTreeMap<String, String>>,
@@ -973,7 +934,6 @@ impl StateBroadcastHandler {
     pub(crate) fn with_capacity(site_id: String, max_origins: usize) -> (Self, OriginStateHandle) {
         let (tx, _) = watch::channel(GridStateSnapshot::new(site_id));
         let (gw_tx, _) = watch::channel(BTreeMap::new());
-        let (cert_tx, _) = watch::channel(BTreeMap::new());
         let (signals_tx, _) = watch::channel(BTreeMap::new());
         let (trust_tx, trust_rx) = watch::channel(TrustStore::new());
         let max_origins = max_origins.max(1);
@@ -982,7 +942,6 @@ impl StateBroadcastHandler {
             retained: Arc::clone(&retained),
             state_tx: tx.clone(),
             gateway_addrs_tx: gw_tx.clone(),
-            cert_pems_tx: cert_tx.clone(),
             signals_addrs_tx: signals_tx.clone(),
         };
         (
@@ -990,7 +949,6 @@ impl StateBroadcastHandler {
                 state_tx: tx,
                 retained,
                 gateway_addrs_tx: gw_tx,
-                cert_pems_tx: cert_tx,
                 signals_addrs_tx: signals_tx,
                 trust_store_tx: trust_tx,
                 trust_store_rx: trust_rx,
@@ -1069,36 +1027,6 @@ impl StateBroadcastHandler {
         self.signals_addrs_tx.subscribe()
     }
 
-    /// Return a receiver for the live public cert PEM map.
-    ///
-    /// Create the receiver **before** moving `self` into foca.
-    pub fn subscribe_cert_pems(&self) -> watch::Receiver<BTreeMap<String, String>> {
-        self.cert_pems_tx.subscribe()
-    }
-
-    /// Return the public site certificate PEM received from `site`, if any.
-    ///
-    /// The returned PEM is the public certificate only — never a private key.
-    #[must_use]
-    pub fn cert_pem_for_site(&self, site: &str) -> Option<String> {
-        self.retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .cert_pems
-            .get(site)
-            .cloned()
-    }
-
-    /// Return a snapshot of all known public cert PEMs, keyed by site name.
-    #[must_use]
-    pub fn cert_pems(&self) -> BTreeMap<String, String> {
-        self.retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .cert_pems
-            .clone()
-    }
-
     /// Store and publish `value` on `lane` unless a newer revision holds it, `true` when refused as from the future.
     fn store_latest(&self, lane: Lane, broadcast: &StateBroadcast, value: &String) -> bool {
         let origin = &broadcast.origin_site;
@@ -1133,7 +1061,6 @@ impl StateBroadcastHandler {
     fn lane_tx(&self, lane: Lane) -> &watch::Sender<BTreeMap<String, String>> {
         match lane {
             Lane::Gateway => &self.gateway_addrs_tx,
-            Lane::Cert => &self.cert_pems_tx,
             Lane::Signals => &self.signals_addrs_tx,
         }
     }
@@ -1142,7 +1069,6 @@ impl StateBroadcastHandler {
     fn store_metadata(&self, broadcast: &StateBroadcast) -> bool {
         let (carried, refused) = [
             (Lane::Gateway, broadcast.gateway_address.as_ref()),
-            (Lane::Cert, broadcast.site_cert_pem.as_ref()),
             (Lane::Signals, broadcast.signals_address.as_ref()),
         ]
         .into_iter()
@@ -1169,9 +1095,6 @@ impl StateBroadcastHandler {
             .send_modify(|snapshot| snapshot.remove_origin_providers(origin));
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
-        });
-        self.cert_pems_tx.send_modify(|certs| {
-            certs.remove(origin);
         });
         self.signals_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
@@ -1316,9 +1239,13 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             });
         }
         self.verify_signature_if_pinned(&broadcast)?;
+        // An older peer's certificate: nothing reads it, so neither store nor relay it.
+        if broadcast.is_cert_only() {
+            return Ok(None);
+        }
         self.make_room_for(&broadcast.origin_site);
 
-        // Metadata-only broadcasts (gateway address or cert PEM, empty CRDT
+        // Metadata-only broadcasts (gateway or signals address, empty CRDT
         // snapshot) have independent revision lanes. They must not be rejected
         // by an unrelated provider-state revision.
         if broadcast.is_metadata_only() {
@@ -1374,6 +1301,14 @@ mod tests {
     use foca::{BroadcastHandler as _, Invalidates as _};
 
     use super::*;
+
+    impl StateBroadcast {
+        /// Carry a certificate the way an older peer gossiped it.
+        fn with_legacy_cert(mut self, pem: Option<String>) -> Self {
+            self.legacy_cert_pem = pem;
+            self
+        }
+    }
 
     fn snapshot(site: &str, revision: u64, queue_depth: f64) -> GridStateSnapshot {
         let mut snap = GridStateSnapshot::new(site.to_owned());
@@ -1496,7 +1431,7 @@ mod tests {
             bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
         let extension = PreCapacityBroadcastExtension {
             gateway_address: broadcast.gateway_address.clone(),
-            site_cert_pem: broadcast.site_cert_pem.clone(),
+            site_cert_pem: broadcast.legacy_cert_pem.clone(),
             signature: None,
             signed_at_ms: broadcast.signed_at_ms,
             grid_id: broadcast.grid_id.clone(),
@@ -1563,6 +1498,30 @@ mod tests {
             handler.snapshot().provider("net", "site-p", "provider").is_some(),
             "the signed broadcast's provider state must be merged"
         );
+    }
+
+    #[test]
+    fn an_older_peer_signature_over_its_certificate_still_verifies() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![raw_pubkey])));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_legacy_cert(Some("pem".to_owned()))
+            .with_signed_at(Some(now_ms()));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &pkcs8_der,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            receive(&mut handler, &unsigned.with_signature(Some(signature))).is_some(),
+            "the certificate slot stays in the signed bytes, so an older peer's state still merges"
+        );
+        assert!(handler.snapshot().provider("net", "site-p", "provider").is_some());
     }
 
     #[test]
@@ -2295,7 +2254,7 @@ mod tests {
             provider.capacity_weight = 7;
         }
         let full = StateBroadcast::new("a".to_owned(), 3, snap, Some("gw:8080".to_owned()))
-            .with_cert(Some("pem".to_owned()))
+            .with_legacy_cert(Some("pem".to_owned()))
             .with_signature(Some(vec![1, 2, 3]))
             .with_signed_at(Some(42))
             .with_grid_id(Some("grid".to_owned()));
@@ -2308,7 +2267,7 @@ mod tests {
             };
             let ext = BroadcastExtension {
                 gateway_address: broadcast.gateway_address.clone(),
-                site_cert_pem: broadcast.site_cert_pem.clone(),
+                site_cert_pem: broadcast.legacy_cert_pem.clone(),
                 signature: broadcast.signature.clone(),
                 signed_at_ms: broadcast.signed_at_ms,
                 grid_id: broadcast.grid_id.clone(),
@@ -2343,7 +2302,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "forged then real revisions on all three lanes")]
     fn a_metadata_revision_from_the_future_is_refused() {
         let (mut handler, _control) = StateBroadcastHandler::with_capacity("local".to_owned(), 8);
         let empty = || GridStateSnapshot::new("a".to_owned());
@@ -2351,19 +2309,14 @@ mod tests {
             StateBroadcast::new("a".to_owned(), revision, empty(), Some(value.to_owned()))
                 .with_signals_address(Some(value.to_owned()))
         };
-        let cert = |revision: u64, value: &str| {
-            StateBroadcast::new("a".to_owned(), revision, empty(), None).with_cert(Some(value.to_owned()))
-        };
         let lanes = |held: &StateBroadcastHandler| {
             (
                 held.gateway_addrs().get("a").cloned(),
                 held.signals_addrs_tx.borrow().get("a").cloned(),
-                held.cert_pems().get("a").cloned(),
             )
         };
         let now = wall_clock();
         let ms = |at: Duration| u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
-        let nanos = |at: Duration| u64::try_from(at.as_nanos()).unwrap_or(u64::MAX);
         assert!(
             receive(&mut handler, &addresses(u64::MAX, "forged")).is_none(),
             "not re-gossiped"
@@ -2376,25 +2329,11 @@ mod tests {
             .is_none(),
             "past one lease and the skew"
         );
-        assert!(receive(&mut handler, &cert(u64::MAX, "forged")).is_none());
-        assert!(
-            receive(
-                &mut handler,
-                &cert(nanos(now + MAX_LEASE_SKEW + Duration::from_secs(60)), "forged")
-            )
-            .is_none(),
-            "the cert lane shares the skew"
-        );
-        assert_eq!(lanes(&handler), (None, None, None), "no lane took a forged revision");
+        assert_eq!(lanes(&handler), (None, None), "no lane took a forged revision");
 
         drop(receive(&mut handler, &addresses(ms(now), "real")));
-        drop(receive(&mut handler, &cert(nanos(now), "real")));
         let real = Some("real".to_owned());
-        assert_eq!(
-            lanes(&handler),
-            (real.clone(), real.clone(), real),
-            "real revisions land"
-        );
+        assert_eq!(lanes(&handler), (real.clone(), real), "real revisions land");
     }
 
     #[test]
@@ -2480,7 +2419,7 @@ mod tests {
             GridStateSnapshot::new("a".to_owned()),
             Some("gw".to_owned()),
         )
-        .with_cert(Some("pem".to_owned()));
+        .with_legacy_cert(Some("pem".to_owned()));
         assert!(receive(&mut handler, &mixed).is_some(), "the address lane took it");
     }
 
@@ -2572,7 +2511,7 @@ mod tests {
             "gateway_address from a pre-signature peer must survive decode, not be silently dropped"
         );
         assert_eq!(
-            decoded.site_cert_pem.as_deref(),
+            decoded.legacy_cert_pem.as_deref(),
             Some("-----BEGIN CERTIFICATE-----legacy-----END CERTIFICATE-----"),
             "site_cert_pem from a pre-signature peer must survive decode, not be silently dropped"
         );
@@ -2603,7 +2542,7 @@ mod tests {
             "gateway_address from a pre-timestamp peer must survive decode, not be silently dropped"
         );
         assert_eq!(
-            decoded.site_cert_pem.as_deref(),
+            decoded.legacy_cert_pem.as_deref(),
             Some("-----BEGIN CERTIFICATE-----legacy-----END CERTIFICATE-----"),
             "site_cert_pem from a pre-timestamp peer must survive decode, not be silently dropped"
         );
@@ -2673,7 +2612,7 @@ mod tests {
             "gateway_address from the original bare-String wire format must survive decode"
         );
         assert_eq!(
-            decoded.site_cert_pem, None,
+            decoded.legacy_cert_pem, None,
             "the bare-String format never carries a cert"
         );
         assert_eq!(
@@ -2704,7 +2643,7 @@ mod tests {
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(decoded.gateway_address, None);
-        assert_eq!(decoded.site_cert_pem, None);
+        assert_eq!(decoded.legacy_cert_pem, None);
         assert_eq!(decoded.signature, None);
     }
 
@@ -3243,69 +3182,26 @@ mod tests {
     fn cert_extension_round_trips() {
         let cert = "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n";
         let broadcast = StateBroadcast::new("site-p".to_owned(), 4, snapshot("site-p", 4, 0.6), None)
-            .with_cert(Some(cert.to_owned()));
+            .with_legacy_cert(Some(cert.to_owned()));
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
 
-        assert_eq!(decoded.site_cert_pem.as_deref(), Some(cert));
+        assert_eq!(decoded.legacy_cert_pem.as_deref(), Some(cert));
         assert!(decoded.gateway_address.is_none());
     }
 
     #[test]
-    fn handler_stores_public_cert_from_extension() {
-        let cert = "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n";
+    fn a_legacy_cert_only_broadcast_is_dropped_not_relayed() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.4), None)
-            .with_cert(Some(cert.to_owned()));
-
-        assert!(receive(&mut handler, &broadcast).is_some());
-        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
-    }
-
-    #[test]
-    fn handler_rejects_out_of_order_certificate_rollback() {
-        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        let newer = StateBroadcast::new(
+        let cert_only = StateBroadcast::new(
             "site-p".to_owned(),
-            8,
+            1,
             GridStateSnapshot::new("site-p".to_owned()),
             None,
         )
-        .with_cert(Some("new-cert".to_owned()));
-        let older = StateBroadcast::new(
-            "site-p".to_owned(),
-            7,
-            GridStateSnapshot::new("site-p".to_owned()),
-            None,
-        )
-        .with_cert(Some("old-cert".to_owned()));
-
-        assert!(receive(&mut handler, &newer).is_some());
-        assert!(receive(&mut handler, &older).is_some());
-        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some("new-cert"));
-    }
-
-    #[test]
-    fn cert_key_does_not_invalidate_gateway_or_state_keys() {
-        let cert = StateBroadcastKey {
-            origin_site: "site-p".to_owned(),
-            revision: 99,
-            kind: StateBroadcastKeyKind::Cert,
-        };
-        let gateway = StateBroadcastKey {
-            origin_site: "site-p".to_owned(),
-            revision: 99,
-            kind: StateBroadcastKeyKind::GatewayAddress,
-        };
-        let state = StateBroadcastKey {
-            origin_site: "site-p".to_owned(),
-            revision: 1,
-            kind: StateBroadcastKeyKind::State,
-        };
-
-        assert!(!cert.invalidates(&gateway));
-        assert!(!cert.invalidates(&state));
-        assert!(!state.invalidates(&cert));
+        .with_legacy_cert(Some("pem".to_owned()));
+        assert!(receive(&mut handler, &cert_only).is_none(), "not relayed");
+        assert!(handler.known_origins().is_empty(), "takes no origin slot");
     }
 
     #[test]
@@ -3318,8 +3214,8 @@ mod tests {
             GridStateSnapshot::new("site-p".to_owned()),
             None,
         )
-        .with_cert(Some(cert.to_owned()));
-        assert!(receive(&mut handler, &cert_only).is_some());
+        .with_legacy_cert(Some(cert.to_owned()));
+        assert!(receive(&mut handler, &cert_only).is_none());
 
         let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.8), None);
         assert!(
@@ -3328,7 +3224,6 @@ mod tests {
         );
 
         assert!(handler.snapshot().provider("net", "site-p", "provider").is_some());
-        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
     }
 
     #[test]
@@ -3341,7 +3236,7 @@ mod tests {
             GridStateSnapshot::new("site-p".to_owned()),
             Some("10.0.0.2:19080".to_owned()),
         )
-        .with_cert(Some(cert.to_owned()));
+        .with_legacy_cert(Some(cert.to_owned()));
         assert!(receive(&mut handler, &metadata_only).is_some());
 
         let state = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.8), None);
@@ -3355,7 +3250,6 @@ mod tests {
             handler.gateway_address_for_site("site-p").as_deref(),
             Some("10.0.0.2:19080")
         );
-        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
     }
 
     // -----------------------------------------------------------------------
@@ -3507,13 +3401,12 @@ mod tests {
             snapshot("site-a", 10, 0.4),
             Some("10.0.0.1:8443".to_owned()),
         )
-        .with_cert(Some(cert.to_owned()));
+        .with_legacy_cert(Some(cert.to_owned()));
         assert!(receive(&mut handler, &original).is_some());
         origin_state.remove_origin("site-a");
 
         assert!(handler.snapshot().provider("net", "site-a", "provider").is_none());
         assert!(handler.gateway_address_for_site("site-a").is_none());
-        assert!(handler.cert_pem_for_site("site-a").is_none());
 
         let restarted = StateBroadcast::new(
             "site-a".to_owned(),
@@ -3541,7 +3434,7 @@ mod tests {
                 snapshot(origin, revision, 0.3),
                 Some(format!("10.0.0.{revision}:8443")),
             )
-            .with_cert(Some(format!("cert-{origin}")));
+            .with_legacy_cert(Some(format!("cert-{origin}")));
             assert!(receive(&mut handler, &broadcast).is_some());
         }
 

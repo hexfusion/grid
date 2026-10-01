@@ -559,8 +559,8 @@ mod tests {
             status,
             age_secs: 0,
             gateway_address: None,
-            site_cert_pem: None,
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }
     }
 

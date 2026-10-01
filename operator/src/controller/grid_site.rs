@@ -34,8 +34,7 @@ use crate::{
         },
         secret::read_secret_bytes,
         tls_probe::{
-            PeerIdentity, build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs,
-            parse_private_key, probe_gateway,
+            PeerIdentity, build_tls_config, parse_ca_roots, parse_client_certs, parse_private_key, probe_gateway,
         },
     },
 };
@@ -51,7 +50,10 @@ use crate::{
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// TCP connect timeout for plaintext gateway reachability probes.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Least and most time between probes of an `Unreachable` site, which backs off as it stays down.
+const UNREACHABLE_BACKOFF: (Duration, Duration) = (Duration::from_secs(30), Duration::from_secs(300));
 
 // ---------------------------------------------------------------------------
 // Reconcile
@@ -107,13 +109,16 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
     };
 
     let probed = outcome.is_some();
-    let (next_phase, reason, message) = match rejection {
-        Some(rejection) => (
+    let (next_phase, reason, message) = if let Some(rejection) = rejection {
+        (
             rejected_phase(current_phase),
             rejection.reason.to_owned(),
             rejection.message,
-        ),
-        None => site_phase_next(current_phase, &site, outcome.as_ref()),
+        )
+    } else {
+        let (phase, reason, message) = site_phase_next(current_phase, &site, outcome.as_ref());
+        let message = identity_message(&reason, &site, &network).unwrap_or(message);
+        (phase, reason, message)
     };
     Box::pin(update_status(
         &site,
@@ -127,7 +132,33 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
     ))
     .await?;
 
-    Ok(Action::requeue(REQUEUE_INTERVAL))
+    let now = time::OffsetDateTime::now_utc();
+    Ok(Action::requeue(requeue_after(&next_phase, site.status.as_ref(), now)))
+}
+
+/// Next probe delay: the usual interval, or for an `Unreachable` site half its time down, bounded, plus jitter.
+fn requeue_after(next: &GridSitePhase, previous: Option<&GridSiteStatus>, now: time::OffsetDateTime) -> Duration {
+    if *next != GridSitePhase::Unreachable {
+        return REQUEUE_INTERVAL;
+    }
+    let down_since = previous
+        .filter(|status| status.phase == GridSitePhase::Unreachable)
+        .and_then(|status| condition::find(&status.conditions, condition::CONNECTED))
+        .and_then(|connected| {
+            time::OffsetDateTime::parse(
+                &connected.last_transition_time,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+        });
+    let down = down_since.map_or(Duration::ZERO, |since| {
+        Duration::try_from(now - since).unwrap_or_default()
+    });
+    let (least, most) = UNREACHABLE_BACKOFF;
+    let base = (down / 2).clamp(least, most);
+    // Spread retries of sites that went down together.
+    let jitter = base.mul_f64(f64::from(now.nanosecond() % 1_000) / 5_000.0);
+    base + jitter
 }
 
 /// Error policy for the [`GridSite`] controller.
@@ -252,27 +283,6 @@ async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwor
     }
 }
 
-/// SWIM-advertised leaf DER, or `None` when absent or unparseable.
-///
-/// Gossiped, so unparseable is ignored: an `Err` would skip the authenticating handshake.
-fn advertised_leaf_der(site: &GridSite) -> Option<Vec<u8>> {
-    site.status
-        .as_ref()
-        .and_then(|s| s.discovered.as_ref())
-        .and_then(|d| d.advertised_cert_pem.as_ref())
-        .and_then(|pem| match first_cert_der_from_pem(pem) {
-            Ok(der) => Some(der),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    site = site.metadata.name.as_deref().unwrap_or_default(),
-                    "ignoring unparseable advertised certificate"
-                );
-                None
-            },
-        })
-}
-
 /// Build a `ProbeConfig` by loading trust material from Kubernetes
 /// Secrets referenced by the `GridNetwork`.
 ///
@@ -337,14 +347,11 @@ async fn build_probe_config_from_secrets(
         PeerIdentity::Pins(resolve_pins(site)?)
     };
 
-    let advertised = advertised_leaf_der(site);
-
     Ok(crate::resources::tls_probe::ProbeConfig {
         address: addr.to_owned(),
         tls_config,
         server_name,
         identity,
-        advertised_leaf_der: advertised,
     })
 }
 
@@ -359,6 +366,35 @@ fn probe_server_name(site: &GridSite) -> String {
             || format!("{}.grid.internal", site.metadata.name.as_deref().unwrap_or_default()),
             ToOwned::to_owned,
         )
+}
+
+/// The status message naming what the handshake checked, for the reasons that depend on the peer trust mode.
+fn identity_message(reason: &str, site: &GridSite, network: &GridNetwork) -> Option<String> {
+    let spiffe = spiffe_peer_trust(network);
+    let expected = if spiffe {
+        format!(
+            "SPIFFE ID {}",
+            certs::spiffe_id(site.metadata.name.as_deref().unwrap_or_default())
+        )
+    } else {
+        let pins: Vec<&str> = site
+            .spec
+            .trust
+            .iter()
+            .flat_map(|trust| trust.canonical_fingerprints.iter().flatten())
+            .map(|pin| pin.get(..12).unwrap_or(pin))
+            .collect();
+        format!("pinned leaf digest {}", pins.join(" or "))
+    };
+    match reason {
+        "TlsVerified" => Some(format!("TLS handshake verified: chain to the Grid CA and {expected}")),
+        "PinMismatch" => Some(format!("server leaf does not match the {expected}")),
+        "IdentityMismatch" if spiffe => Some(format!(
+            "server cert does not match serverName {} or carry {expected}",
+            probe_server_name(site)
+        )),
+        _ => None,
+    }
 }
 
 /// Whether the network verifies peers by SPIFFE ID rather than pins.
@@ -447,7 +483,7 @@ fn rejected_phase(current: &GridSitePhase) -> GridSitePhase {
 }
 
 /// Probe target: the declared `spec.egress` address, else a dialable gossiped one.
-fn egress_address(site: &GridSite) -> Option<&str> {
+pub(crate) fn egress_address(site: &GridSite) -> Option<&str> {
     declared_egress_address(site).or_else(|| gossiped_egress_address(site).filter(|addr| is_dialable_gossip(addr)))
 }
 
@@ -481,13 +517,12 @@ fn gossip_address_refused(site: &GridSite) -> bool {
         && gossiped_egress_address(site).is_some_and(|addr| !is_dialable_gossip(addr))
 }
 
-/// Egress TLS mode: the declared one, else the network default.
+/// Egress TLS mode: the declared one, else the network's `siteDiscovery.defaultEgressTls`.
 fn egress_tls_mode(site: &GridSite, network: &GridNetwork) -> TlsMode {
-    match site.spec.egress.as_ref() {
-        Some(egress) => egress.tls.mode,
-        None if super::grid_network::network_uses_plaintext_egress(network) => TlsMode::Plaintext,
-        None => TlsMode::MutualTls,
-    }
+    site.spec
+        .egress
+        .as_ref()
+        .map_or(network.spec.site_discovery.default_egress_tls, |egress| egress.tls.mode)
 }
 
 /// Attempt a TCP connection to `addr` with [`PROBE_TIMEOUT`].
@@ -508,8 +543,8 @@ async fn tcp_probe(addr: &str) -> bool {
 ///
 /// Patches only fields owned by this controller. `capabilities` and
 /// `discovered` are owned by SWIM reconciliation and are deliberately
-/// omitted. Updates `last_probe_time` when a probe was executed and
-/// `last_transition_time` when the phase changes.
+/// omitted. Updates `last_probe_time` when a probe was executed; each condition
+/// keeps its own transition time.
 #[expect(
     clippy::too_many_lines,
     reason = "linear status-patching sequence; splitting would fragment field ownership"
@@ -543,16 +578,11 @@ async fn update_status(
     } else {
         existing.and_then(|s| s.last_probe_time.clone())
     };
-    let transition_time = if phase_changed {
-        now
-    } else {
-        existing.and_then(|s| s.last_transition_time.clone())
-    };
 
     let observed_generation = site.metadata.generation.unwrap_or(0);
     let conditions = condition::refresh(
         existing.map(|s| s.conditions.as_slice()),
-        condition::site_conditions(phase, reason),
+        condition::site_conditions(phase, reason, message),
         observed_generation,
     );
     let api: Api<GridSite> = Api::all(client.clone());
@@ -560,11 +590,8 @@ async fn update_status(
         conditions,
         phase: phase.clone(),
         observed_generation,
-        reason: reason.to_owned(),
-        message: message.to_owned(),
         capabilities: existing.map_or_else(Default::default, |s| s.capabilities.clone()),
         last_probe_time: probe_time,
-        last_transition_time: transition_time,
         discovered: existing.and_then(|s| s.discovered.clone()),
     };
 
@@ -603,7 +630,7 @@ async fn update_status(
     let patched_rv = patched.metadata.resource_version.as_deref();
     let patch_caused_mutation = rv != patched_rv;
 
-    let reason_changed = existing.is_none_or(|current| current.reason != reason);
+    let reason_changed = existing.is_none_or(|current| last_reason(current) != Some(reason));
     if patch_caused_mutation && (phase_changed || reason_changed) {
         tracing::info!(
             grid_site = name,
@@ -647,10 +674,7 @@ async fn update_status(
 /// [`Warning`]: EventType::Warning
 fn event_type_for_reason(reason: &str) -> EventType {
     match reason {
-        // AdvertisedCertMismatch is a success path, so Warning would be false alarm.
-        "TlsVerified" | "AwaitingDiscovery" | "GatewayAddressKnown" | "Left" | "AdvertisedCertMismatch" => {
-            EventType::Normal
-        },
+        "TlsVerified" | "AwaitingDiscovery" | "GatewayAddressKnown" | "Left" => EventType::Normal,
         _ => EventType::Warning,
     }
 }
@@ -672,19 +696,33 @@ fn truncate_event_note(message: &str) -> String {
     }
 }
 
+/// The reason last reported, read from the `Connected` condition.
+fn last_reason(status: &GridSiteStatus) -> Option<&str> {
+    condition::find(&status.conditions, condition::CONNECTED).map(|c| c.reason.as_str())
+}
+
+/// Each condition's type, status, reason, and generation, without the free-text message.
+///
+/// A probe error's wording can alternate (timeout, then refused) under one reason; writing on that alone
+/// would retrigger a reconcile and skip the unreachable backoff.
+fn condition_verdicts(conditions: &[condition::Condition]) -> Vec<(&str, condition::ConditionStatus, &str, i64)> {
+    conditions
+        .iter()
+        .map(|c| (c.type_.as_str(), c.status, c.reason.as_str(), c.observed_generation))
+        .collect()
+}
+
 /// Whether the controller-owned status fields differ.
 ///
-/// `last_probe_time` and `last_transition_time` are rewritten every probed
-/// reconcile, so comparing them would re-patch each pass into a hot loop.
+/// `last_probe_time` is rewritten every probed reconcile, so comparing it
+/// would re-patch each pass into a hot loop.
 /// `capabilities` and `discovered` are SWIM-owned and not patched here.
 fn grid_site_status_needs_update(current: Option<&GridSiteStatus>, desired: &GridSiteStatus) -> bool {
     let Some(current) = current else {
         return true;
     };
     current.phase != desired.phase
-        || current.conditions != desired.conditions
-        || current.reason != desired.reason
-        || current.message != desired.message
+        || condition_verdicts(&current.conditions) != condition_verdicts(&desired.conditions)
         || current.observed_generation != desired.observed_generation
 }
 
@@ -699,10 +737,7 @@ fn grid_site_owned_status_patch(status: &GridSiteStatus, resource_version: Optio
             "conditions": status.conditions,
             "phase": status.phase,
             "observedGeneration": status.observed_generation,
-            "reason": status.reason,
-            "message": status.message,
-            "lastProbeTime": status.last_probe_time,
-            "lastTransitionTime": status.last_transition_time
+            "lastProbeTime": status.last_probe_time
         }
     })
 }
@@ -729,8 +764,6 @@ mod tests {
         let baseline = GridSiteStatus {
             phase: GridSitePhase::Active,
             observed_generation: 2,
-            reason: "Ready".to_owned(),
-            message: "gateway reachable".to_owned(),
             ..GridSiteStatus::default()
         };
         assert!(!grid_site_status_needs_update(Some(&baseline), &baseline));
@@ -748,16 +781,12 @@ mod tests {
         let baseline = GridSiteStatus {
             phase: GridSitePhase::Active,
             observed_generation: 2,
-            reason: "Ready".to_owned(),
-            message: "gateway reachable".to_owned(),
             last_probe_time: Some("2026-01-01T00:00:00Z".to_owned()),
-            last_transition_time: Some("2026-01-01T00:00:00Z".to_owned()),
             ..GridSiteStatus::default()
         };
         // A probe that changed nothing still rewrites the timestamps, which the guard must ignore.
         let probed_again = GridSiteStatus {
             last_probe_time: Some("2026-01-01T00:00:30Z".to_owned()),
-            last_transition_time: Some("2026-01-01T00:00:30Z".to_owned()),
             ..baseline.clone()
         };
         assert!(
@@ -774,11 +803,10 @@ mod tests {
                 ..Default::default()
             },
             discovered: Some(crate::crd::grid_site::DiscoveredStatus {
-                advertised_cert_pem: Some("sentinel-public-cert".to_owned()),
+                egress_address: Some("10.0.0.9:8443".to_owned()),
                 ..Default::default()
             }),
             phase: GridSitePhase::Active,
-            reason: "TlsVerified".to_owned(),
             ..Default::default()
         };
         let patch = grid_site_owned_status_patch(&status, Some("12345"));
@@ -794,7 +822,7 @@ mod tests {
     fn status_patch_carries_the_site_conditions() {
         let conditions = condition::reconcile_conditions(
             &[],
-            condition::site_conditions(&GridSitePhase::Active, "Verified"),
+            condition::site_conditions(&GridSitePhase::Active, "Verified", ""),
             4,
             "2026-10-01T00:00:00Z",
         );
@@ -820,7 +848,7 @@ mod tests {
         let desired = GridSiteStatus {
             conditions: condition::reconcile_conditions(
                 &[],
-                condition::site_conditions(&GridSitePhase::Pending, ""),
+                condition::site_conditions(&GridSitePhase::Pending, "", ""),
                 0,
                 "t",
             ),
@@ -831,10 +859,61 @@ mod tests {
     }
 
     #[test]
+    fn a_new_probe_error_text_under_the_same_reason_writes_nothing() {
+        let status = |message: &str| GridSiteStatus {
+            phase: GridSitePhase::Unreachable,
+            conditions: condition::reconcile_conditions(
+                &[],
+                condition::site_conditions(&GridSitePhase::Unreachable, "ConnectionFailed", message),
+                1,
+                "t",
+            ),
+            ..Default::default()
+        };
+        assert!(!grid_site_status_needs_update(
+            Some(&status("connect timed out")),
+            &status("connection refused")
+        ));
+        let other_reason = GridSiteStatus {
+            conditions: condition::reconcile_conditions(
+                &[],
+                condition::site_conditions(&GridSitePhase::Unreachable, "ConnectTimeout", ""),
+                1,
+                "t",
+            ),
+            ..status("")
+        };
+        assert!(grid_site_status_needs_update(Some(&status("")), &other_reason));
+    }
+
+    #[test]
+    fn the_last_reason_is_read_back_from_the_connected_condition() {
+        let status = GridSiteStatus {
+            conditions: condition::reconcile_conditions(
+                &[],
+                condition::site_conditions(&GridSitePhase::Unreachable, "PinMismatch", "pin did not match"),
+                1,
+                "t",
+            ),
+            ..Default::default()
+        };
+        assert_eq!(last_reason(&status), Some("PinMismatch"));
+        let connected =
+            condition::find(&status.conditions, condition::CONNECTED).unwrap_or_else(|| std::process::abort());
+        assert_eq!(connected.message, "pin did not match");
+        let patch = grid_site_owned_status_patch(&status, None);
+        for flat in ["reason", "message", "lastTransitionTime"] {
+            assert!(
+                patch.pointer(&format!("/status/{flat}")).is_none(),
+                "{flat} lives in conditions now"
+            );
+        }
+    }
+
+    #[test]
     fn status_patch_includes_resource_version_as_cas_precondition() {
         let status = GridSiteStatus {
             phase: GridSitePhase::Connecting,
-            reason: "PinMismatch".to_owned(),
             ..Default::default()
         };
         let patch = grid_site_owned_status_patch(&status, Some("99887"));
@@ -1188,102 +1267,6 @@ mod tests {
         assert_eq!(reason, "PinMismatch");
     }
 
-    /// A site whose only relevant property is its advertised certificate.
-    fn site_with_advertised(pem: Option<&str>) -> GridSite {
-        GridSite {
-            status: Some(GridSiteStatus {
-                discovered: Some(crate::crd::grid_site::DiscoveredStatus {
-                    advertised_cert_pem: pem.map(ToOwned::to_owned),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..site_no_egress(None)
-        }
-    }
-
-    /// Absent advertised material yields no DER, and no error.
-    #[test]
-    fn advertised_leaf_absent_is_none() {
-        assert!(advertised_leaf_der(&site_no_egress(None)).is_none(), "no status");
-        assert!(
-            advertised_leaf_der(&site_with_advertised(None)).is_none(),
-            "status, no PEM"
-        );
-    }
-
-    /// A real advertised certificate parses to the expected DER.
-    #[test]
-    fn advertised_leaf_valid_is_parsed() {
-        let ca = certs::generate_ca("t").unwrap_or_else(|_| std::process::abort());
-        let leaf = certs::generate_site_cert(&ca, "peer").unwrap_or_else(|_| std::process::abort());
-        let want = first_cert_der_from_pem(&leaf.cert_pem).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(
-            advertised_leaf_der(&site_with_advertised(Some(&leaf.cert_pem))),
-            Some(want)
-        );
-    }
-
-    /// A chain PEM yields the leaf, not an intermediate.
-    #[test]
-    fn advertised_leaf_of_chain_is_the_leaf() {
-        let ca = certs::generate_ca("t").unwrap_or_else(|_| std::process::abort());
-        let leaf = certs::generate_site_cert(&ca, "peer").unwrap_or_else(|_| std::process::abort());
-        let chain = format!("{}{}", leaf.cert_pem, ca.cert_pem);
-        let want = first_cert_der_from_pem(&leaf.cert_pem).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(advertised_leaf_der(&site_with_advertised(Some(&chain))), Some(want));
-    }
-
-    /// An unparseable advertised PEM is ignored, not surfaced as an error.
-    #[test]
-    fn unparseable_advertised_leaf_is_ignored() {
-        let bad = "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9\n-----END CERTIFICATE-----";
-        assert!(
-            first_cert_der_from_pem(bad).is_err(),
-            "fixture must be the unparseable case this guards"
-        );
-        assert!(
-            advertised_leaf_der(&site_with_advertised(Some(bad))).is_none(),
-            "unparseable advertised material must be ignored, never surfaced as an error"
-        );
-    }
-
-    #[test]
-    fn advertised_cert_mismatch_promotes_connecting_to_active() {
-        let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
-        let (phase, reason, _msg) = site_phase_next(
-            &GridSitePhase::Connecting,
-            &site,
-            Some(&GatewayProbeOutcome::AdvertisedCertificateMismatch),
-        );
-        assert_eq!(phase, GridSitePhase::Active);
-        assert_eq!(reason, "AdvertisedCertMismatch");
-    }
-
-    #[test]
-    fn advertised_cert_mismatch_recovers_unreachable_to_active() {
-        let site = site_with_egress(Some(GridSitePhase::Unreachable), "10.0.0.1:8443");
-        let (phase, reason, _msg) = site_phase_next(
-            &GridSitePhase::Unreachable,
-            &site,
-            Some(&GatewayProbeOutcome::AdvertisedCertificateMismatch),
-        );
-        assert_eq!(phase, GridSitePhase::Active);
-        assert_eq!(reason, "AdvertisedCertMismatch");
-    }
-
-    #[test]
-    fn advertised_cert_mismatch_keeps_active() {
-        let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
-        let (phase, reason, _msg) = site_phase_next(
-            &GridSitePhase::Active,
-            &site,
-            Some(&GatewayProbeOutcome::AdvertisedCertificateMismatch),
-        );
-        assert_eq!(phase, GridSitePhase::Active);
-        assert_eq!(reason, "AdvertisedCertMismatch");
-    }
-
     // -----------------------------------------------------------------------
     // Plaintext probe outcomes
     // -----------------------------------------------------------------------
@@ -1329,7 +1312,7 @@ mod tests {
             GridSitePhase::Connecting,
             "TCP reachability without verified identity must not promote to Active"
         );
-        assert_eq!(reason, "IdentityVerificationRequired");
+        assert_eq!(reason, condition::PLAINTEXT_INELIGIBLE);
     }
 
     #[test]
@@ -1345,7 +1328,7 @@ mod tests {
             GridSitePhase::Connecting,
             "plaintext + unreachable must stay Connecting"
         );
-        assert_eq!(reason, "PlaintextUnreachable");
+        assert_eq!(reason, condition::PLAINTEXT_INELIGIBLE);
     }
 
     #[test]
@@ -1361,7 +1344,7 @@ mod tests {
             GridSitePhase::Connecting,
             "changing an Active site to plaintext must revoke routing eligibility"
         );
-        assert_eq!(reason, "IdentityVerificationRequired");
+        assert_eq!(reason, condition::PLAINTEXT_INELIGIBLE);
     }
 
     #[test]
@@ -1377,7 +1360,7 @@ mod tests {
             GridSitePhase::Unreachable,
             "plaintext Active + unreachable must demote"
         );
-        assert_eq!(reason, "PlaintextUnreachable");
+        assert_eq!(reason, condition::PLAINTEXT_INELIGIBLE);
     }
 
     #[test]
@@ -1393,7 +1376,26 @@ mod tests {
             GridSitePhase::Connecting,
             "reachable plaintext cannot recover directly to Active"
         );
-        assert_eq!(reason, "IdentityVerificationRequired");
+        assert_eq!(reason, condition::PLAINTEXT_INELIGIBLE);
+    }
+
+    #[test]
+    fn plaintext_reports_connected_false_with_plaintext_ineligible() {
+        let site = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        for outcome in [
+            GatewayProbeOutcome::PlaintextReachable,
+            GatewayProbeOutcome::PlaintextUnreachable,
+        ] {
+            let (phase, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site, Some(&outcome));
+            assert_ne!(phase, GridSitePhase::Active, "{outcome:?}");
+            let conditions = condition::site_conditions(&phase, &reason, &message);
+            let connected = conditions
+                .iter()
+                .find(|c| c.type_ == condition::CONNECTED)
+                .unwrap_or_else(|| std::process::abort());
+            assert_eq!(connected.status, condition::ConditionStatus::False, "{outcome:?}");
+            assert_eq!(connected.reason, condition::PLAINTEXT_INELIGIBLE, "{outcome:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1448,7 +1450,6 @@ mod tests {
             GatewayProbeOutcome::CertificateExpired,
             GatewayProbeOutcome::CertificateNotYetValid,
             GatewayProbeOutcome::PinMismatch,
-            GatewayProbeOutcome::AdvertisedCertificateMismatch,
             GatewayProbeOutcome::PlaintextReachable,
             GatewayProbeOutcome::PlaintextUnreachable,
             GatewayProbeOutcome::AddressMissing,
@@ -1505,18 +1506,46 @@ mod tests {
         assert_eq!(egress_tls_mode(&mutual, &network), TlsMode::MutualTls);
     }
 
-    #[test]
-    fn a_gossiped_egress_takes_the_network_tls_mode() {
-        let site = site_with_gossiped_egress("10.0.0.9:8443");
-        assert_eq!(egress_tls_mode(&site, &tls_network()), TlsMode::MutualTls);
-        let no_tls: GridNetwork = serde_json::from_value(serde_json::json!({
+    fn network_with_discovery(site_discovery: &serde_json::Value) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": "net" },
-            "spec": {}
+            "spec": { "siteDiscovery": site_discovery }
         }))
-        .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(egress_tls_mode(&site, &no_tls), TlsMode::Plaintext);
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn default_egress_tls_is_mutual_tls() {
+        let network = network_with_discovery(&serde_json::json!({ "mode": "auto" }));
+        assert_eq!(network.spec.site_discovery.default_egress_tls, TlsMode::MutualTls);
+    }
+
+    #[test]
+    fn a_network_without_tls_refs_no_longer_implies_plaintext() {
+        let site = site_with_gossiped_egress("10.0.0.9:8443");
+        let no_tls = network_with_discovery(&serde_json::json!({}));
+        assert!(no_tls.spec.tls.ca_secret_ref.is_none() && no_tls.spec.tls.site_secret_ref.is_none());
+        assert_eq!(egress_tls_mode(&site, &no_tls), TlsMode::MutualTls);
+    }
+
+    #[test]
+    fn an_auto_site_inherits_an_explicit_plaintext_default() {
+        let site = site_with_gossiped_egress("10.0.0.9:8443");
+        let network = network_with_discovery(&serde_json::json!({ "mode": "auto", "defaultEgressTls": "plaintext" }));
+        assert_eq!(egress_tls_mode(&site, &network), TlsMode::Plaintext);
+    }
+
+    #[test]
+    fn a_per_site_egress_tls_override_wins_over_the_network_default() {
+        let plaintext_net = network_with_discovery(&serde_json::json!({ "defaultEgressTls": "plaintext" }));
+        let mutual = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        assert_eq!(egress_tls_mode(&mutual, &plaintext_net), TlsMode::MutualTls);
+
+        let mutual_net = network_with_discovery(&serde_json::json!({ "defaultEgressTls": "mutualTls" }));
+        let plaintext = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        assert_eq!(egress_tls_mode(&plaintext, &mutual_net), TlsMode::Plaintext);
     }
 
     #[test]
@@ -1572,6 +1601,55 @@ mod tests {
         );
     }
 
+    /// A site pinned to two leaf digests, all `a` then all `b`.
+    fn twice_pinned_site() -> GridSite {
+        site_with_trust(
+            Some(GridSitePhase::Connecting),
+            "10.0.0.1:8443",
+            Some(GridSiteTrustPolicy {
+                canonical_fingerprints: Some(vec!["a".repeat(64), "b".repeat(64)]),
+            }),
+        )
+    }
+
+    #[test]
+    fn under_pin_the_status_names_the_pinned_digests() {
+        let (site, network) = (twice_pinned_site(), tls_network());
+        assert_eq!(
+            identity_message("TlsVerified", &site, &network).as_deref(),
+            Some("TLS handshake verified: chain to the Grid CA and pinned leaf digest aaaaaaaaaaaa or bbbbbbbbbbbb")
+        );
+        assert_eq!(
+            identity_message("PinMismatch", &site, &network).as_deref(),
+            Some("server leaf does not match the pinned leaf digest aaaaaaaaaaaa or bbbbbbbbbbbb")
+        );
+        assert!(
+            identity_message("IdentityMismatch", &site, &network).is_none(),
+            "pin mode keeps the SAN wording"
+        );
+        assert!(identity_message("ConnectTimeout", &site, &network).is_none());
+    }
+
+    #[test]
+    fn under_spiffe_the_status_names_the_spiffe_id_and_no_pin() {
+        let site = twice_pinned_site();
+        let mut network = tls_network();
+        network.spec.peer_trust = serde_json::from_value(serde_json::json!({ "mode": "spiffe" })).ok();
+        let verified = identity_message("TlsVerified", &site, &network).unwrap_or_default();
+        assert_eq!(
+            verified,
+            "TLS handshake verified: chain to the Grid CA and SPIFFE ID spiffe://grid.internal/site/test-site"
+        );
+        assert!(!verified.contains("pin"), "no pin is checked under spiffe");
+        assert_eq!(
+            identity_message("IdentityMismatch", &site, &network).as_deref(),
+            Some(
+                "server cert does not match serverName test-site.grid.internal or carry SPIFFE ID \
+                 spiffe://grid.internal/site/test-site"
+            )
+        );
+    }
+
     #[test]
     fn spiffe_peer_trust_follows_the_network_mode() {
         let mut network = tls_network();
@@ -1623,24 +1701,7 @@ mod tests {
     }
 
     #[test]
-    fn an_advertised_certificate_alone_never_makes_a_site_active() {
-        let mut site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
-        site.status = site_with_advertised(Some("-----BEGIN CERTIFICATE-----")).status;
-        for outcome in [
-            GatewayProbeOutcome::PinMismatch,
-            GatewayProbeOutcome::UntrustedIssuer,
-            GatewayProbeOutcome::IdentityMismatch,
-            GatewayProbeOutcome::TrustMaterialMissing,
-        ] {
-            let (phase, ..) = site_phase_next(&GridSitePhase::Connecting, &site, Some(&outcome));
-            assert_ne!(phase, GridSitePhase::Active, "{outcome:?}");
-        }
-        let (unprobed, ..) = site_phase_next(&GridSitePhase::Connecting, &site, None);
-        assert_ne!(unprobed, GridSitePhase::Active, "no probe, no promotion");
-    }
-
-    #[test]
-    fn the_verified_probe_alone_promotes_without_an_advertised_certificate() {
+    fn only_a_verified_handshake_promotes_a_site() {
         let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
         let (phase, ..) = site_phase_next(&GridSitePhase::Connecting, &site, Some(&GatewayProbeOutcome::Verified));
         assert_eq!(phase, GridSitePhase::Active);
@@ -1681,6 +1742,51 @@ mod tests {
         let site = site_with_egress(Some(GridSitePhase::Connecting), "gateway.example.com:8443");
         assert_eq!(egress_address(&site), Some("gateway.example.com:8443"));
         assert!(!gossip_address_refused(&site));
+    }
+
+    fn unreachable_for(minutes: i64) -> (GridSiteStatus, time::OffsetDateTime) {
+        let since = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let stamp = since
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| std::process::abort());
+        let status = GridSiteStatus {
+            phase: GridSitePhase::Unreachable,
+            conditions: condition::reconcile_conditions(
+                &[],
+                condition::site_conditions(&GridSitePhase::Unreachable, "ConnectTimeout", ""),
+                1,
+                &stamp,
+            ),
+            ..Default::default()
+        };
+        (status, since + time::Duration::minutes(minutes))
+    }
+
+    #[test]
+    fn an_unreachable_site_backs_off_between_bounds() {
+        let (least, most) = UNREACHABLE_BACKOFF;
+        let (fresh, at_start) = unreachable_for(0);
+        let first = requeue_after(&GridSitePhase::Unreachable, Some(&fresh), at_start);
+        assert!(first >= least && first <= least.mul_f64(1.2), "{first:?}");
+        let (long_down, an_hour_in) = unreachable_for(60);
+        let later = requeue_after(&GridSitePhase::Unreachable, Some(&long_down), an_hour_in);
+        assert!(later >= most && later <= most.mul_f64(1.2), "{later:?}");
+        let (mid, minutes_in) = unreachable_for(4);
+        let middle = requeue_after(&GridSitePhase::Unreachable, Some(&mid), minutes_in);
+        assert!(
+            middle >= Duration::from_secs(120) && middle <= Duration::from_secs(144),
+            "{middle:?}"
+        );
+    }
+
+    #[test]
+    fn a_reachable_site_keeps_the_usual_interval() {
+        let (down, now) = unreachable_for(60);
+        assert_eq!(
+            requeue_after(&GridSitePhase::Active, Some(&down), now),
+            REQUEUE_INTERVAL
+        );
+        assert_eq!(requeue_after(&GridSitePhase::Connecting, None, now), REQUEUE_INTERVAL);
     }
 
     #[test]
@@ -1851,14 +1957,6 @@ mod tests {
     #[test]
     fn event_type_left_is_normal() {
         assert!(matches!(event_type_for_reason("Left"), EventType::Normal));
-    }
-
-    #[test]
-    fn event_type_advertised_cert_mismatch_is_normal() {
-        assert!(matches!(
-            event_type_for_reason("AdvertisedCertMismatch"),
-            EventType::Normal
-        ));
     }
 
     #[test]

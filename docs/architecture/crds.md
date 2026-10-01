@@ -217,7 +217,8 @@ validation, routing config loading) is verified separately at request time.
 ### Stale candidate TTL
 
 `spec.staleCandidateTtlSeconds` controls when stale (fresh=false) remote
-candidates are evicted from the rendered overlay.
+candidates are evicted from the rendered overlay. In auto discovery it also
+collects unedited auto-created GridSites, as described under GridSite.
 
 | Value | Behaviour |
 |---|---|
@@ -303,10 +304,10 @@ spec:
 
 **Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
 
-**Status fields**: `conditions`, `phase`, `reason`, `message`,
-`observedGeneration`, `discovered` (`egressAddress`, `advertisedCertPem`),
-`capabilities` (inference, agentTools, agentToAgent), `lastProbeTime`,
-`lastTransitionTime`
+**Status fields**: `conditions`, `phase`, `observedGeneration`, `discovered`
+(`egressAddress`, `advertisedCertPem`, `advertisedCertError`), `capabilities`
+(inference, agentTools, agentToAgent), and `lastProbeTime`. The reason and
+message for the current phase live on the `Connected` condition.
 
 The GridSite name is the sanitized SWIM site name, with no network prefix, so a
 declared GridSite and the site SWIM discovers are the same object.
@@ -328,6 +329,10 @@ ones.
 Discovery names a GridSite after a SWIM site ID only when the ID is already a
 DNS-1123 label. It skips any other ID rather than normalizing it, so `HUB` never
 lands on GridSite `hub`. Auto mode creates at most 256 GridSites per network.
+Past that, the GridNetwork reports `DiscoveryConflict` with reason
+`AutoDiscoveryCapReached`. With `spec.staleCandidateTtlSeconds` set, the operator
+deletes an auto-created GridSite whose member has been absent or Dead that long,
+timed from `status.discovered.absentSince`, unless someone edited its spec.
 When a peer withdraws its gateway address, the operator clears
 `status.discovered.egressAddress`. The operator probes a gossiped address only
 when it is a literal `IP:port` outside loopback, link-local, unspecified, and
@@ -343,7 +348,15 @@ from gossip.
 When a SWIM member's name belongs to a GridSite of another network, the operator
 leaves that GridSite untouched. The discovering GridNetwork reports
 `DiscoveryConflict=True` with reason `FieldConflict` and names the member and the
-owning network. `Accepted` stays about the network's own spec, and `Ready` does
+owning network. The same condition reports a member whose ID is not a DNS-1123
+label (`SiteIdInvalid`), and an auto-created GridSite that carries
+`spec.egress` (`StaleAutoDiscoveredEgress`), which the operator never writes, so
+it can only come from re-applying an old export. Two live SWIM addresses claiming
+one ID past a five-minute restart grace report `SiteIdDuplicated`, and discovery
+clears that site's gossiped egress. Mixed problems report
+`UnadoptableMembers`. Only the oldest GridNetwork with
+`siteDiscovery.mode: auto` runs discovery on an operator. Another one reports
+`Accepted=False` with reason `AutoDiscoveryClaimed`. `Accepted` stays about the network's own spec, and `Ready` does
 not change, because the network still serves every site it did adopt.
 
 With Argo CD, ignore operator-written state:
@@ -403,7 +416,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
 
-**Reason codes** (in `status.reason`):
+**Reason codes** (the `Connected` condition reason):
 
 | Reason | Phase | Meaning |
 |---|---|---|
@@ -413,8 +426,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `GatewayAddressMissing` | Discovered | No gateway address known; see `GRID_GATEWAY_ADDRESS` |
 | `EgressMissing` | Connecting or Unreachable | A previously probed site has no egress address |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
-| `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
-| `PlaintextUnreachable` | Connecting or Unreachable | TCP probe failed (explicit Plaintext mode) |
+| `PlaintextIneligible` | Connecting or Unreachable | Egress is plaintext, which never routes. `Connected=False`, and the message says whether TCP reached |
 | `ConnectTimeout` / `ConnectionFailed` | Connecting or Unreachable | TCP connection timed out or failed |
 | `HandshakeTimeout` / `TlsProtocolError` | Connecting | TLS handshake timed out or failed |
 | `UntrustedIssuer` | Connecting | Server certificate does not chain to the configured AGN trust root |
@@ -448,15 +460,17 @@ A discovered SWIM peer is not automatically authorized for routing.
   routing-eligible. Active also requires mTLS client credentials
   (`siteSecretRef` must be configured on the `GridNetwork`).
 - Active → Unreachable: the `GridSite` controller demotes Active to Unreachable when the probe
-  cannot connect. Identity or trust failures demote Active to Connecting, distinguishing a
+  cannot connect. Probes use a 2 second connect timeout, and an Unreachable site is probed
+  again after half its time down, between 30 seconds and 5 minutes plus jitter. Identity or trust failures demote Active to Connecting, distinguishing a
   reachable but unverified endpoint from an unreachable endpoint.
 
 **Egress address source:** `spec.egress.address` is an override. When it is empty, the probe
 uses `status.discovered.egressAddress`, which the remote operator's `GRID_GATEWAY_ADDRESS`
 environment variable sets through the SWIM state broadcast. With neither set, the site stays
 Discovered. `spec.egress.tls` applies to either address, so a GridSite can pin `serverName`
-without pinning the address. With no `spec.egress`, the TLS mode follows the GridNetwork, so
-in auto mode plaintext egress is a per-network choice. `Active` proves the address the probe
+without pinning the address. With no `spec.egress`, the TLS mode is the GridNetwork's
+`spec.siteDiscovery.defaultEgressTls` (`mutualTls` by default, or `plaintext`), which auto-created
+GridSites inherit. To change one discovered site, declare its GridSite with `spec.egress.tls.mode`. `Active` proves the address the probe
 dialed, not the consumer `clusterEndpoints` a gateway routes to.
 
 **`status.discovered.advertisedCertPem`:** The public site certificate PEM received from the remote site via
@@ -524,11 +538,15 @@ Example status — Mutual TLS verified:
 ```yaml
 status:
   phase: Active
-  reason: TlsVerified
-  message: "TLS handshake succeeded; certificate chain, identity, and pin verified"
   observedGeneration: 5
   lastProbeTime: "2026-07-30T12:00:00Z"
-  lastTransitionTime: "2026-07-30T11:55:00Z"
+  conditions:
+    - type: Connected
+      status: "True"
+      reason: TlsVerified
+      message: "TLS handshake succeeded; certificate chain, identity, and pin verified"
+      observedGeneration: 5
+      lastTransitionTime: "2026-07-30T11:55:00Z"
 ```
 
 Example status — trust material missing:
@@ -536,9 +554,12 @@ Example status — trust material missing:
 ```yaml
 status:
   phase: Connecting
-  reason: TrustMaterialMissing
-  message: "required trust material not available"
   observedGeneration: 3
+  conditions:
+    - type: Connected
+      status: Unknown
+      reason: TrustMaterialMissing
+      message: "required trust material not available"
 ```
 
 Example status — gateway address not configured on remote operator:
@@ -546,9 +567,12 @@ Example status — gateway address not configured on remote operator:
 ```yaml
 status:
   phase: Discovered
-  reason: GatewayAddressMissing
-  message: "gateway address not yet available; cannot advance to Connecting"
   observedGeneration: 2
+  conditions:
+    - type: Connected
+      status: Unknown
+      reason: GatewayAddressMissing
+      message: "gateway address not yet available; cannot advance to Connecting"
 ```
 
 ### Spec validation
@@ -559,7 +583,7 @@ reason appears. A rejected spec never fails a reconcile or restarts the operator
 
 | Resource | Reasons | Effect |
 |---|---|---|
-| GridNetwork | `BudgetPolicyInvalid` | The operator stops reconciling the network until the spec changes. |
+| GridNetwork | `BudgetPolicyInvalid`, `AutoDiscoveryClaimed` | The operator stops reconciling the network until the spec changes. |
 | GridSite | `TrustConflictsWithPeerTrust`, `ServerNameForbidden`, `ServerNameInvalid` | The site is not probed and never holds `Active`. |
 | InferenceProvider | `EndpointInvalid`, `MetricsEndpointInvalid`, `ModelNameInvalid` | The provider is `Unavailable`. |
 | AgentToolProvider | `EndpointInvalid`, `GridNetworkRefInvalid` | The provider is `Unavailable`. |
@@ -616,9 +640,16 @@ spec:
   accessPolicy:
     siteSelector:
       matchLabels: {}           # empty = all sites
-  siteSelector:
-    matchLabels: {}
+  hostSelector:
+    matchLabels: {}             # empty = every site; omitted = no site
 ```
+
+`spec.hostSelector` names the GridSites that host the provider, on
+InferenceProvider and AgentToolProvider alike. An empty selector matches every
+site. An omitted one matches no site: the provider stays `Pending` with the
+`Available` reason `HostSelectorMissing` and yields no routing candidate. The
+API server prunes unknown fields, so a manifest that still says `siteSelector`
+lands here instead of on every site.
 
 This external API example intentionally omits `healthCheck`: AGN probes health
 with an unauthenticated HTTP `GET`, which is not the provider's authenticated
@@ -757,8 +788,8 @@ requests to this provider's metrics endpoint.
 `certificateKey` and `privateKeyKey` fields with serde defaults.
 
 **Failure behavior**: when TLS material cannot be resolved or parsed, the
-provider phase is downgraded from `Available` to `Degraded` with a
-machine-readable `status.reason`:
+provider phase is downgraded from `Available` to `Degraded`, and the
+`Available` condition carries one of these reasons:
 
 | Reason | Category | Meaning |
 |--------|----------|---------|
@@ -768,7 +799,7 @@ machine-readable `status.reason`:
 | `MetricsTlsIdentityMismatch` | reconcile-time | Client certificate and private key do not match. |
 
 Scrape-time handshake, authorization, timeout, and transport failures are
-classified in operator logs, not surfaced as `InferenceProvider.status.reason`.
+classified in operator logs, not surfaced as an `InferenceProvider` condition reason.
 The last successful sample is reused only within `staleMetricsSeconds`; after
 that, a TLS-configured provider is marked unhealthy (`healthy: false`) and
 excluded from routing. Without TLS, scrape failures retain the neutral-scoring
@@ -881,6 +912,7 @@ metadata:
   name: db-tools
 spec:
   gridNetworkRef: production
+  hostSelector: {}
   protocol: mcp
   endpoint: http://db-tools.tools:8080
   tools:
@@ -913,6 +945,8 @@ below), `observedGeneration`
 
 #### AgentToolProvider reason codes
 
+These are `Available` condition reasons.
+
 | Reason | Phase | Meaning |
 |---|---|---|
 | `EndpointInvalid` | Unavailable | `spec.endpoint` is not an http or https URL with a host. Reported as `Accepted=False`. |
@@ -928,10 +962,9 @@ below), `observedGeneration`
 | `EndpointTlsMaterialInvalid` | Unavailable | CA certificate PEM material could not be parsed. |
 | `EndpointTlsIdentityMismatch` | Unavailable | Client certificate or private key PEM material could not be parsed. |
 
-An empty `reason` with `phase: Available` means `SitesMatched`; an empty
-`reason` with `phase: Pending` means `AwaitingSiteMatch` — both are
-telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
-`status.reason` itself.
+`SitesMatched` (for `Available`) and `AwaitingSiteMatch` (for `Pending`) are
+telemetry-only labels for `grid_mcp_probe_total` and Events. The `Available`
+condition reason is `Available` or `Pending` in those phases.
 
 ## AgentToAgentProvider
 
@@ -944,6 +977,7 @@ metadata:
   name: claims-agent
 spec:
   gridNetworkRef: production
+  hostSelector: {}
   protocol: a2a
   endpoint: http://claims-agent.agents:8080
   agentCard:

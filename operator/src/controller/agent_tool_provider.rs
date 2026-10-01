@@ -4,7 +4,7 @@
 //! resolves the referenced [`GridNetwork`], resolves matching [`GridSite`]s
 //! via the site selector, live-probes the endpoint's MCP `tools/list`
 //! contract, and sets `status.phase`, `status.matchingSites`,
-//! `status.discoveredTools`, `status.reason`, and `status.observedGeneration`.
+//! `status.discoveredTools`, the `Available` condition reason, and `status.observedGeneration`.
 //!
 //! Structured exactly like [`inference_provider`](crate::controller::inference_provider):
 //! static validation short-circuits first, then `GridNetwork`/site
@@ -171,26 +171,21 @@ pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
     }
 }
 
-/// Apply `siteSelector.matchLabels` against the supplied sites.
+/// Apply `hostSelector.matchLabels` against the supplied sites.
 ///
-/// An empty `matchLabels` matches all sites. All configured key-value pairs
-/// must match (AND semantics); extra labels on the site are ignored.
+/// An omitted `hostSelector` matches no site and an empty `matchLabels` matches all sites. All configured key-value
+/// pairs must match (AND semantics); extra labels on the site are ignored.
 /// Returns a deterministically sorted list of matching site names.
 ///
 /// Network filtering (by `spec.gridNetworkRef`) is the caller's
 /// responsibility — this function does not filter by network, mirroring
 /// [`inference_provider::sites_matching_selector`](crate::controller::inference_provider::sites_matching_selector).
 pub(crate) fn sites_matching_selector(provider: &AgentToolProvider, sites: &[GridSite]) -> Vec<String> {
-    let selector = &provider.spec.site_selector.match_labels;
+    let selector = provider.spec.host_selector.as_ref();
 
     let mut names: Vec<String> = sites
         .iter()
-        .filter(|site| {
-            let site_labels = site.metadata.labels.as_ref();
-            selector
-                .iter()
-                .all(|(k, v)| site_labels.is_some_and(|labels| labels.get(k).is_some_and(|sv| sv == v)))
-        })
+        .filter(|site| crate::crd::auth::hosts_on(selector, site.metadata.labels.as_ref()))
         .filter_map(|site| site.metadata.name.clone())
         .collect();
 
@@ -213,10 +208,10 @@ async fn list_sites_for_network(client: &Client, network_ref: &str) -> Result<Ve
 }
 
 /// Static config validation plus the `GridNetwork`-existence check, both of
-/// which short-circuit straight to `Unavailable` before any site or probe
-/// work runs.
+/// which short-circuit before any site or probe work runs: `Unavailable` for
+/// a bad config, `Pending` for a `GridNetwork` that does not exist yet.
 ///
-/// Unlike `inference_provider.rs` (which leaves status.reason as None for
+/// Unlike `inference_provider.rs` (which leaves the diagnostic reason unset for
 /// its equivalent checks), `AgentToolProvider` populates a stable reason
 /// here: grid#9 requires transition evidence with bounded cardinality
 /// across Events/metrics/logs, and a stable reason string is the shared
@@ -239,7 +234,7 @@ async fn static_config_failure_reason(
     let network_api: Api<GridNetwork> = Api::all(client.clone());
     if network_api.get_opt(network_ref).await?.is_none() {
         tracing::warn!(name, network = %network_ref, "referenced GridNetwork not found");
-        return Ok(Some("GridNetworkNotFound"));
+        return Ok(Some(crate::controller::inference_provider::GRID_NETWORK_NOT_FOUND));
     }
 
     Ok(None)
@@ -264,10 +259,20 @@ async fn resolve_phase_and_sites(
         .map_or_else(Vec::new, |s| s.discovered_tools.clone());
 
     if let Some(reason) = static_config_failure_reason(provider, client, name).await? {
+        // A missing GridNetwork is a wait, often just apply order, not a failure.
+        let phase = if reason == crate::controller::inference_provider::GRID_NETWORK_NOT_FOUND {
+            ProviderPhase::Pending
+        } else {
+            ProviderPhase::Unavailable
+        };
+        return Ok((phase, Vec::new(), Some(reason.to_owned()), previous_tools));
+    }
+
+    if provider.spec.host_selector.is_none() {
         return Ok((
-            ProviderPhase::Unavailable,
+            ProviderPhase::Pending,
             Vec::new(),
-            Some(reason.to_owned()),
+            Some(crate::controller::inference_provider::HOST_SELECTOR_MISSING.to_owned()),
             previous_tools,
         ));
     }
@@ -291,7 +296,7 @@ async fn resolve_phase_and_sites(
 enum CredentialProbeInput {
     /// Credentials (if any) resolved cleanly; the probe may proceed.
     Ready(Option<credentials::BearerToken>),
-    /// Config or Secret resolution failed; carries the stable `status.reason`.
+    /// Config or Secret resolution failed; carries the stable `Available` condition reason.
     Failed(String),
 }
 
@@ -430,21 +435,20 @@ async fn update_status(
     let existing = provider.status.as_ref();
     let current_phase = existing.map(|s| &s.phase);
     let phase_changed = current_phase != Some(&phase);
-    let reason_changed = existing.map(|s| &s.reason) != Some(&reason);
-
     let api: Api<AgentToolProvider> = Api::all(client.clone());
     let conditions = condition::refresh(
         existing.map(|s| s.conditions.as_slice()),
         condition::provider_conditions(&phase, reason.as_deref()),
         observed_generation,
     );
+    let reason_changed =
+        existing.map(|s| condition::provider_reason(&s.conditions)) != Some(condition::provider_reason(&conditions));
     let status = AgentToolProviderStatus {
         conditions,
         discovered_tools,
         matching_sites,
         observed_generation,
         phase,
-        reason,
     };
 
     if !agent_tool_provider_status_needs_update(existing, &status) {
@@ -467,7 +471,7 @@ async fn update_status(
     // patch — so a converged provider being repeatedly re-listed doesn't
     // spam the Event feed or inflate the phase-transition counter.
     if is_real_transition(phase_changed, reason_changed) {
-        emit_transition_telemetry(name, current_phase, &status, recorder, object_ref).await;
+        emit_transition_telemetry(name, current_phase, &status, reason.as_deref(), recorder, object_ref).await;
     }
 
     Ok(())
@@ -480,14 +484,19 @@ async fn update_status(
 /// project's line/complexity lints — this is the transition-telemetry half
 /// of what was previously one larger function, called only once, from the
 /// `is_real_transition` branch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transition's identity, phases, reason, and event sink"
+)]
 async fn emit_transition_telemetry(
     name: &str,
     current_phase: Option<&ProviderPhase>,
     status: &AgentToolProviderStatus,
+    reason: Option<&str>,
     recorder: &Recorder,
     object_ref: &ObjectReference,
 ) {
-    let label = telemetry_reason_label(&status.phase, status.reason.as_deref());
+    let label = telemetry_reason_label(&status.phase, reason);
     let from_label = current_phase.map_or("None", phase_label);
     let to_label = phase_label(&status.phase);
 
@@ -498,7 +507,7 @@ async fn emit_transition_telemetry(
             &Event {
                 type_: event_type_for_reason(label),
                 reason: label.to_owned(),
-                note: status.reason.clone(),
+                note: reason.map(ToOwned::to_owned),
                 action: "Reconcile".to_owned(),
                 secondary: None,
             },
@@ -524,11 +533,11 @@ fn phase_label(phase: &ProviderPhase) -> &'static str {
 
 /// Synthesize a bounded telemetry reason label for Events, metrics, and logs.
 ///
-/// Business rule: when `status.reason` is set (an unhealthy phase with a
+/// Business rule: when the `Available` condition reason is set (an unhealthy phase with a
 /// diagnostic code — see [`AgentToolProviderStatus`]'s doc comment), that
 /// code *is* the telemetry label, keeping a single source of truth between
 /// what a user reads on the CR and what appears in Events/metrics. When
-/// `status.reason` is `None` (a healthy phase), this synthesizes one of two
+/// no diagnostic reason is set (a healthy phase), this synthesizes one of two
 /// bounded labels from the phase alone, since [`AgentToolProviderStatus`]
 /// deliberately never sets `reason` while healthy.
 fn telemetry_reason_label<'reason>(phase: &ProviderPhase, status_reason: Option<&'reason str>) -> &'reason str {
@@ -543,7 +552,7 @@ fn telemetry_reason_label<'reason>(phase: &ProviderPhase, status_reason: Option<
 ///
 /// [`Normal`] for the two healthy-phase labels synthesized by
 /// [`telemetry_reason_label`]; [`Warning`] for every diagnostic
-/// `status.reason` code (config, `GridNetwork`, and probe/TLS failures),
+/// `Available` condition reason (config, `GridNetwork`, and probe/TLS failures),
 /// including any future code not yet in this list,
 /// since an unrecognized reason is safer treated as a `Warning` than
 /// silently downgraded to `Normal`.
@@ -595,6 +604,7 @@ mod tests {
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": grid_network_ref,
+                "hostSelector": {},
                 "endpoint": endpoint
             }
         }))
@@ -727,6 +737,15 @@ mod tests {
         Client::new(service, "default")
     }
 
+    /// The `Available` condition reason in a captured status patch.
+    fn available_reason(patched: &serde_json::Value) -> Option<&str> {
+        patched["status"]["conditions"]
+            .as_array()?
+            .iter()
+            .find(|c| c["type"] == "Available")
+            .and_then(|c| c["reason"].as_str())
+    }
+
     #[tokio::test]
     async fn static_config_failure_reason_short_circuits_on_invalid_config_without_calling_kubernetes() {
         let provider = test_provider("", "net");
@@ -850,7 +869,7 @@ mod tests {
             "spec": {
                 "gridNetworkRef": network,
                 "endpoint": "http://tools:8080",
-                "siteSelector": { "matchLabels": match_labels }
+                "hostSelector": { "matchLabels": match_labels }
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -941,7 +960,6 @@ mod tests {
             matching_sites: vec!["site-a".to_owned()],
             observed_generation: 2,
             phase: ProviderPhase::Available,
-            reason: None,
             conditions: Vec::new(),
         }
     }
@@ -972,7 +990,12 @@ mod tests {
     fn reason_change_needs_update() {
         let baseline = baseline_status();
         let changed = AgentToolProviderStatus {
-            reason: Some("McpEndpointUnreachable".to_owned()),
+            conditions: condition::reconcile_conditions(
+                &[],
+                condition::provider_conditions(&ProviderPhase::Available, Some("McpEndpointUnreachable")),
+                2,
+                "t",
+            ),
             ..baseline.clone()
         };
         assert!(
@@ -1025,7 +1048,7 @@ mod tests {
         assert_eq!(
             telemetry_reason_label(&ProviderPhase::Unavailable, Some("EndpointInvalid")),
             "EndpointInvalid",
-            "an explicit status.reason must be used verbatim as the telemetry label"
+            "an explicit Available reason must be used verbatim as the telemetry label"
         );
     }
 
@@ -1042,7 +1065,7 @@ mod tests {
         assert_eq!(
             telemetry_reason_label(&ProviderPhase::Available, None),
             "SitesMatched",
-            "Available with no status.reason (the healthy case) must synthesize a bounded label"
+            "Available with no diagnostic reason (the healthy case) must synthesize a bounded label"
         );
     }
 
@@ -1051,7 +1074,7 @@ mod tests {
         assert_eq!(
             telemetry_reason_label(&ProviderPhase::Pending, None),
             "AwaitingSiteMatch",
-            "Pending with no status.reason must synthesize a bounded label distinct from Available's"
+            "Pending with no diagnostic reason must synthesize a bounded label distinct from Available's"
         );
     }
 
@@ -1254,7 +1277,8 @@ mod tests {
             "a blank endpoint must surface as Unavailable all the way through to the persisted status"
         );
         assert_eq!(
-            patched["status"]["reason"], "EndpointInvalid",
+            available_reason(&patched),
+            Some("EndpointInvalid"),
             "the specific static-validation failure reason must reach the persisted status"
         );
         assert_eq!(
@@ -1285,11 +1309,12 @@ mod tests {
             .clone()
             .expect("reconcile must PATCH the status subresource once the GridNetwork lookup 404s");
         assert_eq!(
-            patched["status"]["phase"], "Unavailable",
-            "an unresolvable gridNetworkRef must surface as Unavailable through the full reconcile path"
+            patched["status"]["phase"], "Pending",
+            "an unresolvable gridNetworkRef waits as Pending through the full reconcile path"
         );
         assert_eq!(
-            patched["status"]["reason"], "GridNetworkNotFound",
+            available_reason(&patched),
+            Some("GridNetworkNotFound"),
             "the GridNetwork-lookup failure reason must reach the persisted status, proving reconcile actually \
              performed the live GET rather than short-circuiting on static config alone"
         );

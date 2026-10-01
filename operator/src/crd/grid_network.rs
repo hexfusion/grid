@@ -559,6 +559,7 @@ pub fn resolve_budget_statuses(
     kind = "GridNetwork",
     plural = "gridnetworks",
     shortname = "gnw",
+    category = "grid",
     status = "GridNetworkStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Grid ID","type":"string","jsonPath":".status.gridId"}"#,
@@ -571,14 +572,19 @@ pub fn resolve_budget_statuses(
 }]))]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
-    /// Grid ID for tenancy. Empty on creation; auto-generated
-    /// on first join with another site.
+    /// Grid ID shared by every site of one grid. Left empty, each site generates its own UUID, so
+    /// set the same `gridId` everywhere. Immutable once set.
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-validations" = [{
+        "rule": "self == oldSelf || oldSelf == ''",
+        "message": "gridId is immutable once set"
+    }]))]
     pub grid_id: String,
 
     /// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
     /// IPv6, and DNS hostnames are accepted.
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-list-type" = "set"))]
     pub seeds: Vec<String>,
 
     /// References to Praxis Gateways that participate in this grid.
@@ -704,6 +710,10 @@ pub struct GridNetworkSpec {
     /// local candidates are never evicted.  CRDT provider records in storage
     /// are not deleted.
     ///
+    /// In `siteDiscovery.mode: auto` it also bounds auto-created `GridSite`
+    /// objects: one whose member is absent or `Dead` this long, and whose spec
+    /// nobody edited, is deleted, freeing its slot under the per-network cap.
+    ///
     /// **Default (absent):** stale candidates are retained indefinitely —
     /// the same behaviour as before this field existed.
     ///
@@ -810,10 +820,11 @@ pub struct ConsumerConfig {
 }
 
 /// TLS mode for a grid connection, shared by site egress and consumer cluster endpoints.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TlsMode {
     /// Mutual TLS with CA verification and client certificate.
+    #[default]
     MutualTls,
     /// Plain HTTP — no TLS.  Explicit insecure/dev-only mode.
     Plaintext,
@@ -885,6 +896,10 @@ pub struct SiteDiscovery {
     /// Whether the operator creates `GridSite` objects for unknown SWIM members.
     #[serde(default)]
     pub mode: SiteDiscoveryMode,
+
+    /// Egress TLS mode for a `GridSite` without `spec.egress`, auto-created ones included.
+    #[serde(default)]
+    pub default_egress_tls: TlsMode,
 }
 
 /// Whether the operator creates `GridSite` objects from SWIM membership.
@@ -1024,6 +1039,8 @@ pub struct GridNetworkStatus {
 pub enum ConsumerConfigPhase {
     /// Consumer config was successfully rendered and applied.
     Rendered,
+    /// Waiting for the first routing candidate; nothing is rendered yet.
+    Pending,
     /// Consumer config render or apply failed.
     Error,
     /// Consumer config generation is disabled for this gateway.
@@ -1061,10 +1078,12 @@ pub struct ConsumerConfigStatus {
 
     /// Machine-readable reason for the current phase.
     ///
-    /// `""` when `phase` is `Rendered`, or `ListenerPortUnresolved` when the
-    /// gateway Service could not supply the listener port and the fallback was used.
-    /// One of `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`,
-    /// `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
+    /// `""` when `phase` is `Rendered`, or a warning that still renders:
+    /// `ListenerPortUnresolved` when the gateway Service could not supply the listener
+    /// port and the fallback was used, else `RoutedAddressMismatch` when a remote
+    /// endpoint differs from the address its `GridSite` probe verified.
+    /// `EmptyCandidates` when `phase` is `Pending`. One of `MissingClusterEndpoint`,
+    /// `MissingTransport`, `MissingSni`, `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
     /// `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled` otherwise.
     #[serde(default)]
     pub reason: String,
@@ -1100,7 +1119,7 @@ pub enum GridNetworkPhase {
 /// Lifecycle phase of a per-gateway overlay status entry.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum OverlayPhase {
-    /// No overlay distribution result has been observed.
+    /// No overlay distributed yet, including while the gateway has no routing candidate.
     #[default]
     Pending,
     /// Overlay rendered and distributed through the `ConfigMap`.
@@ -1164,7 +1183,8 @@ pub struct OverlayRevisionStatus {
 
     /// Machine-readable reason for the current phase.
     ///
-    /// Empty when `phase` is [`OverlayPhase::Distributed`].
+    /// Empty when `phase` is [`OverlayPhase::Distributed`]; `EmptyCandidates` while the
+    /// gateway has no routing candidate, which is `Pending`, not `Error`.
     #[serde(default)]
     pub reason: String,
 

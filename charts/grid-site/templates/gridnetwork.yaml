@@ -59,15 +59,23 @@ spec:
     mode: {{ . | quote }}
   {{- end }}
   {{- with .Values.gridNetwork.siteDiscovery }}
-  {{- if .mode }}
+  {{- if or .mode .defaultEgressTls }}
   siteDiscovery:
-    mode: {{ .mode | quote }}
+    {{- with .mode }}
+    mode: {{ . | quote }}
+    {{- end }}
+    {{- with .defaultEgressTls }}
+    defaultEgressTls: {{ . | quote }}
+    {{- end }}
   {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}
   metricsRefreshInterval: {{ . | quote }}
   {{- end }}
+  {{- end }}
+  {{- with .Values.gridNetwork.staleCandidateTtlSeconds }}
+  staleCandidateTtlSeconds: {{ . }}
   {{- end }}
   {{- with .Values.gridNetwork.budgetPolicy }}
   budgetPolicy:

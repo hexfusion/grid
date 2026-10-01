@@ -48,7 +48,7 @@ pub(crate) const AGENT_TOOL_TEST_NETWORK: &str = "op-e2e-agent-tool-net";
 /// Name of the test `GridSite` referencing [`AGENT_TOOL_TEST_NETWORK`].
 ///
 /// Its mere existence is sufficient for site-matching: `AgentToolProvider`'s
-/// default (empty) `siteSelector` matches every `GridSite` in the network.
+/// default (empty) `hostSelector` matches every `GridSite` in the network.
 pub(crate) const AGENT_TOOL_TEST_SITE: &str = "op-e2e-agent-tool-site";
 /// Name of the `AgentToolProvider` pointed at a real, reachable mock MCP server.
 pub(crate) const AGENT_TOOL_TEST_PROVIDER_HEALTHY: &str = "op-e2e-agent-tool-healthy";
@@ -66,7 +66,7 @@ pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
 
 /// Name of the `InferenceProvider` whose `healthCheck.tls.caSecretRef` points at a
 /// Secret that exists but lacks the expected key (expected: `Degraded` /
-/// `status.reason = "HealthCheckTlsKeyMissing"`).
+/// `Available` reason `HealthCheckTlsKeyMissing`).
 ///
 /// Live-cluster regression fixture for grid#58: proves the
 /// `SecretMissing`-vs-`KeyMissing` distinction survives a real reconcile
@@ -503,7 +503,7 @@ pub(crate) const SITE_JOIN_PRIMARY_MODEL: &str = "model-sjd-primary";
 /// Model name served by the joining site's provider.
 pub(crate) const SITE_JOIN_JOINING_MODEL: &str = "model-sjd-joining";
 
-/// Metadata label key used in `GridSite` objects to enable per-site `siteSelector` matching.
+/// Metadata label key used in `GridSite` objects to enable per-site `hostSelector` matching.
 ///
 /// The value is the site role string (e.g. `"primary"`, `"joining"`, `"wrong"`).
 /// Harness-only: production site labels are not required to follow this pattern.
@@ -1007,6 +1007,7 @@ fn provider_fixture_json(
 ) -> String {
     let mut spec = serde_json::json!({
         "gridNetworkRef": network_ref,
+        "hostSelector": {},
         "providerKind": "openAi",
         "backendKind": "local",
         "endpoint": endpoint,
@@ -1037,7 +1038,7 @@ fn provider_fixture_json(
 /// `AgentToolProvider` convergence check needs.
 ///
 /// Neither resource needs a `gatewayRef` or labels: `AgentToolProvider`'s
-/// default `siteSelector` matches every `GridSite` referencing the network,
+/// default `hostSelector` matches every `GridSite` referencing the network,
 /// so a bare `GridSite` is enough to clear site-matching once the network
 /// exists.
 pub(crate) fn apply_agent_tool_provider_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1078,6 +1079,7 @@ pub(crate) fn apply_agent_tool_provider(
         "metadata": { "name": name },
         "spec": {
             "gridNetworkRef": AGENT_TOOL_TEST_NETWORK,
+            "hostSelector": {},
             "endpoint": endpoint
         }
     }))
@@ -1154,9 +1156,21 @@ pub(crate) fn read_agent_tool_provider_discovered_tools(
     Ok(tools)
 }
 
-/// Read an `AgentToolProvider`'s `status.reason`.
+/// Read an `AgentToolProvider`'s diagnostic reason from its `Available` condition.
 pub(crate) fn read_agent_tool_provider_reason(context: &str, name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    kubectl_jsonpath(context, &format!("agenttoolproviders/{name}"), "{.status.reason}")
+    let conditions = kubectl_jsonpath(context, &format!("agenttoolproviders/{name}"), "{.status.conditions}")?;
+    Ok(provider_reason_from(&conditions))
+}
+
+/// A provider's diagnostic reason: the `Available` reason while not `True`, empty when healthy.
+fn provider_reason_from(conditions_json: &str) -> String {
+    serde_json::from_str::<Vec<serde_json::Value>>(conditions_json)
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c["type"] == "Available" && c["status"] != "True")
+        .and_then(|c| c["reason"].as_str())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1778,6 +1792,7 @@ pub(crate) fn apply_swim_test_provider(context: &str) -> Result<(), Box<dyn std:
         "metadata": { "name": SWIM_TEST_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_TEST_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-provider.default.svc:8080",
@@ -2283,16 +2298,18 @@ pub(crate) fn wait_for_provider_phase(
     }
 }
 
-/// Read the `status.reason` field from an `InferenceProvider` resource.
+/// Read an `InferenceProvider`'s diagnostic reason from its `Available` condition.
 pub(crate) fn read_provider_reason(context: &str, name: &str) -> String {
-    kubectl_jsonpath(context, &format!("inferenceproviders/{name}"), "{.status.reason}").unwrap_or_default()
+    kubectl_jsonpath(context, &format!("inferenceproviders/{name}"), "{.status.conditions}")
+        .map(|conditions| provider_reason_from(&conditions))
+        .unwrap_or_default()
 }
 
 #[expect(
     clippy::disallowed_methods,
     reason = "synchronous poll loop in xtask; no async runtime available"
 )]
-/// Poll until `InferenceProvider` `name` has both the expected `phase` and `status.reason`.
+/// Poll until `InferenceProvider` `name` has both the expected `phase` and `Available` reason.
 ///
 /// Returns `Ok(())` when both match within `timeout`.  Returns `Err` if the
 /// timeout elapses, reporting the last-observed `(phase, reason)` pair.
@@ -2727,6 +2744,7 @@ pub(crate) fn apply_metrics_provider_fixtures(
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": TEST_NETWORK,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": endpoint,
@@ -2835,6 +2853,7 @@ pub(crate) fn apply_metrics_routing_fixtures(
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": METRICS_ROUTING_NETWORK,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": endpoint,
@@ -3005,6 +3024,7 @@ pub(crate) fn apply_degraded_provider_fixture(context: &str, endpoint: &str) -> 
         "metadata": { "name": TEST_PROVIDER_DEGRADED },
         "spec": {
             "gridNetworkRef": TEST_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
@@ -3046,7 +3066,7 @@ fn apply_tls_key_missing_ca_secret(context: &str) -> Result<(), Box<dyn std::err
 /// The Secret is created with data under `wrong-key` instead of the expected
 /// `ca.crt`, so it exists but the key lookup still fails: `resolve_tls_config`
 /// must return `TlsFailureReason::KeyMissing`, and the provider must
-/// reconcile to `Degraded` / `status.reason = "HealthCheckTlsKeyMissing"`
+/// reconcile to `Degraded` / `Available` reason `HealthCheckTlsKeyMissing`
 /// rather than the pre-fix (incorrect) `"HealthCheckTlsSecretMissing"`.
 ///
 /// The endpoint is a placeholder — TLS resolution runs and fails before any
@@ -3063,6 +3083,7 @@ pub(crate) fn apply_provider_with_health_check_tls_key_missing_fixture(
         "metadata": { "name": TEST_PROVIDER_TLS_KEY_MISSING },
         "spec": {
             "gridNetworkRef": TEST_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://127.0.0.1:1",
@@ -3095,7 +3116,7 @@ pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Resul
         "kind": "InferenceProvider",
         "metadata": { "name": TEST_PROVIDER_API },
         "spec": {
-            "gridNetworkRef": TEST_NETWORK,
+            "gridNetworkRef": TEST_NETWORK, "hostSelector": {},
             "providerKind": "anthropic",
             "backendKind": "apiProvider",
             "endpoint": endpoint,
@@ -3703,6 +3724,7 @@ pub(crate) fn apply_full_grid_fixtures(
         "metadata": { "name": FULL_GRID_PROVIDER_EAST },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": east_endpoint,
@@ -3721,6 +3743,7 @@ pub(crate) fn apply_full_grid_fixtures(
         "metadata": { "name": FULL_GRID_PROVIDER_WEST },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "remote",
             "endpoint": west_endpoint,
@@ -3739,6 +3762,7 @@ pub(crate) fn apply_full_grid_fixtures(
         "metadata": { "name": FULL_GRID_PROVIDER_CLOUD },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "cloudManaged",
             "endpoint": cloud_endpoint,
@@ -3756,6 +3780,7 @@ pub(crate) fn apply_full_grid_fixtures(
         "metadata": { "name": FULL_GRID_PROVIDER_API },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
+            "hostSelector": {},
             "providerKind": "anthropic",
             "backendKind": "apiProvider",
             "endpoint": api_endpoint,
@@ -3953,6 +3978,7 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
         "metadata": { "name": SWIM_OVERLAY_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_OVERLAY_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -4456,6 +4482,7 @@ pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Re
         "metadata": { "name": ROTATION_PROVIDER },
         "spec": {
             "gridNetworkRef": ROTATION_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-rotation.default.svc:8080",
@@ -4487,6 +4514,7 @@ pub(crate) fn apply_rotation_remote_provider(context: &str) -> Result<(), Box<dy
         "metadata": { "name": ROTATION_REMOTE_PROVIDER },
         "spec": {
             "gridNetworkRef": ROTATION_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-rotation-remote.default.svc:8080",
@@ -4556,6 +4584,7 @@ pub(crate) fn apply_convergence_test_fixtures(
         "metadata": { "name": CONVERGENCE_PROVIDER },
         "spec": {
             "gridNetworkRef": CONVERGENCE_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-convergence.default.svc:8080",
@@ -4825,6 +4854,7 @@ pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
         "metadata": { "name": SWIM_ENCRYPT_PROVIDER_A },
         "spec": {
             "gridNetworkRef": SWIM_ENCRYPT_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -5088,7 +5118,7 @@ pub(crate) fn wait_for_no_site_candidate_in_overlay(
 /// Apply the three-node SWIM mesh `GridNetwork` and leaf-node `InferenceProvider` fixtures.
 ///
 /// The `GridNetwork` uses `localSiteName = site_a_name` so node A's operator renders the
-/// overlay `ConfigMap`.  The `InferenceProvider` has no `siteSelector` or `routingClusterRef`,
+/// overlay `ConfigMap`.  The `InferenceProvider` has no `hostSelector` or `routingClusterRef`,
 /// so each operator publishes it as CRDT with its own `site_id`.  The leaf node C's CRDT
 /// contribution (`site_id = site_c_name`) is the primary proof target.
 #[expect(
@@ -5124,6 +5154,7 @@ pub(crate) fn apply_swim_mesh_test_fixtures(
         "metadata": { "name": provider_name },
         "spec": {
             "gridNetworkRef": SWIM_MESH_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -5176,6 +5207,7 @@ pub(crate) fn apply_swim_mesh_wrong_network_fixtures(context: &str) -> Result<()
         "metadata": { "name": SWIM_MESH_WRONG_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_MESH_WRONG_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -5298,6 +5330,7 @@ pub(crate) fn apply_swim_trust_test_fixtures(
         "metadata": { "name": SWIM_TRUST_PROVIDER_B },
         "spec": {
             "gridNetworkRef": SWIM_TRUST_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -5348,27 +5381,6 @@ pub(crate) fn cleanup_swim_trust_test_resources(context: &str) -> Result<(), Box
     Ok(())
 }
 
-/// Read `status.discovered.advertisedCertPem` from a `GridSite` resource.
-///
-/// Returns `None` when the field is absent or empty, `Some(pem)` otherwise.
-pub(crate) fn read_gridsite_advertised_cert_pem(context: &str, site_name: &str) -> Option<String> {
-    let out = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "get",
-            "gridsites",
-            site_name,
-            "-o",
-            "jsonpath={.status.discovered.advertisedCertPem}",
-            "--ignore-not-found",
-        ])
-        .output()
-        .ok()?;
-    let pem = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if pem.is_empty() { None } else { Some(pem) }
-}
-
 /// Apply egress address and TLS configuration to a `GridSite` spec.
 ///
 /// This allows the `GridSite` controller to advance phases naturally —
@@ -5407,7 +5419,7 @@ pub(crate) fn apply_gridsite_egress(
     Ok(())
 }
 
-/// Read the `status.reason` field from a `GridSite` resource.
+/// Read a `GridSite`'s reason from its `Connected` condition, which always carries it.
 pub(crate) fn read_gridsite_reason(context: &str, site_name: &str) -> String {
     Command::new("kubectl")
         .args([
@@ -5417,7 +5429,7 @@ pub(crate) fn read_gridsite_reason(context: &str, site_name: &str) -> String {
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.status.reason}",
+            r#"jsonpath={.status.conditions[?(@.type=="Connected")].reason}"#,
             "--ignore-not-found",
         ])
         .output()
@@ -5426,7 +5438,7 @@ pub(crate) fn read_gridsite_reason(context: &str, site_name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Poll until `GridSite.status.reason == expected_reason`, bumping `network` each cycle.
+/// Poll until the `GridSite` `Connected` reason equals `expected_reason`, bumping `network` each cycle.
 #[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
 pub(crate) fn wait_for_gridsite_reason_in_network(
     context: &str,
@@ -5440,7 +5452,7 @@ pub(crate) fn wait_for_gridsite_reason_in_network(
         drop(bump_gridnetwork(context, network));
         let reason = read_gridsite_reason(context, site_name);
         if reason == expected_reason {
-            eprintln!("  [OK] GridSite {site_name:?}: status.reason={reason:?}");
+            eprintln!("  [OK] GridSite {site_name:?}: reason={reason:?}");
             return Ok(());
         }
         if start.elapsed() >= timeout {
@@ -5458,7 +5470,7 @@ pub(crate) fn wait_for_gridsite_reason_in_network(
     }
 }
 
-/// Poll until both `GridSite.status.phase` and `GridSite.status.reason` match,
+/// Poll until both `GridSite.status.phase` and its `Connected` reason match,
 /// bumping `network` each cycle.
 #[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
 #[expect(
@@ -5499,7 +5511,7 @@ pub(crate) fn wait_for_gridsite_phase_and_reason_in_network(
     }
 }
 
-/// Poll until `GridSite.status.reason == expected_reason` (bumps [`SWIM_TRUST_NETWORK`]).
+/// Poll until the `GridSite` `Connected` reason equals `expected_reason` (bumps [`SWIM_TRUST_NETWORK`]).
 #[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
 pub(crate) fn wait_for_gridsite_reason(
     context: &str,
@@ -5512,7 +5524,7 @@ pub(crate) fn wait_for_gridsite_reason(
         drop(bump_gridnetwork(context, SWIM_TRUST_NETWORK));
         let reason = read_gridsite_reason(context, site_name);
         if reason == expected_reason {
-            eprintln!("  [OK] GridSite {site_name:?}: status.reason={reason:?}");
+            eprintln!("  [OK] GridSite {site_name:?}: reason={reason:?}");
             return Ok(());
         }
         if start.elapsed() >= timeout {
@@ -5576,6 +5588,7 @@ pub(crate) fn apply_swim_routing_east_fixtures(
         "metadata": { "name": SWIM_ROUTING_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_ROUTING_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -5637,6 +5650,7 @@ pub(crate) fn apply_swim_routing_west_fixtures(
         "metadata": { "name": SWIM_ROUTING_WEST_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_ROUTING_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -5767,6 +5781,7 @@ fn multi_provider_fixture_json(
         "metadata": { "name": name },
         "spec": {
             "gridNetworkRef": network_ref,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
@@ -6106,7 +6121,7 @@ pub(crate) fn apply_site_join_wrong_network(context: &str) -> Result<(), Box<dyn
 /// Apply a `GridSite` resource with an egress address and a harness label.
 ///
 /// The `label_value` is set on [`SITE_JOIN_LABEL_KEY`] so the site can be
-/// selected by `InferenceProvider.spec.siteSelector.matchLabels` in the
+/// selected by `InferenceProvider.spec.hostSelector.matchLabels` in the
 /// overlay rendering step.
 ///
 /// The site controller validates that `network_ref` exists as a `GridNetwork`
@@ -6309,7 +6324,7 @@ pub(crate) fn verify_gridsite_routing_data(
 
 /// Apply the primary site's `InferenceProvider` for the overlay generation step.
 ///
-/// Uses `siteSelector.matchLabels` to restrict candidates to the primary
+/// Uses `hostSelector.matchLabels` to restrict candidates to the primary
 /// `GridSite` only, so the overlay contains exactly one candidate per model.
 pub(crate) fn apply_site_join_primary_provider(
     context: &str,
@@ -6327,7 +6342,7 @@ pub(crate) fn apply_site_join_primary_provider(
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
             "routingClusterRef": local_site_name,
-            "siteSelector": {
+            "hostSelector": {
                 "matchLabels": { SITE_JOIN_LABEL_KEY: "primary" }
             }
         }
@@ -6339,14 +6354,14 @@ pub(crate) fn apply_site_join_primary_provider(
     kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] InferenceProvider {SITE_JOIN_PRIMARY_PROVIDER:?} applied \
-         (model={model:?}, siteSelector=primary)"
+         (model={model:?}, hostSelector=primary)"
     );
     Ok(())
 }
 
 /// Apply the joining site's `InferenceProvider` for the overlay generation step.
 ///
-/// Uses `siteSelector.matchLabels` to restrict candidates to the joining
+/// Uses `hostSelector.matchLabels` to restrict candidates to the joining
 /// `GridSite` only.  After the joining site reaches `Active` phase, this
 /// provider's model appears in the overlay under the joining site's identity.
 pub(crate) fn apply_site_join_joining_provider(
@@ -6365,7 +6380,7 @@ pub(crate) fn apply_site_join_joining_provider(
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
             "routingClusterRef": joining_site_name,
-            "siteSelector": {
+            "hostSelector": {
                 "matchLabels": { SITE_JOIN_LABEL_KEY: "joining" }
             }
         }
@@ -6377,7 +6392,7 @@ pub(crate) fn apply_site_join_joining_provider(
     kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] InferenceProvider {SITE_JOIN_JOINING_PROVIDER:?} applied \
-         (model={model:?}, siteSelector=joining)"
+         (model={model:?}, hostSelector=joining)"
     );
     Ok(())
 }
@@ -6393,6 +6408,7 @@ pub(crate) fn apply_site_join_wrong_provider(context: &str) -> Result<(), Box<dy
         "metadata": { "name": SITE_JOIN_WRONG_PROVIDER },
         "spec": {
             "gridNetworkRef": SITE_JOIN_WRONG_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -6820,37 +6836,6 @@ pub(crate) fn gridsite_phase_index(phase: &str) -> Option<usize> {
 // Identity trust bootstrap
 // ---------------------------------------------------------------------------
 
-/// Wait for certificate gossip to deliver the expected provider certificate.
-///
-/// Compares the canonical DER-based SHA-256 fingerprint of the SWIM-advertised
-/// certificate against the out-of-band staged identity.
-pub(crate) fn wait_for_expected_site_certificate(
-    context: &str,
-    site_name: &str,
-    expected_canonical_fp: &str,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if read_gridsite_advertised_cert_pem(context, site_name)
-            .is_some_and(|pem| super::certs::pem_to_canonical_fingerprint(&pem) == expected_canonical_fp)
-        {
-            eprintln!("  [OK] GridSite {site_name:?}: advertised certificate matches the staged identity");
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                format!("timeout waiting for GridSite {site_name:?} to advertise its expected certificate").into(),
-            );
-        }
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "bounded polling for asynchronous SWIM certificate propagation"
-        )]
-        std::thread::sleep(Duration::from_secs(2));
-    }
-}
-
 /// Patch a `GridSite` with canonical fingerprint and server name for identity-aware probing.
 pub(crate) fn patch_gridsite_identity_trust(
     context: &str,
@@ -6926,6 +6911,7 @@ pub(crate) fn apply_failover_east_fixtures(
         "metadata": { "name": FAILOVER_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": FAILOVER_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -7125,6 +7111,7 @@ pub(crate) fn apply_failover_shared_east_provider(
         "metadata": { "name": FAILOVER_SHARED_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": FAILOVER_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -7170,6 +7157,7 @@ pub(crate) fn apply_failover_west_fixtures_with_shared(
         "metadata": { "name": FAILOVER_WEST_PROVIDER },
         "spec": {
             "gridNetworkRef": FAILOVER_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "remote",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -7346,6 +7334,7 @@ pub(crate) fn apply_stale_gc_east_fixtures(
         "metadata": { "name": STALE_GC_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": STALE_GC_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -7388,6 +7377,7 @@ pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Re
         "metadata": { "name": STALE_GC_WEST_PROVIDER },
         "spec": {
             "gridNetworkRef": STALE_GC_NETWORK,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "remote",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
@@ -7796,6 +7786,19 @@ pub(crate) fn delete_api_credential_secret(context: &str, namespace: &str) -> Re
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_reason_reads_the_unavailable_condition() {
+        let unavailable = r#"[{"type":"Accepted","status":"True","reason":"Valid"},{"type":"Available","status":"False","reason":"HealthCheckTlsKeyMissing"}]"#;
+        assert_eq!(provider_reason_from(unavailable), "HealthCheckTlsKeyMissing");
+        let healthy = r#"[{"type":"Available","status":"True","reason":"Available"}]"#;
+        assert_eq!(
+            provider_reason_from(healthy),
+            "",
+            "a healthy provider has no diagnostic reason"
+        );
+        assert_eq!(provider_reason_from(""), "", "no status yet");
+    }
 
     // -----------------------------------------------------------------------
     // network_fixture_json — E2E harness contract (grid#60)

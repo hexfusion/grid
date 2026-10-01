@@ -4,7 +4,7 @@
 //! access.  This separation keeps security-critical transition logic
 //! directly testable without mocks.
 
-use crate::crd::grid_site::GridSitePhase;
+use crate::crd::{condition::PLAINTEXT_INELIGIBLE, grid_site::GridSitePhase};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,10 +82,6 @@ pub(crate) enum GatewayProbeOutcome {
     /// match any configured pin.
     PinMismatch,
 
-    /// The certificate advertised via SWIM does not match any configured
-    /// canonical pin.
-    AdvertisedCertificateMismatch,
-
     /// Plaintext probe: TCP connect succeeded.
     PlaintextReachable,
 
@@ -110,7 +106,6 @@ impl GatewayProbeOutcome {
             Self::CertificateExpired => "CertificateExpired",
             Self::CertificateNotYetValid => "CertificateNotYetValid",
             Self::PinMismatch => "PinMismatch",
-            Self::AdvertisedCertificateMismatch => "AdvertisedCertMismatch",
             Self::PlaintextReachable => "PlaintextReachable",
             Self::PlaintextUnreachable => "PlaintextUnreachable",
         }
@@ -139,16 +134,17 @@ pub(crate) fn probe_transition(current_phase: &GridSitePhase, outcome: &GatewayP
     use GatewayProbeOutcome as O;
 
     match outcome {
-        O::Verified => success("TlsVerified", "TLS handshake verified: chain, identity, and pin valid"),
-        O::PlaintextReachable => trust_failure(
-            "IdentityVerificationRequired",
-            "TCP endpoint is reachable but did not provide identity-verified TLS",
-        ),
+        O::Verified => success("TlsVerified", "TLS handshake verified"),
+        O::PlaintextReachable => trust_failure(PLAINTEXT_INELIGIBLE, "plaintext never routes; TCP endpoint reachable"),
         O::AddressMissing => connectivity_failure(current_phase, "EgressMissing", "no egress address configured"),
         O::ConnectTimeout => connectivity_failure(current_phase, "ConnectTimeout", "TCP connect timed out"),
         O::HandshakeTimeout => trust_failure("HandshakeTimeout", "TLS handshake timed out"),
         O::ConnectionFailed => connectivity_failure(current_phase, "ConnectionFailed", "TCP connection failed"),
-        O::PlaintextUnreachable => connectivity_failure(current_phase, "PlaintextUnreachable", "TCP probe failed"),
+        O::PlaintextUnreachable => connectivity_failure(
+            current_phase,
+            PLAINTEXT_INELIGIBLE,
+            "plaintext never routes; TCP failed",
+        ),
         O::TrustMaterialMissing => trust_failure("TrustMaterialMissing", "required trust material not available"),
         O::TrustMaterialInvalid => trust_failure("TrustMaterialInvalid", "trust material is structurally invalid"),
         O::TlsProtocolError => trust_failure("TlsProtocolError", "TLS handshake failed at protocol level"),
@@ -159,11 +155,6 @@ pub(crate) fn probe_transition(current_phase: &GridSitePhase, outcome: &GatewayP
         O::PinMismatch => trust_failure(
             "PinMismatch",
             "server cert fingerprint does not match any configured pin",
-        ),
-        // Recorded, not acted on: the live leaf already matched a pin above.
-        O::AdvertisedCertificateMismatch => success(
-            "AdvertisedCertMismatch",
-            "SWIM-advertised certificate does not match any configured pin; live leaf verified",
         ),
     }
 }
@@ -474,53 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn advertised_cert_mismatch_keeps_active() {
-        let t = probe_transition(
-            &GridSitePhase::Active,
-            &GatewayProbeOutcome::AdvertisedCertificateMismatch,
-        );
-        assert_eq!(
-            t.phase,
-            GridSitePhase::Active,
-            "the live leaf already matched a pin; the advertised copy must not demote"
-        );
-        assert_eq!(
-            t.reason, "AdvertisedCertMismatch",
-            "the mismatch is still recorded in the reason"
-        );
-    }
-
-    #[test]
-    fn advertised_cert_mismatch_recovers_from_unreachable() {
-        let t = probe_transition(
-            &GridSitePhase::Unreachable,
-            &GatewayProbeOutcome::AdvertisedCertificateMismatch,
-        );
-        assert_eq!(
-            t.phase,
-            GridSitePhase::Active,
-            "the peer answered and verified, so it is no longer unreachable"
-        );
-    }
-
-    #[test]
-    fn advertised_cert_mismatch_does_not_block_active() {
-        let t = probe_transition(
-            &GridSitePhase::Connecting,
-            &GatewayProbeOutcome::AdvertisedCertificateMismatch,
-        );
-        assert_eq!(
-            t.phase,
-            GridSitePhase::Active,
-            "reached only after chain, SAN, and live-leaf pin verified"
-        );
-        assert_eq!(
-            t.reason, "AdvertisedCertMismatch",
-            "reason must be AdvertisedCertMismatch"
-        );
-    }
-
-    #[test]
     fn trust_material_missing_stays_connecting() {
         let t = probe_transition(&GridSitePhase::Connecting, &GatewayProbeOutcome::TrustMaterialMissing);
         assert_eq!(t.phase, GridSitePhase::Connecting);
@@ -563,14 +507,14 @@ mod tests {
     fn plaintext_reachable_cannot_promote_to_active() {
         let t = probe_transition(&GridSitePhase::Connecting, &GatewayProbeOutcome::PlaintextReachable);
         assert_eq!(t.phase, GridSitePhase::Connecting);
-        assert_eq!(t.reason, "IdentityVerificationRequired");
+        assert_eq!(t.reason, PLAINTEXT_INELIGIBLE);
     }
 
     #[test]
     fn plaintext_reachable_demotes_active_to_connecting() {
         let t = probe_transition(&GridSitePhase::Active, &GatewayProbeOutcome::PlaintextReachable);
         assert_eq!(t.phase, GridSitePhase::Connecting);
-        assert_eq!(t.reason, "IdentityVerificationRequired");
+        assert_eq!(t.reason, PLAINTEXT_INELIGIBLE);
     }
 
     #[test]
@@ -825,11 +769,10 @@ mod tests {
             GatewayProbeOutcome::CertificateExpired,
             GatewayProbeOutcome::CertificateNotYetValid,
             GatewayProbeOutcome::PinMismatch,
-            GatewayProbeOutcome::AdvertisedCertificateMismatch,
             GatewayProbeOutcome::PlaintextReachable,
             GatewayProbeOutcome::PlaintextUnreachable,
         ];
-        assert_eq!(all.len(), 16, "must cover all 16 variants");
+        assert_eq!(all.len(), 15, "must cover all 15 variants");
 
         let forbidden = [
             "BEGIN CERTIFICATE",

@@ -1,5 +1,8 @@
 {{- include "grid-site.normalize" . }}
 {{- range .Values.inferenceProviders }}
+{{- if hasKey . "siteSelector" }}
+{{- fail (printf "inferenceProviders %s: siteSelector was renamed hostSelector" (.name | default "")) }}
+{{- end }}
 ---
 apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
@@ -18,9 +21,9 @@ spec:
   {{- with .routingClusterRef }}
   routingClusterRef: {{ . | quote }}
   {{- end }}
-  {{- with .siteSelector }}
-  siteSelector:
-    {{- toYaml . | nindent 4 }}
+  {{- if hasKey . "hostSelector" }}
+  hostSelector:
+    {{- toYaml .hostSelector | nindent 4 }}
   {{- end }}
   {{- with .accessPolicy }}
   accessPolicy:

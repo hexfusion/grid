@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 
-use super::trust_bundle::MAX_PUBLIC_CERT_PEM_BYTES;
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -30,31 +29,6 @@ pub fn ca_secret_data(ca: &certs::CaCert) -> BTreeMap<String, ByteString> {
     data.insert("ca.crt".to_owned(), ByteString(ca.cert_pem.as_bytes().to_vec()));
     data.insert("ca.key".to_owned(), ByteString(ca.key_pem.as_bytes().to_vec()));
     data
-}
-
-/// Read only the public certificate PEM from a site certificate Secret.
-///
-/// Reads the `tls.crt` key from the named Secret.  The private key (`tls.key`)
-/// is deliberately not read — this function must never return private key material.
-///
-/// Returns `None` when the Secret does not exist or does not contain the
-/// `tls.crt` key.
-///
-/// # Errors
-///
-/// Returns [`kube::Error`] on Kubernetes API failures.
-pub async fn read_site_cert_pem(
-    client: &kube::Client,
-    secret_ref: Option<&crate::crd::grid_network::SecretRef>,
-) -> Result<Option<String>, kube::Error> {
-    let Some(r) = secret_ref else {
-        return Ok(None);
-    };
-    let api: kube::Api<Secret> = kube::Api::namespaced(client.clone(), &r.namespace);
-    let Some(secret) = api.get_opt(&r.name).await? else {
-        return Ok(None);
-    };
-    Ok(public_cert_pem_from_secret(&secret))
 }
 
 /// Result of looking up a named key within a Kubernetes Secret's `data` map.
@@ -110,27 +84,6 @@ pub(crate) async fn read_secret_bytes(
         Some(bytes) if !bytes.0.is_empty() => SecretKeyLookup::Found(bytes.0.clone()),
         Some(_) | None => SecretKeyLookup::KeyMissing,
     })
-}
-
-/// Extract public certificate PEM from `secret.data["tls.crt"]`.
-///
-/// Returns `None` for missing, empty, invalid UTF-8, or private-key-looking
-/// content.  This is deliberately conservative because the returned value may
-/// be broadcast to peers and written to `GridSite.status.discovered.advertisedCertPem`.
-fn public_cert_pem_from_secret(secret: &Secret) -> Option<String> {
-    secret
-        .data
-        .as_ref()
-        .and_then(|d| d.get("tls.crt"))
-        .and_then(|b| String::from_utf8(b.0.clone()).ok())
-        .filter(|s| !s.trim().is_empty())
-        .filter(|s| s.len() <= MAX_PUBLIC_CERT_PEM_BYTES)
-        .filter(|s| !contains_private_key_marker(s))
-}
-
-/// Return true if PEM text appears to contain private key material.
-fn contains_private_key_marker(pem: &str) -> bool {
-    pem.contains("PRIVATE KEY")
 }
 
 /// Read a 32-byte AES-256-GCM encryption key from a Kubernetes Secret.
@@ -353,61 +306,5 @@ mod tests {
         let data = site_cert_secret_data(&site);
         assert!(data.contains_key("tls.crt"), "should have tls.crt");
         assert!(data.contains_key("tls.key"), "should have tls.key");
-    }
-
-    #[test]
-    fn public_cert_pem_from_secret_reads_only_tls_crt() {
-        let secret = build(
-            "site-cert",
-            "default",
-            BTreeMap::from([
-                (
-                    "tls.crt".to_owned(),
-                    ByteString(b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n".to_vec()),
-                ),
-                (
-                    "tls.key".to_owned(),
-                    ByteString(b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n".to_vec()),
-                ),
-            ]),
-        );
-
-        let pem = public_cert_pem_from_secret(&secret).unwrap_or_else(|| std::process::abort());
-        assert!(pem.contains("BEGIN CERTIFICATE"));
-        assert!(!pem.contains("PRIVATE KEY"));
-    }
-
-    #[test]
-    fn public_cert_pem_from_secret_rejects_private_key_marker_in_tls_crt() {
-        let secret = build(
-            "site-cert",
-            "default",
-            BTreeMap::from([(
-                "tls.crt".to_owned(),
-                ByteString(b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n".to_vec()),
-            )]),
-        );
-
-        assert!(
-            public_cert_pem_from_secret(&secret).is_none(),
-            "tls.crt content with private-key marker must not be propagated"
-        );
-    }
-
-    #[test]
-    fn public_cert_pem_from_secret_rejects_oversized_certificate() {
-        let oversized = format!(
-            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
-            "A".repeat(MAX_PUBLIC_CERT_PEM_BYTES)
-        );
-        let secret = build(
-            "site-cert",
-            "default",
-            BTreeMap::from([("tls.crt".to_owned(), ByteString(oversized.into_bytes()))]),
-        );
-        assert!(
-            public_cert_pem_from_secret(&secret).is_none(),
-            "oversized public certificate must not enter SWIM state"
-        );
     }
 }

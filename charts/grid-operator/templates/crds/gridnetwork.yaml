@@ -13,6 +13,8 @@ metadata:
 spec:
   group: grid.praxis-proxy.io
   names:
+    categories:
+      - grid
     kind: GridNetwork
     plural: gridnetworks
     shortNames:
@@ -288,9 +290,12 @@ spec:
                 gridId:
                   default: ""
                   description: |-
-                    Grid ID for tenancy. Empty on creation; auto-generated
-                    on first join with another site.
+                    Grid ID shared by every site of one grid. Left empty, each site generates its own UUID, so
+                    set the same `gridId` everywhere. Immutable once set.
                   type: string
+                  x-kubernetes-validations:
+                    - message: gridId is immutable once set
+                      rule: self == oldSelf || oldSelf == ''
                 metricsRefreshInterval:
                   description: |-
                     Maximum time between metric refreshes and score/ranking recalculation.
@@ -377,6 +382,7 @@ spec:
                   items:
                     type: string
                   type: array
+                  x-kubernetes-list-type: set
                 selectionPolicy:
                   description: |-
                     Local request distribution policy for the active selection group.
@@ -417,9 +423,17 @@ spec:
                   type: object
                 siteDiscovery:
                   default:
+                    defaultEgressTls: mutualTls
                     mode: manual
                   description: How the operator turns SWIM members into `GridSite` objects.
                   properties:
+                    defaultEgressTls:
+                      default: mutualTls
+                      description: Egress TLS mode for a `GridSite` without `spec.egress`, auto-created ones included.
+                      enum:
+                        - mutualTls
+                        - plaintext
+                      type: string
                     mode:
                       default: manual
                       description: Whether the operator creates `GridSite` objects for unknown SWIM members.
@@ -444,6 +458,10 @@ spec:
                     omitted from the rendered overlay.  Fresh (`fresh=true`) candidates and
                     local candidates are never evicted.  CRDT provider records in storage
                     are not deleted.
+
+                    In `siteDiscovery.mode: auto` it also bounds auto-created `GridSite`
+                    objects: one whose member is absent or `Dead` this long, and whose spec
+                    nobody edited, is deleted, freeing its slot under the per-network cap.
 
                     **Default (absent):** stale candidates are retained indefinitely —
                     the same behaviour as before this field existed.
@@ -718,6 +736,7 @@ spec:
                         description: Current render/apply phase.
                         enum:
                           - Rendered
+                          - Pending
                           - Error
                           - Disabled
                         type: string
@@ -726,10 +745,12 @@ spec:
                         description: |-
                           Machine-readable reason for the current phase.
 
-                          `""` when `phase` is `Rendered`, or `ListenerPortUnresolved` when the
-                          gateway Service could not supply the listener port and the fallback was used.
-                          One of `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`,
-                          `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
+                          `""` when `phase` is `Rendered`, or a warning that still renders:
+                          `ListenerPortUnresolved` when the gateway Service could not supply the listener
+                          port and the fallback was used, else `RoutedAddressMismatch` when a remote
+                          endpoint differs from the address its `GridSite` probe verified.
+                          `EmptyCandidates` when `phase` is `Pending`. One of `MissingClusterEndpoint`,
+                          `MissingTransport`, `MissingSni`, `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
                           `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled` otherwise.
                         type: string
                     required:
@@ -833,7 +854,8 @@ spec:
                         description: |-
                           Machine-readable reason for the current phase.
 
-                          Empty when `phase` is [`OverlayPhase::Distributed`].
+                          Empty when `phase` is [`OverlayPhase::Distributed`]; `EmptyCandidates` while the
+                          gateway has no routing candidate, which is `Pending`, not `Error`.
                         type: string
                       renderedAt:
                         default: ""

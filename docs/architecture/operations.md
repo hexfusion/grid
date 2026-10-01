@@ -635,7 +635,7 @@ The `GridSite` controller verifies gateway reachability and identity against
 | `SWIMReachable` | SWIM membership reports the peer Alive |
 | `GatewayAddressKnown` | `spec.egress.address` or `status.discovered.egressAddress` is non-empty |
 | `TlsVerified` | Mutual TLS handshake, chain, SAN, and live-leaf pin all verify |
-| `IdentityVerificationRequired` | Plaintext endpoint accepts TCP, but remains ineligible because its identity is not verified |
+| `PlaintextIneligible` | Egress is plaintext, so `Connected=False` whether or not TCP connects. Set by `spec.egress.tls.mode` or the GridNetwork `siteDiscovery.defaultEgressTls` (default `mutualTls`) |
 
 Request-time authorization remains enforced by the provider gateway after the
 control-plane health evaluation succeeds.
@@ -664,6 +664,7 @@ metadata:
   name: anthropic-api
 spec:
   gridNetworkRef: production
+  hostSelector: {}
   providerKind: anthropic
   backendKind: apiProvider
   endpoint: https://api.anthropic.com
@@ -687,6 +688,7 @@ metadata:
   name: local-vllm
 spec:
   gridNetworkRef: production
+  hostSelector: {}
   providerKind: openAi
   backendKind: local
   endpoint: http://vllm-service.inference:8000
@@ -945,7 +947,7 @@ op-e2e-sjd-net-grid-site-b       Connecting   op-e2e-sjd-net
 To see the reason and diagnostic message:
 
 ```console
-kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.status.message}'
+kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.conditions[?(@.type=="Connected")].reason}: {.status.conditions[?(@.type=="Connected")].message}'
 ```
 
 ### Phase transitions and their cause
@@ -981,11 +983,10 @@ separate steps.
 
 **Phase stays Connecting**
 
-- Check `status.reason`:
+- Check the `Connected` condition reason:
   - `TrustMaterialMissing`: configure the CA Secret, local client identity,
     `serverName`, and canonical pin policy.
-  - `TrustMaterialInvalid`: trust material is malformed, oversized, or uses the
-    deprecated PEM fingerprint field.
+  - `TrustMaterialInvalid`: trust material is malformed or oversized.
   - `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, or
     `CertificateNotYetValid`: inspect the live gateway certificate and
     configured CA/server name.

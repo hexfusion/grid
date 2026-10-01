@@ -83,14 +83,11 @@ pub struct MemberRecord {
     /// endpoint.  `None` when the peer has not configured a gateway address.
     pub gateway_address: Option<String>,
 
-    /// Public site certificate PEM received from this peer via SWIM broadcast.
-    ///
-    /// Contains only the public certificate — never a private key.
-    /// `None` when the peer has not yet broadcast its site certificate.
-    pub site_cert_pem: Option<String>,
-
     /// Signals `host:port` advertised by this peer, `None` for an older peer.
     pub signals_address: Option<String>,
+
+    /// SWIM addresses of two or more live claimants of this site ID, empty unless duplicated.
+    pub duplicate_endpoints: Vec<String>,
 }
 
 impl MemberRecord {
@@ -179,8 +176,8 @@ mod tests {
             status,
             age_secs: 0,
             gateway_address: None,
-            site_cert_pem: None,
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }
     }
 

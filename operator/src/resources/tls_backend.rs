@@ -441,7 +441,7 @@ pub(crate) fn build_tls_config(
 #[cfg(not(feature = "fips"))]
 pub(crate) fn first_cert_der_from_pem(pem: &str) -> Result<Vec<u8>, &'static str> {
     if pem.len() > MAX_CERT_BUNDLE_BYTES {
-        return Err("advertised certificate PEM exceeds maximum size");
+        return Err("certificate PEM exceeds maximum size");
     }
     let cert = CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
@@ -462,7 +462,7 @@ pub(crate) fn first_cert_der_from_pem(pem: &str) -> Result<Vec<u8>, &'static str
 #[cfg(feature = "fips")]
 pub(crate) fn first_cert_der_from_pem(pem: &str) -> Result<Vec<u8>, &'static str> {
     if pem.len() > MAX_CERT_BUNDLE_BYTES {
-        return Err("advertised certificate PEM exceeds maximum size");
+        return Err("certificate PEM exceeds maximum size");
     }
     let certs = X509::stack_from_pem(pem.as_bytes()).map_err(|_err| "advertised certificate PEM is malformed")?;
     let cert = certs

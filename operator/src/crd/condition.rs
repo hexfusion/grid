@@ -204,6 +204,9 @@ pub const FIELD_CONFLICT: &str = "FieldConflict";
 /// The network discovered members it cannot adopt; never a verdict on its own spec.
 pub const DISCOVERY_CONFLICT: &str = "DiscoveryConflict";
 
+/// A plaintext-egress site: never routable, so `Connected` is false rather than pending.
+pub const PLAINTEXT_INELIGIBLE: &str = "PlaintextIneligible";
+
 /// `GridSite` status reasons that reject the spec itself.
 const SITE_SPEC_REJECTIONS: [&str; 3] = [
     "TrustConflictsWithPeerTrust",
@@ -211,33 +214,39 @@ const SITE_SPEC_REJECTIONS: [&str; 3] = [
     "ServerNameInvalid",
 ];
 
-/// `Accepted`, `Discovered`, `Connected`, and `Ready` for a site in `phase` with status `reason`.
+/// `Accepted`, `Discovered`, `Connected`, and `Ready` for a site in `phase` with its `reason` and `message`.
+///
+/// `Connected` always carries the site reason, so it is where the last reason is read back.
 #[must_use]
-pub fn site_conditions(phase: &super::grid_site::GridSitePhase, reason: &str) -> Vec<Observed> {
+pub fn site_conditions(phase: &super::grid_site::GridSitePhase, reason: &str, message: &str) -> Vec<Observed> {
     use super::grid_site::GridSitePhase;
 
+    let because = |type_: &'static str, status: ConditionStatus| {
+        Observed::new(type_, status, reason).with_message(message.to_owned())
+    };
     let accepted = if SITE_SPEC_REJECTIONS.contains(&reason) {
-        Observed::new(ACCEPTED, ConditionStatus::False, reason)
+        because(ACCEPTED, ConditionStatus::False)
     } else {
         Observed::new(ACCEPTED, ConditionStatus::True, "Valid")
     };
     let discovered = match phase {
-        GridSitePhase::Pending | GridSitePhase::Left => Observed::new(DISCOVERED, ConditionStatus::False, reason),
+        GridSitePhase::Pending | GridSitePhase::Left => because(DISCOVERED, ConditionStatus::False),
         GridSitePhase::Discovered | GridSitePhase::Connecting | GridSitePhase::Active | GridSitePhase::Unreachable => {
             Observed::new(DISCOVERED, ConditionStatus::True, "MemberKnown")
         },
     };
     let connected = match phase {
-        GridSitePhase::Active => Observed::new(CONNECTED, ConditionStatus::True, reason),
-        GridSitePhase::Unreachable | GridSitePhase::Left => Observed::new(CONNECTED, ConditionStatus::False, reason),
+        GridSitePhase::Active => because(CONNECTED, ConditionStatus::True),
+        _ if reason == PLAINTEXT_INELIGIBLE => because(CONNECTED, ConditionStatus::False),
+        GridSitePhase::Unreachable | GridSitePhase::Left => because(CONNECTED, ConditionStatus::False),
         GridSitePhase::Pending | GridSitePhase::Discovered | GridSitePhase::Connecting => {
-            Observed::new(CONNECTED, ConditionStatus::Unknown, reason)
+            because(CONNECTED, ConditionStatus::Unknown)
         },
     };
     let ready = if *phase == GridSitePhase::Active {
         Observed::new(READY, ConditionStatus::True, "Active")
     } else {
-        Observed::new(READY, ConditionStatus::False, reason)
+        because(READY, ConditionStatus::False)
     };
     vec![accepted, discovered, connected, ready]
 }
@@ -251,7 +260,7 @@ pub fn network_conditions(
     phase: &super::grid_network::GridNetworkPhase,
     rejection: Option<&Rejection>,
     unready: Option<&Rejection>,
-    conflicts: &[String],
+    conflicts: &[Rejection],
 ) -> Vec<Observed> {
     use super::grid_network::GridNetworkPhase;
 
@@ -270,11 +279,7 @@ pub fn network_conditions(
             Observed::new(ACCEPTED, ConditionStatus::False, rejection.reason).with_message(rejection.message.clone())
         },
     );
-    let conflict = if conflicts.is_empty() {
-        Observed::new(DISCOVERY_CONFLICT, ConditionStatus::False, "NoConflict")
-    } else {
-        Observed::new(DISCOVERY_CONFLICT, ConditionStatus::True, FIELD_CONFLICT).with_message(conflicts.join("; "))
-    };
+    let conflict = discovery_conflict(conflicts);
     vec![accepted, ready, conflict]
 }
 
@@ -298,6 +303,32 @@ pub fn metrics_signals_condition(issue: Option<super::inference_provider::Signal
                 .with_message("the preset queue metric is a raw count; set metricsConfig.queueCapacity".to_owned())
         },
     }
+}
+
+/// A provider's diagnostic reason: the `Available` reason while it is not `True`.
+#[must_use]
+pub fn provider_reason(conditions: &[Condition]) -> Option<&str> {
+    find(conditions, AVAILABLE)
+        .filter(|available| available.status != ConditionStatus::True)
+        .map(|available| available.reason.as_str())
+}
+
+/// `DiscoveryConflict` for the members discovery could not adopt: their shared reason, or a generic one.
+fn discovery_conflict(conflicts: &[Rejection]) -> Observed {
+    let Some(first) = conflicts.first() else {
+        return Observed::new(DISCOVERY_CONFLICT, ConditionStatus::False, "NoConflict");
+    };
+    let reason = if conflicts.iter().all(|c| c.reason == first.reason) {
+        first.reason
+    } else {
+        "UnadoptableMembers"
+    };
+    let message = conflicts
+        .iter()
+        .map(|c| c.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Observed::new(DISCOVERY_CONFLICT, ConditionStatus::True, reason).with_message(message)
 }
 
 /// The condition of `type_`, if present.
@@ -349,7 +380,7 @@ mod tests {
 
     #[test]
     fn an_active_site_is_discovered_connected_and_ready() {
-        let observed = site_conditions(&crate::crd::grid_site::GridSitePhase::Active, "Verified");
+        let observed = site_conditions(&crate::crd::grid_site::GridSitePhase::Active, "Verified", "");
         for type_ in [ACCEPTED, DISCOVERED, CONNECTED, READY] {
             assert_eq!(status_of(&observed, type_), ConditionStatus::True, "{type_}");
         }
@@ -357,7 +388,7 @@ mod tests {
 
     #[test]
     fn a_pending_site_is_not_discovered_and_connection_is_unknown() {
-        let observed = site_conditions(&crate::crd::grid_site::GridSitePhase::Pending, "AwaitingDiscovery");
+        let observed = site_conditions(&crate::crd::grid_site::GridSitePhase::Pending, "AwaitingDiscovery", "");
         assert_eq!(status_of(&observed, DISCOVERED), ConditionStatus::False);
         assert_eq!(status_of(&observed, CONNECTED), ConditionStatus::Unknown);
         assert_eq!(status_of(&observed, READY), ConditionStatus::False);
@@ -365,7 +396,7 @@ mod tests {
 
     #[test]
     fn an_unreachable_site_carries_the_probe_reason_on_connected() {
-        let observed = site_conditions(&crate::crd::grid_site::GridSitePhase::Unreachable, "PinMismatch");
+        let observed = site_conditions(&crate::crd::grid_site::GridSitePhase::Unreachable, "PinMismatch", "");
         let connected = observed
             .iter()
             .find(|o| o.type_ == CONNECTED)
@@ -380,6 +411,7 @@ mod tests {
         let observed = site_conditions(
             &crate::crd::grid_site::GridSitePhase::Connecting,
             "TrustMaterialInvalid",
+            "",
         );
         let missing = site_conditions(
             &crate::crd::grid_site::GridSitePhase::Connecting,
@@ -424,7 +456,10 @@ mod tests {
     #[test]
     fn a_discovery_name_collision_is_a_discovery_conflict_not_a_rejection() {
         use crate::crd::grid_network::GridNetworkPhase;
-        let conflicts = vec!["SWIM member east not adopted: GridSite east belongs to network other".to_owned()];
+        let conflicts = vec![Rejection::new(
+            FIELD_CONFLICT,
+            "SWIM member east not adopted: GridSite east belongs to network other",
+        )];
         let observed = network_conditions(&GridNetworkPhase::Active, None, None, &conflicts);
         let conflict = observed
             .iter()
@@ -432,7 +467,7 @@ mod tests {
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(conflict.status, ConditionStatus::True);
         assert_eq!(conflict.reason, FIELD_CONFLICT);
-        assert_eq!(conflict.message, conflicts[0]);
+        assert_eq!(conflict.message, conflicts[0].message);
         assert_eq!(
             status_of(&observed, ACCEPTED),
             ConditionStatus::True,
@@ -466,6 +501,22 @@ mod tests {
     }
 
     #[test]
+    fn mixed_discovery_problems_report_one_generic_reason() {
+        use crate::crd::grid_network::GridNetworkPhase;
+        let problems = [
+            Rejection::new(FIELD_CONFLICT, "a"),
+            Rejection::new("SiteIdInvalid", "b"),
+        ];
+        let observed = network_conditions(&GridNetworkPhase::Active, None, None, &problems);
+        let conflict = observed
+            .iter()
+            .find(|o| o.type_ == DISCOVERY_CONFLICT)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(conflict.reason, "UnadoptableMembers");
+        assert_eq!(conflict.message, "a; b");
+    }
+
+    #[test]
     fn a_network_without_conflicts_reports_discovery_conflict_false() {
         use crate::crd::grid_network::GridNetworkPhase;
         let observed = network_conditions(&GridNetworkPhase::Active, None, None, &[]);
@@ -476,7 +527,12 @@ mod tests {
     fn a_network_rejection_and_conflicts_report_separately() {
         use crate::crd::grid_network::GridNetworkPhase;
         let rejection = Rejection::new("BudgetPolicyInvalid", "duplicate tenantId a");
-        let observed = network_conditions(&GridNetworkPhase::Pending, Some(&rejection), None, &["c".to_owned()]);
+        let observed = network_conditions(
+            &GridNetworkPhase::Pending,
+            Some(&rejection),
+            None,
+            &[Rejection::new(FIELD_CONFLICT, "c")],
+        );
         let accepted = observed
             .iter()
             .find(|o| o.type_ == ACCEPTED)

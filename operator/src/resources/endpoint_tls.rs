@@ -22,7 +22,7 @@ use crate::{
 
 /// Machine-readable reason for a TLS configuration failure.
 ///
-/// Surfaced in [`InferenceProvider`] `status.reason` so administrators can
+/// Surfaced in the [`InferenceProvider`] `Available` condition reason so administrators can
 /// diagnose material and configuration errors without inspecting operator
 /// logs.  Values are stable across releases and safe for automation to parse.
 ///
@@ -100,7 +100,7 @@ pub(crate) fn secret_ref_from_client_cert(
 /// Read raw bytes from a Kubernetes Secret for TLS material resolution.
 ///
 /// Returns a structured `(TlsFailureReason, String)` error so callers can
-/// derive a machine-readable `status.reason` without parsing error text.
+/// derive a machine-readable `Available` condition reason without parsing error text.
 pub(crate) async fn read_secret_bytes_for_tls(
     client: &kube::Client,
     secret_ref: &crate::crd::grid_network::SecretRef,
@@ -225,8 +225,8 @@ pub(crate) async fn resolve_tls_config(
 /// # Returns
 ///
 /// - `Ok(None)` — TLS material is accessible and valid (or no TLS configured).
-/// - `Ok(Some(reason))` — failure; the provider should be marked [`Degraded`] with the returned reason in
-///   `status.reason`.
+/// - `Ok(Some(reason))` — failure; the provider should be marked [`Degraded`] with the returned reason in the
+///   `Available` condition reason.
 ///
 /// [`Degraded`]: crate::crd::inference_provider::ProviderPhase::Degraded
 ///

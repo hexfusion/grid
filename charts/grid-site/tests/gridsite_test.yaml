@@ -1,0 +1,19 @@
+suite: local GridSite
+templates:
+  - templates/gridsite.yaml
+set:
+  gridSite.name: site-a
+tests:
+  - it: labels the local GridSite with its provider-site, defaulting to the site name
+    asserts:
+      - equal:
+          path: metadata.labels["grid.praxis-proxy.io/provider-site"]
+          value: site-a
+
+  - it: labels the local GridSite with providerSiteLabel when set
+    set:
+      gridSite.providerSiteLabel: east-provider
+    asserts:
+      - equal:
+          path: metadata.labels["grid.praxis-proxy.io/provider-site"]
+          value: east-provider

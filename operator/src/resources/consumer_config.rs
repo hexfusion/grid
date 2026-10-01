@@ -25,6 +25,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use crate::{
     crd::grid_network::{ClusterEndpointConfig, SelectionMode, TlsMode},
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay, scoped_configmap_name},
+    signals::SignalsEndpoint,
 };
 
 // ---------------------------------------------------------------------------
@@ -187,6 +188,46 @@ pub(crate) fn generate_consumer_praxis_config(
     config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
 
     Ok(config)
+}
+
+/// Consumer config status reason when a remote route differs from the address its site probe verified.
+pub(crate) const ROUTED_ADDRESS_MISMATCH: &str = "RoutedAddressMismatch";
+
+/// The first remote candidate whose endpoint differs from its site's probed address, with a count of the rest.
+pub(crate) fn routed_address_mismatch<'site>(
+    overlay: &RoutingOverlay,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    probed_address: impl Fn(&str) -> Option<&'site str>,
+) -> Option<String> {
+    let routes: BTreeSet<(&str, &str)> = overlay
+        .candidates
+        .iter()
+        .filter(|c| c.site != overlay.local_site)
+        .map(|c| (c.site.as_str(), c.cluster.as_str()))
+        .collect();
+    let mut mismatches = routes.into_iter().filter_map(|(site, cluster)| {
+        let endpoint = cluster_endpoints
+            .iter()
+            .rfind(|ep| ep.cluster == cluster)?
+            .address
+            .as_str();
+        let proven = probed_address(site)?;
+        (!same_address(endpoint, proven)).then_some((endpoint, proven))
+    });
+    let (endpoint, proven) = mismatches.next()?;
+    Some(match mismatches.count() {
+        0 => format!("routes {endpoint}, Active proves {proven}"),
+        more => format!("routes {endpoint}, Active proves {proven} (and {more} more)"),
+    })
+}
+
+/// Whether two `host:port` addresses name the same host and port, IPv6 brackets normalised.
+fn same_address(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    match (SignalsEndpoint::parse(a), SignalsEndpoint::parse(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a.eq_ignore_ascii_case(b),
+    }
 }
 
 /// The operator-owned consumer Praxis `ConfigMap` name for one gateway.
@@ -1646,5 +1687,60 @@ mod tests {
             "aaa-cluster endpoint must appear before zzz-cluster endpoint in load_balancer"
         );
         let _ = (pos_aaa, pos_zzz); // used only for determinism check above
+    }
+
+    // -----------------------------------------------------------------------
+    // Routed versus probed address
+    // -----------------------------------------------------------------------
+
+    fn probed<'addr>(site: &str, address: &'addr str) -> impl Fn(&str) -> Option<&'addr str> {
+        let site = site.to_owned();
+        move |candidate| (candidate == site).then_some(address)
+    }
+
+    #[test]
+    fn matching_routed_address_does_not_warn() {
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "site-b", "b", true)]);
+        let endpoints = [mtls_ep("b", "[2001:DB8::1]:8443", "b.grid")];
+        assert_eq!(
+            routed_address_mismatch(&overlay, &endpoints, probed("site-b", "[2001:db8::1]:8443")),
+            None
+        );
+    }
+
+    #[test]
+    fn mismatched_routed_address_warns_and_still_renders() {
+        let overlay = simple_overlay(vec![
+            plain_candidate("inference_model", "m1", "site-b", "b", true),
+            plain_candidate("inference_model", "m2", "site-c", "c", true),
+        ]);
+        let endpoints = [
+            mtls_ep("b", "lb.site-b.example:8443", "b.grid"),
+            mtls_ep("c", "10.0.0.9:8443", "c.grid"),
+        ];
+        let probes = |site: &str| match site {
+            "site-b" => Some("10.0.0.2:8443"),
+            "site-c" => Some("10.0.0.3:8443"),
+            _ => None,
+        };
+        assert_eq!(
+            routed_address_mismatch(&overlay, &endpoints, probes).as_deref(),
+            Some("routes lb.site-b.example:8443, Active proves 10.0.0.2:8443 (and 1 more)")
+        );
+        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        assert!(
+            yaml.contains("lb.site-b.example:8443"),
+            "the mismatched route still renders"
+        );
+    }
+
+    #[test]
+    fn local_candidates_are_not_compared() {
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "site-a", "a", true)]);
+        let endpoints = [plain_ep("a", "127.0.0.1:8000")];
+        assert_eq!(
+            routed_address_mismatch(&overlay, &endpoints, probed("site-a", "10.0.0.1:8443")),
+            None
+        );
     }
 }

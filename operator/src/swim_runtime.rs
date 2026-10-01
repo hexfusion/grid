@@ -28,7 +28,7 @@
 //! [`OperatorCtx`]: crate::controller::grid_network::OperatorCtx
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -251,12 +251,36 @@ impl std::fmt::Debug for SwimConfig {
 // Internal runtime member tracking
 // ---------------------------------------------------------------------------
 
+/// Whether an identity is up or down, and since when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Liveness {
+    /// Up since the instant held.
+    Up(Instant),
+    /// Down since the instant held.
+    Down(Instant),
+}
+
+impl Liveness {
+    /// When it went down, `None` while up.
+    const fn down_at(self) -> Option<Instant> {
+        match self {
+            Self::Up(_) => None,
+            Self::Down(at) => Some(at),
+        }
+    }
+
+    /// Whether it is up.
+    const fn is_up(self) -> bool {
+        matches!(self, Self::Up(_))
+    }
+}
+
 /// One site's mirrored identities, Alive while any is, reached at the highest live generation.
 struct TrackedMember {
     /// Opaque site identity, mirrors [`MemberRecord::site_id`].
     site_id: String,
-    /// Each identity by `(generation, address)`: `None` while up, else when it went down.
-    identities: BTreeMap<(u64, SocketAddr), Option<Instant>>,
+    /// Each identity by `(generation, address)`.
+    identities: BTreeMap<(u64, SocketAddr), Liveness>,
     /// When the site lost its last live identity, `None` while Alive.
     status_changed_at: Option<Instant>,
 
@@ -266,12 +290,6 @@ struct TrackedMember {
     /// from membership events.  Always `None` until
     /// [`members_snapshot`] enriches it.
     gateway_address: Option<String>,
-
-    /// Public site certificate PEM for this member.
-    ///
-    /// Populated from the `cert_pems` map at snapshot time.
-    /// Contains only the public certificate — never a private key.
-    site_cert_pem: Option<String>,
 }
 
 impl TrackedMember {
@@ -282,13 +300,12 @@ impl TrackedMember {
             identities: BTreeMap::new(),
             status_changed_at: None,
             gateway_address: None,
-            site_cert_pem: None,
         }
     }
 
     /// Whether any identity is up.
     fn is_alive(&self) -> bool {
-        self.identities.values().any(Option::is_none)
+        self.identities.values().any(|liveness| liveness.is_up())
     }
 
     /// Alive or Dead, from the identities held.
@@ -305,7 +322,7 @@ impl TrackedMember {
         self.identities
             .iter()
             .rev()
-            .find(|(_, down)| down.is_none())
+            .find(|(_, liveness)| liveness.is_up())
             .or_else(|| self.identities.iter().next_back())
             .map(|(identity, _)| *identity)
     }
@@ -316,7 +333,7 @@ impl TrackedMember {
             let oldest_down = self
                 .identities
                 .iter()
-                .filter_map(|(held, down)| down.map(|at| (at, *held)))
+                .filter_map(|(held, liveness)| liveness.down_at().map(|at| (at, *held)))
                 .min()
                 .map(|(_, held)| held);
             let Some(oldest_down) = oldest_down else {
@@ -324,11 +341,11 @@ impl TrackedMember {
             };
             self.identities.remove(&oldest_down);
         }
-        let down = self.identities.entry(identity).or_insert(Some(now));
-        if up {
-            *down = None;
-        } else if down.is_none() {
-            *down = Some(now);
+        let liveness = self.identities.entry(identity).or_insert(Liveness::Down(now));
+        match (up, *liveness) {
+            (true, Liveness::Down(_)) => *liveness = Liveness::Up(now),
+            (false, Liveness::Up(_)) => *liveness = Liveness::Down(now),
+            _ => {},
         }
         self.refresh_status(now);
         true
@@ -343,6 +360,38 @@ impl TrackedMember {
         }
     }
 
+    /// Addresses of two or more identities up past [`DUPLICATE_GRACE`] that foca still holds, empty otherwise.
+    fn duplicate_endpoints(&self, now: Instant, live: &[&NodeId]) -> Vec<String> {
+        // A missed Left must never withdraw a healthy site, so foca has the final say.
+        let foca_holds = |&(generation, addr): &(u64, SocketAddr)| {
+            live.iter()
+                .any(|id| id.site_name() == self.site_id && id.generation() == generation && id.socket_addr() == addr)
+        };
+        let settled: BTreeSet<SocketAddr> = self
+            .identities
+            .iter()
+            .filter(|(held, liveness)| {
+                matches!(liveness, Liveness::Up(since) if now.saturating_duration_since(*since) >= DUPLICATE_GRACE)
+                    && foca_holds(held)
+            })
+            .map(|((_, addr), _)| *addr)
+            .collect();
+        if settled.len() < 2 {
+            return Vec::new();
+        }
+        settled.iter().map(ToString::to_string).collect()
+    }
+
+    /// Whether identities at two addresses are up, so a duplicate may surface with time alone.
+    fn has_rival_addresses(&self) -> bool {
+        let mut up = self
+            .identities
+            .iter()
+            .filter(|(_, liveness)| liveness.is_up())
+            .map(|((_, addr), _)| addr);
+        up.next().is_some_and(|first| up.any(|addr| addr != first))
+    }
+
     /// Convert to a public [`MemberRecord`], aging only a Dead site.
     fn to_member_record(&self, now: Instant) -> MemberRecord {
         MemberRecord {
@@ -354,8 +403,8 @@ impl TrackedMember {
                 .status_changed_at
                 .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
             gateway_address: self.gateway_address.clone(),
-            site_cert_pem: self.site_cert_pem.clone(),
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }
     }
 }
@@ -365,8 +414,6 @@ impl TrackedMember {
 struct PeerMetadata<'meta> {
     /// Data-plane gateway addresses.
     gateway_addrs: &'meta BTreeMap<String, String>,
-    /// Public site certificate PEMs.
-    cert_pems: &'meta BTreeMap<String, String>,
     /// Signals addresses.
     signals_addrs: &'meta BTreeMap<String, String>,
 }
@@ -378,7 +425,6 @@ impl Default for PeerMetadata<'static> {
     fn default() -> Self {
         Self {
             gateway_addrs: &NO_METADATA,
-            cert_pems: &NO_METADATA,
             signals_addrs: &NO_METADATA,
         }
     }
@@ -386,18 +432,19 @@ impl Default for PeerMetadata<'static> {
 
 /// Build a [`MembershipSnapshot`] from the tracked members and gossiped metadata, ordered by site.
 ///
-/// `now` is injected so tests can use a fixed [`Instant`].
+/// `now` is injected so tests can use a fixed [`Instant`]; `live` is what foca holds.
 fn members_snapshot(
     tracked: &HashMap<String, TrackedMember>,
     now: Instant,
     metadata: &PeerMetadata<'_>,
+    live: &[&NodeId],
 ) -> MembershipSnapshot {
     let mut members: Vec<MemberRecord> = tracked
         .values()
         .map(|t| {
             let mut record = t.to_member_record(now);
+            record.duplicate_endpoints = t.duplicate_endpoints(now, live);
             record.gateway_address = metadata.gateway_addrs.get(&t.site_id).cloned();
-            record.site_cert_pem = metadata.cert_pems.get(&t.site_id).cloned();
             record.signals_address = metadata.signals_addrs.get(&t.site_id).cloned();
             record
         })
@@ -413,13 +460,17 @@ fn publish_members(
     now: Instant,
     node: &SwimNode,
 ) {
-    let snapshot = node.with_peer_metadata(|gateway_addrs, cert_pems, signals_addrs| {
+    let live: Vec<&NodeId> = if tracked.values().any(TrackedMember::has_rival_addresses) {
+        node.live_identities().collect()
+    } else {
+        Vec::new()
+    };
+    let snapshot = node.with_peer_metadata(|gateway_addrs, signals_addrs| {
         let metadata = PeerMetadata {
             gateway_addrs,
-            cert_pems,
             signals_addrs,
         };
-        members_snapshot(tracked, now, &metadata)
+        members_snapshot(tracked, now, &metadata, &live)
     });
     snapshot_tx.send_if_modified(|current| {
         let changed = *current != snapshot;
@@ -443,9 +494,11 @@ fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
     });
 }
 
-/// Return true when any tracked member needs age recomputation in snapshots.
+/// Return true when any tracked member needs age or duplicate recomputation in snapshots.
 fn has_aging_members(tracked: &HashMap<String, TrackedMember>) -> bool {
-    tracked.values().any(|t| t.status_changed_at.is_some())
+    tracked
+        .values()
+        .any(|t| t.status_changed_at.is_some() || t.has_rival_addresses())
 }
 
 /// Internal channels owned by the SWIM runtime loop.
@@ -491,6 +544,9 @@ const MAX_TRACKED_MEMBERS: usize = 1_024;
 const MAX_NON_ALIVE_MEMBERS: usize = 512;
 /// Identities held per site, enough for a rolling update and its leftovers.
 const MAX_IDENTITIES_PER_SITE: usize = 16;
+/// Restart overlap before two live addresses count as two claimants: a replaced incarnation goes down well inside the
+/// dead TTL.
+const DUPLICATE_GRACE: Duration = Duration::from_secs(DEFAULT_DEAD_MEMBER_TTL_SECS);
 
 /// Wait before retrying a failed revision renewal.
 const RENEWAL_RETRY: Duration = Duration::from_secs(5);
@@ -1003,10 +1059,10 @@ struct ReconciliationMember {
     non_alive_age_secs: Option<u64>,
     /// Peer data-plane gateway address.
     gateway_address: Option<String>,
-    /// Peer public certificate.
-    site_cert_pem: Option<String>,
     /// Peer signals address.
     signals_address: Option<String>,
+    /// Addresses of rival live claimants.
+    duplicate_endpoints: Vec<String>,
 }
 
 /// Least time between gossip-driven reconciles: the first change reconciles at once, a burst after it once.
@@ -1032,8 +1088,8 @@ fn reconciliation_view(
             },
             non_alive_age_secs: (member.status != MemberStatus::Alive).then_some(member.age_secs / 5),
             gateway_address: member.gateway_address.clone(),
-            site_cert_pem: member.site_cert_pem.clone(),
             signals_address: member.signals_address.clone(),
+            duplicate_endpoints: member.duplicate_endpoints.clone(),
         })
         .collect();
     members.sort();
@@ -1690,9 +1746,11 @@ fn prune_tracked_members(
     let mut emptied: Vec<(Instant, String)> = tracked
         .iter_mut()
         .filter_map(|(site, member)| {
-            member
-                .identities
-                .retain(|_, down| down.is_none_or(|at| now.saturating_duration_since(at) < dead_ttl));
+            member.identities.retain(|_, liveness| {
+                liveness
+                    .down_at()
+                    .is_none_or(|at| now.saturating_duration_since(at) < dead_ttl)
+            });
             member
                 .identities
                 .is_empty()
@@ -2051,7 +2109,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
         apply_member_event(joined("site-b"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &PeerMetadata::default());
+        let snap = members_snapshot(&tracked, t, &PeerMetadata::default(), &[]);
         assert_eq!(snap.connected_count(), 2, "two Alive members must give count=2");
     }
 
@@ -2137,7 +2195,7 @@ mod tests {
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(50));
-        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default());
+        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default(), &[]);
         let m = snap.members.first().expect("member");
         assert_eq!(m.age_secs, 60, "a repeated leave must not reset the age clock");
     }
@@ -2195,6 +2253,108 @@ mod tests {
         let member = tracked.get("site-a").expect("tracked");
         assert_eq!(member.identities.len(), 1, "only the dead identity expired");
         assert_eq!(member.to_member_record(t0).endpoint, lb);
+    }
+
+    /// Every identity the mirror holds up, as foca would.
+    fn foca_view(tracked: &HashMap<String, TrackedMember>) -> Vec<NodeId> {
+        tracked
+            .values()
+            .flat_map(|member| {
+                member
+                    .identities
+                    .iter()
+                    .filter(|(_, liveness)| liveness.is_up())
+                    .map(|(&(generation, addr), _)| NodeId::with_generation(member.site_id.clone(), addr, generation))
+            })
+            .collect()
+    }
+
+    fn duplicates_in(tracked: &HashMap<String, TrackedMember>, at: Instant, live: &[NodeId]) -> Vec<String> {
+        let live: Vec<&NodeId> = live.iter().collect();
+        members_snapshot(tracked, at, &PeerMetadata::default(), &live)
+            .members
+            .into_iter()
+            .flat_map(|m| m.duplicate_endpoints)
+            .collect()
+    }
+
+    fn duplicates(tracked: &HashMap<String, TrackedMember>, at: Instant) -> Vec<String> {
+        duplicates_in(tracked, at, &foca_view(tracked))
+    }
+
+    #[test]
+    fn a_stale_up_identity_foca_dropped_is_not_a_duplicate() {
+        let t0 = now();
+        let lb = "203.0.113.7:7946";
+        let mut tracked = HashMap::new();
+        apply_member_event(joined_at("site-a", POD_ADDR, 1), &mut tracked, t0);
+        apply_member_event(joined_at("site-a", lb, 2), &mut tracked, t0);
+        let later = t0 + DUPLICATE_GRACE;
+        assert!(!duplicates(&tracked, later).is_empty(), "both up in the mirror");
+        let only_lb = [NodeId::with_generation(
+            "site-a".to_owned(),
+            lb.parse().expect("addr"),
+            2,
+        )];
+        assert!(
+            duplicates_in(&tracked, later, &only_lb).is_empty(),
+            "the mirror missed the Left, foca did not"
+        );
+    }
+
+    #[test]
+    fn a_restart_overlap_within_the_grace_is_not_a_duplicate() {
+        let t0 = now();
+        let lb = "203.0.113.7:7946";
+        let mut tracked = HashMap::new();
+        apply_member_event(joined_at("site-a", POD_ADDR, 1), &mut tracked, t0);
+        let restarted = t0 + DUPLICATE_GRACE;
+        apply_member_event(joined_at("site-a", lb, 2), &mut tracked, restarted);
+        let old_down = restarted + DUPLICATE_GRACE.saturating_sub(Duration::from_secs(1));
+        assert!(
+            duplicates(&tracked, old_down).is_empty(),
+            "the new incarnation is in its grace"
+        );
+        assert!(
+            has_aging_members(&tracked),
+            "the overlap keeps the snapshot republishing"
+        );
+        apply_member_event(left_at("site-a", POD_ADDR, 1), &mut tracked, old_down);
+        assert!(duplicates(&tracked, old_down + DUPLICATE_GRACE).is_empty());
+        assert!(!has_aging_members(&tracked));
+    }
+
+    #[test]
+    fn two_live_claimants_past_the_grace_are_a_duplicate() {
+        let t0 = now();
+        let lb = "203.0.113.7:7946";
+        let mut tracked = HashMap::new();
+        apply_member_event(joined_at("site-a", POD_ADDR, 1), &mut tracked, t0);
+        apply_member_event(joined_at("site-a", lb, 2), &mut tracked, t0);
+        assert!(duplicates(&tracked, t0 + DUPLICATE_GRACE.saturating_sub(Duration::from_secs(1))).is_empty());
+        assert_eq!(duplicates(&tracked, t0 + DUPLICATE_GRACE), [POD_ADDR, lb]);
+    }
+
+    #[test]
+    fn a_duplicate_clears_when_one_claimant_leaves() {
+        let t0 = now();
+        let lb = "203.0.113.7:7946";
+        let mut tracked = HashMap::new();
+        apply_member_event(joined_at("site-a", POD_ADDR, 1), &mut tracked, t0);
+        apply_member_event(joined_at("site-a", lb, 2), &mut tracked, t0);
+        let later = t0 + DUPLICATE_GRACE;
+        assert!(!duplicates(&tracked, later).is_empty());
+        apply_member_event(left_at("site-a", lb, 2), &mut tracked, later);
+        assert!(duplicates(&tracked, later).is_empty());
+    }
+
+    #[test]
+    fn a_restart_in_place_is_never_a_duplicate() {
+        let t0 = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined_at("site-a", POD_ADDR, 1), &mut tracked, t0);
+        apply_member_event(joined_at("site-a", POD_ADDR, 2), &mut tracked, t0);
+        assert!(duplicates(&tracked, t0 + DUPLICATE_GRACE).is_empty());
     }
 
     #[test]
@@ -2274,7 +2434,7 @@ mod tests {
         let t = now();
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &PeerMetadata::default());
+        let snap = members_snapshot(&tracked, t, &PeerMetadata::default(), &[]);
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.age_secs, 0, "Alive member must have age_secs=0");
     }
@@ -2287,7 +2447,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap, &PeerMetadata::default());
+        let snap = members_snapshot(&tracked, t_snap, &PeerMetadata::default(), &[]);
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "dead age must be 80s - 20s = 60s");
@@ -2301,7 +2461,7 @@ mod tests {
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
         // Rejoin clears status_changed_at → age=0.
         apply_member_event(joined("site-a"), &mut tracked, t0 + Duration::from_secs(50));
-        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default());
+        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default(), &[]);
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Alive);
         assert_eq!(m.age_secs, 0, "rejoined Alive member must have age=0");
@@ -2314,7 +2474,7 @@ mod tests {
         let t_snap = t0 + Duration::from_secs(75);
         let mut tracked = HashMap::new();
         apply_member_event(left("unknown-site"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap, &PeerMetadata::default());
+        let snap = members_snapshot(&tracked, t_snap, &PeerMetadata::default(), &[]);
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "unknown Left tombstone age must be 75s - 15s = 60s");
@@ -2358,8 +2518,8 @@ mod tests {
             status,
             age_secs,
             gateway_address: Some("10.0.0.1:8443".to_owned()),
-            site_cert_pem: Some("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_owned()),
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }
     }
 
@@ -2497,6 +2657,29 @@ mod tests {
                 .await
                 .is_ok_and(|event| event.is_some()),
             "runtime termination must trigger reconciliation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_surfacing_duplicate_triggers_reconciliation() {
+        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let mut events = Box::pin(handle.reconciliation_events());
+        let mut member = reconciliation_member(MemberStatus::Alive, 0);
+        drop(snapshot_tx.send(MembershipSnapshot {
+            members: vec![member.clone()],
+        }));
+        assert!(
+            tokio::time::timeout(RECONCILE_SPACING + Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some())
+        );
+        member.duplicate_endpoints = vec![POD_ADDR.to_owned(), "203.0.113.7:7946".to_owned()];
+        drop(snapshot_tx.send(MembershipSnapshot { members: vec![member] }));
+        assert!(
+            tokio::time::timeout(RECONCILE_SPACING + Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "a duplicate surfacing must trigger reconciliation"
         );
     }
 
@@ -2784,8 +2967,8 @@ mod tests {
                 status: MemberStatus::Alive,
                 age_secs: 0,
                 gateway_address: None,
-                site_cert_pem: None,
                 signals_address: None,
+                duplicate_endpoints: Vec::new(),
             }],
         };
         drop(snapshot_tx.send(snap_with_member));

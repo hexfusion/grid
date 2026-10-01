@@ -199,20 +199,6 @@ pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn
     certificate_sha256(&Path::new(CERTS_DIR).join(format!("{site}-cert.pem")))
 }
 
-/// Compute the canonical fingerprint from a PEM certificate string.
-///
-/// Used to compare a SWIM-advertised `advertisedCertPem` against a staged identity.
-pub(crate) fn pem_to_canonical_fingerprint(pem: &str) -> String {
-    let tmp = match tempfile::NamedTempFile::new() {
-        Ok(f) => f,
-        Err(_err) => return String::new(),
-    };
-    if std::fs::write(tmp.path(), pem.trim()).is_err() {
-        return String::new();
-    }
-    certificate_sha256(tmp.path()).unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------

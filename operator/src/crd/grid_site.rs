@@ -26,6 +26,7 @@ use super::grid_network::TlsMode;
     kind = "GridSite",
     plural = "gridsites",
     shortname = "gs",
+    category = "grid",
     status = "GridSiteStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
@@ -157,16 +158,6 @@ pub struct GridSiteStatus {
     /// produces no status changes.
     pub last_probe_time: Option<String>,
 
-    /// Timestamp of the last phase transition.
-    pub last_transition_time: Option<String>,
-
-    /// Human-readable diagnostic for the current phase.
-    ///
-    /// Never contains credential token bytes.  Populated on every reconcile;
-    /// empty when the operator has no additional context.
-    #[serde(default)]
-    pub message: String,
-
     /// Last observed generation.
     #[serde(default)]
     pub observed_generation: i64,
@@ -178,26 +169,19 @@ pub struct GridSiteStatus {
     /// What SWIM gossip reports about this site; observed, never authored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovered: Option<DiscoveredStatus>,
-
-    /// Machine-readable reason for the current phase.
-    ///
-    /// Examples: `"AwaitingDiscovery"`, `"GatewayAddressKnown"`,
-    /// `"TlsVerified"`, and `"IdentityVerificationRequired"`.
-    #[serde(default)]
-    pub reason: String,
 }
 
 /// Site state learned from SWIM gossip.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredStatus {
-    /// Certificate PEM the remote operator advertised; never a trust anchor on its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub advertised_cert_pem: Option<String>,
-
     /// Gateway address the remote operator advertised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_address: Option<String>,
+
+    /// When gossip lost this member (absent or `Dead`), RFC 3339; cleared when it returns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent_since: Option<String>,
 }
 
 /// Capabilities a site advertises over the grid.

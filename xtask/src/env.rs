@@ -691,7 +691,7 @@ pub(crate) enum Action {
     /// Spawns two SWIM-enabled operators. The test proves:
     ///
     /// 1. B reaches `Connecting` with a TCP listener reachable.
-    /// 2. `status.reason` is `IdentityVerificationRequired`.
+    /// 2. the `Connected` condition reason is `PlaintextIneligible`.
     /// 3. B never reaches `Active` through a plaintext probe.
     /// 4. B's CRDT provider remains absent from A's routing overlay.
     ///
@@ -704,23 +704,6 @@ pub(crate) enum Action {
         /// Kind cluster context to run against (first provider site by default).
         #[arg(long)]
         site: Option<String>,
-    },
-
-    /// Print the SHA-256 fingerprint of a `GridSite.status.discovered.advertisedCertPem`.
-    ///
-    /// Reads the public certificate PEM from the named `GridSite` status and
-    /// prints the canonical DER SHA-256 fingerprint for
-    /// `spec.trust.canonicalFingerprints`.
-    ///
-    /// Never prints private key material.
-    GridsiteFingerprint {
-        /// Kubernetes context to use.
-        #[arg(long)]
-        context: String,
-
-        /// Name of the `GridSite` resource.
-        #[arg(long)]
-        name: String,
     },
 
     /// Verify the dedicated llm-d-compatible provider-gateway path.
@@ -891,7 +874,7 @@ pub(crate) enum Action {
     /// `GridSite` + healthy `AgentToolProvider`, and asserts the phase transitions to
     /// `Available` with the mock's tool names in `status.discoveredTools`. A second
     /// `AgentToolProvider` pointed at a nonexistent Service confirms the failure path:
-    /// `Unavailable` with a populated `status.reason`.
+    /// `Unavailable` with a populated `Available` condition reason.
     ///
     /// Requires a kind cluster with Grid CRDs and the `grid-mock-providers` image
     /// loaded (or pullable). Safe to rerun.
@@ -1279,7 +1262,6 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyGridsiteTrustFingerprint { config, site } => {
             env_verify_gridsite_trust_fingerprint(config, site.as_deref())
         },
-        Action::GridsiteFingerprint { context, name } => env_gridsite_fingerprint(context.as_str(), name.as_str()),
         Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
         Action::VerifyLlmdCompatibleRouting { config } => env_verify_llmd_compat_routing(config),
         Action::VerifyResponsesRouting { config } => env_verify_responses_routing(config),
@@ -5796,6 +5778,7 @@ fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
         ("watch", "gridnetworks.grid.praxis-proxy.io", None),
         ("patch", "gridsites.grid.praxis-proxy.io", None),
         ("patch", "gridsites.grid.praxis-proxy.io/status", None),
+        ("delete", "gridsites.grid.praxis-proxy.io", None),
         ("list", "inferenceproviders.grid.praxis-proxy.io", None),
         ("patch", "inferenceproviders.grid.praxis-proxy.io/status", None),
         ("get", "secrets", Some("default")),
@@ -5945,6 +5928,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
         "metadata": { "name": provider_name },
         "spec": {
             "gridNetworkRef": network_name,
+            "hostSelector": {},
             "models": [{ "name": "model-rbac-test" }],
             "backendKind": "local",
             "providerKind": "openAi",
@@ -6321,21 +6305,6 @@ mod validate_all_tests {
 // Fingerprint trust promotion E2E
 // ---------------------------------------------------------------------------
 
-/// Print the canonical DER-based SHA-256 fingerprint of a `GridSite.status.discovered.advertisedCertPem`.
-fn env_gridsite_fingerprint(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let pem = operator::read_gridsite_advertised_cert_pem(context, site_name)
-        .ok_or_else(|| format!("GridSite {site_name:?} has no advertisedCertPem in status"))?;
-    let fp = certs::pem_to_canonical_fingerprint(&pem);
-    if fp.is_empty() {
-        return Err(
-            format!("GridSite {site_name:?}: failed to compute canonical fingerprint from advertisedCertPem").into(),
-        );
-    }
-    eprintln!("GridSite: {site_name:?}  context: {context}");
-    println!("{fp}");
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Certificate rotation verifier
 // ---------------------------------------------------------------------------
@@ -6601,8 +6570,6 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             ROTATION_POLL_TIMEOUT,
         )?;
         eprintln!("  [PASS] step 6b: TlsVerified — cert-B matches fp-B in dual-pin");
-        // No step for AdvertisedCertificateMismatch: it needs the remote TLS broadcast
-        // secret patched apart from the probe cert, and no longer changes phase.
 
         // ── Step 7: Patch [fp-B] only → still Active/TlsVerified ────────────
         eprintln!("verify-gridsite-rotation: [7] single pin [fp-B]");
@@ -7106,7 +7073,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
 /// 4. Spawn the operator locally and wait for `Pending` -> `Available` with `discoveredTools` matching the mock's
 ///    configured tool list.
 /// 5. Apply a second `AgentToolProvider` pointed at a nonexistent Service and confirm it lands on `Unavailable` with a
-///    populated `status.reason`.
+///    populated `Available` condition reason.
 #[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
 fn env_verify_agenttoolprovider_convergence(
     config: &Path,
@@ -7183,7 +7150,7 @@ fn env_verify_agenttoolprovider_convergence(
         )?;
         let reason = operator::read_agent_tool_provider_reason(&context, AGENT_TOOL_TEST_PROVIDER_UNREACHABLE)?;
         if reason.is_empty() {
-            return Err("expected a populated status.reason for the unreachable-endpoint AgentToolProvider".into());
+            return Err("expected a populated Available reason for the unreachable-endpoint AgentToolProvider".into());
         }
         eprintln!("  [OK] unreachable endpoint reason = {reason:?}");
         Ok(())
@@ -7221,7 +7188,7 @@ fn env_verify_agenttoolprovider_convergence(
 /// 3. Apply `GridNetwork` fixtures so B broadcasts its CRDT state.
 /// 4. Wait for B's CRDT to appear via SWIM.
 /// 5. Bind TCP listener and apply plaintext egress to B's `GridSite`.
-/// 6. Wait for `IdentityVerificationRequired` while B remains `Connecting`.
+/// 6. Wait for `PlaintextIneligible` while B remains `Connecting`.
 /// 7. Assert B's CRDT provider remains absent from the overlay.
 #[expect(
     clippy::too_many_lines,
@@ -7278,11 +7245,11 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
         operator::apply_gridsite_egress(&context, &b_site_k8s_name, SWIM_TRUST_NETWORK, &egress_addr, None)?;
 
         // ── Step 6: Prove TCP reachability does not establish identity ───────
-        eprintln!("verify-gridsite-trust-fingerprint: [6] waiting for IdentityVerificationRequired...");
+        eprintln!("verify-gridsite-trust-fingerprint: [6] waiting for PlaintextIneligible...");
         operator::wait_for_gridsite_reason(
             &context,
             &b_site_k8s_name,
-            "IdentityVerificationRequired",
+            "PlaintextIneligible",
             SWIM_STATUS_POLL_TIMEOUT,
         )?;
         operator::wait_for_gridsite_phase(&context, &b_site_k8s_name, "Connecting", SWIM_STATUS_POLL_TIMEOUT)?;

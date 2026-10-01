@@ -119,3 +119,12 @@ tests:
           path: spec.tls
       - notExists:
           path: spec.siteDiscovery
+
+  - it: a declared peer never carries the local provider-site label
+    template: templates/peers.yaml
+    set:
+      gridSite.name: site-a
+      peers.hub: {}
+    asserts:
+      - notExists:
+          path: metadata.labels["grid.praxis-proxy.io/provider-site"]

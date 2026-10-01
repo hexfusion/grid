@@ -372,7 +372,7 @@ impl SignalStore {
     /// Replace the access rules for every target.
     ///
     /// A target absent from `access` is unrestricted, which is what an empty
-    /// `siteSelector` means on the provider.
+    /// `hostSelector` means on the provider.
     pub fn set_access(&self, access: AccessMap) {
         if let Ok(mut guard) = self.access.write() {
             *guard = access;
@@ -1364,8 +1364,8 @@ mod tests {
             status: crate::swim::MemberStatus::Alive,
             age_secs: 0,
             gateway_address: None,
-            site_cert_pem: None,
             signals_address: signals.map(str::to_owned),
+            duplicate_endpoints: Vec::new(),
         };
         let members = [
             member("hub", "10.0.0.1:7946", None),

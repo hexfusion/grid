@@ -44,7 +44,7 @@
 //!
 //! The controller lists all [`GridSite`]s whose `spec.gridNetworkRef` equals
 //! the provider's `spec.gridNetworkRef`, then applies the provider's
-//! `spec.siteSelector.matchLabels`.  An empty selector matches all sites in
+//! `spec.hostSelector.matchLabels`.  An empty selector matches all sites in
 //! the network.  Network filtering (by `spec.gridNetworkRef`) is the
 //! controller's responsibility — `sites_matching_selector` itself does not
 //! filter by network.
@@ -125,7 +125,8 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) ->
 
     info!(name, "reconciling InferenceProvider");
 
-    if let Some(rejection) = validate_provider_config(&provider) {
+    let rejection = validate_provider_config(&provider);
+    if let Some(rejection) = rejection.as_ref() {
         let previous = provider.status.as_ref().map_or(&[][..], |s| s.conditions.as_slice());
         let object_ref = provider.object_ref(&());
         if !rejection.reported_on(previous, condition::ACCEPTED) {
@@ -133,12 +134,13 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) ->
                 &client,
                 "inference-provider-controller",
                 &object_ref,
-                &rejection,
+                rejection,
             ))
             .await;
         }
     }
-    let (phase, matching_sites, reason) = Box::pin(resolve_phase_and_sites(&provider, &client)).await?;
+    let (phase, matching_sites, reason) =
+        Box::pin(resolve_phase_and_sites(&provider, &client, rejection.as_ref())).await?;
     let generation = provider.metadata.generation.unwrap_or(0);
     update_status(&provider, &client, phase, matching_sites, generation, reason).await?;
 
@@ -277,6 +279,12 @@ pub fn phase_from_probe(outcome: ProbeOutcome, site_phase: ProviderPhase) -> Pro
         ProbeOutcome::Unavailable => ProviderPhase::Unavailable,
     }
 }
+
+/// `Available` reason while the referenced `GridNetwork` does not exist yet.
+pub(crate) const GRID_NETWORK_NOT_FOUND: &str = "GridNetworkNotFound";
+
+/// `Available` reason for a provider without a `hostSelector`, which places it on no site.
+pub(crate) const HOST_SELECTOR_MISSING: &str = "HostSelectorMissing";
 
 /// Compute the provider phase from site matching results.
 ///
@@ -510,11 +518,12 @@ pub(crate) async fn probe_endpoint(
 async fn resolve_phase_and_sites(
     provider: &InferenceProvider,
     client: &Client,
+    rejection: Option<&Rejection>,
 ) -> Result<(ProviderPhase, Vec<String>, Option<String>), OperatorError> {
     let name = provider.metadata.name.as_deref().unwrap_or("?");
 
-    // Static validation: config errors map immediately to Unavailable.
-    if let Some(rejection) = validate_provider_config(provider) {
+    // Static validation, computed once by the caller: config errors map immediately to Unavailable.
+    if let Some(rejection) = rejection {
         tracing::warn!(name, reason = rejection.reason, "InferenceProvider config invalid");
         return Ok((
             ProviderPhase::Unavailable,
@@ -536,7 +545,7 @@ async fn resolve_phase_and_sites(
 
     // Credential accessibility: verify Secret exists, key present, value is UTF-8.
     // Kubernetes API errors propagate as Err (requeue); credential failures return
-    // Ok(Some(reason)) and mark the provider Unavailable with status.reason.
+    // Ok(Some(reason)) and mark the provider Unavailable with the Available condition reason.
     if let Some(cr) = credentials::verify_credential_accessible(client, &plan).await? {
         tracing::warn!(
             name,
@@ -551,7 +560,20 @@ async fn resolve_phase_and_sites(
     let network_api: Api<GridNetwork> = Api::all(client.clone());
     if network_api.get_opt(network_ref).await?.is_none() {
         tracing::warn!(name, network = %network_ref, "referenced GridNetwork not found");
-        return Ok((ProviderPhase::Unavailable, Vec::new(), None));
+        // Often just apply order; Pending keeps it a wait while the reason still names a typo.
+        return Ok((
+            ProviderPhase::Pending,
+            Vec::new(),
+            Some(GRID_NETWORK_NOT_FOUND.to_owned()),
+        ));
+    }
+
+    if provider.spec.host_selector.is_none() {
+        return Ok((
+            ProviderPhase::Pending,
+            Vec::new(),
+            Some(HOST_SELECTOR_MISSING.to_owned()),
+        ));
     }
 
     // Resolve matching sites.
@@ -635,25 +657,20 @@ async fn list_sites_for_network(client: &Client, network_ref: &str) -> Result<Ve
         .collect())
 }
 
-/// Apply `siteSelector.matchLabels` against the supplied sites.
+/// Apply `hostSelector.matchLabels` against the supplied sites.
 ///
-/// An empty `matchLabels` matches all sites.  All configured key-value pairs
-/// must match (AND semantics); extra labels on the site are ignored.
+/// An omitted `hostSelector` matches no site and an empty `matchLabels` matches all sites.  All configured key-value
+/// pairs must match (AND semantics); extra labels on the site are ignored.
 /// Returns a deterministically sorted list of matching site names.
 ///
 /// Network filtering is the caller's responsibility — pass only sites that
 /// already belong to the relevant network.
 pub(crate) fn sites_matching_selector(provider: &InferenceProvider, sites: &[GridSite]) -> Vec<String> {
-    let selector = &provider.spec.site_selector.match_labels;
+    let selector = provider.spec.host_selector.as_ref();
 
     let mut names: Vec<String> = sites
         .iter()
-        .filter(|site| {
-            let site_labels = site.metadata.labels.as_ref();
-            selector
-                .iter()
-                .all(|(k, v)| site_labels.is_some_and(|labels| labels.get(k).is_some_and(|sv| sv == v)))
-        })
+        .filter(|site| crate::crd::auth::hosts_on(selector, site.metadata.labels.as_ref()))
         .filter_map(|site| site.metadata.name.clone())
         .collect();
 
@@ -691,7 +708,7 @@ async fn update_status(
         .unwrap_or_else(|| std::process::abort());
 
     let api: Api<InferenceProvider> = Api::all(client.clone());
-    let status = desired_status(provider, phase, matching_sites, observed_generation, reason);
+    let status = desired_status(provider, phase, matching_sites, observed_generation, reason.as_deref());
 
     if provider
         .status
@@ -720,10 +737,10 @@ fn desired_status(
     phase: ProviderPhase,
     matching_sites: Vec<String>,
     observed_generation: i64,
-    reason: Option<String>,
+    reason: Option<&str>,
 ) -> InferenceProviderStatus {
     let metrics_config = provider.spec.metrics_config.as_ref();
-    let mut observed = condition::provider_conditions(&phase, reason.as_deref());
+    let mut observed = condition::provider_conditions(&phase, reason);
     observed.extend(metrics_config.map(|mc| condition::metrics_signals_condition(mc.signal_names_issue())));
     let conditions = condition::refresh(
         provider.status.as_ref().map(|s| s.conditions.as_slice()),
@@ -740,7 +757,6 @@ fn desired_status(
         }),
         observed_generation,
         phase,
-        reason,
     }
 }
 
@@ -764,7 +780,6 @@ mod tests {
             model_discovery_url: None,
             observed_generation: 2,
             phase: ProviderPhase::Available,
-            reason: None,
             conditions: Vec::new(),
         };
         assert!(baseline.matches_reconciler_status(&baseline));
@@ -881,7 +896,7 @@ mod tests {
             ProviderPhase::Unavailable,
             vec!["site-a".to_owned()],
             7,
-            Some("UnsupportedAuthStrategy".to_owned()),
+            Some("UnsupportedAuthStrategy"),
         );
         assert_eq!(status.observed_generation, 7);
         assert_eq!(status.phase, ProviderPhase::Unavailable);
@@ -899,6 +914,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -923,7 +939,7 @@ mod tests {
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{"name": "model"}],
-                "siteSelector": { "matchLabels": match_labels }
+                "hostSelector": { "matchLabels": match_labels }
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -937,7 +953,7 @@ mod tests {
     // resolve_tls_config/read_secret_bytes directly. These tests instead
     // drive the same scenario through resolve_phase_and_sites — the actual
     // function reconcile() calls — proving the SecretMissing/KeyMissing
-    // distinction survives all the way to the (phase, status.reason) pair
+    // distinction survives all the way to the (phase, Available reason) pair
     // reconcile() writes to the CR, not just to an intermediate type.
     // -----------------------------------------------------------------------
 
@@ -1036,6 +1052,7 @@ mod tests {
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -1058,9 +1075,10 @@ mod tests {
         );
         let provider = provider_with_health_check_tls("net-1", "ca-secret");
 
-        let (phase, matching, reason) = resolve_phase_and_sites(&provider, &client)
-            .await
-            .expect("mocked API calls must not fail");
+        let (phase, matching, reason) =
+            resolve_phase_and_sites(&provider, &client, validate_provider_config(&provider).as_ref())
+                .await
+                .expect("mocked API calls must not fail");
 
         assert_eq!(phase, ProviderPhase::Degraded);
         assert!(matching.is_empty(), "no GridSites exist in this fixture");
@@ -1068,7 +1086,7 @@ mod tests {
             reason.as_deref(),
             Some("HealthCheckTlsKeyMissing"),
             "grid#58: end-to-end through resolve_phase_and_sites (the function reconcile() calls), a key \
-             absent from an existing Secret's data must produce status.reason = HealthCheckTlsKeyMissing, \
+             absent from an existing Secret's data must produce Available reason HealthCheckTlsKeyMissing, \
              not HealthCheckTlsSecretMissing"
         );
     }
@@ -1078,9 +1096,10 @@ mod tests {
         let client = mock_kube_client_for_health_tls("net-1", HashMap::new());
         let provider = provider_with_health_check_tls("net-1", "absent-secret");
 
-        let (phase, _matching, reason) = resolve_phase_and_sites(&provider, &client)
-            .await
-            .expect("mocked API calls must not fail");
+        let (phase, _matching, reason) =
+            resolve_phase_and_sites(&provider, &client, validate_provider_config(&provider).as_ref())
+                .await
+                .expect("mocked API calls must not fail");
 
         assert_eq!(phase, ProviderPhase::Degraded);
         assert_eq!(reason.as_deref(), Some("HealthCheckTlsSecretMissing"));
@@ -1099,6 +1118,7 @@ mod tests {
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "",
@@ -1125,6 +1145,7 @@ mod tests {
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "   ",
@@ -1147,6 +1168,7 @@ mod tests {
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -1171,6 +1193,7 @@ mod tests {
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -1194,10 +1217,18 @@ mod tests {
         );
     }
 
-    // Item 5: missing GridNetwork → Unavailable
-    // Requires a Kubernetes API call (network_api.get_opt) and cannot be
-    // unit-tested without a live cluster or a mock Kubernetes server.
-    // Covered at the integration level; documented here for completeness.
+    #[tokio::test]
+    async fn a_missing_grid_network_is_a_wait_not_a_failure() {
+        let client = mock_kube_client_for_health_tls("net-1", HashMap::new());
+        let provider = provider_with_health_check_tls("absent-net", "unused");
+        let (phase, matching, reason) =
+            resolve_phase_and_sites(&provider, &client, validate_provider_config(&provider).as_ref())
+                .await
+                .expect("mocked API calls must not fail");
+        assert_eq!(phase, ProviderPhase::Pending, "Available stays Unknown, not False");
+        assert!(matching.is_empty());
+        assert_eq!(reason.as_deref(), Some(GRID_NETWORK_NOT_FOUND));
+    }
 
     // -----------------------------------------------------------------------
     // phase_from_matching — pure phase logic (items 6-7, 12)
@@ -1460,6 +1491,7 @@ mod tests {
             "metadata": { "name": "bad" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "",
@@ -1492,6 +1524,14 @@ mod tests {
             vec!["site-a", "site-b"],
             "empty selector must match all pre-filtered sites"
         );
+    }
+
+    #[test]
+    fn omitted_selector_matches_no_site() {
+        let mut provider = test_provider("prov", "net", &["model"]);
+        provider.spec.host_selector = None;
+        let sites = vec![test_site("site-a", "net"), test_site("site-b", "net")];
+        assert!(sites_matching_selector(&provider, &sites).is_empty());
     }
 
     #[test]
@@ -1608,6 +1648,7 @@ mod tests {
             "metadata": {"name": "p"},
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "backendKind": "local",
                 "endpoint": "http://vllm:8000",
                 "providerKind": "openAi",
@@ -1857,6 +1898,7 @@ mod tests {
     fn requeue_uses_tls_interval_when_metrics_tls_configured() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
@@ -1879,6 +1921,7 @@ mod tests {
     fn requeue_interval_below_tls_bound_passes_through() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
@@ -1902,6 +1945,7 @@ mod tests {
     fn requeue_interval_above_tls_bound_is_capped() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
@@ -1992,6 +2036,7 @@ mod tests {
     fn probe_url_uses_health_check_endpoint_override() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -2013,6 +2058,7 @@ mod tests {
     fn probe_url_falls_back_to_spec_endpoint_when_override_absent() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -2036,6 +2082,7 @@ mod tests {
         // surfacing the error instead of silently skipping the probe.
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -2056,6 +2103,7 @@ mod tests {
     fn probe_url_endpoint_override_strips_trailing_slash() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -2081,6 +2129,7 @@ mod tests {
     fn requeue_uses_tls_interval_for_health_check_tls() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
@@ -2104,6 +2153,7 @@ mod tests {
     fn requeue_interval_below_hc_tls_bound_passes_through() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
@@ -2132,6 +2182,7 @@ mod tests {
     fn health_check_config_with_endpoint_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -2160,6 +2211,7 @@ mod tests {
     fn health_check_config_with_tls_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://backend:8443",
@@ -2193,6 +2245,7 @@ mod tests {
     fn health_check_config_with_tls_and_client_cert_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://backend:8443",
@@ -2653,6 +2706,7 @@ mod tests {
             "metadata": { "name": "bad" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "",
@@ -2688,6 +2742,7 @@ mod tests {
     fn make_spec(endpoint: &str, health_path: Option<&str>, timeout: Option<&str>) -> InferenceProviderSpec {
         serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
@@ -2711,6 +2766,7 @@ mod tests {
     ) -> InferenceProviderSpec {
         serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
@@ -2751,7 +2807,7 @@ mod tests {
             routing_cluster_ref: None,
             metrics_config: None,
             traffic_policy: None,
-            site_selector: crate::crd::auth::SelectorConfig::default(),
+            host_selector: Some(crate::crd::auth::SelectorConfig::default()),
         }
     }
 }

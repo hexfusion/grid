@@ -10,7 +10,7 @@
 use tokio::time::Duration;
 
 pub(crate) use crate::resources::tls_backend::{
-    build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs, parse_private_key,
+    build_tls_config, parse_ca_roots, parse_client_certs, parse_private_key,
 };
 use crate::resources::{
     gateway_probe::{CanonicalFingerprint, GatewayProbeOutcome, fingerprint_matches_any},
@@ -24,8 +24,8 @@ use crate::resources::{
 /// Maximum wall-clock time for TCP connect + TLS handshake combined.
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Maximum TCP connect timeout (subset of [`PROBE_DEADLINE`]).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum TCP connect timeout (subset of [`PROBE_DEADLINE`]); short so blackholed peers cannot tie up workers.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Probe configuration
@@ -49,10 +49,6 @@ pub(crate) struct ProbeConfig {
 
     /// What the verified leaf must also satisfy.
     pub identity: PeerIdentity,
-
-    /// Optional SWIM-advertised leaf cert DER, compared with the configured
-    /// rotation pins for diagnostics only.
-    pub advertised_leaf_der: Option<Vec<u8>>,
 }
 
 /// The leaf check after the chain verifies, set by the network `peerTrust.mode`.
@@ -92,8 +88,6 @@ impl PeerIdentity {
 /// 2. TLS handshake under [`PROBE_DEADLINE`] (total, including connect).
 /// 3. Extract peer leaf certificate DER.
 /// 4. Validate the leaf against the pins or the SPIFFE ID.
-/// 5. If present, compare the SWIM-advertised leaf with the same identity and record a mismatch without failing the
-///    verified connection.
 ///
 /// Returns a `GatewayProbeOutcome` — never panics, never leaks
 /// private material.
@@ -150,14 +144,6 @@ fn verify_peer_certificate(tls_stream: &tls_backend::ClientTlsStream, config: &P
         return config.identity.mismatch();
     }
 
-    if config
-        .advertised_leaf_der
-        .as_ref()
-        .is_some_and(|advertised| !config.identity.accepts(advertised))
-    {
-        return GatewayProbeOutcome::AdvertisedCertificateMismatch;
-    }
-
     GatewayProbeOutcome::Verified
 }
 
@@ -185,7 +171,7 @@ mod tests {
     #[cfg(not(feature = "fips"))]
     use crate::resources::tls_backend::classify_rustls_error;
     use crate::resources::tls_backend::{
-        MAX_CA_CERTIFICATES, MAX_CERT_BUNDLE_BYTES, MAX_PRIVATE_KEY_BYTES, classify_tls_error,
+        MAX_CA_CERTIFICATES, MAX_CERT_BUNDLE_BYTES, MAX_PRIVATE_KEY_BYTES, classify_tls_error, first_cert_der_from_pem,
     };
 
     fn test_ca() -> certs::CaCert {
@@ -339,7 +325,7 @@ mod tests {
         let oversized = "x".repeat(MAX_CERT_BUNDLE_BYTES + 1);
         assert_eq!(
             first_cert_der_from_pem(&oversized).unwrap_err(),
-            "advertised certificate PEM exceeds maximum size"
+            "certificate PEM exceeds maximum size"
         );
     }
 
@@ -458,7 +444,6 @@ mod tests {
             tls_config,
             server_name: tls_backend::parse_server_name("test-site.grid.internal").unwrap(),
             identity: PeerIdentity::Pins(vec![fp]),
-            advertised_leaf_der: None,
         };
 
         assert!(!config.address.contains("PRIVATE KEY"), "address must not leak keys");
@@ -491,7 +476,6 @@ mod tests {
             tls_config: client_tls_config(ca, client),
             server_name: ServerName::try_from(server_name.to_owned()).unwrap(),
             identity: PeerIdentity::Pins(pins),
-            advertised_leaf_der: None,
         }
     }
 
@@ -653,45 +637,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pinned_advertised_cert_never_vouches_for_a_different_live_leaf() {
-        let ca = test_ca();
-        let pinned = test_site(&ca, "test-site");
-        let impostor = test_site(&ca, "test-site");
-        let addr = start_tls_server(&impostor, &ca);
-        let pinned_der = first_cert_der_from_pem(&pinned.cert_pem).unwrap();
-        let config = ProbeConfig {
-            advertised_leaf_der: Some(pinned_der.clone()),
-            ..make_probe_config(
-                addr,
-                &ca,
-                &test_site(&ca, "client-site"),
-                "test-site.grid.internal",
-                vec![CanonicalFingerprint::from_der(&pinned_der)],
-            )
-        };
-        assert_eq!(probe_gateway(&config).await, GatewayProbeOutcome::PinMismatch);
-    }
-
-    #[tokio::test]
-    async fn a_pinned_live_leaf_verifies_with_its_own_advertised_cert() {
-        let ca = test_ca();
-        let server = test_site(&ca, "test-site");
-        let addr = start_tls_server(&server, &ca);
-        let der = first_cert_der_from_pem(&server.cert_pem).unwrap();
-        let config = ProbeConfig {
-            advertised_leaf_der: Some(der.clone()),
-            ..make_probe_config(
-                addr,
-                &ca,
-                &test_site(&ca, "client-site"),
-                "test-site.grid.internal",
-                vec![CanonicalFingerprint::from_der(&der)],
-            )
-        };
-        assert_eq!(probe_gateway(&config).await, GatewayProbeOutcome::Verified);
-    }
-
-    #[tokio::test]
     async fn connection_refused_yields_connection_failed() {
         let ca = test_ca();
         let client = test_site(&ca, "client-site");
@@ -704,7 +649,6 @@ mod tests {
             tls_config: client_tls_config(&ca, &client),
             server_name: tls_backend::parse_server_name("test-site.grid.internal").unwrap(),
             identity: PeerIdentity::Pins(vec![pin]),
-            advertised_leaf_der: None,
         };
         let outcome = probe_gateway(&config).await;
         assert_eq!(outcome, GatewayProbeOutcome::ConnectionFailed, "refused port must fail");
@@ -790,78 +734,6 @@ mod tests {
             outcome,
             GatewayProbeOutcome::Verified,
             "current pin in two-pin set must match"
-        );
-    }
-
-    #[tokio::test]
-    async fn advertised_cert_mismatch_detected() {
-        let ca = test_ca();
-        let server = test_site(&ca, "test-site");
-        let client = test_site(&ca, "client-site");
-        let addr = start_tls_server(&server, &ca);
-
-        let server_der = first_cert_der_from_pem(&server.cert_pem).unwrap();
-        let pin = CanonicalFingerprint::from_der(&server_der);
-
-        let different_cert = test_site(&ca, "other-site");
-        let different_der = first_cert_der_from_pem(&different_cert.cert_pem).unwrap();
-
-        let config = ProbeConfig {
-            advertised_leaf_der: Some(different_der),
-            ..make_probe_config(addr, &ca, &client, "test-site.grid.internal", vec![pin])
-        };
-        let outcome = probe_gateway(&config).await;
-        assert_eq!(
-            outcome,
-            GatewayProbeOutcome::AdvertisedCertificateMismatch,
-            "advertised cert outside the configured pin set must be detected"
-        );
-    }
-
-    #[tokio::test]
-    async fn advertised_cert_match_succeeds() {
-        let ca = test_ca();
-        let server = test_site(&ca, "test-site");
-        let client = test_site(&ca, "client-site");
-        let addr = start_tls_server(&server, &ca);
-
-        let server_der = first_cert_der_from_pem(&server.cert_pem).unwrap();
-        let pin = CanonicalFingerprint::from_der(&server_der);
-
-        let config = ProbeConfig {
-            advertised_leaf_der: Some(server_der),
-            ..make_probe_config(addr, &ca, &client, "test-site.grid.internal", vec![pin])
-        };
-        let outcome = probe_gateway(&config).await;
-        assert_eq!(
-            outcome,
-            GatewayProbeOutcome::Verified,
-            "matching advertised cert must succeed"
-        );
-    }
-
-    #[tokio::test]
-    async fn advertised_rotation_overlap_succeeds_when_both_pins_are_authorized() {
-        let ca = test_ca();
-        let live_server = test_site(&ca, "test-site");
-        let next_server = test_site(&ca, "test-site");
-        let client = test_site(&ca, "client-site");
-        let addr = start_tls_server(&live_server, &ca);
-
-        let live_der = first_cert_der_from_pem(&live_server.cert_pem).unwrap();
-        let next_der = first_cert_der_from_pem(&next_server.cert_pem).unwrap();
-        let live_pin = CanonicalFingerprint::from_der(&live_der);
-        let next_pin = CanonicalFingerprint::from_der(&next_der);
-
-        let config = ProbeConfig {
-            advertised_leaf_der: Some(next_der),
-            ..make_probe_config(addr, &ca, &client, "test-site.grid.internal", vec![live_pin, next_pin])
-        };
-        let outcome = probe_gateway(&config).await;
-        assert_eq!(
-            outcome,
-            GatewayProbeOutcome::Verified,
-            "old and new certificates may overlap when both canonical pins are authorized"
         );
     }
 

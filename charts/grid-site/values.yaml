@@ -33,9 +33,15 @@ gridNetwork:
   # peerTrust:
   #   mode: spiffe
   # manual (default) fills declared GridSites from SWIM; auto also creates one
-  # per undeclared member, named by its bare site name.
+  # per undeclared member, named by its bare site name. defaultEgressTls is the
+  # egress TLS mode of a GridSite with no spec.egress: mutualTls (default) or
+  # plaintext, which never becomes routing-eligible.
   # siteDiscovery:
   #   mode: auto
+  #   defaultEgressTls: mutualTls
+  # -- Seconds a dead peer's candidates, and an unedited auto-created GridSite,
+  # are kept before the operator drops them. Unset keeps them; 3600 is a sane start.
+  # staleCandidateTtlSeconds: 3600
 
 gridSite:
   name: ""
@@ -56,8 +62,9 @@ peers: {}
 #     digest: <64 lowercase hex>
 
 # -- InferenceProviders keyed by name. model defaults to the name, providerKind to openAi,
-# and backendKind to local. The older list of full InferenceProvider specs still
-# renders.
+# backendKind to local, and hostSelector to this site's provider-site label, so the
+# provider is hosted here and not on peers. The older list of full InferenceProvider
+# specs still renders; there an omitted hostSelector places the provider on no site.
 # inferenceProviders:
 #   my-model:
 #     endpoint: http://10.96.0.20:8000

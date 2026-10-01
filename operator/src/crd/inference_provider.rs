@@ -26,6 +26,7 @@ use super::{
     kind = "InferenceProvider",
     plural = "inferenceproviders",
     shortname = "infpvd",
+    category = "grid",
     status = "InferenceProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Provider","type":"string","jsonPath":".spec.providerKind"}"#,
@@ -74,6 +75,7 @@ pub struct InferenceProviderSpec {
 
     /// Models served by this provider.
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["name"]))]
     pub models: Vec<ModelInfo>,
 
     /// Where to discover the models this provider serves.
@@ -105,9 +107,8 @@ pub struct InferenceProviderSpec {
     /// [`GridSite`]: crate::crd::grid_site::GridSite
     pub routing_cluster_ref: Option<String>,
 
-    /// Which sites host this provider.
-    #[serde(default)]
-    pub site_selector: super::auth::SelectorConfig,
+    /// Which sites host this provider. Omitted matches no site; `{}` matches every site.
+    pub host_selector: Option<super::auth::SelectorConfig>,
 
     /// Prometheus metrics scraping configuration.
     ///
@@ -693,6 +694,7 @@ pub struct InferenceProviderStatus {
 
     /// Sites matched by the site selector.
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-list-type" = "set"))]
     pub matching_sites: Vec<String>,
 
     /// Signal metric names the scrape uses after `metricsConfig.preset`, absent without `metricsConfig`.
@@ -716,22 +718,6 @@ pub struct InferenceProviderStatus {
     /// Current phase.
     #[serde(default)]
     pub phase: ProviderPhase,
-
-    /// Machine-readable reason for the current phase when not `Available`.
-    ///
-    /// Set when the provider cannot reach `Available` due to a configuration,
-    /// credential, or metrics/health-check collection error.  `None` when the
-    /// provider is `Available`, `Pending`, or the reason is unknown.
-    ///
-    /// Stable reason values:
-    /// - `EndpointInvalid`, `MetricsEndpointInvalid`, `ModelNameInvalid`
-    /// - `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`, `CredentialSecretMissing`,
-    ///   `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
-    /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
-    /// - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
-    ///   `HealthCheckTlsIdentityMismatch`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 impl InferenceProviderStatus {
@@ -743,7 +729,6 @@ impl InferenceProviderStatus {
             && self.model_discovery_url == desired.model_discovery_url
             && self.observed_generation == desired.observed_generation
             && self.phase == desired.phase
-            && self.reason == desired.reason
     }
 }
 
@@ -800,6 +785,7 @@ mod tests {
     fn spec_serde() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
+            "hostSelector": {},
             "providerKind": "anthropic",
             "backendKind": "apiProvider",
             "endpoint": "https://api.anthropic.com",
@@ -824,6 +810,7 @@ mod tests {
         ] {
             let json = serde_json::json!({
                 "gridNetworkRef": "production",
+                "hostSelector": {},
                 "providerKind": provider_kind,
                 "backendKind": backend_kind,
                 "endpoint": "http://backend:8080"
@@ -873,6 +860,7 @@ mod tests {
     fn administrative_policy_round_trips_and_is_omitted_by_default() {
         let base = serde_json::json!({
             "gridNetworkRef": "production", "providerKind": "openAi",
+            "hostSelector": {},
             "backendKind": "local", "endpoint": "http://backend:8080"
         });
         let spec: InferenceProviderSpec = serde_json::from_value(base).unwrap_or_else(|_| std::process::abort());
@@ -882,6 +870,7 @@ mod tests {
 
         let drained: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "production", "providerKind": "openAi",
+            "hostSelector": {},
             "backendKind": "local", "endpoint": "http://backend:8080",
             "gatewayRef": "provider-gateway-a", "trafficPolicy": {"drain": true}
         }))
@@ -964,15 +953,15 @@ mod tests {
     }
 
     #[test]
-    fn inference_provider_crd_has_site_selector_field() {
+    fn inference_provider_crd_has_host_selector_field() {
         let crd = crd_json();
         let spec_properties = crd
             .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties")
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(
-            spec_properties.contains_key("siteSelector"),
-            "CRD schema must include siteSelector field"
+            spec_properties.contains_key("hostSelector"),
+            "CRD schema must include hostSelector field"
         );
     }
 
@@ -1019,6 +1008,7 @@ mod tests {
     fn metrics_config_absent_deserializes() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -1039,6 +1029,7 @@ mod tests {
     fn metrics_config_with_path_and_signal_names_deserializes() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -1158,6 +1149,7 @@ mod tests {
     fn metrics_config_defaults_apply_when_fields_absent() {
         let json = serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -1176,6 +1168,7 @@ mod tests {
     fn stale_metrics_seconds_defaults_to_none_when_absent() {
         let json = serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
@@ -1194,6 +1187,7 @@ mod tests {
     fn stale_metrics_seconds_round_trips() {
         let json = serde_json::json!({
             "gridNetworkRef": "net",
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",

@@ -11,7 +11,7 @@ spec:
     - name: Qwen/Qwen3-0.6B
       capabilities: ["text_generation"]
       contextWindow: 4096
-  siteSelector:
+  hostSelector:
     matchLabels:
       grid.praxis-proxy.io/provider-site: east-provider
   accessPolicy:

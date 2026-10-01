@@ -97,7 +97,7 @@ fn upgrade(context: &str, crds: &str, legacy: &str) -> Result<(), Box<dyn std::e
 
 /// Confirm a `v1beta1` object round-trips and `v1alpha1` is no longer served.
 fn verify_upgraded(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("  [4/5] a v1beta1 GridNetwork applies and reads back");
+    eprintln!("  [4/5] a v1beta1 GridNetwork applies, reads back, and keeps its gridId");
     kubectl_ok(context, &["apply", "-f", "-"], Some(&network_manifest("v1beta1")))?;
     let read = kubectl_ok(
         context,
@@ -112,6 +112,7 @@ fn verify_upgraded(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     if String::from_utf8_lossy(&read.stdout) != NETWORK {
         return Err("v1beta1 GridNetwork did not read back".into());
     }
+    verify_grid_id_immutable(context)?;
 
     eprintln!("  [5/5] the v1alpha1 version is no longer served; only the operator's old consumer ConfigMap is gone");
     verify_consumer_config_maps(context)?;
@@ -140,6 +141,26 @@ fn as_v1alpha1(crds: &str) -> Result<String, Box<dyn std::error::Error>> {
         }
     }
     Ok(serde_json::to_string(&list)?)
+}
+
+/// A set `gridId` refuses a change, through the schema's transition rule.
+fn verify_grid_id_immutable(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let changed = kubectl(
+        context,
+        &[
+            "patch",
+            &format!("gridnetworks.grid.praxis-proxy.io/{NETWORK}"),
+            "--type",
+            "merge",
+            "-p",
+            r#"{"spec":{"gridId":"another"}}"#,
+        ],
+        None,
+    )?;
+    if changed.status.success() || !String::from_utf8_lossy(&changed.stderr).contains("gridId is immutable") {
+        return Err("a set gridId must be immutable".into());
+    }
+    Ok(())
 }
 
 /// Only the operator-written `praxis-consumer-config` is gone; another one stays.

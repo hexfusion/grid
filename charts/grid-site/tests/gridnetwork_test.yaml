@@ -125,3 +125,58 @@ tests:
       - equal:
           path: spec.siteDiscovery.mode
           value: auto
+
+  - it: omits defaultEgressTls by default so the CRD default of mutualTls applies
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.siteDiscovery.mode: auto
+    asserts:
+      - notExists:
+          path: spec.siteDiscovery.defaultEgressTls
+
+  - it: renders siteDiscovery.defaultEgressTls when set
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.siteDiscovery.defaultEgressTls: plaintext
+    asserts:
+      - equal:
+          path: spec.siteDiscovery
+          value:
+            defaultEgressTls: plaintext
+
+  - it: rejects an unknown siteDiscovery.defaultEgressTls
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.siteDiscovery.defaultEgressTls: insecure
+    asserts:
+      - failedTemplate: {}
+
+  - it: renders staleCandidateTtlSeconds so GridSite GC works from the chart
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.staleCandidateTtlSeconds: 3600
+    asserts:
+      - equal:
+          path: spec.staleCandidateTtlSeconds
+          value: 3600
+
+  - it: leaves staleCandidateTtlSeconds unset by default
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+    asserts:
+      - notExists:
+          path: spec.staleCandidateTtlSeconds
+
+  - it: refuses a zero staleCandidateTtlSeconds
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.staleCandidateTtlSeconds: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "staleCandidateTtlSeconds"

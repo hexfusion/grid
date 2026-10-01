@@ -23,6 +23,14 @@ pub(crate) mod consumer_config;
 /// [`verify_credential_accessible`]: credentials::verify_credential_accessible
 pub mod credentials;
 
+/// Shared TLS material resolution and validation for endpoint probes.
+pub(crate) mod endpoint_tls;
+/// Typed gateway probe outcome and phase-transition contracts.
+pub(crate) mod gateway_probe;
+/// Live MCP `tools/list` probe for [`AgentToolProvider`](crate::crd::agent_tool_provider::AgentToolProvider).
+pub(crate) mod mcp_probe;
+/// Served-model discovery sources for [`InferenceProvider`](crate::crd::inference_provider::InferenceProvider).
+pub(crate) mod model_discovery;
 /// Bridge from operator routing overlays to Praxis `intelligent_route` filter config.
 pub mod overlay_bridge;
 /// Versioned overlay envelope for content-addressed revision tracking.
@@ -43,17 +51,6 @@ pub(crate) mod serving_config;
 /// unit tests instead of each keeping its own copy of the same mock.
 #[cfg(test)]
 pub(crate) mod test_doubles;
-/// Trust bundle management for grid mTLS.
-pub mod trust_bundle;
-
-/// Shared TLS material resolution and validation for endpoint probes.
-pub(crate) mod endpoint_tls;
-/// Typed gateway probe outcome and phase-transition contracts.
-pub(crate) mod gateway_probe;
-/// Live MCP `tools/list` probe for [`AgentToolProvider`](crate::crd::agent_tool_provider::AgentToolProvider).
-pub(crate) mod mcp_probe;
-/// Served-model discovery sources for [`InferenceProvider`](crate::crd::inference_provider::InferenceProvider).
-pub(crate) mod model_discovery;
 /// TLS backend abstraction: client config, connectors, handshake, PEM gates.
 pub mod tls_backend;
 /// TLS gateway probe — bounded handshake and peer certificate extraction.

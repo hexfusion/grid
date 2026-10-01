@@ -11,7 +11,7 @@
 //!
 //! # Phase 1 / OP-01 semantics
 //!
-//! - [`GridSite`]s are used to resolve per-provider site membership via `spec.siteSelector.matchLabels`.  An empty
+//! - [`GridSite`]s are used to resolve per-provider site membership via `spec.hostSelector.matchLabels`.  An empty
 //!   selector matches all sites in the same [`GridNetwork`].
 //! - Each `(model, site)` pair becomes one `RoutingCandidate`.
 //! - `candidate.site` = the [`GridSite`] name (resolved via selector).
@@ -22,7 +22,7 @@
 //!
 //! # Spec-based vs status-based site derivation
 //!
-//! The renderer derives `candidate.site` from `spec.siteSelector.matchLabels`
+//! The renderer derives `candidate.site` from `spec.hostSelector.matchLabels`
 //! against live [`GridSite`] data, **not** from
 //! `status.matchingSites`.  `status.matchingSites` is set asynchronously by
 //! the OP-02 `InferenceProvider` controller and may be stale if sites or
@@ -680,8 +680,8 @@ pub(crate) enum AccessPolicyResult {
 ///
 /// # Design Notes
 ///
-/// This function is separate from placement logic (`siteSelector`) and evaluates
-/// authorization policy (`accessPolicy`) independently. The provider's `siteSelector`
+/// This function is separate from placement logic (`hostSelector`) and evaluates
+/// authorization policy (`accessPolicy`) independently. The provider's `hostSelector`
 /// controls where the provider is placed; the `accessPolicy` controls which consumer
 /// sites may use it.
 pub(crate) fn evaluate_access_policy(
@@ -740,7 +740,7 @@ enum SiteResolution {
     Unavailable,
 
     /// Site CRDs are available.  Contains the names matched by the provider's
-    /// `siteSelector`.
+    /// `hostSelector`.
     ///
     /// An empty `Vec` means the selector matched no sites; the provider
     /// contributes no candidates to the overlay.
@@ -808,7 +808,7 @@ pub struct RoutingCandidate {
 
     /// Site name where this model is hosted.
     ///
-    /// Resolved via `spec.siteSelector.matchLabels` against [`GridSite`]
+    /// Resolved via `spec.hostSelector.matchLabels` against [`GridSite`]
     /// metadata labels.  Falls back to the provider routing identity
     /// (`spec.routingClusterRef`, or provider metadata name when absent)
     /// when no [`GridSite`]s are passed (Phase 1 self-hosted fallback).
@@ -1100,7 +1100,7 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 ///
 /// Only [`InferenceProvider`]s whose `spec.gridNetworkRef` matches
 /// `network.metadata.name` are included.  Each provider's
-/// `spec.siteSelector.matchLabels` is matched against the supplied
+/// `spec.hostSelector.matchLabels` is matched against the supplied
 /// `sites`; an empty selector matches all sites in the network.
 ///
 /// The `local_site` parameter identifies this gateway's own site.
@@ -1466,25 +1466,21 @@ fn collect_candidates(
 
 /// Resolve matching sites for a provider against the network site inventory.
 ///
-/// Returns [`SiteResolution::Unavailable`] when no site inventory exists,
-/// which enables the Phase 1 provider-name fallback.  Returns
-/// [`SiteResolution::Known`] otherwise — with an empty `Vec` if the
-/// selector matched nothing, which suppresses candidate generation.
+/// Returns [`SiteResolution::Unavailable`] when no site inventory exists and
+/// the provider has a `hostSelector`, which enables the Phase 1 provider-name
+/// fallback.  Returns [`SiteResolution::Known`] otherwise — with an empty `Vec`
+/// if the selector matched nothing or is omitted, which suppresses candidate
+/// generation.
 fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite]) -> SiteResolution {
-    if network_sites.is_empty() {
+    let selector = provider.spec.host_selector.as_ref();
+    if network_sites.is_empty() && selector.is_some() {
         return SiteResolution::Unavailable;
     }
 
-    let selector = &provider.spec.site_selector.match_labels;
 
     let names: Vec<String> = network_sites
         .iter()
-        .filter(|site| {
-            let site_labels = site.metadata.labels.as_ref();
-            selector
-                .iter()
-                .all(|(k, v)| site_labels.is_some_and(|labels| labels.get(k).is_some_and(|sv| sv == v)))
-        })
+        .filter(|site| crate::crd::auth::hosts_on(selector, site.metadata.labels.as_ref()))
         .map(|site| site.metadata.name.clone().unwrap_or_else(|| "unknown-site".to_owned()))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1996,6 +1992,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -2103,7 +2100,7 @@ mod tests {
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": models_json,
-                "siteSelector": { "matchLabels": match_labels }
+                "hostSelector": { "matchLabels": match_labels }
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -2117,6 +2114,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -2151,6 +2149,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8000",
@@ -2167,6 +2166,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -2255,6 +2255,7 @@ mod tests {
             "metadata": { "name": "prov-g" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "anthropic",
                 "backendKind": "apiProvider",
                 "endpoint": "https://api.anthropic.com",
@@ -2299,6 +2300,7 @@ mod tests {
             "metadata": {},
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -2529,6 +2531,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8000",
@@ -3246,6 +3249,30 @@ mod tests {
             "selector hw=gpu should match only gpu-site"
         );
         assert_eq!(overlay.candidates[0].site, "gpu-site", "site must be gpu-site");
+    }
+
+    #[test]
+    fn omitted_host_selector_yields_no_candidates() {
+        let network = test_network("net-a");
+        let mut provider = test_provider("prov", "net-a", &["model"]);
+        provider.spec.host_selector = None;
+        for sites in [vec![], vec![test_site("site-a", "net-a")]] {
+            let overlay = render_routing_overlay(
+                &network,
+                &sites,
+                std::slice::from_ref(&provider),
+                &[],
+                "test-site",
+                None,
+                None,
+                &scoring::ScoringWeights::default(),
+            );
+            assert!(
+                overlay.map_or(true, |overlay| overlay.candidates.is_empty()),
+                "an omitted hostSelector must not fall back to the provider name ({} sites)",
+                sites.len()
+            );
+        }
     }
 
     #[test]
@@ -4066,6 +4093,7 @@ mod tests {
             "metadata": {},
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -4836,6 +4864,7 @@ mod tests {
     ) -> InferenceProvider {
         let mut spec = serde_json::json!({
             "gridNetworkRef": network,
+            "hostSelector": {},
             "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://localhost:8000",
@@ -4938,6 +4967,7 @@ mod tests {
             "metadata": { "name": "prov-a" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -4999,6 +5029,7 @@ mod tests {
             "metadata": { "name": "prov-a" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -5034,6 +5065,7 @@ mod tests {
             "metadata": { "name": "prov-a" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -5077,6 +5109,7 @@ mod tests {
             "metadata": { "name": "prov-api" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "anthropic",
                 "backendKind": "apiProvider",
                 "endpoint": "https://api.example.com",
@@ -5489,6 +5522,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "apiProvider",
                 "endpoint": "https://api.openai.com",
@@ -5513,6 +5547,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "apiProvider",
                 "endpoint": "https://api.openai.com",
@@ -5560,6 +5595,7 @@ mod tests {
             "metadata": { "name": "sigv4-prov" },
             "spec": {
                 "gridNetworkRef": "net",
+                "hostSelector": {},
                 "providerKind": "bedrock",
                 "backendKind": "apiProvider",
                 "endpoint": "https://bedrock.us-east-1.amazonaws.com",
@@ -5762,8 +5798,8 @@ mod tests {
             status,
             age_secs,
             gateway_address: None,
-            site_cert_pem: None,
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         }
     }
 
@@ -6223,6 +6259,7 @@ mod tests {
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
+                "hostSelector": {},
                 "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
@@ -6241,7 +6278,7 @@ mod tests {
         let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
         let provider = test_provider("unrestricted-prov", "net", &["model-a"]);
 
-        // The provider has an empty siteSelector, so it should generate candidates
+        // The provider has an empty hostSelector, so it should generate candidates
         // for ALL sites in the network when it appears in any overlay.
         // With both sites present and an unrestricted access policy,
         // we get one candidate per site.
@@ -6295,7 +6332,7 @@ mod tests {
         let provider = test_provider_with_access_policy("prod-only-prov", "net", &["model-a"], &[("env", "prod")]);
 
         // Consumer from prod site should get candidates
-        // Since the provider has an empty siteSelector but restricted access policy,
+        // Since the provider has an empty hostSelector but restricted access policy,
         // it will generate candidates for all sites if the consumer passes access policy
         let overlay = render_routing_overlay(
             &network,
@@ -6827,7 +6864,7 @@ mod tests {
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8000",
                 "models": models_json,
-                "siteSelector": { "matchLabels": { "site": site_label } }
+                "hostSelector": { "matchLabels": { "site": site_label } }
             }
         }))
         .unwrap_or_else(|_| std::process::abort())

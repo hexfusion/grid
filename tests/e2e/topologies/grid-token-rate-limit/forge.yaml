@@ -419,7 +419,7 @@ spec:
                 providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-west.grid-system.svc.cluster.local:8000"
-                siteSelector:
+                hostSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: west
                 accessPolicy:
@@ -490,7 +490,7 @@ spec:
                 providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-central.grid-system.svc.cluster.local:8000"
-                siteSelector:
+                hostSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: central
                 accessPolicy:
@@ -561,7 +561,7 @@ spec:
                 providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-east.grid-system.svc.cluster.local:8000"
-                siteSelector:
+                hostSelector:
                   matchLabels:
                     grid.praxis-proxy.io/provider-site: east
                 accessPolicy:

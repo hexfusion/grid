@@ -32,7 +32,7 @@ inferenceProviders:
     providerKind: openAi
     backendKind: local
     endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
-    siteSelector:
+    hostSelector:
       matchLabels:
         grid.praxis-proxy.io/provider-site: east-b
     accessPolicy:

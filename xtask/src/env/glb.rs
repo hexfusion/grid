@@ -654,7 +654,7 @@ spec:
   models:
     - name: {model}
   routingClusterRef: {routing_cluster}
-  siteSelector:
+  hostSelector:
     matchLabels:
       grid.praxis-proxy.io/provider-site: east-provider
   accessPolicy:

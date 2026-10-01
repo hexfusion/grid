@@ -224,7 +224,7 @@ configuration.
 ## GridSite Labels
 
 Each GridSite must carry the `grid.praxis-proxy.io/provider-site` label
-matching the value used in InferenceProvider `siteSelector.matchLabels`.
+matching the value used in InferenceProvider `hostSelector.matchLabels`.
 Without this label, the operator finds no matching sites for the
 InferenceProvider, produces zero overlay candidates, and never creates
 the overlay ConfigMap.
@@ -451,7 +451,7 @@ spec:
   providerKind: openAi
   backendKind: local
   endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
-  siteSelector:
+  hostSelector:
     matchLabels:
       grid.praxis-proxy.io/provider-site: west1
   models:
@@ -467,7 +467,7 @@ spec:
   providerKind: openAi
   backendKind: local
   endpoint: "http://mock-inference-b.grid-system.svc.cluster.local:8080"
-  siteSelector:
+  hostSelector:
     matchLabels:
       grid.praxis-proxy.io/provider-site: west1
   models:
@@ -840,7 +840,7 @@ logs: "routing overlay has no candidates; skipping ConfigMap apply".
 
 **Cause:** No InferenceProvider matches any GridSite. The GridSite is
 missing the `grid.praxis-proxy.io/provider-site` label that the
-InferenceProvider's `siteSelector.matchLabels` requires.
+InferenceProvider's `hostSelector.matchLabels` requires.
 
 **Fix:** Label the GridSite:
 `kubectl label gridsite east2 grid.praxis-proxy.io/provider-site=east2`

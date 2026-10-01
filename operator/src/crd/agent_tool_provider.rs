@@ -23,6 +23,7 @@ use super::{
     kind = "AgentToolProvider",
     plural = "agenttoolproviders",
     shortname = "atp",
+    category = "grid",
     status = "AgentToolProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Protocol","type":"string","jsonPath":".spec.protocol"}"#,
@@ -50,9 +51,8 @@ pub struct AgentToolProviderSpec {
     #[serde(default)]
     pub protocol: ToolProtocol,
 
-    /// Which sites host this provider.
-    #[serde(default)]
-    pub site_selector: SelectorConfig,
+    /// Which sites host this provider. Omitted matches no site; `{}` matches every site.
+    pub host_selector: Option<SelectorConfig>,
 
     /// TLS configuration for the operator's own MCP `tools/list` probe.
     ///
@@ -66,6 +66,7 @@ pub struct AgentToolProviderSpec {
 
     /// Tool definitions (auto-discovered if omitted).
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["name"]))]
     pub tools: Vec<ToolInfo>,
 }
 
@@ -85,9 +86,9 @@ pub struct ToolInfo {
 
 /// Observed status of an [`AgentToolProvider`].
 ///
-/// # Stable `reason` values
+/// # Stable `Available` condition reasons
 ///
-/// `reason` is `None` while the provider is healthy. When set, it is one
+/// While the provider is healthy the `Available` reason is `Available` or `Pending`. Otherwise it is one
 /// of the following stable, machine-readable strings — following the
 /// same naming convention as [`InferenceProvider`]'s `MetricsTls*`/
 /// `HealthCheckTls*` reasons:
@@ -116,10 +117,12 @@ pub struct AgentToolProviderStatus {
 
     /// Tools discovered via MCP `tools/list`.
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-list-type" = "set"))]
     pub discovered_tools: Vec<String>,
 
     /// Sites matched by the site selector.
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-list-type" = "set"))]
     pub matching_sites: Vec<String>,
 
     /// Last observed generation.
@@ -129,12 +132,6 @@ pub struct AgentToolProviderStatus {
     /// Current phase.
     #[serde(default)]
     pub phase: ProviderPhase,
-
-    /// Machine-readable reason for the current phase, `None` when healthy.
-    ///
-    /// See the type-level doc comment for the table of stable values.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,43 +238,6 @@ mod tests {
         assert_eq!(
             client_ref.private_key_key, "tls.key",
             "privateKeyKey must default to tls.key"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // status.reason — absent must default to None, present must round-trip,
-    // and must be omitted from serialized output when None (not written as
-    // an explicit null onto the status subresource).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn status_reason_absent_defaults_to_none() {
-        let json = serde_json::json!({});
-        let status: AgentToolProviderStatus = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert!(status.reason.is_none(), "absent status.reason must default to None");
-    }
-
-    #[test]
-    fn status_reason_round_trips_when_present() {
-        let json = serde_json::json!({ "reason": "McpEndpointUnreachable" });
-        let status: AgentToolProviderStatus = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(
-            status.reason.as_deref(),
-            Some("McpEndpointUnreachable"),
-            "status.reason must round-trip"
-        );
-    }
-
-    #[test]
-    fn status_reason_none_is_omitted_from_serialized_output() {
-        let status = AgentToolProviderStatus::default();
-        let value = serde_json::to_value(&status).unwrap_or_else(|_| std::process::abort());
-        assert!(
-            !value
-                .as_object()
-                .unwrap_or_else(|| std::process::abort())
-                .contains_key("reason"),
-            "None reason must be omitted, not serialized as an explicit null"
         );
     }
 }

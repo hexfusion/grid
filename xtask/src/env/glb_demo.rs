@@ -2328,11 +2328,11 @@ fn apply_edge_stacks(forge: &str, config: &Path) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Pin each provider's SWIM-advertised public certificate on both edge sites.
+/// Pin each provider's staged certificate on both edge sites.
 ///
-/// SWIM discovery supplies the endpoint and public certificate, but it does
-/// not authorize routing.  The demo compares the received certificate to the
-/// locally generated out-of-band identity and configures the `GridSite` with:
+/// SWIM discovery supplies the endpoint, but it does not authorize routing.
+/// The demo takes the fingerprint from the locally generated out-of-band
+/// identity and configures the `GridSite` with:
 ///
 /// - `canonicalFingerprints`: DER-based SHA-256 pin for the provider certificate
 /// - `serverName`: DNS SAN identity for TLS SNI/SAN verification
@@ -2350,7 +2350,6 @@ fn authorize_provider_sites_for_edges() -> Result<(), Box<dyn std::error::Error>
             let site_name = format!("glb-demo-{provider}");
             operator::wait_for_auto_gridsite(&context, &site_name, "glb-demo", TRUST_TIMEOUT)?;
             let canonical_fp = certs::site_certificate_fingerprint(provider)?;
-            operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
             let server_name = format!("{provider}.grid.internal");
             operator::patch_gridsite_identity_trust(&context, &site_name, &canonical_fp, &server_name)?;
             operator::wait_for_gridsite_phase(&context, &site_name, "Active", TRUST_TIMEOUT)?;

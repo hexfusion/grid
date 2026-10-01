@@ -751,7 +751,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                         "-l", "grid.praxis-proxy.io/auto-discovered=true",
                         "--context", &context,
                         "-n", GRID_SYSTEM_NS,
-                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.status.discovered.egressAddress}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
+                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.conditions[?(@.type==\"Connected\")].reason}\t{.status.discovered.egressAddress}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
                     ])
                     .output()?;
                 if !output.status.success() {
@@ -1999,7 +1999,7 @@ fn prepare_setup(forge_config: &Path) -> Result<ProviderTrafficContext, Box<dyn 
 /// Authorize auto-discovered remote `GridSites` with identity trust material.
 ///
 /// For each local cluster, waits for the two remote auto-discovered `GridSites`,
-/// verifies the SWIM-advertised certificate matches the staged identity, then
+/// takes the provider fingerprint from the staged identity, then
 /// patches `spec.egress.tls.serverName` and `spec.trust.canonicalFingerprints`.
 /// The controller transitions the site to Active naturally after the patch.
 fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
@@ -2017,7 +2017,6 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
             let site_name = (*remote).to_owned();
             operator::wait_for_auto_gridsite(&context, &site_name, GRID_NETWORK, TRUST_TIMEOUT)?;
             let canonical_fp = certs::site_certificate_fingerprint(remote)?;
-            operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
             let server_name = format!("{remote}.grid.internal");
             operator::patch_gridsite_identity_trust(&context, &site_name, &canonical_fp, &server_name)?;
             operator::wait_for_gridsite_phase(&context, &site_name, "Active", TRUST_TIMEOUT)?;

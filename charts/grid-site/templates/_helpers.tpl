@@ -49,6 +49,13 @@ Normalize values once per render, in place and idempotently. Listing peers selec
 enrolled multi-cluster default: the TLS Secrets the operator writes. Declared peers need
 no discovery mode, since manual discovery fills them from SWIM. inferenceProviders keyed by name become the list the template reads.
 */}}
+{{- define "grid-site.localHostSelector" -}}
+{{- with .Values.gridSite.name }}
+matchLabels:
+  grid.praxis-proxy.io/provider-site: {{ $.Values.gridSite.providerSiteLabel | default . | quote }}
+{{- end }}
+{{- end }}
+
 {{- define "grid-site.normalize" -}}
 {{- $v := .Values }}
 {{- $net := $v.gridNetwork }}
@@ -65,6 +72,9 @@ no discovery mode, since manual discovery fills them from SWIM. inferenceProvide
 {{- $list := list }}
 {{- range $name := keys $v.inferenceProviders | sortAlpha }}
 {{- $p := deepCopy (get $v.inferenceProviders $name | default dict) }}
+{{- if not (hasKey $p "hostSelector") }}
+{{- $_ := set $p "hostSelector" (include "grid-site.localHostSelector" $ | fromYaml) }}
+{{- end }}
 {{- $model := $p.model | default $name }}
 {{- $_ := unset $p "model" }}
 {{- $list = append $list (merge $p (dict

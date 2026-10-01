@@ -23,6 +23,7 @@ use super::{
     kind = "AgentToAgentProvider",
     plural = "agenttoagentproviders",
     shortname = "a2ap",
+    category = "grid",
     status = "AgentToAgentProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Protocol","type":"string","jsonPath":".spec.protocol"}"#,
@@ -52,9 +53,8 @@ pub struct AgentToAgentProviderSpec {
     #[serde(default)]
     pub protocol: AgentProtocol,
 
-    /// Which sites host this provider.
-    #[serde(default)]
-    pub site_selector: SelectorConfig,
+    /// Which sites host this provider. Omitted matches no site; `{}` matches every site.
+    pub host_selector: Option<SelectorConfig>,
 }
 
 /// Agent Card metadata from the `.well-known` endpoint.
@@ -84,6 +84,7 @@ pub struct AgentToAgentProviderStatus {
 
     /// Sites matched by the site selector.
     #[serde(default)]
+    #[schemars(extend("x-kubernetes-list-type" = "set"))]
     pub matching_sites: Vec<String>,
 
     /// Last observed generation.

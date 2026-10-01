@@ -2231,7 +2231,6 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
             let site_name = (*remote).to_owned();
             operator::wait_for_auto_gridsite(&context, &site_name, GRID_NETWORK, TRUST_TIMEOUT)?;
             let canonical_fp = certs::site_certificate_fingerprint(remote)?;
-            operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
             let server_name = format!("{remote}.grid.internal");
             operator::patch_gridsite_identity_trust(&context, &site_name, &canonical_fp, &server_name)?;
             operator::wait_for_gridsite_phase(&context, &site_name, "Active", TRUST_TIMEOUT)?;

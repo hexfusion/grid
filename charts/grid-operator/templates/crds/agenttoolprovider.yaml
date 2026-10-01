@@ -13,6 +13,8 @@ metadata:
 spec:
   group: grid.praxis-proxy.io
   names:
+    categories:
+      - grid
     kind: AgentToolProvider
     plural: agenttoolproviders
     shortNames:
@@ -116,16 +118,9 @@ spec:
 
                     [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                   type: string
-                protocol:
-                  default: mcp
-                  description: Protocol the provider speaks.
-                  enum:
-                    - mcp
-                  type: string
-                siteSelector:
-                  default:
-                    matchLabels: {}
-                  description: Which sites host this provider.
+                hostSelector:
+                  description: Which sites host this provider. Omitted matches no site; `{}` matches every site.
+                  nullable: true
                   properties:
                     matchLabels:
                       additionalProperties:
@@ -134,6 +129,12 @@ spec:
                       description: Label key-value pairs that must match.
                       type: object
                   type: object
+                protocol:
+                  default: mcp
+                  description: Protocol the provider speaks.
+                  enum:
+                    - mcp
+                  type: string
                 tls:
                   description: |-
                     TLS configuration for the operator's own MCP `tools/list` probe.
@@ -232,6 +233,9 @@ spec:
                       - name
                     type: object
                   type: array
+                  x-kubernetes-list-map-keys:
+                    - name
+                  x-kubernetes-list-type: map
               required:
                 - endpoint
                 - gridNetworkRef
@@ -240,9 +244,9 @@ spec:
               description: |-
                 Observed status of an [`AgentToolProvider`].
 
-                # Stable `reason` values
+                # Stable `Available` condition reasons
 
-                `reason` is `None` while the provider is healthy. When set, it is one
+                While the provider is healthy the `Available` reason is `Available` or `Pending`. Otherwise it is one
                 of the following stable, machine-readable strings — following the
                 same naming convention as [`InferenceProvider`]'s `MetricsTls*`/
                 `HealthCheckTls*` reasons:
@@ -309,12 +313,14 @@ spec:
                   items:
                     type: string
                   type: array
+                  x-kubernetes-list-type: set
                 matchingSites:
                   default: []
                   description: Sites matched by the site selector.
                   items:
                     type: string
                   type: array
+                  x-kubernetes-list-type: set
                 observedGeneration:
                   default: 0
                   description: Last observed generation.
@@ -328,13 +334,6 @@ spec:
                     - Available
                     - Degraded
                     - Unavailable
-                  type: string
-                reason:
-                  description: |-
-                    Machine-readable reason for the current phase, `None` when healthy.
-
-                    See the type-level doc comment for the table of stable values.
-                  nullable: true
                   type: string
               type: object
           required:

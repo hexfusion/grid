@@ -61,12 +61,6 @@ pub struct SwimNode {
     /// with a gateway address extension is received.
     gateway_addrs_rx: watch::Receiver<BTreeMap<String, String>>,
 
-    /// Watch receiver for the public site certificate PEM map.
-    ///
-    /// Updated by the [`StateBroadcastHandler`] inside foca when a broadcast
-    /// carrying a `site_cert_pem` extension is received.
-    cert_pems_rx: watch::Receiver<BTreeMap<String, String>>,
-
     /// Watch receiver for the signals address map, keyed by origin site.
     signals_addrs_rx: watch::Receiver<BTreeMap<String, String>>,
 
@@ -117,7 +111,6 @@ impl SwimNode {
         let (handler, origin_state) = StateBroadcastHandler::with_capacity(site_id, max_origins);
         let state_rx = handler.subscribe();
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
-        let cert_pems_rx = handler.subscribe_cert_pems();
         let signals_addrs_rx = handler.subscribe_signals_addrs();
         let trust_store_tx = handler.trust_store_sender();
 
@@ -126,7 +119,6 @@ impl SwimNode {
             runtime: GridRuntime::new(),
             state_rx,
             gateway_addrs_rx,
-            cert_pems_rx,
             signals_addrs_rx,
             origin_state,
             trust_store_tx,
@@ -307,26 +299,12 @@ impl SwimNode {
         self.gateway_addrs_rx.borrow().clone()
     }
 
-    /// Return the current public site certificate PEM map from all received broadcasts.
-    ///
-    /// Keyed by origin site name.  Contains only public certificate material —
-    /// never private keys.  Updated whenever a broadcast carrying a
-    /// `site_cert_pem` extension is received from a peer.
-    #[must_use]
-    pub fn cert_pems(&self) -> BTreeMap<String, String> {
-        self.cert_pems_rx.borrow().clone()
-    }
-
-    /// Run `read` over the gateway, certificate, and signals maps without cloning them.
+    /// Run `read` over the gateway and signals address maps without cloning them.
     pub fn with_peer_metadata<R, Read>(&self, read: Read) -> R
     where
-        Read: FnOnce(&BTreeMap<String, String>, &BTreeMap<String, String>, &BTreeMap<String, String>) -> R,
+        Read: FnOnce(&BTreeMap<String, String>, &BTreeMap<String, String>) -> R,
     {
-        read(
-            &self.gateway_addrs_rx.borrow(),
-            &self.cert_pems_rx.borrow(),
-            &self.signals_addrs_rx.borrow(),
-        )
+        read(&self.gateway_addrs_rx.borrow(), &self.signals_addrs_rx.borrow())
     }
 
     /// Run `read` over the merged grid state without cloning it.

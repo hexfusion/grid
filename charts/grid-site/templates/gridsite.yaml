@@ -6,9 +6,7 @@ metadata:
   name: {{ .Values.gridSite.name }}
   labels:
     {{- include "grid-site.labels" . | nindent 4 }}
-    {{- if .Values.gridSite.providerSiteLabel }}
-    grid.praxis-proxy.io/provider-site: {{ .Values.gridSite.providerSiteLabel | quote }}
-    {{- end }}
+    grid.praxis-proxy.io/provider-site: {{ .Values.gridSite.providerSiteLabel | default .Values.gridSite.name | quote }}
 spec:
   gridNetworkRef: {{ required "gridNetwork.name is required when gridSite is defined" .Values.gridNetwork.name }}
   {{- with .Values.gridSite.region }}

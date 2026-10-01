@@ -3062,8 +3062,8 @@ mod tests {
             status: operator::swim::MemberStatus::Alive,
             age_secs: 0,
             gateway_address: None,
-            site_cert_pem: None,
             signals_address: None,
+            duplicate_endpoints: Vec::new(),
         };
         let snapshot = operator::swim::MembershipSnapshot {
             members: vec![

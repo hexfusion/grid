@@ -114,7 +114,7 @@ inferenceProviders:
     providerKind: openAi
     backendKind: local
     endpoint: "http://mock-inference-existing.grid-system.svc.cluster.local:8080"
-    siteSelector:
+    hostSelector:
       matchLabels:
         grid.praxis-proxy.io/provider-site: east1
     models:
@@ -126,7 +126,7 @@ inferenceProviders:
     providerKind: openAi
     backendKind: local
     endpoint: "http://mock-inference-new-provider.grid-system.svc.cluster.local:8080"
-    siteSelector:
+    hostSelector:
       matchLabels:
         grid.praxis-proxy.io/provider-site: east1
     models:
@@ -513,8 +513,10 @@ NetworkPolicy allows grid-operator ingress.
 
 ### Overlay missing new candidate
 
-**Cause**: InferenceProvider CR not reconciled, or `siteSelector` does
-not match any GridSite.
+**Cause**: InferenceProvider CR not reconciled, or `hostSelector` does
+not match any GridSite. An omitted `hostSelector` matches no site and reports
+the `Available` reason `HostSelectorMissing`. Set `hostSelector: {}` to match
+every site.
 
 **Check**:
 ```bash
@@ -524,7 +526,7 @@ kubectl get configmap -l grid.praxis-proxy.io/network -n grid-system \
 
 **Fix**: Verify the GridSite has the
 `grid.praxis-proxy.io/provider-site` label matching the
-InferenceProvider's `siteSelector.matchLabels`.
+InferenceProvider's `hostSelector.matchLabels`.
 
 ### Consumer returns 500 for new model
 

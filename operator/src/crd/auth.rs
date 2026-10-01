@@ -82,6 +82,25 @@ pub struct SelectorConfig {
     pub match_labels: std::collections::BTreeMap<String, String>,
 }
 
+impl SelectorConfig {
+    /// Whether `labels` carry every `matchLabels` pair; empty `matchLabels` matches everything.
+    #[must_use]
+    pub fn matches(&self, labels: Option<&std::collections::BTreeMap<String, String>>) -> bool {
+        self.match_labels
+            .iter()
+            .all(|(key, value)| labels.and_then(|labels| labels.get(key)) == Some(value))
+    }
+}
+
+/// Whether a provider's `hostSelector` places it on a site with `labels`; an omitted selector places it nowhere.
+#[must_use]
+pub fn hosts_on(
+    selector: Option<&SelectorConfig>,
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+) -> bool {
+    selector.is_some_and(|selector| selector.matches(labels))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -100,6 +119,49 @@ mod tests {
     fn access_policy_default_allows_all() {
         let policy = AccessPolicy::default();
         assert!(policy.site_selector.match_labels.is_empty(), "default should allow all");
+    }
+
+    #[test]
+    fn host_selector_omitted_places_nowhere_and_empty_places_everywhere() {
+        let labels: std::collections::BTreeMap<String, String> = [("region".to_owned(), "east".to_owned())].into();
+        let east = SelectorConfig {
+            match_labels: labels.clone(),
+        };
+        let west = SelectorConfig {
+            match_labels: [("region".to_owned(), "west".to_owned())].into(),
+        };
+        assert!(!hosts_on(None, Some(&labels)), "omitted matches no site");
+        assert!(!hosts_on(None, None), "omitted matches an unlabelled site neither");
+        assert!(
+            hosts_on(Some(&SelectorConfig::default()), None),
+            "empty matches every site"
+        );
+        assert!(hosts_on(Some(&east), Some(&labels)));
+        assert!(!hosts_on(Some(&west), Some(&labels)));
+        assert!(
+            !hosts_on(Some(&east), None),
+            "a label selector never matches an unlabelled site"
+        );
+    }
+
+    #[test]
+    fn host_selector_schema_has_no_default() {
+        let schema = serde_json::to_value(schemars::schema_for!(
+            super::super::inference_provider::InferenceProviderSpec
+        ))
+        .unwrap_or_else(|_| std::process::abort());
+        let host = schema
+            .pointer("/properties/hostSelector")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            host.get("default").is_none(),
+            "a default would make an omitted selector match every site"
+        );
+        let required = schema.pointer("/required").and_then(serde_json::Value::as_array);
+        assert!(
+            !required.is_some_and(|r| r.contains(&serde_json::json!("hostSelector"))),
+            "hostSelector stays optional"
+        );
     }
 
     #[test]

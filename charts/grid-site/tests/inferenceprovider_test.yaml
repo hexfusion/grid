@@ -21,6 +21,11 @@ tests:
           path: spec.backendKind
           value: local
       - equal:
+          path: spec.hostSelector
+          value:
+            matchLabels:
+              grid.praxis-proxy.io/provider-site: site-a
+      - equal:
           path: spec.models
           value:
             - name: my-model
@@ -47,3 +52,99 @@ tests:
       - equal:
           path: metadata.name
           value: old
+
+  - it: a keyed provider refuses the renamed siteSelector instead of matching every site
+    set:
+      inferenceProviders.my-model.endpoint: http://10.96.0.20:8000
+      inferenceProviders.my-model.siteSelector.region: us-east
+    asserts:
+      - failedTemplate:
+          errorPattern: "my-model: siteSelector was renamed hostSelector"
+
+  - it: a listed provider refuses the renamed siteSelector
+    set:
+      inferenceProviders:
+        - name: old
+          gridNetworkRef: grid
+          providerKind: openAi
+          backendKind: local
+          endpoint: http://10.0.0.1:8000
+          siteSelector:
+            region: us-east
+    asserts:
+      - failedTemplate:
+          errorPattern: "old: siteSelector was renamed hostSelector"
+
+  - it: a keyed provider renders its hostSelector
+    set:
+      inferenceProviders.my-model.endpoint: http://10.96.0.20:8000
+      inferenceProviders.my-model.hostSelector.region: us-east
+    asserts:
+      - equal:
+          path: spec.hostSelector
+          value:
+            region: us-east
+
+  - it: a keyed provider refuses a v1alpha1 providerKind
+    set:
+      inferenceProviders.my-model.endpoint: http://10.96.0.20:8000
+      inferenceProviders.my-model.providerKind: open_ai
+    asserts:
+      - failedTemplate:
+          errorPattern: "providerKind"
+
+  - it: a keyed provider refuses a v1alpha1 backendKind
+    set:
+      inferenceProviders.my-model.endpoint: http://10.96.0.20:8000
+      inferenceProviders.my-model.backendKind: api_provider
+    asserts:
+      - failedTemplate:
+          errorPattern: "backendKind"
+
+  - it: a listed provider without hostSelector renders none, so it lands on no site
+    set:
+      inferenceProviders:
+        - name: old
+          gridNetworkRef: grid
+          providerKind: openAi
+          backendKind: local
+          endpoint: http://10.0.0.1:8000
+    asserts:
+      - notExists:
+          path: spec.hostSelector
+
+  - it: a listed provider keeps an explicit empty hostSelector
+    set:
+      inferenceProviders:
+        - name: old
+          gridNetworkRef: grid
+          providerKind: openAi
+          backendKind: local
+          endpoint: http://10.0.0.1:8000
+          hostSelector: {}
+    asserts:
+      - equal:
+          path: spec.hostSelector
+          value: {}
+
+  - it: a keyed provider is hosted on this site's providerSiteLabel when one is set
+    set:
+      gridSite.providerSiteLabel: east-provider
+      inferenceProviders.my-model.endpoint: http://10.96.0.20:8000
+    asserts:
+      - equal:
+          path: spec.hostSelector
+          value:
+            matchLabels:
+              grid.praxis-proxy.io/provider-site: east-provider
+
+  - it: a keyed provider keeps its own hostSelector without the site label merged in
+    set:
+      inferenceProviders.my-model.endpoint: http://10.96.0.20:8000
+      inferenceProviders.my-model.hostSelector.matchLabels.region: us-east
+    asserts:
+      - equal:
+          path: spec.hostSelector
+          value:
+            matchLabels:
+              region: us-east
