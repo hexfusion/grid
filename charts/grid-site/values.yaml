@@ -54,8 +54,8 @@ peers: {}
 #     address: 203.0.113.20:8080
 #     digest: <64 lowercase hex>
 
-# -- InferenceProviders keyed by name. model defaults to the name, providerKind to vllm,
-# and backendKind to local_model. The older list of full InferenceProvider specs still
+# -- InferenceProviders keyed by name. model defaults to the name, providerKind to openAi,
+# and backendKind to local. The older list of full InferenceProvider specs still
 # renders.
 # inferenceProviders:
 #   my-model:

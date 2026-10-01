@@ -16,10 +16,10 @@ tests:
           value: grid
       - equal:
           path: spec.providerKind
-          value: vllm
+          value: openAi
       - equal:
           path: spec.backendKind
-          value: local_model
+          value: local
       - equal:
           path: spec.models
           value:
@@ -40,8 +40,8 @@ tests:
       inferenceProviders:
         - name: old
           gridNetworkRef: grid
-          providerKind: vllm
-          backendKind: local_model
+          providerKind: openAi
+          backendKind: local
           endpoint: http://10.0.0.1:8000
     asserts:
       - equal:

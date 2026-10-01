@@ -23,8 +23,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     crd::{
-        grid_network::GridNetwork,
-        grid_site::{EgressTlsMode, GridSite, GridSitePhase, GridSiteStatus},
+        grid_network::{GridNetwork, TlsMode},
+        grid_site::{GridSite, GridSitePhase, GridSiteStatus},
     },
     error::OperatorError,
     resources::{
@@ -343,10 +343,6 @@ async fn build_probe_config_from_secrets(
 
 /// Resolve the canonical fingerprint pins from the [`GridSite`] trust policy.
 ///
-/// Enforces mutual exclusion between `certFingerprint` (legacy) and
-/// `canonicalFingerprints` (canonical).  When only the legacy field is set,
-/// the probe fails closed — migration to canonical format is required.
-///
 /// Missing pin policy is reported separately from malformed pin policy so
 /// operators can distinguish incomplete bootstrap from invalid configuration.
 fn resolve_pins(site: &GridSite) -> Result<Vec<CanonicalFingerprint>, GatewayProbeOutcome> {
@@ -355,19 +351,6 @@ fn resolve_pins(site: &GridSite) -> Result<Vec<CanonicalFingerprint>, GatewayPro
     let Some(trust) = site.spec.trust.as_ref() else {
         return Err(O::TrustMaterialMissing);
     };
-
-    let has_legacy = trust.cert_fingerprint.is_some();
-    let has_canonical = trust.canonical_fingerprints.as_ref().is_some_and(|v| !v.is_empty());
-
-    if has_legacy && has_canonical {
-        tracing::warn!("certFingerprint and canonicalFingerprints are mutually exclusive");
-        return Err(O::TrustMaterialInvalid);
-    }
-
-    if has_legacy {
-        tracing::warn!("certFingerprint is deprecated; migrate to canonicalFingerprints");
-        return Err(O::TrustMaterialInvalid);
-    }
 
     match trust.canonical_fingerprints.as_ref() {
         Some(fps) => validate_canonical_pins(fps).map_err(|e| {
@@ -395,7 +378,7 @@ fn is_plaintext_transport(site: &GridSite) -> bool {
     site.spec
         .egress
         .as_ref()
-        .is_some_and(|e| e.tls.mode == EgressTlsMode::Plaintext)
+        .is_some_and(|e| e.tls.mode == TlsMode::Plaintext)
 }
 
 /// Attempt a TCP connection to `addr` with [`PROBE_TIMEOUT`].
@@ -1153,7 +1136,7 @@ mod tests {
                 egress: Some(EgressConfig {
                     address: egress.to_owned(),
                     tls: EgressTls {
-                        mode: EgressTlsMode::Plaintext,
+                        mode: TlsMode::Plaintext,
                         server_name: None,
                     },
                 }),
@@ -1402,7 +1385,6 @@ mod tests {
     #[test]
     fn resolve_pins_single_canonical_pin() {
         let trust = GridSiteTrustPolicy {
-            cert_fingerprint: None,
             canonical_fingerprints: Some(vec![valid_pin()]),
         };
         let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
@@ -1413,7 +1395,6 @@ mod tests {
     #[test]
     fn resolve_pins_two_canonical_pins_for_rotation() {
         let trust = GridSiteTrustPolicy {
-            cert_fingerprint: None,
             canonical_fingerprints: Some(vec![valid_pin(), valid_pin_2()]),
         };
         let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
@@ -1424,7 +1405,6 @@ mod tests {
     #[test]
     fn resolve_pins_three_pins_rejected() {
         let trust = GridSiteTrustPolicy {
-            cert_fingerprint: None,
             canonical_fingerprints: Some(vec![valid_pin(), valid_pin_2(), "c".repeat(64)]),
         };
         let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
@@ -1439,7 +1419,6 @@ mod tests {
     #[test]
     fn resolve_pins_empty_pin_list_rejected() {
         let trust = GridSiteTrustPolicy {
-            cert_fingerprint: None,
             canonical_fingerprints: Some(Vec::new()),
         };
         let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
@@ -1453,7 +1432,6 @@ mod tests {
     #[test]
     fn resolve_pins_invalid_pin_format_rejected() {
         let trust = GridSiteTrustPolicy {
-            cert_fingerprint: None,
             canonical_fingerprints: Some(vec!["not-a-valid-hex-fingerprint".to_owned()]),
         };
         let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
@@ -1462,36 +1440,6 @@ mod tests {
             result,
             Err(GatewayProbeOutcome::TrustMaterialInvalid),
             "invalid pin format must be rejected"
-        );
-    }
-
-    #[test]
-    fn resolve_pins_legacy_fingerprint_only_rejected() {
-        let trust = GridSiteTrustPolicy {
-            cert_fingerprint: Some("ab:cd:ef:01:23".to_owned()),
-            canonical_fingerprints: None,
-        };
-        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
-        let result = resolve_pins(&site);
-        assert_eq!(
-            result,
-            Err(GatewayProbeOutcome::TrustMaterialInvalid),
-            "legacy-only fingerprint must be rejected (migration required)"
-        );
-    }
-
-    #[test]
-    fn resolve_pins_both_legacy_and_canonical_rejected() {
-        let trust = GridSiteTrustPolicy {
-            cert_fingerprint: Some("ab:cd:ef:01:23".to_owned()),
-            canonical_fingerprints: Some(vec![valid_pin()]),
-        };
-        let site = site_with_trust(Some(GridSitePhase::Connecting), "10.0.0.1:8443", Some(trust));
-        let result = resolve_pins(&site);
-        assert_eq!(
-            result,
-            Err(GatewayProbeOutcome::TrustMaterialInvalid),
-            "both legacy and canonical must be rejected (mutually exclusive)"
         );
     }
 

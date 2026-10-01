@@ -344,7 +344,7 @@ Candidate fields:
 |`site`|AGN site advertising the capability.|
 |`cluster`|Praxis load-balancer cluster identity used for upstream routing.|
 |`fresh`|Whether provider status is considered fresh enough for normal routing.|
-|`credential`|Optional. Projected when auth is non-manual `bearer_token` and the Secret reference has non-empty `name`, `namespace`, and `key`, regardless of `backendKind`. Contains only Secret locating information, never the token value.|
+|`credential`|Optional. Projected when auth is non-manual `bearerToken` and the Secret reference has non-empty `name`, `namespace`, and `key`, regardless of `backendKind`. Contains only Secret locating information, never the token value.|
 |`stable_id`|Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. Used as `candidate_id` in provider gateway `provider_route` configuration. This differs from InferenceProvider `.metadata.name`; it can also key consumer-side affinity.|
 |`admission_state`|Optional Praxis value: `new_and_existing`, `existing_only`, or `none`. AGN removes excluded candidates before serialization and does not currently emit `none`.|
 |`selection_tier`|Optional locality tier: `same_site`, `same_zone`, `same_region`, `cross_region`, or `unknown`. Derived from `GridSite` region and zone.|
@@ -567,10 +567,10 @@ or does not use a Praxis gateway.
 |----------------|---------|--------------|------------------|
 | `local` | Self-hosted capacity in the local site. | Consumer Praxis directly to local/provider-side Praxis or local backend cluster. | Prefer first when healthy. |
 | `remote` | Self-hosted capacity in another AGN site. | Gateway-to-gateway mTLS to a remote Praxis provider gateway. | Prefer after local AGN capacity. |
-| `cloud_managed` | Managed model capacity under the operator's cloud account. | Praxis gateway, provider adapter, or direct managed-service endpoint depending on deployment. | Prefer after AGN-managed capacity and before generic SaaS fallback. |
-| `api_provider` | Third-party API/SaaS provider fallback. | Praxis injects configured provider credential and forwards to the API endpoint. | Last-resort or explicit fallback tier. |
+| `cloudManaged` | Managed model capacity under the operator's cloud account. | Praxis gateway, provider adapter, or direct managed-service endpoint depending on deployment. | Prefer after AGN-managed capacity and before generic SaaS fallback. |
+| `apiProvider` | Third-party API/SaaS provider fallback. | Praxis injects configured provider credential and forwards to the API endpoint. | Last-resort or explicit fallback tier. |
 
-`cloud_managed` is distinct because AGN should apply different cost,
+`cloudManaged` is distinct because AGN should apply different cost,
 credential, observability, and placement assumptions than it applies to
 self-hosted sites. A deployment may still place Praxis in front of a
 cloud-managed backend; the category describes operational ownership, not a
@@ -611,7 +611,7 @@ by the provider-side serving stack, such as llm-d/EPP endpoint selection.
 API-provider fallback uses the same overlay mechanism as self-hosted routing.
 The difference is the backend category and credential handling:
 
-1. An `InferenceProvider` declares `backendKind: api_provider`.
+1. An `InferenceProvider` declares `backendKind: apiProvider`.
 2. The operator includes the API provider as a candidate when it is available.
 3. Scoring normally places self-hosted candidates ahead of API-provider
    candidates, so API providers are used as fallback or explicit lower-priority
@@ -632,7 +632,7 @@ semantics, error mapping, streaming behavior, and credential rotation.
 
 ## Credential injection
 
-When an `InferenceProvider` has `spec.auth.strategy: bearer_token` with a
+When an `InferenceProvider` has `spec.auth.strategy: bearerToken` with a
 `spec.auth.secretRef`, the operator projects a credential reference — never the
 token value — into the routing overlay candidate:
 

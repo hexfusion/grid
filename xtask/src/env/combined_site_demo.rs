@@ -5642,7 +5642,7 @@ const GRIDSITE_PROVIDER_LABEL: &str = "grid.praxis-proxy.io/provider-site";
 /// Render the `InferenceProvider` manifest for an external provider.
 fn external_inference_provider_manifest(external_provider: &ExternalProviderDescriptor, site: &str) -> String {
     format!(
-        r#"apiVersion: grid.praxis-proxy.io/v1alpha1
+        r#"apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: {resource_name}
@@ -5822,13 +5822,13 @@ spec:
     let routing_cluster = format!("vcr-{site}-provider-secondary");
     let label = GRIDSITE_PROVIDER_LABEL;
     let inference_provider = format!(
-        r#"apiVersion: grid.praxis-proxy.io/v1alpha1
+        r#"apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: {provider_name}
 spec:
   gridNetworkRef: grid-combined-site
-  providerKind: vllm-vcr
+  providerKind: openAi
   backendKind: local
   endpoint: http://{deploy_name}.grid-system.svc.cluster.local:8000
   models:

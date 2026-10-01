@@ -25,6 +25,8 @@ pub(crate) struct ExternalProviderDescriptor {
     pub(crate) kind: ExternalProvider,
     /// `InferenceProvider` `providerKind` field.
     pub(crate) provider_kind: &'static str,
+    /// Lowercase name for Kubernetes resources, independent of the camelCase kind.
+    pub(crate) slug: &'static str,
     /// `InferenceProvider` `backendKind` field.
     pub(crate) backend_kind: &'static str,
     /// Public hostname of the external API.
@@ -61,8 +63,9 @@ impl ExternalProviderDescriptor {
     pub(crate) fn openai(model: &str) -> Self {
         Self {
             kind: ExternalProvider::OpenAi,
-            provider_kind: "open_ai",
-            backend_kind: "api_provider",
+            provider_kind: "openAi",
+            slug: "open-ai",
+            backend_kind: "apiProvider",
             hostname: "api.openai.com",
             port: 443,
             sni: "api.openai.com",
@@ -83,7 +86,7 @@ impl ExternalProviderDescriptor {
 
     /// Return the RFC 1123-compatible name used for Kubernetes resources.
     pub(crate) fn resource_name(&self) -> String {
-        format!("external-{}", self.provider_kind.replace('_', "-"))
+        format!("external-{}", self.slug)
     }
 
     /// Return the credential file path inside the gateway pod.
@@ -223,9 +226,9 @@ mod tests {
         fn openai_descriptor_fields() {
             let desc = ExternalProviderDescriptor::openai("gpt-5-mini");
             assert_eq!(desc.kind, ExternalProvider::OpenAi);
-            assert_eq!(desc.provider_kind, "open_ai");
+            assert_eq!(desc.provider_kind, "openAi");
             assert_eq!(desc.resource_name(), "external-open-ai");
-            assert_eq!(desc.backend_kind, "api_provider");
+            assert_eq!(desc.backend_kind, "apiProvider");
             assert_eq!(desc.hostname, "api.openai.com");
             assert_eq!(desc.port, 443);
             assert_eq!(desc.sni, "api.openai.com");

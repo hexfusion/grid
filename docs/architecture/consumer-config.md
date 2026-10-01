@@ -26,7 +26,7 @@ clusterEndpoints:
   - cluster: site-a
     address: "10.0.0.4:30080"
     transport:
-      mode: mutual_tls
+      mode: mutualTls
       sni: site-a.grid.internal
   - cluster: api-provider
     address: "mock-api.default.svc:8080"
@@ -37,7 +37,7 @@ clusterEndpoints:
 Key differences:
 
 - `sni` moves from a top-level field to `transport.sni`.
-- `transport.mode` is the security switch (`mutual_tls` or explicit
+- `transport.mode` is the security switch (`mutualTls` or explicit
   insecure/dev-only `plaintext`), not `sni` presence.
 - Missing `transport` fails closed — the operator will not render the cluster entry.
 - `plaintext` must not set `sni` (rejected as likely misconfiguration).
@@ -50,7 +50,7 @@ every reconcile.  The generated config includes:
 
 **Validation status:** `verify-api-fallback-native` proves end-to-end runtime
 consumption of the operator-generated `ConfigMap`.  The xtask harness reads the
-exact `praxis.yaml` from `op-e2e-consumer-config` in the provider cluster,
+exact `praxis.yaml` from `grid-consumer-op-e2e-net-op-e2e-gw` in the provider cluster,
 applies it byte-for-byte as `praxis-consumer-config` in the consumer cluster, and
 confirms all 9 routing assertions pass with the live consumer pod running the
 operator-generated config.  Token bytes are absent from the `ConfigMap`,
@@ -58,7 +58,7 @@ consumer-cluster replica, overlay JSON, and all logs.
 
 The generated config is a complete, runnable Praxis config containing:
 
-- `listeners:` — one public listener at `0.0.0.0:{listenerPort}` (default 8080)
+- `listeners:`: one public listener at `0.0.0.0:{port}`, where `port` comes from the gateway's own Service (`gatewayRefs[].name` in `gatewayRefs[].namespace`): the numeric `targetPort` (or `port`, when `targetPort` is unset) of its only port, or of the port named `http`. `consumer.listenerPort` (default 8080) applies only when that Service cannot be read or names its `targetPort`
 - `filter_chains:` — the consumer filter chain:
   - `intelligent_route` candidates from the overlay (with `credential.secretRef` for
     credential-bearing candidates)
@@ -66,7 +66,7 @@ The generated config is a complete, runnable Praxis config containing:
     candidates are present — token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
     cluster must have a matching `consumerConfig.clusterEndpoints[]` entry with
-    endpoint address and explicit `transport` configuration (`mutual_tls` or
+    endpoint address and explicit `transport` configuration (`mutualTls` or
     `plaintext`).  Missing transport fails closed — the operator will not
     silently render a plain-HTTP cluster when transport intent is absent
 - `admin:` — admin listener at `127.0.0.1:9901`
@@ -103,10 +103,10 @@ Example success output:
   {
     "gatewayName": "inference-gw",
     "namespace": "praxis-system",
-    "configMapName": "praxis-consumer-config",
+    "configMapName": "grid-consumer-production-inference-gw",
     "phase": "Rendered",
     "reason": "",
-    "message": "consumer config rendered and applied to praxis-system/praxis-consumer-config",
+    "message": "consumer config rendered and applied to praxis-system/grid-consumer-production-inference-gw",
     "observedGeneration": 7
   }
 ]
@@ -119,7 +119,7 @@ Example failure output:
   {
     "gatewayName": "inference-gw",
     "namespace": "praxis-system",
-    "configMapName": "praxis-consumer-config",
+    "configMapName": "grid-consumer-production-inference-gw",
     "phase": "Error",
     "reason": "ConsumerConfigApplyFailed",
     "message": "kube error: ...",
@@ -133,10 +133,11 @@ Example failure output:
 | Reason | Phase | Meaning |
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
+| `ListenerPortUnresolved` | `Rendered` | The gateway Service could not be read, so the listener uses the `consumer.listenerPort` fallback |
 | `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
-| `MissingSni` | `Error` | A `mutual_tls` cluster endpoint has no (or blank) `sni` — mTLS requires a server name |
-| `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
+| `MissingSni` | `Error` | A `mutualTls` cluster endpoint has no (or blank) `sni` — mTLS requires a server name |
+| `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutualTls` if TLS is intended |
 | `ConsumerConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
 | `ConsumerConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
 | `ConsumerConfigError` | `Error` | Other error during render or apply |
@@ -171,13 +172,13 @@ cluster before restarting or rolling out the consumer gateway.
 
 A cluster endpoint has no `transport` field.  The operator requires every
 `clusterEndpoints[]` entry to declare explicit transport intent — either
-`mutual_tls` (with `sni`) or `plaintext`.  Add a `transport` block to the
+`mutualTls` (with `sni`) or `plaintext`.  Add a `transport` block to the
 identified endpoint.  The operator will not guess whether a cluster should use
 TLS or plaintext.
 
 **Phase is `Error` / reason `MissingSni`**
 
-A `mutual_tls` cluster endpoint has a blank or missing `sni` field.  The `sni`
+A `mutualTls` cluster endpoint has a blank or missing `sni` field.  The `sni`
 must match the Subject Alternative Name in the provider gateway's server
 certificate.  Add a non-blank `sni` to the endpoint's `transport` block.
 
@@ -185,7 +186,7 @@ certificate.  Add a non-blank `sni` to the endpoint's `transport` block.
 
 A `plaintext` cluster endpoint has `sni` set.  Setting `sni` on a plaintext
 transport does not enable TLS — it is almost certainly a misconfiguration.
-Either change the mode to `mutual_tls` (if TLS is intended) or remove `sni`
+Either change the mode to `mutualTls` (if TLS is intended) or remove `sni`
 from the endpoint.
 
 **Consumer pod does not reload generated static configuration**

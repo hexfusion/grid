@@ -25,6 +25,51 @@ pub struct Cli {
     /// Signals serving and peer polling options.
     #[command(flatten)]
     pub signals: SignalsArgs,
+
+    /// Consumer Praxis config rendering options.
+    #[command(flatten)]
+    pub consumer: ConsumerArgs,
+}
+
+/// How the operator renders consumer Praxis config, deployment settings rather than grid intent.
+#[derive(Args, Debug, Clone)]
+#[group(id = "consumer")]
+pub struct ConsumerArgs {
+    /// Directory the consumer pod mounts credential Secrets under.
+    #[arg(
+        long = "consumer-credential-mount-base",
+        env = "GRID_CONSUMER_CREDENTIAL_MOUNT_BASE",
+        default_value = crate::crd::grid_network::DEFAULT_CREDENTIAL_MOUNT_BASE,
+        value_parser = non_blank
+    )]
+    pub credential_mount_base: String,
+
+    /// Directory the consumer pod mounts its grid TLS Secret at.
+    #[arg(
+        long = "consumer-tls-cert-mount-path",
+        env = "GRID_CONSUMER_TLS_CERT_MOUNT_PATH",
+        default_value = crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH,
+        value_parser = non_blank
+    )]
+    pub tls_cert_mount_path: String,
+
+    /// Consumer listener port when the gateway Service cannot be read.
+    #[arg(
+        long = "consumer-listener-port",
+        env = "GRID_CONSUMER_LISTENER_PORT",
+        default_value_t = crate::crd::grid_network::DEFAULT_CONSUMER_LISTENER_PORT,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    pub listener_port: u16,
+}
+
+/// Refuse a blank path.
+fn non_blank(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("must not be blank".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
 }
 
 /// SWIM runtime options.
@@ -232,6 +277,25 @@ mod tests {
         let ids: Vec<String> = Cli::command().get_groups().map(|g| g.get_id().to_string()).collect();
         let unique: HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "duplicate clap group ids: {ids:?}");
+    }
+
+    /// Consumer settings default to the `DEFAULT_*` constants in `crd::grid_network` and refuse bad values.
+    #[test]
+    fn consumer_settings_default_and_validate() {
+        let cli = Cli::try_parse_from(["grid-operator"]).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(cli.consumer.credential_mount_base, "/run/secrets/grid-credentials");
+        assert_eq!(cli.consumer.tls_cert_mount_path, "/etc/praxis/tls");
+        assert_eq!(cli.consumer.listener_port, 8080);
+        for bad in [
+            ["--consumer-listener-port", "0"],
+            ["--consumer-tls-cert-mount-path", " "],
+            ["--consumer-credential-mount-base", ""],
+        ] {
+            assert!(
+                Cli::try_parse_from(["grid-operator", bad[0], bad[1]]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 
     /// The advertised signals endpoint is parsed strictly and normalized.

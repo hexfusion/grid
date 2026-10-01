@@ -101,6 +101,12 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            - name: GRID_CONSUMER_CREDENTIAL_MOUNT_BASE
+              value: {{ .Values.consumer.credentialMountBase | quote }}
+            - name: GRID_CONSUMER_TLS_CERT_MOUNT_PATH
+              value: {{ .Values.consumer.tlsCertMountPath | quote }}
+            - name: GRID_CONSUMER_LISTENER_PORT
+              value: {{ .Values.consumer.listenerPort | quote }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}
             - name: RUST_LOG

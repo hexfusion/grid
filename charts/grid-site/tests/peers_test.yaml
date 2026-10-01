@@ -44,7 +44,7 @@ tests:
             egress:
               address: 203.0.113.21:8080
               tls:
-                mode: Mutual
+                mode: mutualTls
                 serverName: site-b.grid.internal
         documentIndex: 1
 

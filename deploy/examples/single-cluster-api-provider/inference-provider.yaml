@@ -1,4 +1,4 @@
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: openai-production
@@ -7,8 +7,8 @@ spec:
   gridNetworkRef: example
 
   # Provider configuration
-  providerKind: open_ai
-  backendKind: api_provider
+  providerKind: openAi
+  backendKind: apiProvider
   endpoint: https://api.openai.com
 
   # Models served
@@ -18,7 +18,7 @@ spec:
 
   # Authentication (requires Secret)
   auth:
-    strategy: bearer_token
+    strategy: bearerToken
     secretRef:
       name: openai-api-key
       namespace: default

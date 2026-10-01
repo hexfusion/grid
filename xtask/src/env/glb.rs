@@ -642,7 +642,7 @@ pub(crate) fn apply_openai_inference_provider(
     ext: &ExternalProviderDescriptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = format!(
-        "apiVersion: grid.praxis-proxy.io/v1alpha1
+        "apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: {name}
@@ -5088,7 +5088,7 @@ clusters:
                 .unwrap_or_else(|_| std::process::abort());
             assert!(provider.contains("healthCheck:"));
             assert!(provider.contains("path: /health"));
-            assert!(provider.contains("providerKind: vllm-vcr"));
+            assert!(provider.contains("providerKind: openAi"));
         }
 
         let verifier = fs::read_to_string(root.join("xtask/src/env/glb.rs")).unwrap_or_else(|_| std::process::abort());

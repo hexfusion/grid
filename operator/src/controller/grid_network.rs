@@ -14,7 +14,10 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::{
+    api::core::v1::{ConfigMap, Service},
+    apimachinery::pkg::util::intstr::IntOrString,
+};
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams},
@@ -26,8 +29,8 @@ use tracing::info;
 use crate::{
     crd::{
         grid_network::{
-            ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TransportMode,
+            ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus,
+            OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TlsMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -123,6 +126,9 @@ pub struct OperatorCtx {
     /// Peer addressing and trust, resolved once at startup.
     pub(crate) peer_settings: PeerSettings,
 
+    /// How consumer Praxis config is rendered, from operator deployment settings.
+    pub(crate) consumer: ConsumerSettings,
+
     /// Whether membership-derived writes may run, cleared while SWIM converges.
     membership_ready: std::sync::atomic::AtomicBool,
 }
@@ -144,6 +150,27 @@ impl Default for PeerSettings {
             local_signals_addr: None,
             trust: signals::PeerTrustMode::default(),
             peer_port: signals::DEFAULT_PEER_PORT,
+        }
+    }
+}
+
+/// Consumer Praxis config rendering settings, resolved once at startup.
+#[derive(Clone, Debug)]
+pub struct ConsumerSettings {
+    /// Directory the consumer pod mounts credential Secrets under.
+    pub credential_mount_base: String,
+    /// Directory the consumer pod mounts its grid TLS Secret at.
+    pub tls_cert_mount_path: String,
+    /// Consumer listener port when the gateway Service cannot be read.
+    pub listener_port: u16,
+}
+
+impl Default for ConsumerSettings {
+    fn default() -> Self {
+        Self {
+            credential_mount_base: crate::crd::grid_network::DEFAULT_CREDENTIAL_MOUNT_BASE.to_owned(),
+            tls_cert_mount_path: crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH.to_owned(),
+            listener_port: crate::crd::grid_network::DEFAULT_CONSUMER_LISTENER_PORT,
         }
     }
 }
@@ -174,6 +201,7 @@ impl OperatorCtx {
             signal_mode,
             serving_writes: WriteGate::default(),
             peer_settings: PeerSettings::default(),
+            consumer: ConsumerSettings::default(),
             membership_ready: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -218,6 +246,13 @@ impl OperatorCtx {
     #[must_use]
     pub fn with_peer_settings(mut self, settings: PeerSettings) -> Self {
         self.peer_settings = settings;
+        self
+    }
+
+    /// Replace the consumer rendering settings resolved at startup.
+    #[must_use]
+    pub fn with_consumer_settings(mut self, settings: ConsumerSettings) -> Self {
+        self.consumer = settings;
         self
     }
 
@@ -792,6 +827,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &scoring_weights,
         &admission_states,
         serving.as_ref(),
+        &ctx.consumer,
     )
     .await?;
 
@@ -883,7 +919,7 @@ async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Cli
         return Ok(());
     }
     let status_doc = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridSite",
         "status": {
             "phase": "Discovered",
@@ -1303,6 +1339,7 @@ async fn reconcile_routing_overlay_inner(
     scoring_weights: &scoring::ScoringWeights,
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
     serving: Option<&ServingSource<'_>>,
+    consumer: &ConsumerSettings,
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -1478,24 +1515,16 @@ async fn reconcile_routing_overlay_inner(
         // abort the reconcile loop — other gateways continue to be processed.
         // Gateways with consumerConfig.enabled=false get a Disabled entry.
         // Gateways without a consumerConfig block are omitted from status.
-        if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
-            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await {
-                Ok(()) => {
-                    consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        network = network_name,
-                        gateway = %gw_ref.name,
-                        namespace = %gw_ref.namespace,
-                        error = %e,
-                        "consumer Praxis config render/apply failed; recorded in status"
-                    );
-                    consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &e, observed_generation));
-                },
-            }
-        } else if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| !cc.enabled) {
-            consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
+        if gw_ref.consumer_config.as_ref().is_some_and(|cc| cc.enabled) {
+            consumer_statuses.push(
+                reconcile_consumer_config(&overlay, network_name, gw_ref, consumer, client, observed_generation).await,
+            );
+        } else if gw_ref.consumer_config.as_ref().is_some_and(|cc| !cc.enabled) {
+            consumer_statuses.push(consumer_config_status_disabled(
+                gw_ref,
+                network_name,
+                observed_generation,
+            ));
         }
     }
     Ok(OverlayOutcome {
@@ -1528,6 +1557,8 @@ struct ServingSource<'src> {
     gate: &'src WriteGate,
     /// Peer addressing resolved at startup.
     settings: &'src PeerSettings,
+    /// Where the gateway mounts its grid TLS Secret.
+    tls_mount: &'src str,
 }
 
 /// Build the serving source from membership, `None` outside poll mode.
@@ -1559,6 +1590,7 @@ fn serving_source<'src>(
         pins,
         gate: &ctx.serving_writes,
         settings: &ctx.peer_settings,
+        tls_mount: &ctx.consumer.tls_cert_mount_path,
     })
 }
 
@@ -1566,16 +1598,9 @@ fn serving_source<'src>(
 fn render_serving_text(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
-    gw_ref: &GatewayRef,
 ) -> Result<Option<String>, OperatorError> {
-    let tls_mount = gw_ref
-        .consumer_config
-        .as_ref()
-        .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
-            cc.tls_cert_mount_path.as_str()
-        });
     let inputs = ServingInputs {
-        tls_mount,
+        tls_mount: source.tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
         pins: &source.pins,
     };
@@ -1595,7 +1620,7 @@ async fn apply_serving_config(
     gw_ref: &GatewayRef,
     client: &Client,
 ) -> Result<Option<Duration>, OperatorError> {
-    let Some(text) = render_serving_text(overlay, source, gw_ref)? else {
+    let Some(text) = render_serving_text(overlay, source)? else {
         tracing::debug!(gateway = %gw_ref.name, "serving config has no candidates; leaving any prior config");
         return Ok(None);
     };
@@ -1764,6 +1789,76 @@ async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorE
     Ok(list.items)
 }
 
+/// Render and apply one gateway's consumer config, recording the outcome as status.
+///
+/// Render/apply errors do not abort the reconcile; other gateways continue.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "status needs the network name and generation alongside the render inputs"
+)]
+async fn reconcile_consumer_config(
+    overlay: &routing_overlay::RoutingOverlay,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    settings: &ConsumerSettings,
+    client: &Client,
+    observed_generation: i64,
+) -> ConsumerConfigStatus {
+    let resolved = consumer_listener_port(client, gw_ref).await;
+    let settings = ConsumerSettings {
+        listener_port: *resolved.as_ref().unwrap_or(&settings.listener_port),
+        ..settings.clone()
+    };
+    match apply_consumer_config_for_gateway(overlay, network_name, gw_ref, &settings, client).await {
+        Ok(()) => {
+            let status = consumer_config_status_rendered(gw_ref, network_name, observed_generation);
+            match resolved {
+                Ok(_) => status,
+                Err(detail) => consumer_config_status_listener_fallback(status, settings.listener_port, &detail),
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                network = network_name,
+                gateway = %gw_ref.name,
+                namespace = %gw_ref.namespace,
+                error = %e,
+                "consumer Praxis config render/apply failed; recorded in status"
+            );
+            consumer_config_status_error(gw_ref, network_name, &e, observed_generation)
+        },
+    }
+}
+
+/// Read the consumer listener port from the gateway's own Service, named by the gateway ref.
+async fn consumer_listener_port(client: &Client, gw_ref: &GatewayRef) -> Result<u16, String> {
+    let api: Api<Service> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    let service = format!("Service {}/{}", gw_ref.namespace, gw_ref.name);
+    match api.get_opt(&gw_ref.name).await {
+        Ok(Some(svc)) => service_listener_port(&svc)
+            .ok_or_else(|| format!("{service} has no single port or port named http with a numeric targetPort")),
+        Ok(None) => Err(format!("{service} not found")),
+        Err(e) => Err(format!("{service}: {e}")),
+    }
+    .inspect_err(|detail| tracing::warn!(%detail, "consumer listener port unresolved; using the configured fallback"))
+}
+
+/// The numeric pod port behind a Service's only port, or its port named `http`.
+fn service_listener_port(svc: &Service) -> Option<u16> {
+    let ports = svc.spec.as_ref()?.ports.as_deref()?;
+    let port = match ports {
+        [only] => only,
+        _ => ports.iter().find(|p| p.name.as_deref() == Some("http"))?,
+    };
+    // A named targetPort resolves only against the pod, so it leaves the port unresolved.
+    let number = match &port.target_port {
+        Some(IntOrString::Int(target)) => *target,
+        Some(IntOrString::String(_)) => return None,
+        None => port.port,
+    };
+    u16::try_from(number).ok()
+}
+
 /// Server-side apply the operator-generated consumer Praxis config `ConfigMap`.
 ///
 /// Only called when `gw_ref.consumer_config.enabled` is `true`.  Renders the
@@ -1773,34 +1868,30 @@ async fn apply_consumer_config_for_gateway(
     overlay: &routing_overlay::RoutingOverlay,
     network_name: &str,
     gw_ref: &GatewayRef,
-    cc: &ConsumerConfig,
+    settings: &ConsumerSettings,
     client: &Client,
 ) -> Result<(), OperatorError> {
+    let endpoints = gw_ref
+        .consumer_config
+        .as_ref()
+        .map_or(&[][..], |cc| cc.cluster_endpoints.as_slice());
     let config_yaml = consumer_config::generate_consumer_praxis_config(
         overlay,
-        &cc.credential_mount_base,
-        &cc.cluster_endpoints,
-        &cc.tls_cert_mount_path,
-        cc.listener_port,
+        &settings.credential_mount_base,
+        endpoints,
+        &settings.tls_cert_mount_path,
+        settings.listener_port,
     )?;
-    let cm = consumer_config::build_consumer_config_map(
-        &config_yaml,
-        &cc.config_map_name,
-        &gw_ref.namespace,
-        network_name,
-        &gw_ref.name,
-    );
+    let name = consumer_config::consumer_config_map_name(network_name, &gw_ref.name);
+    let cm =
+        consumer_config::build_consumer_config_map(&config_yaml, &name, &gw_ref.namespace, network_name, &gw_ref.name);
 
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
-    api.patch(
-        &cc.config_map_name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&cm),
-    )
-    .await?;
+    api.patch(&name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
+        .await?;
 
     info!(
-        config_map = %cc.config_map_name,
+        config_map = %name,
         namespace = %gw_ref.namespace,
         "applied consumer Praxis config ConfigMap"
     );
@@ -2180,7 +2271,7 @@ fn provider_state_from_kube(
         provider_id: provider_id.to_owned(),
         routing_cluster,
         models,
-        backend_kind: provider.spec.backend_kind.clone(),
+        backend_kind: provider.spec.backend_kind.wire_name().to_owned(),
         capacity_weight,
         phase,
         metrics: metrics_to_crdt(metrics),
@@ -2411,7 +2502,7 @@ async fn update_status(
     }
 
     let patch = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "status": status
     });
@@ -2434,34 +2525,52 @@ fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired
 /// Build a `Rendered` [`ConsumerConfigStatus`] for a successfully applied consumer config.
 pub(crate) fn consumer_config_status_rendered(
     gw_ref: &GatewayRef,
-    cc: &ConsumerConfig,
+    network_name: &str,
     observed_generation: i64,
 ) -> ConsumerConfigStatus {
+    let config_map_name = consumer_config::consumer_config_map_name(network_name, &gw_ref.name);
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
         namespace: gw_ref.namespace.clone(),
-        config_map_name: cc.config_map_name.clone(),
+        message: format!(
+            "consumer config rendered and applied to {}/{config_map_name}",
+            gw_ref.namespace
+        ),
+        config_map_name,
         phase: ConsumerConfigPhase::Rendered,
         reason: String::new(),
-        message: format!(
-            "consumer config rendered and applied to {}/{}",
-            gw_ref.namespace, cc.config_map_name
-        ),
         observed_generation,
     }
+}
+
+/// Consumer status reason when the gateway Service could not supply the listener port.
+const LISTENER_PORT_UNRESOLVED: &str = "ListenerPortUnresolved";
+
+/// Mark a rendered consumer status as using the fallback listener port.
+fn consumer_config_status_listener_fallback(
+    mut status: ConsumerConfigStatus,
+    listener_port: u16,
+    detail: &str,
+) -> ConsumerConfigStatus {
+    LISTENER_PORT_UNRESOLVED.clone_into(&mut status.reason);
+    status.message = format!(
+        "{}; listener on fallback port {listener_port}: {detail}",
+        status.message
+    );
+    status
 }
 
 /// Build a `Disabled` [`ConsumerConfigStatus`] for a gateway whose
 /// `consumerConfig.enabled` is `false`.
 pub(crate) fn consumer_config_status_disabled(
     gw_ref: &GatewayRef,
-    cc: &ConsumerConfig,
+    network_name: &str,
     observed_generation: i64,
 ) -> ConsumerConfigStatus {
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
         namespace: gw_ref.namespace.clone(),
-        config_map_name: cc.config_map_name.clone(),
+        config_map_name: consumer_config::consumer_config_map_name(network_name, &gw_ref.name),
         phase: ConsumerConfigPhase::Disabled,
         reason: "ConsumerConfigDisabled".to_owned(),
         message: "consumerConfig.enabled is false; no ConfigMap generated".to_owned(),
@@ -2478,7 +2587,7 @@ pub(crate) fn consumer_config_status_disabled(
 /// structural failures (blank fields, JSON errors, Kubernetes API errors).
 pub(crate) fn consumer_config_status_error(
     gw_ref: &GatewayRef,
-    cc: &ConsumerConfig,
+    network_name: &str,
     err: &OperatorError,
     observed_generation: i64,
 ) -> ConsumerConfigStatus {
@@ -2501,7 +2610,7 @@ pub(crate) fn consumer_config_status_error(
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
         namespace: gw_ref.namespace.clone(),
-        config_map_name: cc.config_map_name.clone(),
+        config_map_name: consumer_config::consumer_config_map_name(network_name, &gw_ref.name),
         phase: ConsumerConfigPhase::Error,
         reason: reason.to_owned(),
         message: format!("{err}"),
@@ -2690,7 +2799,7 @@ fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
             cc.cluster_endpoints.iter().any(|ep| {
                 ep.transport
                     .as_ref()
-                    .is_some_and(|transport| transport.mode == TransportMode::Plaintext)
+                    .is_some_and(|transport| transport.mode == TlsMode::Plaintext)
             })
         })
     });
@@ -2834,7 +2943,7 @@ async fn reconcile_site_cert_pem(
             // Write a status marker so operators can see the invalid material.
             // Do not store the raw PEM; record only the invalid status.
             let invalid_status_doc = serde_json::json!({
-                "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                "apiVersion": "grid.praxis-proxy.io/v1beta1",
                 "kind": "GridSite",
                 "status": {
                     "publicCertPem": null,
@@ -2897,7 +3006,7 @@ async fn reconcile_discovered_sites(
         // Server-side apply the spec.  Creating on first call; updating on subsequent
         // calls is a no-op when the spec has not changed.
         let mut spec_obj = serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": {
                 "name": site.name,
@@ -2911,7 +3020,11 @@ async fn reconcile_discovered_sites(
             }
         });
         if !site.egress_address.is_empty() {
-            let tls_mode = if plaintext { "Plaintext" } else { "Mutual" };
+            let tls_mode = if plaintext {
+                TlsMode::Plaintext
+            } else {
+                TlsMode::MutualTls
+            };
             spec_obj.get_mut("spec").and_then(|s| {
                 s.as_object_mut().map(|o| {
                     o.insert(
@@ -2953,7 +3066,7 @@ async fn reconcile_discovered_sites(
 
         if should_write_discovered {
             let status_doc = serde_json::json!({
-                "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                "apiVersion": "grid.praxis-proxy.io/v1beta1",
                 "kind": "GridSite",
                 "status": {
                     "phase": "Discovered",
@@ -3128,12 +3241,12 @@ mod tests {
 
     fn make_inference_provider(name: &str, network_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network_ref,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": []
@@ -3144,7 +3257,7 @@ mod tests {
 
     fn make_grid_site(name: &str, network_ref: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": name },
             "spec": { "gridNetworkRef": network_ref }
@@ -3242,7 +3355,7 @@ mod tests {
 
     fn base_network() -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": "net" },
             "spec": { "seeds": [], "gridId": "test-id" }
@@ -3697,12 +3810,12 @@ mod tests {
 
     fn make_provider(name: &str, network: &str, backend_kind: &str, generation: i64) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name, "generation": generation },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8080",
                 "models": [{ "name": "model-a" }, { "name": "model-b" }]
@@ -3713,12 +3826,12 @@ mod tests {
 
     fn make_provider_with_routing_ref(name: &str, network: &str, routing_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
                 "models": [{ "name": "model-x" }],
@@ -3730,12 +3843,12 @@ mod tests {
 
     fn make_provider_with_status(name: &str, network: &str, phase: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
                 "models": [{ "name": "model-x" }]
@@ -3761,7 +3874,7 @@ mod tests {
 
     #[test]
     fn provider_state_from_kube_uses_metadata_name_as_routing_cluster_by_default() {
-        let p = make_provider("prov-a", "net", "api_provider", 0);
+        let p = make_provider("prov-a", "net", "apiProvider", 0);
         let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.routing_cluster, "prov-a",
@@ -3782,12 +3895,12 @@ mod tests {
     #[test]
     fn provider_state_from_kube_returns_none_for_missing_name() {
         let p: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": {},
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
                 "models": []
@@ -3891,12 +4004,12 @@ mod tests {
     #[test]
     fn revision_defaults_to_zero_when_no_generation() {
         let p: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov-no-gen" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
                 "models": []
@@ -4178,7 +4291,7 @@ mod tests {
     #[test]
     fn network_site_name_falls_back_to_unknown_site_when_metadata_name_absent() {
         let network: GridNetwork = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": {},
             "spec": { "seeds": [] }
@@ -4431,7 +4544,7 @@ mod tests {
             None => serde_json::json!({"mode": mode}),
         };
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": "glb-demo" },
             "spec": {
@@ -4469,7 +4582,7 @@ mod tests {
 
     #[test]
     fn network_uses_mutual_egress_when_endpoint_transport_mtls() {
-        let network = network_with_endpoint_transport("mutual_tls", Some("provider.example.com"));
+        let network = network_with_endpoint_transport("mutualTls", Some("provider.example.com"));
         assert!(
             !network_uses_plaintext_egress(&network),
             "mTLS endpoint transport plus TLS refs must keep discovered GridSite egress mutual"
@@ -4921,14 +5034,6 @@ mod tests {
         }
     }
 
-    fn make_consumer_config(cm_name: &str) -> ConsumerConfig {
-        ConsumerConfig {
-            enabled: true,
-            config_map_name: cm_name.to_owned(),
-            ..ConsumerConfig::default()
-        }
-    }
-
     fn rendered_overlay_status(gw: &GatewayRef) -> OverlayRevisionStatus {
         OverlayRevisionStatus {
             gateway_name: gw.name.clone(),
@@ -5338,8 +5443,7 @@ mod tests {
     #[test]
     fn consumer_config_status_rendered_has_rendered_phase() {
         let gw = make_gw_ref("inference-gw", "praxis-system");
-        let cc = make_consumer_config("praxis-consumer-config");
-        let status = consumer_config_status_rendered(&gw, &cc, 5);
+        let status = consumer_config_status_rendered(&gw, "net", 5);
         assert_eq!(
             status.phase,
             ConsumerConfigPhase::Rendered,
@@ -5354,13 +5458,13 @@ mod tests {
             "namespace must match gw_ref.namespace"
         );
         assert_eq!(
-            status.config_map_name, "praxis-consumer-config",
-            "config_map_name must match cc"
+            status.config_map_name, "grid-consumer-net-inference-gw",
+            "the operator owns the consumer ConfigMap name"
         );
         assert_eq!(status.observed_generation, 5, "observed_generation must propagate");
         assert!(status.reason.is_empty(), "Rendered status must have empty reason");
         assert!(
-            status.message.contains("praxis-consumer-config"),
+            status.message.contains("grid-consumer-net-inference-gw"),
             "message must name the ConfigMap"
         );
     }
@@ -5368,9 +5472,8 @@ mod tests {
     #[test]
     fn consumer_config_status_error_has_error_phase() {
         let gw = make_gw_ref("inference-gw", "praxis-system");
-        let cc = make_consumer_config("praxis-consumer-config");
         let err = OperatorError::OverlayRender("structural failure".to_owned());
-        let status = consumer_config_status_error(&gw, &cc, &err, 3);
+        let status = consumer_config_status_error(&gw, "net", &err, 3);
         assert_eq!(status.phase, ConsumerConfigPhase::Error, "error must set phase=Error");
         assert!(!status.reason.is_empty(), "Error status must have non-empty reason");
         assert!(
@@ -5384,9 +5487,8 @@ mod tests {
     fn consumer_config_status_render_failed_reason() {
         use crate::resources::consumer_config::ConsumerConfigError;
         let gw = make_gw_ref("gw", "ns");
-        let cc = make_consumer_config("cm");
         let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::BlankLocalSite);
-        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        let status = consumer_config_status_error(&gw, "net", &err, 1);
         assert_eq!(
             status.reason, "ConsumerConfigRenderFailed",
             "render error must map to ConsumerConfigRenderFailed reason"
@@ -5396,11 +5498,10 @@ mod tests {
     #[test]
     fn consumer_config_status_missing_endpoint_reason() {
         let gw = make_gw_ref("gw", "ns");
-        let cc = make_consumer_config("cm");
         let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingClusterEndpoint {
             cluster: "site-a".to_owned(),
         });
-        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        let status = consumer_config_status_error(&gw, "net", &err, 1);
         assert_eq!(
             status.reason, "MissingClusterEndpoint",
             "missing endpoint topology must map to a specific operator-facing reason"
@@ -5414,11 +5515,10 @@ mod tests {
     #[test]
     fn consumer_config_status_missing_transport_reason() {
         let gw = make_gw_ref("gw", "ns");
-        let cc = make_consumer_config("cm");
         let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingTransport {
             cluster: "site-b".to_owned(),
         });
-        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        let status = consumer_config_status_error(&gw, "net", &err, 1);
         assert_eq!(
             status.reason, "MissingTransport",
             "missing transport must map to MissingTransport reason"
@@ -5432,14 +5532,13 @@ mod tests {
     #[test]
     fn consumer_config_status_missing_sni_reason() {
         let gw = make_gw_ref("gw", "ns");
-        let cc = make_consumer_config("cm");
         let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingSni {
             cluster: "site-c".to_owned(),
         });
-        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        let status = consumer_config_status_error(&gw, "net", &err, 1);
         assert_eq!(
             status.reason, "MissingSni",
-            "missing sni on mutual_tls must map to MissingSni reason"
+            "missing sni on mutualTls must map to MissingSni reason"
         );
         assert!(
             status.message.contains("site-c"),
@@ -5450,11 +5549,10 @@ mod tests {
     #[test]
     fn consumer_config_status_plaintext_with_sni_reason() {
         let gw = make_gw_ref("gw", "ns");
-        let cc = make_consumer_config("cm");
         let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::PlaintextWithSni {
             cluster: "site-d".to_owned(),
         });
-        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        let status = consumer_config_status_error(&gw, "net", &err, 1);
         assert_eq!(
             status.reason, "PlaintextWithSni",
             "plaintext with sni must map to PlaintextWithSni reason"
@@ -5469,10 +5567,9 @@ mod tests {
     fn consumer_config_status_error_message_does_not_contain_sentinel_token() {
         let sentinel = "sk-super-secret-token-do-not-emit";
         let gw = make_gw_ref("gw", "ns");
-        let cc = make_consumer_config("cm");
         // OverlayRender error message must not include the token (it never sees it).
         let err = OperatorError::OverlayRender("render failed: blank field".to_owned());
-        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        let status = consumer_config_status_error(&gw, "net", &err, 1);
         assert!(
             !status.message.contains(sentinel),
             "error status message must not contain token bytes"
@@ -5482,9 +5579,7 @@ mod tests {
     #[test]
     fn consumer_config_status_disabled_has_disabled_phase() {
         let gw = make_gw_ref("gw", "ns");
-        let mut cc = make_consumer_config("cm");
-        cc.enabled = false;
-        let status = consumer_config_status_disabled(&gw, &cc, 2);
+        let status = consumer_config_status_disabled(&gw, "net", 2);
         assert_eq!(status.phase, ConsumerConfigPhase::Disabled, "must set phase=Disabled");
         assert_eq!(
             status.reason, "ConsumerConfigDisabled",
@@ -5498,8 +5593,7 @@ mod tests {
     fn consumer_config_status_disabled_message_does_not_contain_sentinel_token() {
         let sentinel = "sk-super-secret-token-must-not-appear";
         let gw = make_gw_ref("gw", "ns");
-        let cc = make_consumer_config("cm");
-        let status = consumer_config_status_disabled(&gw, &cc, 1);
+        let status = consumer_config_status_disabled(&gw, "net", 1);
         assert!(
             !status.message.contains(sentinel),
             "disabled message must not contain token bytes"
@@ -5557,16 +5651,164 @@ mod tests {
     fn consumer_config_status_multiple_gateways_produce_separate_entries() {
         let gw_a = make_gw_ref("gw-a", "ns-a");
         let gw_b = make_gw_ref("gw-b", "ns-b");
-        let cc_a = make_consumer_config("cm-a");
-        let cc_b = make_consumer_config("cm-b");
-        let status_a = consumer_config_status_rendered(&gw_a, &cc_a, 1);
-        let status_b = consumer_config_status_rendered(&gw_b, &cc_b, 1);
+        let status_a = consumer_config_status_rendered(&gw_a, "net", 1);
+        let status_b = consumer_config_status_rendered(&gw_b, "net", 1);
         assert_eq!(status_a.gateway_name, "gw-a");
         assert_eq!(status_b.gateway_name, "gw-b");
-        assert_eq!(status_a.config_map_name, "cm-a");
-        assert_eq!(status_b.config_map_name, "cm-b");
+        assert_eq!(status_a.config_map_name, "grid-consumer-net-gw-a");
+        assert_eq!(status_b.config_map_name, "grid-consumer-net-gw-b");
         assert_eq!(status_a.phase, ConsumerConfigPhase::Rendered);
         assert_eq!(status_b.phase, ConsumerConfigPhase::Rendered);
+    }
+
+    // -----------------------------------------------------------------------
+    // consumer listener port from the gateway Service
+    // -----------------------------------------------------------------------
+
+    /// Serves the gateway Service GET (`service_status`, `service`) and records the applied consumer `ConfigMap`.
+    fn mock_consumer_client(
+        service_status: u16,
+        service: serde_json::Value,
+        applied: Arc<std::sync::Mutex<Option<ConfigMap>>>,
+    ) -> Client {
+        let svc = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let service = service.clone();
+            let applied = Arc::clone(&applied);
+            async move {
+                let path = req.uri().path().to_owned();
+                let (status, body) = if path.contains("/services/") {
+                    (service_status, service)
+                } else {
+                    let bytes = http_body_util::BodyExt::collect(req.into_body())
+                        .await
+                        .unwrap_or_else(|_| std::process::abort())
+                        .to_bytes();
+                    let cm: ConfigMap = serde_json::from_slice(&bytes).unwrap_or_else(|_| std::process::abort());
+                    let body = serde_json::to_value(&cm).unwrap_or_else(|_| std::process::abort());
+                    *applied.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cm);
+                    (200, body)
+                };
+                let response = http::Response::builder()
+                    .status(status)
+                    .body(kube::client::Body::from(
+                        serde_json::to_vec(&body).unwrap_or_else(|_| std::process::abort()),
+                    ))
+                    .unwrap_or_else(|_| std::process::abort());
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        Client::new(svc, "default")
+    }
+
+    fn gateway_service(ports: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "consumer-gateway", "namespace": "grid-system" },
+            "spec": { "ports": ports },
+        })
+    }
+
+    async fn reconcile_consumer_with(
+        service_status: u16,
+        service: serde_json::Value,
+    ) -> (ConsumerConfigStatus, String) {
+        let applied = Arc::new(std::sync::Mutex::new(None));
+        let client = mock_consumer_client(service_status, service, Arc::clone(&applied));
+        let mut gw = make_gw_ref("consumer-gateway", "grid-system");
+        gw.consumer_config = Some(crate::crd::grid_network::ConsumerConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        let overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site".to_owned(),
+            candidates: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        };
+        let settings = ConsumerSettings {
+            listener_port: 9999,
+            ..ConsumerSettings::default()
+        };
+        let status = reconcile_consumer_config(&overlay, "net", &gw, &settings, &client, 1).await;
+        let praxis_yaml = applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .and_then(|cm| cm.data)
+            .and_then(|mut data| data.remove("praxis.yaml"))
+            .unwrap_or_default();
+        (status, praxis_yaml)
+    }
+
+    #[tokio::test]
+    async fn consumer_listener_port_is_read_from_gateway_service() {
+        let service = gateway_service(&serde_json::json!([{ "name": "http", "port": 80, "targetPort": 8080 }]));
+        let (status, praxis_yaml) = reconcile_consumer_with(200, service).await;
+        assert_eq!(status.phase, ConsumerConfigPhase::Rendered);
+        assert!(status.reason.is_empty(), "resolved port must not report a reason");
+        assert!(
+            praxis_yaml.contains("address: \"0.0.0.0:8080\""),
+            "listener must bind the container port, not Service port 80: {praxis_yaml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_listener_port_without_target_port_uses_the_service_port() {
+        let service = gateway_service(&serde_json::json!([{ "name": "http", "port": 8443 }]));
+        let (status, praxis_yaml) = reconcile_consumer_with(200, service).await;
+        assert!(status.reason.is_empty(), "resolved port must not report a reason");
+        assert!(praxis_yaml.contains("address: \"0.0.0.0:8443\""), "{praxis_yaml}");
+    }
+
+    #[tokio::test]
+    async fn consumer_listener_port_refuses_a_named_target_port() {
+        let service = gateway_service(&serde_json::json!([{ "name": "http", "port": 80, "targetPort": "http" }]));
+        let (status, praxis_yaml) = reconcile_consumer_with(200, service).await;
+        assert_eq!(
+            status.reason, LISTENER_PORT_UNRESOLVED,
+            "a named targetPort cannot be resolved here"
+        );
+        assert!(praxis_yaml.contains("address: \"0.0.0.0:9999\""), "{praxis_yaml}");
+    }
+
+    #[tokio::test]
+    async fn consumer_listener_port_picks_named_http_port_on_multi_port_service() {
+        let service = gateway_service(&serde_json::json!([
+            { "name": "admin", "port": 9901 },
+            { "name": "http", "port": 80, "targetPort": 8081 },
+        ]));
+        let (status, praxis_yaml) = reconcile_consumer_with(200, service).await;
+        assert!(status.reason.is_empty(), "resolved port must not report a reason");
+        assert!(
+            praxis_yaml.contains("address: \"0.0.0.0:8081\""),
+            "listener must bind the http port's target: {praxis_yaml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_listener_port_falls_back_when_service_unreadable() {
+        let forbidden = serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "message": "services \"consumer-gateway\" is forbidden",
+            "reason": "Forbidden",
+            "code": 403,
+        });
+        let (status, praxis_yaml) = reconcile_consumer_with(403, forbidden).await;
+        assert_eq!(status.phase, ConsumerConfigPhase::Rendered, "fallback still renders");
+        assert_eq!(status.reason, LISTENER_PORT_UNRESOLVED);
+        assert!(
+            status.message.contains("fallback port 9999"),
+            "message: {}",
+            status.message
+        );
+        assert!(
+            praxis_yaml.contains("address: \"0.0.0.0:9999\""),
+            "listener must bind the fallback port: {praxis_yaml}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5592,7 +5834,7 @@ mod tests {
 
     fn make_active_grid_site(k8s_name: &str, network_ref: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": k8s_name },
             "spec": { "gridNetworkRef": network_ref },
@@ -5603,7 +5845,7 @@ mod tests {
 
     fn make_phase_grid_site(k8s_name: &str, network_ref: &str, phase: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": k8s_name },
             "spec": { "gridNetworkRef": network_ref },
@@ -5739,12 +5981,12 @@ mod tests {
 
     fn make_provider_with_tls(name: &str, network_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network_ref,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [],
@@ -5761,12 +6003,12 @@ mod tests {
 
     fn make_provider_with_tls_and_health_interval(name: &str, network_ref: &str, interval: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network_ref,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [],

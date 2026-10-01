@@ -1,4 +1,4 @@
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridNetwork
 metadata:
   name: example
@@ -25,10 +25,6 @@ spec:
       namespace: default
       consumerConfig:
         enabled: true
-        configMapName: praxis-consumer-config
-        listenerPort: 8080
-        credentialMountBase: /run/secrets/grid-credentials
-        tlsCertMountPath: /etc/praxis/tls
         # Cluster endpoints populated by gateway deployment or platform automation
         clusterEndpoints: []
 

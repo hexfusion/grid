@@ -1,4 +1,4 @@
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridNetwork
 metadata:
   name: glb-demo
@@ -26,17 +26,17 @@ spec:
           - cluster: vcr-east-provider
             address: "{{ captures.east-provider.provider-gateway-ip }}:8443"
             transport:
-              mode: mutual_tls
+              mode: mutualTls
               sni: east-provider.grid.internal
           - cluster: vcr-east-provider-secondary
             address: "{{ captures.east-provider.provider-gateway-ip }}:8443"
             transport:
-              mode: mutual_tls
+              mode: mutualTls
               sni: east-provider.grid.internal
           - cluster: vcr-west-provider
             address: "{{ captures.west-provider.provider-gateway-ip }}:8443"
             transport:
-              mode: mutual_tls
+              mode: mutualTls
               sni: west-provider.grid.internal
   tls:
     caSecretRef:

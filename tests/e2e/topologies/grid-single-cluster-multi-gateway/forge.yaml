@@ -183,7 +183,7 @@ spec:
               - name: vcr-provider-a-provider
                 gridNetworkRef: grid-single-cluster-multi-gateway
                 gatewayRef: provider-gateway-a
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-provider-a.grid-system.svc.cluster.local:8000"
                 siteSelector:
@@ -208,7 +208,7 @@ spec:
               - name: vcr-provider-b-provider
                 gridNetworkRef: grid-single-cluster-multi-gateway
                 gatewayRef: provider-gateway-a
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-provider-b.grid-system.svc.cluster.local:8000"
                 siteSelector:
@@ -228,7 +228,7 @@ spec:
               - name: vcr-provider-c-provider
                 gridNetworkRef: grid-single-cluster-multi-gateway
                 gatewayRef: provider-gateway-b
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-provider-c.grid-system.svc.cluster.local:8000"
                 siteSelector:

@@ -30,7 +30,7 @@ spec:
         - jsonPath: .status.connectedSites
           name: Sites
           type: integer
-      name: v1alpha1
+      name: v1beta1
       schema:
         openAPIV3Schema:
           description: Auto-generated derived type for GridNetworkSpec via `CustomResource`
@@ -212,7 +212,7 @@ spec:
 
                                 The `transport` field is required.  Missing transport fails closed
                                 during config rendering with status reason `MissingTransport`.
-                                When `transport.mode` is `mutual_tls`, `transport.sni` must also
+                                When `transport.mode` is `mutualTls`, `transport.sni` must also
                                 be present and non-blank; otherwise rendering fails with status
                                 reason `MissingSni`.
                               properties:
@@ -226,21 +226,19 @@ spec:
                                   description: |-
                                     Explicit transport configuration.
 
-                                    Required.  Use `mutual_tls` with `sni` for remote/provider-gateway
+                                    Required.  Use `mutualTls` with `sni` for remote/provider-gateway
                                     traffic.  Use `plaintext` only for local/dev-only endpoints.
                                     Missing transport fails closed during config rendering.
                                   nullable: true
                                   properties:
                                     mode:
-                                      description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                      description: Transport mode, required with no default so plaintext is always a declared choice.
                                       enum:
-                                        - mutual_tls
+                                        - mutualTls
                                         - plaintext
                                       type: string
                                     sni:
-                                      description: |-
-                                        TLS Server Name Indication (required when mode is `mutual_tls`;
-                                        must not be set when mode is `plaintext`).
+                                      description: TLS Server Name Indication, required for `mutualTls` and refused for `plaintext`.
                                       nullable: true
                                       type: string
                                   required:
@@ -251,23 +249,6 @@ spec:
                                 - cluster
                               type: object
                             type: array
-                          configMapName:
-                            default: praxis-consumer-config
-                            description: |-
-                              Name of the generated consumer Praxis `ConfigMap`.
-
-                              Default: `praxis-consumer-config`.
-                            type: string
-                          credentialMountBase:
-                            default: /run/secrets/grid-credentials
-                            description: |-
-                              Base directory for mounted credential Secret files inside the consumer pod.
-
-                              Each credential Secret is expected to be mounted at
-                              `{credentialMountBase}/{secret-name}/{secret-key}`.
-
-                              Default: `/run/secrets/grid-credentials`.
-                            type: string
                           enabled:
                             default: false
                             description: |-
@@ -275,29 +256,6 @@ spec:
 
                               Default: `false`.  Set to `true` to opt in.
                             type: boolean
-                          listenerPort:
-                            default: 8080
-                            description: |-
-                              HTTP port for the generated Praxis listener.
-
-                              The rendered `listeners[0].address` is `0.0.0.0:{listenerPort}`.
-
-                              Default: `8080`.
-                            format: uint16
-                            maximum: 65535.0
-                            minimum: 0.0
-                            type: integer
-                          tlsCertMountPath:
-                            default: /etc/praxis/tls
-                            description: |-
-                              Mount path for TLS certificates inside the consumer pod.
-
-                              Used when rendering mTLS cluster entries from `clusterEndpoints`.
-                              The operator expects the consumer pod to mount a TLS Secret at this path,
-                              containing `ca.crt`, `tls.crt`, and `tls.key`.
-
-                              Default: `/etc/praxis/tls`.
-                            type: string
                         type: object
                       localSiteName:
                         description: |-
@@ -683,7 +641,7 @@ spec:
                         description: |-
                           Name of the generated `ConfigMap`.
 
-                          Populated from `consumerConfig.configMapName`; empty for `Disabled` entries.
+                          The operator-owned consumer `ConfigMap` name, `grid-consumer-<network>-<gateway>`.
                         type: string
                       gatewayName:
                         description: Name of the `GatewayRef` this status entry corresponds to.
@@ -715,7 +673,8 @@ spec:
                         description: |-
                           Machine-readable reason for the current phase.
 
-                          `""` when `phase` is `Rendered`.
+                          `""` when `phase` is `Rendered`, or `ListenerPortUnresolved` when the
+                          gateway Service could not supply the listener port and the fallback was used.
                           One of `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`,
                           `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
                           `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled` otherwise.

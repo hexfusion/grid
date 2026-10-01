@@ -686,7 +686,7 @@ async fn update_status(
     }
 
     let patch = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "status": status
     });
@@ -745,7 +745,7 @@ mod tests {
 
     fn test_site(name: &str, network: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": name },
             "spec": { "gridNetworkRef": network }
@@ -759,7 +759,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": name, "labels": labels_map },
             "spec": { "gridNetworkRef": network }
@@ -770,12 +770,12 @@ mod tests {
     fn test_provider(name: &str, network: &str, models: &[&str]) -> InferenceProvider {
         let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": models_json
@@ -790,12 +790,12 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{"name": "model"}],
@@ -874,13 +874,13 @@ mod tests {
                         .map_or_else(|| json_not_found(&format!("secrets {name:?}")), json_ok)
                 } else if path.ends_with("/gridsites") {
                     json_ok(&serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "apiVersion": "grid.praxis-proxy.io/v1beta1",
                         "kind": "GridSiteList",
                         "items": [],
                     }))
                 } else if path.contains("/gridnetworks/") && name == grid_network_name {
                     json_ok(&serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "apiVersion": "grid.praxis-proxy.io/v1beta1",
                         "kind": "GridNetwork",
                         "metadata": { "name": grid_network_name },
                         "spec": {},
@@ -907,12 +907,12 @@ mod tests {
     /// at `ca_secret_name` in the `default` namespace.
     fn provider_with_health_check_tls(network: &str, ca_secret_name: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{"name": "model"}],
@@ -970,12 +970,12 @@ mod tests {
     fn blank_endpoint_maps_to_unavailable() {
         // Item 1: blank endpoint
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "",
                 "models": [{"name": "model"}]
@@ -994,12 +994,12 @@ mod tests {
     fn whitespace_only_endpoint_maps_to_unavailable() {
         // Item 2: whitespace-only endpoint
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "   ",
                 "models": [{"name": "model"}]
@@ -1016,12 +1016,12 @@ mod tests {
     fn blank_model_name_maps_to_unavailable() {
         // Item 3: blank model name
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{"name": ""}]
@@ -1040,12 +1040,12 @@ mod tests {
     fn second_model_blank_maps_to_unavailable() {
         // Item 4: first model valid, second blank
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{"name": "model-ok"}, {"name": ""}]
@@ -1329,12 +1329,12 @@ mod tests {
         // validate_provider_config catches the config error AND that
         // phase_from_probe does not participate in that path.
         let provider_with_blank_endpoint: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "bad" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "",
                 "models": [{"name": "model"}]
@@ -1477,14 +1477,14 @@ mod tests {
     #[test]
     fn empty_selector_with_no_sites_returns_empty() {
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": {"name": "p"},
             "spec": {
                 "gridNetworkRef": "net",
                 "backendKind": "local",
                 "endpoint": "http://vllm:8000",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "models": []
             }
         }))
@@ -1731,7 +1731,7 @@ mod tests {
     fn requeue_uses_tls_interval_when_metrics_tls_configured() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
             "models": [{"name": "model"}],
@@ -1753,7 +1753,7 @@ mod tests {
     fn requeue_interval_below_tls_bound_passes_through() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
             "models": [{"name": "model"}],
@@ -1776,7 +1776,7 @@ mod tests {
     fn requeue_interval_above_tls_bound_is_capped() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
             "models": [{"name": "model"}],
@@ -1866,7 +1866,7 @@ mod tests {
     fn probe_url_uses_health_check_endpoint_override() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -1887,7 +1887,7 @@ mod tests {
     fn probe_url_falls_back_to_spec_endpoint_when_override_absent() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -1910,7 +1910,7 @@ mod tests {
         // surfacing the error instead of silently skipping the probe.
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -1930,7 +1930,7 @@ mod tests {
     fn probe_url_endpoint_override_strips_trailing_slash() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -1955,7 +1955,7 @@ mod tests {
     fn requeue_uses_tls_interval_for_health_check_tls() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
             "models": [{"name": "model"}],
@@ -1978,7 +1978,7 @@ mod tests {
     fn requeue_interval_below_hc_tls_bound_passes_through() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://vllm:8443",
             "models": [{"name": "model"}],
@@ -2006,7 +2006,7 @@ mod tests {
     fn health_check_config_with_endpoint_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -2034,7 +2034,7 @@ mod tests {
     fn health_check_config_with_tls_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://backend:8443",
             "models": [{"name": "model-a"}],
@@ -2067,7 +2067,7 @@ mod tests {
     fn health_check_config_with_tls_and_client_cert_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "https://backend:8443",
             "models": [{"name": "model-a"}],
@@ -2522,12 +2522,12 @@ mod tests {
         // probe_url_for_provider would also return None for a blank endpoint,
         // but the static validation check runs first in resolve_phase_and_sites.
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "bad" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "",
                 "models": [{"name": "model"}],
@@ -2562,7 +2562,7 @@ mod tests {
     fn make_spec(endpoint: &str, health_path: Option<&str>, timeout: Option<&str>) -> InferenceProviderSpec {
         serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
             "models": [{"name": "model-a"}],
@@ -2585,7 +2585,7 @@ mod tests {
     ) -> InferenceProviderSpec {
         serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
             "models": [{"name": "model-a"}],
@@ -2610,7 +2610,7 @@ mod tests {
             grid_network_ref: "net".to_owned(),
             access_policy: crate::crd::auth::AccessPolicy::default(),
             auth: None,
-            backend_kind: "local".to_owned(),
+            backend_kind: crate::crd::inference_provider::BackendKind::Local,
             gateway_ref: None,
             cost: None,
             endpoint: endpoint.to_owned(),
@@ -2621,7 +2621,7 @@ mod tests {
                 context_window: None,
             }],
             model_discovery: None,
-            provider_kind: "self_hosted".to_owned(),
+            provider_kind: crate::crd::inference_provider::ProviderKind::OpenAi,
             routing_cluster_ref: None,
             metrics_config: None,
             traffic_policy: None,

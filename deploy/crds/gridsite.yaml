@@ -19,7 +19,7 @@ spec:
         - jsonPath: .spec.gridNetworkRef
           name: Network
           type: string
-      name: v1alpha1
+      name: v1beta1
       schema:
         openAPIV3Schema:
           description: Auto-generated derived type for GridSiteSpec via `CustomResource`
@@ -40,23 +40,23 @@ spec:
                       type: string
                     tls:
                       default:
-                        mode: Mutual
+                        mode: mutualTls
                       description: TLS mode for the connection.
                       properties:
                         mode:
-                          default: Mutual
-                          description: TLS transport mode.
+                          default: mutualTls
+                          description: TLS transport mode, `mutualTls` when absent.
                           enum:
-                            - Mutual
-                            - Plaintext
+                            - mutualTls
+                            - plaintext
                           type: string
                         serverName:
                           description: |-
                             Expected DNS identity for TLS verification.
 
                             Used as both the TLS SNI value and for certificate SAN
-                            verification.  Required when `mode` is [`EgressTlsMode::Mutual`];
-                            must be absent for [`EgressTlsMode::Plaintext`].
+                            verification.  Required when `mode` is [`TlsMode::MutualTls`];
+                            must be absent for [`TlsMode::Plaintext`].
 
                             Must be a valid DNS name (not an IP address), at most 253
                             characters.
@@ -110,18 +110,6 @@ spec:
                       minItems: 1
                       nullable: true
                       type: array
-                    certFingerprint:
-                      description: |-
-                        Legacy SHA-256 fingerprint of the remote site's public certificate PEM.
-
-                        Format: colon-separated lowercase hex bytes, e.g. `"ab:cd:ef:..."`.
-                        Computed as `sha256(pem_bytes)` where `pem_bytes` are the UTF-8 bytes of
-                        `status.publicCertPem`.
-
-                        **Deprecated:** use `canonicalFingerprints` for new deployments.
-                        The two fields must not both be set.
-                      nullable: true
-                      type: string
                   type: object
                 zone:
                   description: Availability zone.

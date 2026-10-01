@@ -326,7 +326,7 @@ The AGN and Praxis integration provides:
 - geography-derived locality tiers;
 - threshold-derived admission metadata;
 - `stable_id`, `rank`, and `generated_at` metadata;
-- explicit `mutual_tls` or `plaintext` endpoint transport in generated
+- explicit `mutualTls` or `plaintext` endpoint transport in generated
   consumer config;
 - SWIM membership and CRDT provider propagation;
 - provider Service address discovery and remote `GridSite` materialization;

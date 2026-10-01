@@ -264,7 +264,7 @@ spec:
             inferenceProviders:
               - name: llmd-pool-a-provider
                 gridNetworkRef: grid-llmd-pool-metrics
-                providerKind: llm-d-inference-sim
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
                 siteSelector:
@@ -341,7 +341,7 @@ spec:
             inferenceProviders:
               - name: llmd-pool-b-provider
                 gridNetworkRef: grid-llmd-pool-metrics
-                providerKind: llm-d-inference-sim
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
                 siteSelector:

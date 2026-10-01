@@ -245,8 +245,8 @@
         "properties": {
           "name": { "type": "string", "minLength": 1 },
           "gridNetworkRef": { "type": "string", "minLength": 1 },
-          "providerKind": { "type": "string", "minLength": 1 },
-          "backendKind": { "type": "string", "minLength": 1 },
+          "providerKind": { "type": "string", "enum": ["openAi", "anthropic", "bedrock", "vertex"] },
+          "backendKind": { "type": "string", "enum": ["local", "remote", "cloudManaged", "apiProvider"] },
           "endpoint": { "type": "string", "minLength": 1 },
           "routingClusterRef": { "type": "string" },
           "gatewayRef": { "type": "string", "minLength": 1 },

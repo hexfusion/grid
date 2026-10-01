@@ -1,4 +1,4 @@
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridNetwork
 metadata:
   name: grid-combined-site

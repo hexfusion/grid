@@ -212,6 +212,19 @@ fi
 
 # ── Service link env vars ───────────────────────────────────────────
 echo ""
+echo "=== Consumer rendering settings ==="
+CONSUMER_ENV=$(helm template verify-consumer "$CHART_DIR" --show-only templates/deployment.yaml 2>&1)
+for kv in "GRID_CONSUMER_CREDENTIAL_MOUNT_BASE=/run/secrets/grid-credentials" \
+  "GRID_CONSUMER_TLS_CERT_MOUNT_PATH=/etc/praxis/tls" "GRID_CONSUMER_LISTENER_PORT=8080"; do
+  if echo "$CONSUMER_ENV" | grep -A1 "name: ${kv%%=*}$" | grep -q "value: \"${kv#*=}\""; then
+    pass "operator env ${kv%%=*} defaults to ${kv#*=}"
+  else
+    fail "operator env ${kv%%=*} must default to ${kv#*=}"
+  fi
+done
+try_reject "$CHART_DIR" "consumer.listenerPort 0" --set consumer.listenerPort=0
+try_reject "$CHART_DIR" "relative consumer.tlsCertMountPath" --set consumer.tlsCertMountPath=relative
+
 echo "=== Service links ==="
 # A Service named grid-gateway injects GRID_GATEWAY_PORT=tcp://..., which clap
 # parses as --gateway-port and the operator crashes.
@@ -866,21 +879,23 @@ try_template "$GW_DIR" "absent gridServing and peerTrust maps (gw)" "${GW_REQ[@]
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
   --set gatewayConfig.listenerTls.enabled=true --namespace grid-system
 
-# listenerTls names the port https (render or BYO); probes follow the port name.
+# listenerTls names the port https (render or BYO); probes follow the port name, and
+# the Service targets the numeric container port so the grid operator can read it.
 for mode in render byo; do
   if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); else args=(--set config.existingConfigMap=byo); fi
   out=$(helm template v-port "$GW_DIR" "${args[@]}" --set gatewayConfig.listenerTls.enabled=true \
     --set gatewayConfig.listenerTls.existingSecret=l --namespace grid-system)
-  if [ "$(echo "$out" | grep -cE 'name: https|port: https|targetPort: https')" = 5 ]; then
-    pass "listenerTls ($mode): port, probes, and Service target https"
+  if [ "$(echo "$out" | grep -cE 'name: https|port: https')" = 4 ] && echo "$out" | grep -qE 'targetPort: 8080$'; then
+    pass "listenerTls ($mode): port and probes use https, Service targets 8080"
   else
-    fail "listenerTls ($mode): port, probes, and Service should target https"
+    fail "listenerTls ($mode): port and probes should use https, Service should target 8080"
   fi
 done
-if [ "$(helm template v-port "$GW_DIR" "${GW_RENDER[@]}" --namespace grid-system | grep -cE 'port: http$|targetPort: http$')" = 3 ]; then
-  pass "default port: probes and Service target http"
+out=$(helm template v-port "$GW_DIR" "${GW_RENDER[@]}" --namespace grid-system)
+if [ "$(echo "$out" | grep -cE 'port: http$')" = 2 ] && echo "$out" | grep -qE 'targetPort: 8080$'; then
+  pass "default port: probes use http, Service targets 8080"
 else
-  fail "default port: probes and Service should target http"
+  fail "default port: probes should use http, Service should target 8080"
 fi
 
 # Default probes must target the container port by its name, or the pod never goes Ready.
@@ -959,13 +974,13 @@ try_template "$SITE_DIR" "site default" "${SITE_REQ[@]}" --namespace grid-system
 try_template "$SITE_DIR" "site with providers" "${SITE_REQ[@]}" --namespace grid-system \
   --set 'inferenceProviders[0].name=mock-a' \
   --set 'inferenceProviders[0].gridNetworkRef=test-net' \
-  --set 'inferenceProviders[0].providerKind=simulator' \
-  --set 'inferenceProviders[0].backendKind=local_model' \
+  --set 'inferenceProviders[0].providerKind=openAi' \
+  --set 'inferenceProviders[0].backendKind=local' \
   --set 'inferenceProviders[0].endpoint=http://mock-a:8080' \
   --set 'inferenceProviders[1].name=mock-b' \
   --set 'inferenceProviders[1].gridNetworkRef=test-net' \
-  --set 'inferenceProviders[1].providerKind=simulator' \
-  --set 'inferenceProviders[1].backendKind=local_model' \
+  --set 'inferenceProviders[1].providerKind=openAi' \
+  --set 'inferenceProviders[1].backendKind=local' \
   --set 'inferenceProviders[1].endpoint=http://mock-b:8080'
 try_template "$SITE_DIR" "site with gateway refs" "${SITE_REQ[@]}" --namespace grid-system \
   --set 'gridNetwork.gatewayRefs[0].name=consumer-gateway' \
@@ -973,6 +988,14 @@ try_template "$SITE_DIR" "site with gateway refs" "${SITE_REQ[@]}" --namespace g
   --set 'gridNetwork.gatewayRefs[0].localSiteName=east-a'
 try_template "$SITE_DIR" "site with provider-site label" "${SITE_REQ[@]}" --namespace grid-system \
   --set gridSite.providerSiteLabel=test-site
+try_reject "$SITE_DIR" "v1alpha1 providerKind value" "${SITE_REQ[@]}" --namespace grid-system \
+  --set 'inferenceProviders[0].name=mock-a' --set 'inferenceProviders[0].gridNetworkRef=test-net' \
+  --set 'inferenceProviders[0].providerKind=self_hosted' --set 'inferenceProviders[0].backendKind=local' \
+  --set 'inferenceProviders[0].endpoint=http://mock-a:8080'
+try_reject "$SITE_DIR" "v1alpha1 backendKind value" "${SITE_REQ[@]}" --namespace grid-system \
+  --set 'inferenceProviders[0].name=mock-a' --set 'inferenceProviders[0].gridNetworkRef=test-net' \
+  --set 'inferenceProviders[0].providerKind=openAi' --set 'inferenceProviders[0].backendKind=local_model' \
+  --set 'inferenceProviders[0].endpoint=http://mock-a:8080'
 
 echo ""
 echo "=== Schema rejection (site) ==="
@@ -1212,7 +1235,7 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
   fi
 
   kubectl --context "$KCTX" apply -f - <<'CR_EOF' 2>/dev/null || true
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
   name: helm-test-site
@@ -1460,9 +1483,9 @@ try_template "$SITE_DIR" "three providers" --namespace grid-system \
   --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
   --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
   --set-json 'inferenceProviders=[
-    {"name":"prov-a","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://a:8080"},
-    {"name":"prov-b","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://b:8080"},
-    {"name":"prov-c","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://c:8080"}
+    {"name":"prov-a","gridNetworkRef":"test-grid","providerKind":"openAi","backendKind":"local","endpoint":"http://a:8080"},
+    {"name":"prov-b","gridNetworkRef":"test-grid","providerKind":"openAi","backendKind":"local","endpoint":"http://b:8080"},
+    {"name":"prov-c","gridNetworkRef":"test-grid","providerKind":"openAi","backendKind":"local","endpoint":"http://c:8080"}
   ]'
 
 # Duplicate provider name renders (Helm doesn't enforce uniqueness — K8s API does)
@@ -1470,8 +1493,8 @@ DUPE_RENDER=$(helm template verify-dupe "$SITE_DIR" --namespace grid-system \
   --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
   --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
   --set-json 'inferenceProviders=[
-    {"name":"same-name","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://a:8080"},
-    {"name":"same-name","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://b:8080"}
+    {"name":"same-name","gridNetworkRef":"test-grid","providerKind":"openAi","backendKind":"local","endpoint":"http://a:8080"},
+    {"name":"same-name","gridNetworkRef":"test-grid","providerKind":"openAi","backendKind":"local","endpoint":"http://b:8080"}
   ]' 2>&1)
 DUPE_COUNT=$(echo "$DUPE_RENDER" | grep -c 'name: same-name' || true)
 if [ "$DUPE_COUNT" -eq 2 ]; then
@@ -1485,7 +1508,7 @@ try_reject "$SITE_DIR" "missing endpoint" \
   --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
   --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
   --set-json 'inferenceProviders=[
-    {"name":"no-ep","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock"}
+    {"name":"no-ep","gridNetworkRef":"test-grid","providerKind":"openAi","backendKind":"local"}
   ]'
 
 # Provider removal: template with 1 provider (down from 2)
@@ -1493,7 +1516,7 @@ ONE_PROV=$(helm template verify-removal "$SITE_DIR" --namespace grid-system \
   --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
   --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
   --set-json 'inferenceProviders=[
-    {"name":"prov-a","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://a:8080"}
+    {"name":"prov-a","gridNetworkRef":"test-grid","providerKind":"openAi","backendKind":"local","endpoint":"http://a:8080"}
   ]' 2>&1)
 PROV_COUNT=$(echo "$ONE_PROV" | grep -c 'kind: InferenceProvider' || true)
 if [ "$PROV_COUNT" -eq 1 ]; then

@@ -525,7 +525,7 @@ provider-local candidate, model, and path policy remain the authorization
 boundary.
 
 When transport configuration changes, such as changing a remote endpoint from
-`plaintext` to `mutual_tls` or updating `transport.sni`, the deployment owner
+`plaintext` to `mutualTls` or updating `transport.sni`, the deployment owner
 must ensure the gateway reloads that configuration.
 
 ## Trust and Readiness

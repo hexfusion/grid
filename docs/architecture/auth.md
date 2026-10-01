@@ -32,7 +32,7 @@ gateway or provider component that makes the final upstream call authenticates
 to the selected backend after routing has chosen a candidate.  It does not
 replace or rewrite credentials on the inbound client request.
 
-The implemented native path is `bearer_token`:
+The implemented native path is `bearerToken` (`spec.auth.strategy`):
 
 1. A provider Secret contains the provider token.
 2. `InferenceProvider.spec.auth.secretRef` points at that Secret.
@@ -109,7 +109,7 @@ The `InferenceProvider` controller validates credentials during every reconcile:
 - The `CredentialResolver` trait and `KubernetesSecretResolver` v1 backend are
   in production operator code.
 - **Credential reference projection into the routing overlay**: when a provider's
-  `spec.auth` declares `strategy: bearer_token` with a valid `secretRef`, the
+  `spec.auth` declares `strategy: bearerToken` with a valid `secretRef`, the
   operator includes a `credential` field in every routing candidate produced for
   that provider. The field carries `{ strategy, secretRef: { name, namespace, key } }` —
   only the Secret reference, never the token value. This appears in the
@@ -154,11 +154,11 @@ stringData:
 ```
 
 Partial `InferenceProvider.spec.auth` snippet (merge it into a complete
-`InferenceProvider` using the `grid.praxis-proxy.io/v1alpha1` API):
+`InferenceProvider` using the `grid.praxis-proxy.io/v1beta1` API):
 
 ```yaml
 auth:
-  strategy: bearer_token
+  strategy: bearerToken
   secretRef:
     name: api-provider-creds
     namespace: default
@@ -209,7 +209,7 @@ and the user manages authentication externally.
 
 ### Credential Lifecycle
 
-For the current static `bearer_token` strategy, the
+For the current static `bearerToken` strategy, the
 credential value is mounted into the final-hop gateway or
 provider-side component as a Kubernetes Secret file.  `credential_inject`
 reads that file at filter construction time and injects
@@ -472,7 +472,7 @@ A non-empty `publicCertPem` with no private-key rejection indicates:
 - The remote site is authenticated or authorized for routing.
 - The mTLS handshake has succeeded.
 
-**Identity-aware gateway verification:** For `spec.egress.tls.mode: Mutual`,
+**Identity-aware gateway verification:** For `spec.egress.tls.mode: mutualTls`,
 the operator performs an mTLS handshake with the advertised gateway. It verifies
 the server chain against `GridNetwork.spec.tls.caSecretRef`, verifies the DNS SAN
 against `spec.egress.tls.serverName`, proves possession of the server private key
@@ -489,7 +489,7 @@ spec:
   egress:
     address: provider.example.com:8443
     tls:
-      mode: Mutual
+      mode: mutualTls
       serverName: provider.example.com
   trust:
     canonicalFingerprints:

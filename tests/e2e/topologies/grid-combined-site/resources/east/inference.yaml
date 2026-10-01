@@ -1,10 +1,10 @@
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: vcr-east-provider
 spec:
   gridNetworkRef: grid-combined-site
-  providerKind: vllm-vcr
+  providerKind: openAi
   backendKind: local
   endpoint: http://vcr-inference-east.grid-system.svc.cluster.local:8000
   models:

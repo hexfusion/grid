@@ -1,6 +1,6 @@
 # Custom Resource Definitions
 
-API group: `grid.praxis-proxy.io/v1alpha1`
+API group: `grid.praxis-proxy.io/v1beta1`
 
 The AI Grid Network (AGN) Operator defines these resources to describe sites,
 provider capacity, and routing policy. The established API identities remain
@@ -15,7 +15,7 @@ cluster can host multiple `GridNetworks` for
 multi-tenancy.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridNetwork
 metadata:
   name: production
@@ -29,14 +29,11 @@ spec:
       localSiteName: cluster-east   # optional; defaults to network name
       consumerConfig:               # optional; opt-in consumer Praxis config generation
         enabled: true
-        credentialMountBase: /run/secrets/grid-credentials
-        configMapName: praxis-consumer-config
-        tlsCertMountPath: /etc/praxis/tls
         clusterEndpoints:           # endpoint topology for load_balancer
           - cluster: site-a
             address: "10.0.0.4:30080"
             transport:
-              mode: mutual_tls         # mTLS with CA verification and client cert
+              mode: mutualTls         # mTLS with CA verification and client cert
               sni: site-a.grid.internal
           - cluster: api-provider
             address: "mock-api.default.svc:8080"
@@ -133,7 +130,7 @@ options under consideration if per-tenant confidentiality is required.
 |---|---|---|
 | `gatewayName` | string | Name of the gateway reference |
 | `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
-| `configMapName` | string | Name of the generated `ConfigMap` |
+| `configMapName` | string | Operator-owned name of the generated `ConfigMap`, `grid-consumer-<network>-<gateway>` |
 | `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
 | `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
@@ -149,14 +146,14 @@ status:
   consumerConfigStatus:
     - gatewayName: inference-gw
       namespace: praxis-system
-      configMapName: praxis-consumer-config
+      configMapName: grid-consumer-production-inference-gw
       phase: Rendered
       reason: ""
-      message: "consumer config rendered and applied to praxis-system/praxis-consumer-config"
+      message: "consumer config rendered and applied to praxis-system/grid-consumer-production-inference-gw"
       observedGeneration: 7
     - gatewayName: fallback-gw
       namespace: default
-      configMapName: op-e2e-consumer-config
+      configMapName: grid-consumer-op-e2e-net-op-e2e-gw
       phase: Error
       reason: ConsumerConfigRenderFailed
       message: "consumer config render: overlay local_site must not be blank"
@@ -239,19 +236,19 @@ Praxis `ConfigMap` generation.
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
-| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
-| `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
-| `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (mTLS with CA/client cert/SNI/verify) or `plaintext` (no TLS, insecure/dev-only). |
-| `clusterEndpoints[].transport.sni` | _(required for `mutual_tls`)_ | TLS Server Name Indication; must match the provider certificate SAN. |
-| `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
-| `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
+| `clusterEndpoints[].transport.mode` | _(required)_ | `mutualTls` (mTLS with CA/client cert/SNI/verify) or `plaintext` (no TLS, insecure/dev-only). |
+| `clusterEndpoints[].transport.sni` | _(required for `mutualTls`)_ | TLS Server Name Indication; must match the provider certificate SAN. |
+
+The operator names the generated `ConfigMap` `grid-consumer-<network>-<gateway>`.
+The credential mount base, TLS mount path, and fallback listener port are operator
+deployment settings (grid-operator chart `consumer.*` values), not grid intent.
 
 When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
 complete, runnable Praxis config containing:
 
-- `listeners:` — one public listener at `0.0.0.0:{listenerPort}`
+- `listeners:`: one public listener on the numeric `targetPort` of the gateway Service named by the gateway ref (its only port, or the port named `http`), falling back to `GRID_CONSUMER_LISTENER_PORT` with reason `ListenerPortUnresolved`
 - `filter_chains:` — the consumer chain with:
   - `intelligent_route` candidates from the routing overlay (with `credential.secretRef` for
     credential-bearing candidates)
@@ -283,7 +280,7 @@ Represents another site in the grid. Created manually
 for seed peers or automatically by SWIM discovery.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
   name: cluster-b
@@ -294,7 +291,7 @@ spec:
   egress:
     address: egress.cluster-b.example.com:8443
     tls:
-      mode: Mutual
+      mode: mutualTls
       serverName: egress.cluster-b.example.com
   trust:
     canonicalFingerprints:
@@ -409,7 +406,6 @@ be written to status.
 | Field | Meaning |
 |---|---|
 | `canonicalFingerprints` | Required DER-certificate SHA-256 pins (`hex(sha256(der_bytes))`), one or two entries for bounded rotation overlap |
-| `certFingerprint` | **Deprecated.** Legacy PEM-based fingerprint; rejected at runtime with `TrustMaterialInvalid`; migrate to `canonicalFingerprints` |
 
 **Routing eligibility:** `GridSite.status.phase == Active` is the control-plane eligibility
 gate for remote CRDT provider records. Active means the control plane has
@@ -506,20 +502,20 @@ Represents an inference backend available over the
 grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: openai-api
 spec:
   gridNetworkRef: production
-  providerKind: open_ai          # open_ai | anthropic | bedrock | vertex | self_hosted
-  backendKind: api_provider     # local | remote | cloud_managed | api_provider
+  providerKind: openAi          # openAi | anthropic | bedrock | vertex
+  backendKind: apiProvider     # local | remote | cloudManaged | apiProvider
   endpoint: https://api.openai.com
   models:
     - name: gpt-5-mini
       capabilities: [text_generation]
   auth:
-    strategy: bearer_token      # current native path; see Auth doc
+    strategy: bearerToken      # current native path; see Auth doc
     secretRef:
       name: openai-token
       namespace: praxis-system
@@ -546,6 +542,12 @@ weightedRandom` and `placementPolicy.strategy: static`. If omitted, the
 effective weight is `1`. AGN copies this value to the overlay's
 `traffic_weight`; it does not represent a percentage.
 
+### Provider kind
+
+`spec.providerKind` is the wire API the provider speaks: `openAi`,
+`anthropic`, `bedrock`, or `vertex`. Self-hosted vLLM and llm-d serve the
+OpenAI API, so they use `openAi`.
+
 ### Backend kind
 
 `spec.backendKind` describes the provider's placement and policy category:
@@ -554,11 +556,11 @@ effective weight is `1`. AGN copies this value to the overlay's
 |-------|---------|
 | `local` | Self-hosted capacity in the local site. |
 | `remote` | Self-hosted capacity in another AGN site. |
-| `cloud_managed` | Managed cloud capacity controlled by the operator's cloud account. |
-| `api_provider` | External API/SaaS provider used as fallback or explicit API route. |
+| `cloudManaged` | Managed cloud capacity controlled by the operator's cloud account. |
+| `apiProvider` | External API/SaaS provider used as fallback or explicit API route. |
 
 The value influences scoring and routing policy. It does not require a specific
-transport implementation; for example, a `cloud_managed` backend can still be
+transport implementation; for example, a `cloudManaged` backend can still be
 fronted by Praxis.
 
 The current CRD schema represents `backendKind` as a string rather than an
@@ -766,7 +768,7 @@ Each poll increments `grid_model_discovery_total{provider,outcome}`, where
 Represents MCP tool servers available over the grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: AgentToolProvider
 metadata:
   name: db-tools
@@ -778,7 +780,7 @@ spec:
     - name: database-query
       description: "Query the database"
   auth:
-    strategy: bearer_token
+    strategy: bearerToken
     secretRef:
       name: tool-token
       namespace: praxis-system
@@ -828,7 +830,7 @@ telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
 Represents A2A agents available over the grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: AgentToAgentProvider
 metadata:
   name: claims-agent
@@ -840,7 +842,7 @@ spec:
     skills: [claims-processing, document-review]
     modalities: [text]
   auth:
-    strategy: mtls_only
+    strategy: mtlsOnly
   accessPolicy:
     siteSelector:
       matchLabels:

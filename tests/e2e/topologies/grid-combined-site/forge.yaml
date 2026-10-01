@@ -238,7 +238,7 @@ spec:
             inferenceProviders:
               - name: vcr-west-provider
                 gridNetworkRef: grid-combined-site
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-west.grid-system.svc.cluster.local:8000"
                 siteSelector:
@@ -301,7 +301,7 @@ spec:
             inferenceProviders:
               - name: vcr-central-provider
                 gridNetworkRef: grid-combined-site
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-central.grid-system.svc.cluster.local:8000"
                 siteSelector:
@@ -364,7 +364,7 @@ spec:
             inferenceProviders:
               - name: vcr-east-provider
                 gridNetworkRef: grid-combined-site
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 endpoint: "http://vcr-inference-east.grid-system.svc.cluster.local:8000"
                 siteSelector:

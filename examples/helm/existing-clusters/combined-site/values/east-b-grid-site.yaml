@@ -29,8 +29,8 @@ gridSite:
 inferenceProviders:
   - name: mock-east-b-provider
     gridNetworkRef: REPLACE_NETWORK_NAME
-    providerKind: simulator
-    backendKind: local_model
+    providerKind: openAi
+    backendKind: local
     endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
     siteSelector:
       matchLabels:

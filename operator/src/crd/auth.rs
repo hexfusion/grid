@@ -33,7 +33,7 @@ pub struct AuthConfig {
 
 /// How credentials are presented to a provider.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum AuthStrategy {
     /// API key in a custom header (e.g. `x-api-key`).
     ApiKey,
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn auth_strategy_serde() {
         let json = serde_json::to_string(&AuthStrategy::BearerToken).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(json, "\"bearer_token\"", "snake_case serialization");
+        assert_eq!(json, "\"bearerToken\"", "camelCase serialization");
     }
 
     #[test]
@@ -105,9 +105,20 @@ mod tests {
     #[test]
     fn auth_config_manual_default_false() {
         let json = serde_json::json!({
-            "strategy": "bearer_token"
+            "strategy": "bearerToken"
         });
         let cfg: AuthConfig = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(!cfg.manual, "manual should default false");
+    }
+
+    #[test]
+    fn auth_strategy_is_camel_case_and_refuses_snake_case() {
+        let parsed: AuthStrategy =
+            serde_json::from_value(serde_json::json!("bearerToken")).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(parsed, AuthStrategy::BearerToken, "bearerToken parses");
+        assert!(
+            serde_json::from_value::<AuthStrategy>(serde_json::json!("bearer_token")).is_err(),
+            "the v1alpha1 value is refused"
+        );
     }
 }

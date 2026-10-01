@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::api::core::v1::ConfigMap;
 
 use crate::{
-    crd::grid_network::{ClusterEndpointConfig, SelectionMode, TransportMode},
-    resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
+    crd::grid_network::{ClusterEndpointConfig, SelectionMode, TlsMode},
+    resources::routing_overlay::{RoutingCandidate, RoutingOverlay, scoped_configmap_name},
 };
 
 // ---------------------------------------------------------------------------
@@ -66,8 +66,8 @@ pub enum ConsumerConfigError {
         cluster: String,
     },
 
-    /// A `mutual_tls` cluster endpoint has no SNI (or blank SNI).
-    #[error("mutual_tls transport for cluster {cluster:?} requires a non-blank sni")]
+    /// A `mutualTls` cluster endpoint has no SNI (or blank SNI).
+    #[error("mutualTls transport for cluster {cluster:?} requires a non-blank sni")]
     MissingSni {
         /// Cluster name with missing SNI.
         cluster: String,
@@ -77,9 +77,9 @@ pub enum ConsumerConfigError {
     ///
     /// Plaintext transport does not use TLS, so `sni` has no effect.
     /// Setting it is almost certainly a configuration mistake — the author
-    /// likely intended `mutual_tls`.
+    /// likely intended `mutualTls`.
     #[error(
-        "plaintext transport for cluster {cluster:?} must not set sni (sni does not enable TLS; use mutual_tls if TLS is intended)"
+        "plaintext transport for cluster {cluster:?} must not set sni (sni does not enable TLS; use mutualTls if TLS is intended)"
     )]
     PlaintextWithSni {
         /// Cluster name with the conflicting configuration.
@@ -109,7 +109,7 @@ pub enum ConsumerConfigError {
 ///   `/run/secrets/grid-credentials`).
 /// - `cluster_endpoints` — explicit endpoint topology for the `load_balancer` section.  Every unique candidate cluster
 ///   must have a matching endpoint entry with explicit transport configuration.  Missing transport or missing SNI on
-///   `mutual_tls` endpoints fail closed.
+///   `mutualTls` endpoints fail closed.
 /// - `tls_cert_mount_path` — mount path for TLS certificates inside the consumer pod.  Used only when rendering mTLS
 ///   cluster entries.
 /// - `listener_port` — HTTP port for the generated listener (`0.0.0.0:{listener_port}`).
@@ -122,7 +122,7 @@ pub enum ConsumerConfigError {
 /// - Any candidate has a blank cluster name.
 /// - Any candidate cluster has no matching endpoint in `cluster_endpoints`.
 /// - Any cluster endpoint has no `transport` configuration.
-/// - Any `mutual_tls` endpoint has no (or blank) `sni`.
+/// - Any `mutualTls` endpoint has no (or blank) `sni`.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
@@ -187,6 +187,12 @@ pub(crate) fn generate_consumer_praxis_config(
     config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
 
     Ok(config)
+}
+
+/// The operator-owned consumer Praxis `ConfigMap` name for one gateway.
+#[must_use]
+pub(crate) fn consumer_config_map_name(network_name: &str, gateway_name: &str) -> String {
+    scoped_configmap_name("grid-consumer", network_name, gateway_name)
 }
 
 /// Build the Kubernetes `ConfigMap` for the generated consumer Praxis config.
@@ -410,7 +416,7 @@ fn render_load_balancer(
 
 /// Render a full cluster entry with endpoint address and explicit transport.
 ///
-/// Validates that `transport` is present and, for `mutual_tls`, that `sni`
+/// Validates that `transport` is present and, for `mutualTls`, that `sni`
 /// is non-blank.  Missing transport fails closed with [`ConsumerConfigError::MissingTransport`];
 /// missing SNI on mTLS fails with [`ConsumerConfigError::MissingSni`].
 #[expect(
@@ -432,7 +438,7 @@ fn render_cluster_entry(
         })?;
 
     match transport.mode {
-        TransportMode::MutualTls => {
+        TlsMode::MutualTls => {
             let raw_sni = transport
                 .sni
                 .as_deref()
@@ -456,7 +462,7 @@ fn render_cluster_entry(
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
             ))
         },
-        TransportMode::Plaintext => {
+        TlsMode::Plaintext => {
             if transport.sni.as_deref().is_some_and(|s| !s.trim().is_empty()) {
                 return Err(ConsumerConfigError::PlaintextWithSni {
                     cluster: ep.cluster.clone(),
@@ -538,6 +544,18 @@ mod tests {
             routing_overlay::{ProjectedCredential, ProjectedCredentialRef},
         },
     };
+
+    #[test]
+    fn consumer_config_map_name_is_operator_owned_and_bounded() {
+        assert_eq!(consumer_config_map_name("net", "gw"), "grid-consumer-net-gw");
+        let long = consumer_config_map_name(&"n".repeat(60), &"g".repeat(60));
+        assert!(long.len() <= 63 && long.starts_with("grid-consumer-"), "{long}");
+        assert_ne!(
+            long,
+            consumer_config_map_name(&"n".repeat(60), &"g".repeat(61)),
+            "long names stay distinct"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Test utilities
@@ -623,7 +641,7 @@ mod tests {
                 cluster: cluster.to_owned(),
                 address: format!("127.0.0.1:{}", 30_000 + idx),
                 transport: Some(EndpointTransport {
-                    mode: TransportMode::Plaintext,
+                    mode: TlsMode::Plaintext,
                     sni: None,
                 }),
             })
@@ -1314,7 +1332,7 @@ mod tests {
             cluster: cluster.to_owned(),
             address: address.to_owned(),
             transport: Some(EndpointTransport {
-                mode: TransportMode::MutualTls,
+                mode: TlsMode::MutualTls,
                 sni: Some(sni.to_owned()),
             }),
         }
@@ -1325,7 +1343,7 @@ mod tests {
             cluster: cluster.to_owned(),
             address: address.to_owned(),
             transport: Some(EndpointTransport {
-                mode: TransportMode::Plaintext,
+                mode: TlsMode::Plaintext,
                 sni: None,
             }),
         }
@@ -1427,7 +1445,7 @@ mod tests {
             cluster: "mtls-no-sni".to_owned(),
             address: "10.0.0.1:8080".to_owned(),
             transport: Some(EndpointTransport {
-                mode: TransportMode::MutualTls,
+                mode: TlsMode::MutualTls,
                 sni: None,
             }),
         }];
@@ -1449,7 +1467,7 @@ mod tests {
             cluster: "mtls-blank-sni".to_owned(),
             address: "10.0.0.1:8080".to_owned(),
             transport: Some(EndpointTransport {
-                mode: TransportMode::MutualTls,
+                mode: TlsMode::MutualTls,
                 sni: Some("  ".to_owned()),
             }),
         }];
@@ -1477,7 +1495,7 @@ mod tests {
             cluster: "plain-with-sni".to_owned(),
             address: "10.0.0.1:8080".to_owned(),
             transport: Some(EndpointTransport {
-                mode: TransportMode::Plaintext,
+                mode: TlsMode::Plaintext,
                 sni: Some("unexpected.grid.internal".to_owned()),
             }),
         }];
@@ -1505,7 +1523,7 @@ mod tests {
             cluster: "plain-blank-sni".to_owned(),
             address: "10.0.0.1:8080".to_owned(),
             transport: Some(EndpointTransport {
-                mode: TransportMode::Plaintext,
+                mode: TlsMode::Plaintext,
                 sni: Some("  ".to_owned()),
             }),
         }];
@@ -1529,7 +1547,7 @@ mod tests {
             cluster: "trim-test".to_owned(),
             address: "10.0.0.1:8080".to_owned(),
             transport: Some(EndpointTransport {
-                mode: TransportMode::MutualTls,
+                mode: TlsMode::MutualTls,
                 sni: Some("  site-a.grid.internal  ".to_owned()),
             }),
         }];

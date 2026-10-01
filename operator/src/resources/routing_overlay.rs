@@ -52,7 +52,7 @@ use crate::{
         auth::{AccessPolicy, AuthStrategy},
         grid_network::GridNetwork,
         grid_site::GridSite,
-        inference_provider::{InferenceProvider, ProviderPhase},
+        inference_provider::{BackendKind, InferenceProvider, ProviderPhase},
     },
     resources::geography::{AdmissionState, LocalityTier},
     swim::{MemberStatus, MembershipSnapshot},
@@ -81,26 +81,8 @@ const DEFAULT_LOCALITY: f64 = 0.5;
 // Locality scoring
 // ---------------------------------------------------------------------------
 
-/// Derive the locality score for an [`InferenceProvider`] from its
-/// `spec.backendKind` string.
-///
-/// Parses the `backend_kind` value as a [`scoring::BackendKind`] and
-/// delegates to [`scoring::locality_score`] with no region context
-/// (`None, None`).  Unrecognised kinds default to
-/// [`DEFAULT_LOCALITY`] (0.5).
-///
-/// | `backend_kind` | Score |
-/// |----------------|-------|
-/// | `"local"` | 1.0 |
-/// | `"remote"` | 0.5 (no region context) |
-/// | `"cloud_managed"` | 0.2 |
-/// | `"api_provider"` | 0.1 |
-/// | unknown | 0.5 |
-///
-/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
-pub(crate) fn backend_locality_score(backend_kind: &str) -> f64 {
-    let kind: Option<scoring::BackendKind> =
-        serde_json::from_value(serde_json::Value::String(backend_kind.to_owned())).ok();
+/// Locality score for a backend kind with no region context, [`DEFAULT_LOCALITY`] when unknown.
+pub(crate) fn backend_locality_score(kind: Option<scoring::BackendKind>) -> f64 {
     kind.map_or(DEFAULT_LOCALITY, |k| scoring::locality_score(k, None, None))
 }
 
@@ -154,11 +136,8 @@ pub(crate) fn routing_identity(provider: &InferenceProvider) -> Option<&str> {
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 pub(crate) fn provider_to_backend_config(provider: &InferenceProvider) -> Option<scoring::BackendConfig> {
     let name = routing_identity(provider)?.to_owned();
-    let kind: scoring::BackendKind =
-        serde_json::from_value(serde_json::Value::String(provider.spec.backend_kind.clone())).ok()?;
-    let provider_kind: scoring::ProviderKind =
-        serde_json::from_value(serde_json::Value::String(provider.spec.provider_kind.clone()))
-            .unwrap_or(scoring::ProviderKind::OpenAi);
+    let kind = provider.spec.backend_kind.to_scoring();
+    let provider_kind = provider.spec.provider_kind.to_scoring();
     let cost_per_1k_input = provider
         .spec
         .cost
@@ -332,10 +311,9 @@ pub(crate) fn remote_crdt_provider_to_backend_config(provider: &crdt::ProviderSt
     if provider.phase == crdt::ProviderPhase::Unavailable {
         return None;
     }
-    let kind = match provider.backend_kind.as_str() {
-        "cloud_managed" => scoring::BackendKind::CloudManaged,
-        "api_provider" => scoring::BackendKind::ApiProvider,
-        _ => scoring::BackendKind::Remote,
+    let kind = match BackendKind::from_wire_name(&provider.backend_kind) {
+        Some(kind @ (scoring::BackendKind::CloudManaged | scoring::BackendKind::ApiProvider)) => kind,
+        Some(scoring::BackendKind::Local | scoring::BackendKind::Remote) | None => scoring::BackendKind::Remote,
     };
     Some(scoring::BackendConfig::new(
         provider.routing_cluster.clone(),
@@ -533,7 +511,10 @@ pub(crate) fn apply_stale_gc_filter(
 /// crate's default for missing metrics) and no cost (treated as free → cost
 /// signal = 1.0).  This places unmapped providers on the same numeric scale
 /// as scored providers so they can be sorted in a single pass.
-fn unmapped_provider_breakdown(backend_kind: &str, weights: &scoring::ScoringWeights) -> scoring::ScoreBreakdown {
+fn unmapped_provider_breakdown(
+    backend_kind: Option<scoring::BackendKind>,
+    weights: &scoring::ScoringWeights,
+) -> scoring::ScoreBreakdown {
     let w = weights;
     let locality = w.locality * backend_locality_score(backend_kind);
     let cost = w.cost * 1.0;
@@ -597,7 +578,7 @@ fn provider_ordering_scores(
             let breakdown = from_engine
                 .get(cluster.as_str())
                 .cloned()
-                .unwrap_or_else(|| unmapped_provider_breakdown(&p.spec.backend_kind, weights));
+                .unwrap_or_else(|| unmapped_provider_breakdown(Some(p.spec.backend_kind.to_scoring()), weights));
             Some((cluster, breakdown))
         })
         .collect();
@@ -607,7 +588,9 @@ fn provider_ordering_scores(
             from_engine
                 .get(provider.routing_cluster.as_str())
                 .cloned()
-                .unwrap_or_else(|| unmapped_provider_breakdown(&provider.backend_kind, weights))
+                .unwrap_or_else(|| {
+                    unmapped_provider_breakdown(BackendKind::from_wire_name(&provider.backend_kind), weights)
+                })
         });
     }
 
@@ -1726,7 +1709,7 @@ pub(crate) fn overlay_configmap_name(network_name: &str, gateway_name: &str) -> 
     scoped_configmap_name("grid-overlay", network_name, gateway_name)
 }
 
-/// `{kind}-{network}-{gateway}`, hash-suffixed past 63 characters for a `kind` of up to 12.
+/// `{kind}-{network}-{gateway}`, hash-suffixed to fit 63 characters for a `kind` of up to 14.
 pub(crate) fn scoped_configmap_name(kind: &str, network_name: &str, gateway_name: &str) -> String {
     let raw = format!("{kind}-{network_name}-{gateway_name}");
     if raw.len() <= MAX_K8S_NAME {
@@ -1734,8 +1717,14 @@ pub(crate) fn scoped_configmap_name(kind: &str, network_name: &str, gateway_name
     }
 
     let hash = fnv1a_hex8(&format!("{network_name}/{gateway_name}"));
-    let net_prefix: String = network_name.chars().take(MAX_COMPONENT_PREFIX).collect();
-    let gw_prefix: String = gateway_name.chars().take(MAX_COMPONENT_PREFIX).collect();
+    // Three dashes and the 8-digit hash, the rest split between the two prefixes.
+    let prefix = MAX_K8S_NAME
+        .saturating_sub(kind.len().saturating_add(11))
+        .checked_div(2)
+        .unwrap_or_default()
+        .min(MAX_COMPONENT_PREFIX);
+    let net_prefix: String = network_name.chars().take(prefix).collect();
+    let gw_prefix: String = gateway_name.chars().take(prefix).collect();
     format!("{kind}-{net_prefix}-{gw_prefix}-{hash}")
 }
 
@@ -1788,7 +1777,7 @@ mod tests {
 
     fn test_network(name: &str) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": name },
             "spec": { "seeds": [] }
@@ -1798,7 +1787,7 @@ mod tests {
 
     fn test_network_score_first(name: &str) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": name },
             "spec": { "seeds": [], "routingPolicy": "scoreFirst" }
@@ -1808,7 +1797,7 @@ mod tests {
 
     fn test_weighted_network(name: &str) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": name },
             "spec": {
@@ -1974,7 +1963,7 @@ mod tests {
 
     fn test_site(name: &str, network: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": name },
             "spec": { "gridNetworkRef": network }
@@ -1988,7 +1977,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": {
                 "name": name,
@@ -2002,12 +1991,12 @@ mod tests {
     fn test_provider(name: &str, network: &str, models: &[&str]) -> InferenceProvider {
         let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": models_json
@@ -2105,12 +2094,12 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": models_json,
@@ -2123,12 +2112,12 @@ mod tests {
     fn test_provider_with_phase(name: &str, network: &str, models: &[&str], phase: &str) -> InferenceProvider {
         let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": models_json
@@ -2155,14 +2144,14 @@ mod tests {
         build_overlay_configmap(overlay, None, net, gw, "ns").unwrap_or_else(|_| std::process::abort())
     }
 
-    fn test_provider_with_backend_kind(name: &str, network: &str, backend_kind: &str) -> InferenceProvider {
+    fn test_provider_with_backend_kind(name: &str, network: &str, backend_kind: BackendKind) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8000",
                 "models": [{ "name": "model-a" }]
@@ -2173,12 +2162,12 @@ mod tests {
 
     fn test_provider_with_cost(name: &str, network: &str, per_million_input: f64) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "open_ai",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{ "name": "model-a" }],
@@ -2190,7 +2179,7 @@ mod tests {
 
     fn test_network_with_region(name: &str, region: &str) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": name },
             "spec": { "seeds": [], "region": region }
@@ -2204,7 +2193,7 @@ mod tests {
 
     #[test]
     fn provider_to_backend_config_maps_local_backend_kind() {
-        let p = test_provider_with_backend_kind("prov-a", "net", "local");
+        let p = test_provider_with_backend_kind("prov-a", "net", BackendKind::Local);
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
         assert_eq!(cfg.name, "prov-a", "name must match metadata.name");
         assert_eq!(
@@ -2216,7 +2205,7 @@ mod tests {
 
     #[test]
     fn provider_to_backend_config_maps_remote_backend_kind() {
-        let p = test_provider_with_backend_kind("prov-b", "net", "remote");
+        let p = test_provider_with_backend_kind("prov-b", "net", BackendKind::Remote);
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             cfg.kind,
@@ -2227,7 +2216,7 @@ mod tests {
 
     #[test]
     fn provider_to_backend_config_maps_cloud_managed_backend_kind() {
-        let p = test_provider_with_backend_kind("prov-c", "net", "cloud_managed");
+        let p = test_provider_with_backend_kind("prov-c", "net", BackendKind::CloudManaged);
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             cfg.kind,
@@ -2238,7 +2227,7 @@ mod tests {
 
     #[test]
     fn provider_to_backend_config_maps_api_provider_backend_kind() {
-        let p = test_provider_with_backend_kind("prov-d", "net", "api_provider");
+        let p = test_provider_with_backend_kind("prov-d", "net", BackendKind::ApiProvider);
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             cfg.kind,
@@ -2248,46 +2237,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_to_backend_config_unknown_backend_kind_returns_none() {
-        let p = test_provider_with_backend_kind("prov-x", "net", "nonexistent_kind");
-        assert!(
-            provider_to_backend_config(&p).is_none(),
-            "unknown backend_kind must return None"
-        );
-    }
-
-    #[test]
-    fn provider_to_backend_config_empty_backend_kind_returns_none() {
-        let p = test_provider_with_backend_kind("prov-e", "net", "");
-        assert!(
-            provider_to_backend_config(&p).is_none(),
-            "empty backend_kind must return None"
-        );
-    }
-
-    #[test]
-    fn provider_to_backend_config_unknown_provider_kind_defaults_to_open_ai() {
-        // "self_hosted" is not a scoring::ProviderKind variant; must default to OpenAi.
-        // provider_kind is metadata only and does not affect the scoring formula.
-        let p = test_provider_with_backend_kind("prov-f", "net", "local");
+    fn provider_to_backend_config_maps_open_ai_provider_kind() {
+        let p = test_provider_with_backend_kind("prov-f", "net", BackendKind::Local);
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             cfg.provider,
             scoring::ProviderKind::OpenAi,
-            "self_hosted provider_kind must default to OpenAi"
+            "openAi maps to the scoring engine's OpenAi"
         );
     }
 
     #[test]
     fn provider_to_backend_config_known_provider_kind_is_preserved() {
         let p: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov-g" },
             "spec": {
                 "gridNetworkRef": "net",
                 "providerKind": "anthropic",
-                "backendKind": "api_provider",
+                "backendKind": "apiProvider",
                 "endpoint": "https://api.anthropic.com",
                 "models": [{ "name": "claude" }]
             }
@@ -2316,7 +2285,7 @@ mod tests {
     #[test]
     #[expect(clippy::float_cmp, reason = "exact zero comparison for absent cost")]
     fn provider_to_backend_config_absent_cost_is_zero() {
-        let p = test_provider_with_backend_kind("prov-i", "net", "local");
+        let p = test_provider_with_backend_kind("prov-i", "net", BackendKind::Local);
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
         assert_eq!(cfg.cost_per_1k_input, 0.0, "absent cost must be 0.0");
         assert_eq!(cfg.cost_per_1k_output, 0.0, "absent output cost must be 0.0");
@@ -2325,12 +2294,12 @@ mod tests {
     #[test]
     fn provider_to_backend_config_missing_metadata_name_returns_none() {
         let p: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": {},
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{ "name": "m" }]
@@ -2348,7 +2317,7 @@ mod tests {
         // InferenceProvider carries no region; BackendConfig.region must be None.
         // Region-aware scoring (0.7 same-region) requires per-provider region data
         // which is not yet in the CRD.
-        let p = test_provider_with_backend_kind("prov-j", "net", "remote");
+        let p = test_provider_with_backend_kind("prov-j", "net", BackendKind::Remote);
         let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
         assert!(cfg.region.is_none(), "provider region must always be None (not in CRD)");
     }
@@ -2369,8 +2338,8 @@ mod tests {
     fn score_ordered_local_ranks_before_api_provider() {
         // Regression-safe: full scoring engine must preserve local > api ordering.
         let network = test_network("net");
-        let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
-        let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let local_prov = test_provider_with_backend_kind("local-prov", "net", BackendKind::Local);
+        let api_prov = test_provider_with_backend_kind("api-prov", "net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2419,8 +2388,8 @@ mod tests {
     fn score_ordered_deterministic_for_equal_scores() {
         // Two identical providers (same kind, same cost) → alphabetical tiebreak.
         let network = test_network("net");
-        let p_z = test_provider_with_backend_kind("z-local", "net", "local");
-        let p_a = test_provider_with_backend_kind("a-local", "net", "local");
+        let p_z = test_provider_with_backend_kind("z-local", "net", BackendKind::Local);
+        let p_a = test_provider_with_backend_kind("a-local", "net", BackendKind::Local);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2440,40 +2409,12 @@ mod tests {
     }
 
     #[test]
-    fn score_ordered_unknown_backend_kind_uses_same_scale_fallback() {
-        // Providers with unknown backend_kind fall back to unmapped_provider_score,
-        // which is on the same numeric scale as score_backends output.
-        // unknown kind → locality 0.5 → same scale score ≈ 7.0
-        // cloud_managed → locality 0.2 → score ≈ 6.1
-        // unknown (7.0) must rank before cloud_managed (6.1).
-        let network = test_network("net");
-        let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
-        let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[cloud, unknown],
-            &[],
-            "test-site",
-            None,
-            None,
-            &scoring::ScoringWeights::default(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(
-            overlay.candidates.first().map(|c| c.cluster.as_str()),
-            Some("unknown-prov"),
-            "unmapped-kind provider (same scale as remote, ≈7.0) must rank before cloud_managed (≈6.1)"
-        );
-    }
-
-    #[test]
     fn score_ordered_self_hosted_provider_kind_is_included() {
         // "self_hosted" provider_kind (vLLM / llm-d) defaults to ProviderKind::OpenAi.
         // The provider must appear in the overlay with correct ordering.
         let network = test_network("net");
-        let self_hosted = test_provider_with_backend_kind("vllm-prov", "net", "local");
-        let api = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let self_hosted = test_provider_with_backend_kind("vllm-prov", "net", BackendKind::Local);
+        let api = test_provider_with_backend_kind("api-prov", "net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2497,8 +2438,8 @@ mod tests {
     fn score_ordered_input_order_does_not_affect_output() {
         // Scoring must be deterministic regardless of which slice order providers arrive in.
         let network = test_network("net");
-        let local = test_provider_with_backend_kind("local-prov", "net", "local");
-        let api = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let local = test_provider_with_backend_kind("local-prov", "net", BackendKind::Local);
+        let api = test_provider_with_backend_kind("api-prov", "net", BackendKind::ApiProvider);
         let fwd = render_routing_overlay(
             &network,
             &[],
@@ -2535,8 +2476,8 @@ mod tests {
         // None (not in CRD), remote providers still score 0.5 regardless — but the
         // call must not panic or produce wrong results.
         let network = test_network_with_region("net", "eu-west-1");
-        let local = test_provider_with_backend_kind("local-prov", "net", "local");
-        let remote = test_provider_with_backend_kind("remote-prov", "net", "remote");
+        let local = test_provider_with_backend_kind("local-prov", "net", BackendKind::Local);
+        let remote = test_provider_with_backend_kind("remote-prov", "net", BackendKind::Remote);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2583,12 +2524,12 @@ mod tests {
         phase: &str,
     ) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8000",
                 "models": [{ "name": "shared-model" }]
@@ -2608,8 +2549,8 @@ mod tests {
         // the same model. Overlay must contain both candidates and order local
         // before remote. Phase-1 no-site mode: site = provider name.
         let network = test_network("mesh-net");
-        let local_prov = test_provider_with_backend_kind("provider-self-hosted", "mesh-net", "local");
-        let remote_prov = test_provider_with_backend_kind("provider-remote", "mesh-net", "remote");
+        let local_prov = test_provider_with_backend_kind("provider-self-hosted", "mesh-net", BackendKind::Local);
+        let remote_prov = test_provider_with_backend_kind("provider-remote", "mesh-net", BackendKind::Remote);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2652,7 +2593,7 @@ mod tests {
         let network = test_network("fallback-net");
         let local_down =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Unavailable");
-        let api_fallback = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
+        let api_fallback = test_provider_with_backend_kind("provider-api", "fallback-net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2694,7 +2635,7 @@ mod tests {
         let network = test_network("fallback-net");
         let local_degraded =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Degraded");
-        let api_ok = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
+        let api_ok = test_provider_with_backend_kind("provider-api", "fallback-net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2737,10 +2678,10 @@ mod tests {
         // ordering is driven entirely by locality score through the scoring
         // engine. Validates the full four-kind candidate set shape.
         let network = test_network("full-net");
-        let self_hosted = test_provider_with_backend_kind("prov-local", "full-net", "local");
-        let remote = test_provider_with_backend_kind("prov-remote", "full-net", "remote");
-        let cloud = test_provider_with_backend_kind("prov-cloud", "full-net", "cloud_managed");
-        let api = test_provider_with_backend_kind("prov-api", "full-net", "api_provider");
+        let self_hosted = test_provider_with_backend_kind("prov-local", "full-net", BackendKind::Local);
+        let remote = test_provider_with_backend_kind("prov-remote", "full-net", BackendKind::Remote);
+        let cloud = test_provider_with_backend_kind("prov-cloud", "full-net", BackendKind::CloudManaged);
+        let api = test_provider_with_backend_kind("prov-api", "full-net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2774,7 +2715,8 @@ mod tests {
         // call is pure and stateless; this test simulates two consecutive
         // reconcile cycles.
         let network = test_network("recovery-net");
-        let api_always_available = test_provider_with_backend_kind("prov-api", "recovery-net", "api_provider");
+        let api_always_available =
+            test_provider_with_backend_kind("prov-api", "recovery-net", BackendKind::ApiProvider);
 
         // Cycle 1: local is down — only API candidate.
         let local_down =
@@ -2863,8 +2805,8 @@ mod tests {
         // `endpoint` is NOT in the candidate — Praxis looks up the backend
         // endpoint via the `cluster` name in its own load_balancer config.
         let network = test_network("json-net");
-        let local_prov = test_provider_with_backend_kind("prov-a", "json-net", "local");
-        let api_prov = test_provider_with_backend_kind("prov-b", "json-net", "api_provider");
+        let local_prov = test_provider_with_backend_kind("prov-a", "json-net", BackendKind::Local);
+        let api_prov = test_provider_with_backend_kind("prov-b", "json-net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -2912,14 +2854,14 @@ mod tests {
 
     #[test]
     fn local_backend_kind_scores_highest() {
-        let score = backend_locality_score("local");
+        let score = backend_locality_score(Some(scoring::BackendKind::Local));
         assert!((score - 1.0).abs() < f64::EPSILON, "local must score 1.0, got {score}");
     }
 
     #[test]
     fn remote_backend_kind_scores_half() {
         // No region context → remote falls back to 0.5.
-        let score = backend_locality_score("remote");
+        let score = backend_locality_score(Some(scoring::BackendKind::Remote));
         assert!(
             (score - 0.5).abs() < f64::EPSILON,
             "remote (no region) must score 0.5, got {score}"
@@ -2928,7 +2870,7 @@ mod tests {
 
     #[test]
     fn cloud_managed_backend_kind_scores_low() {
-        let score = backend_locality_score("cloud_managed");
+        let score = backend_locality_score(Some(scoring::BackendKind::CloudManaged));
         assert!(
             (score - 0.2).abs() < f64::EPSILON,
             "cloud_managed must score 0.2, got {score}"
@@ -2937,7 +2879,7 @@ mod tests {
 
     #[test]
     fn api_provider_backend_kind_scores_lowest() {
-        let score = backend_locality_score("api_provider");
+        let score = backend_locality_score(Some(scoring::BackendKind::ApiProvider));
         assert!(
             (score - 0.1).abs() < f64::EPSILON,
             "api_provider must score 0.1, got {score}"
@@ -2946,7 +2888,7 @@ mod tests {
 
     #[test]
     fn unknown_backend_kind_defaults_to_half() {
-        let score = backend_locality_score("unknown_kind_xyz");
+        let score = backend_locality_score(BackendKind::from_wire_name("unknown_kind_xyz"));
         assert!(
             (score - DEFAULT_LOCALITY).abs() < f64::EPSILON,
             "unknown kind must default to {DEFAULT_LOCALITY}, got {score}"
@@ -2955,7 +2897,7 @@ mod tests {
 
     #[test]
     fn empty_backend_kind_defaults_to_half() {
-        let score = backend_locality_score("");
+        let score = backend_locality_score(BackendKind::from_wire_name(""));
         assert!(
             (score - DEFAULT_LOCALITY).abs() < f64::EPSILON,
             "empty kind must default to {DEFAULT_LOCALITY}, got {score}"
@@ -2964,10 +2906,10 @@ mod tests {
 
     #[test]
     fn locality_scores_are_strictly_ordered() {
-        let local = backend_locality_score("local");
-        let remote = backend_locality_score("remote");
-        let cloud = backend_locality_score("cloud_managed");
-        let api = backend_locality_score("api_provider");
+        let local = backend_locality_score(Some(scoring::BackendKind::Local));
+        let remote = backend_locality_score(Some(scoring::BackendKind::Remote));
+        let cloud = backend_locality_score(Some(scoring::BackendKind::CloudManaged));
+        let api = backend_locality_score(Some(scoring::BackendKind::ApiProvider));
         assert!(local > remote, "local ({local}) must outscore remote ({remote})");
         assert!(
             remote > cloud,
@@ -2986,8 +2928,8 @@ mod tests {
     #[test]
     fn local_provider_ranks_before_api_provider() {
         let network = test_network("net");
-        let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
-        let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let local_prov = test_provider_with_backend_kind("local-prov", "net", BackendKind::Local);
+        let api_prov = test_provider_with_backend_kind("api-prov", "net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -3010,10 +2952,10 @@ mod tests {
     fn all_four_backend_kinds_order_correctly() {
         let network = test_network("net");
         // Deliberately supply in reverse priority order.
-        let api = test_provider_with_backend_kind("z-api", "net", "api_provider");
-        let cloud = test_provider_with_backend_kind("z-cloud", "net", "cloud_managed");
-        let remote = test_provider_with_backend_kind("z-remote", "net", "remote");
-        let local = test_provider_with_backend_kind("z-local", "net", "local");
+        let api = test_provider_with_backend_kind("z-api", "net", BackendKind::ApiProvider);
+        let cloud = test_provider_with_backend_kind("z-cloud", "net", BackendKind::CloudManaged);
+        let remote = test_provider_with_backend_kind("z-remote", "net", BackendKind::Remote);
+        let local = test_provider_with_backend_kind("z-local", "net", BackendKind::Local);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -3037,8 +2979,8 @@ mod tests {
     #[test]
     fn same_locality_kind_falls_back_to_alphabetical() {
         let network = test_network("net");
-        let p_z = test_provider_with_backend_kind("z-api", "net", "api_provider");
-        let p_a = test_provider_with_backend_kind("a-api", "net", "api_provider");
+        let p_z = test_provider_with_backend_kind("z-api", "net", BackendKind::ApiProvider);
+        let p_a = test_provider_with_backend_kind("a-api", "net", BackendKind::ApiProvider);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -3060,8 +3002,8 @@ mod tests {
     #[test]
     fn locality_ordering_is_deterministic_regardless_of_input_order() {
         let network = test_network("net");
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let api = test_provider_with_backend_kind("prov-api", "net", BackendKind::ApiProvider);
         let fwd = render_routing_overlay(
             &network,
             &[],
@@ -3091,35 +3033,6 @@ mod tests {
             "locality ordering must be deterministic regardless of input order"
         );
     }
-
-    #[test]
-    fn unknown_backend_kind_sorts_with_remote() {
-        // Unknown kind defaults to 0.5 (same as remote with no region).
-        // Both should sort before cloud_managed (0.2) and api_provider (0.1).
-        let network = test_network("net");
-        let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
-        let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
-        let overlay = render_routing_overlay(
-            &network,
-            &[],
-            &[cloud, unknown],
-            &[],
-            "test-site",
-            None,
-            None,
-            &scoring::ScoringWeights::default(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(
-            overlay.candidates.first().map(|c| c.cluster.as_str()),
-            Some("unknown-prov"),
-            "unknown kind (0.5) must rank before cloud_managed (0.2)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Basic rendering
-    // -----------------------------------------------------------------------
 
     #[test]
     fn empty_network_renders_empty_candidates() {
@@ -4124,7 +4037,7 @@ mod tests {
     fn missing_network_name_returns_error() {
         // GridNetwork with no metadata.name must produce an error.
         let network: GridNetwork = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": {},
             "spec": { "seeds": [] }
@@ -4148,12 +4061,12 @@ mod tests {
         // InferenceProvider with no metadata.name must produce an error.
         let network = test_network("net");
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": {},
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": [{"name": "model"}]
@@ -4185,8 +4098,8 @@ mod tests {
         // Two local providers with equal locality and no cost difference.
         // Without metrics they are tied and fall back to alphabetical order.
         // With metrics the high-queue provider scores lower and yields the lead.
-        let provider_busy = test_provider_with_backend_kind("provider-busy", "net", "local");
-        let provider_idle = test_provider_with_backend_kind("provider-idle", "net", "local");
+        let provider_busy = test_provider_with_backend_kind("provider-busy", "net", BackendKind::Local);
+        let provider_idle = test_provider_with_backend_kind("provider-idle", "net", BackendKind::Local);
 
         let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
         metrics.insert(
@@ -4222,8 +4135,8 @@ mod tests {
     fn no_metrics_map_preserves_static_ordering() {
         // Passing None for metrics must produce the same result as the current
         // static-only path (locality and cost only).
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let api = test_provider_with_backend_kind("prov-api", "net", BackendKind::ApiProvider);
         let ps_static = [local.clone(), api.clone()];
         let ordering_static =
             provider_ordering_scores("net", &ps_static, &[], None, None, &scoring::ScoringWeights::default());
@@ -4268,8 +4181,8 @@ mod tests {
 
     #[test]
     fn no_metrics_all_score_contributions_are_zero() {
-        let a = test_provider_with_backend_kind("prov-a", "net", "local");
-        let b = test_provider_with_backend_kind("prov-b", "net", "local");
+        let a = test_provider_with_backend_kind("prov-a", "net", BackendKind::Local);
+        let b = test_provider_with_backend_kind("prov-b", "net", BackendKind::Local);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4308,8 +4221,8 @@ mod tests {
 
     #[test]
     fn no_metrics_opposing_metrics_produce_equal_dynamic_scores() {
-        let a = test_provider_with_backend_kind("prov-a", "net", "local");
-        let b = test_provider_with_backend_kind("prov-b", "net", "local");
+        let a = test_provider_with_backend_kind("prov-a", "net", BackendKind::Local);
+        let b = test_provider_with_backend_kind("prov-b", "net", BackendKind::Local);
         let network = test_network_score_first("net");
 
         let mut metrics = HashMap::new();
@@ -4345,8 +4258,8 @@ mod tests {
 
     #[test]
     fn no_metrics_geography_first_still_prefers_local() {
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let remote = test_provider_with_backend_kind("prov-remote", "net", BackendKind::Remote);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4380,8 +4293,8 @@ mod tests {
 
     #[test]
     fn no_metrics_admission_still_restricts_saturated_provider() {
-        let healthy = test_provider_with_backend_kind("prov-healthy", "net", "api_provider");
-        let saturated = test_provider_with_backend_kind("prov-saturated", "net", "local");
+        let healthy = test_provider_with_backend_kind("prov-healthy", "net", BackendKind::ApiProvider);
+        let saturated = test_provider_with_backend_kind("prov-saturated", "net", BackendKind::Local);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4420,7 +4333,7 @@ mod tests {
 
     #[test]
     fn no_metrics_unavailable_provider_still_excluded() {
-        let available = test_provider_with_backend_kind("prov-up", "net", "local");
+        let available = test_provider_with_backend_kind("prov-up", "net", BackendKind::Local);
         let unavailable = test_provider_with_backend_kind_and_phase("prov-down", "net", "local", "Unavailable");
 
         let network = test_network("net");
@@ -4446,8 +4359,8 @@ mod tests {
 
     #[test]
     fn no_metrics_score_first_does_not_manufacture_preference() {
-        let a = test_provider_with_backend_kind("prov-a", "net", "local");
-        let b = test_provider_with_backend_kind("prov-b", "net", "local");
+        let a = test_provider_with_backend_kind("prov-a", "net", BackendKind::Local);
+        let b = test_provider_with_backend_kind("prov-b", "net", BackendKind::Local);
         let network = test_network_score_first("net");
 
         let mut metrics = HashMap::new();
@@ -4490,8 +4403,8 @@ mod tests {
         // Without metrics they are tied and fall back to alphabetical order;
         // provider-busy < provider-idle alphabetically, so busy comes first.
         // With metrics the high-queue provider scores lower and yields the lead.
-        let busy = test_provider_with_backend_kind("provider-busy", "net", "local");
-        let idle = test_provider_with_backend_kind("provider-idle", "net", "local");
+        let busy = test_provider_with_backend_kind("provider-busy", "net", BackendKind::Local);
+        let idle = test_provider_with_backend_kind("provider-idle", "net", BackendKind::Local);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4530,8 +4443,8 @@ mod tests {
     fn render_without_metrics_preserves_static_locality_ordering() {
         // None metrics and empty-metrics-map must produce the same candidate order.
         // local backend outscores api_provider on locality regardless of input order.
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let api = test_provider_with_backend_kind("prov-api", "net", BackendKind::ApiProvider);
         let network = test_network("net");
 
         let overlay_none = render_routing_overlay(
@@ -4574,8 +4487,8 @@ mod tests {
         // A provider that is not present in the metrics map must not panic and must
         // still appear in the overlay.  It receives a neutral score from
         // unmapped_provider_score — on the same scale as scored providers.
-        let known = test_provider_with_backend_kind("known-prov", "net", "local");
-        let unmapped = test_provider_with_backend_kind("unmapped-prov", "net", "local");
+        let known = test_provider_with_backend_kind("known-prov", "net", BackendKind::Local);
+        let unmapped = test_provider_with_backend_kind("unmapped-prov", "net", BackendKind::Local);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4651,8 +4564,8 @@ mod tests {
 
     #[test]
     fn metrics_pressure_outranks_locality() {
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let remote = test_provider_with_backend_kind("prov-remote", "net", BackendKind::Remote);
         let network = test_network_score_first("net");
 
         let mut metrics = HashMap::new();
@@ -4686,8 +4599,8 @@ mod tests {
 
     #[test]
     fn equal_metrics_prefers_local() {
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let remote = test_provider_with_backend_kind("prov-remote", "net", BackendKind::Remote);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4722,7 +4635,7 @@ mod tests {
     #[test]
     fn fresh_outranks_score() {
         let local = test_provider_with_backend_kind_and_phase("prov-local", "net", "local", "Degraded");
-        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let api = test_provider_with_backend_kind("prov-api", "net", BackendKind::ApiProvider);
         let network = test_network_score_first("net");
 
         let overlay = render_routing_overlay(
@@ -4748,8 +4661,8 @@ mod tests {
 
     #[test]
     fn admission_outranks_everything() {
-        let healthy = test_provider_with_backend_kind("prov-healthy", "net", "api_provider");
-        let saturated = test_provider_with_backend_kind("prov-saturated", "net", "local");
+        let healthy = test_provider_with_backend_kind("prov-healthy", "net", BackendKind::ApiProvider);
+        let saturated = test_provider_with_backend_kind("prov-saturated", "net", BackendKind::Local);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4793,7 +4706,7 @@ mod tests {
 
     #[test]
     fn score_breakdown_populates_on_candidates() {
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4832,13 +4745,13 @@ mod tests {
 
     #[test]
     fn geography_first_produces_same_order_as_absent_policy() {
-        let local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
-        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let remote = test_provider_with_backend_kind("prov-remote", "net", BackendKind::Remote);
+        let api = test_provider_with_backend_kind("prov-api", "net", BackendKind::ApiProvider);
 
         let no_policy = test_network("net");
         let geo_policy: GridNetwork = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": "net" },
             "spec": { "seeds": [], "routingPolicy": "geographyFirst" }
@@ -4879,8 +4792,8 @@ mod tests {
 
     #[test]
     fn absent_routing_policy_preserves_geography_above_score() {
-        let local = test_provider_with_backend_kind("local-site", "net", "local");
-        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let local = test_provider_with_backend_kind("local-site", "net", BackendKind::Local);
+        let remote = test_provider_with_backend_kind("prov-remote", "net", BackendKind::Remote);
         let network = test_network("net");
 
         let mut metrics = HashMap::new();
@@ -4923,7 +4836,7 @@ mod tests {
     ) -> InferenceProvider {
         let mut spec = serde_json::json!({
             "gridNetworkRef": network,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://localhost:8000",
             "models": [{ "name": "model-x" }]
@@ -4932,7 +4845,7 @@ mod tests {
             spec["routingClusterRef"] = serde_json::Value::String(r.to_owned());
         }
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": spec
@@ -5020,12 +4933,12 @@ mod tests {
     fn routing_cluster_ref_applies_to_all_models() {
         let network = test_network("net");
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov-a" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "routingClusterRef": "gateway-site-x",
@@ -5081,12 +4994,12 @@ mod tests {
     fn unavailable_with_routing_cluster_ref_is_excluded() {
         let network = test_network("net");
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov-a" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "routingClusterRef": "site-x",
@@ -5116,12 +5029,12 @@ mod tests {
     fn degraded_with_routing_cluster_ref_has_fresh_false() {
         let network = test_network("net");
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov-a" },
             "spec": {
                 "gridNetworkRef": "net",
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "routingClusterRef": "site-x",
@@ -5159,13 +5072,13 @@ mod tests {
         let network = test_network("net");
         let local_with_ref = test_provider_with_routing_cluster_ref("prov-local", "net", Some("site-x"));
         let api_provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov-api" },
             "spec": {
                 "gridNetworkRef": "net",
                 "providerKind": "anthropic",
-                "backendKind": "api_provider",
+                "backendKind": "apiProvider",
                 "endpoint": "https://api.example.com",
                 "models": [{ "name": "model-z" }]
             }
@@ -5194,8 +5107,8 @@ mod tests {
     #[test]
     fn build_grid_state_with_metrics_attaches_metrics_to_correct_provider() {
         let providers = vec![
-            test_provider_with_backend_kind("prov-a", "net", "local"),
-            test_provider_with_backend_kind("prov-b", "net", "local"),
+            test_provider_with_backend_kind("prov-a", "net", BackendKind::Local),
+            test_provider_with_backend_kind("prov-b", "net", BackendKind::Local),
         ];
         let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
         metrics.insert("prov-a", scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.8));
@@ -5344,6 +5257,18 @@ mod tests {
             config.kind,
             scoring::BackendKind::ApiProvider,
             "api_provider must be preserved for remote CRDT providers"
+        );
+    }
+
+    #[test]
+    fn remote_provider_unknown_gossiped_backend_kind_is_scored_as_remote() {
+        let mut provider = make_crdt_provider("remote-site", "cluster-1", crdt::ProviderPhase::Available, &["model-a"]);
+        provider.backend_kind = "from_a_newer_operator".to_owned();
+        let config = remote_crdt_provider_to_backend_config(&provider).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            config.kind,
+            scoring::BackendKind::Remote,
+            "an unknown gossip name scores as remote"
         );
     }
 
@@ -5559,17 +5484,17 @@ mod tests {
 
     fn test_provider_with_bearer_auth(name: &str, network: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "open_ai",
-                "backendKind": "api_provider",
+                "providerKind": "openAi",
+                "backendKind": "apiProvider",
                 "endpoint": "https://api.openai.com",
                 "models": [{ "name": "gpt-4" }],
                 "auth": {
-                    "strategy": "bearer_token",
+                    "strategy": "bearerToken",
                     "secretRef": {
                         "name": "my-secret",
                         "namespace": "default",
@@ -5583,16 +5508,16 @@ mod tests {
 
     fn test_provider_with_manual_auth(name: &str, network: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "open_ai",
-                "backendKind": "api_provider",
+                "providerKind": "openAi",
+                "backendKind": "apiProvider",
                 "endpoint": "https://api.openai.com",
                 "models": [{ "name": "gpt-4" }],
-                "auth": { "manual": true, "strategy": "bearer_token" }
+                "auth": { "manual": true, "strategy": "bearerToken" }
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -5630,13 +5555,13 @@ mod tests {
     #[test]
     fn unsupported_auth_strategy_produces_no_credential_ref() {
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "sigv4-prov" },
             "spec": {
                 "gridNetworkRef": "net",
                 "providerKind": "bedrock",
-                "backendKind": "api_provider",
+                "backendKind": "apiProvider",
                 "endpoint": "https://bedrock.us-east-1.amazonaws.com",
                 "models": [{ "name": "claude" }],
                 "auth": { "strategy": "sigv4" }
@@ -6103,7 +6028,7 @@ mod tests {
     #[test]
     fn render_overlay_local_providers_unchanged_with_empty_remote() {
         let network = test_network("net");
-        let local_prov = test_provider_with_backend_kind("prov-local", "net", "local");
+        let local_prov = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
         let overlay = render_routing_overlay(
             &network,
             &[],
@@ -6293,12 +6218,12 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
                 "models": models_json,
@@ -6893,12 +6818,12 @@ mod tests {
     ) -> InferenceProvider {
         let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": network,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": backend_kind,
                 "endpoint": "http://localhost:8000",
                 "models": models_json,
@@ -6922,7 +6847,7 @@ mod tests {
             spec["zone"] = serde_json::json!(z);
         }
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": name, "labels": { "site": name } },
             "spec": spec
@@ -7065,8 +6990,8 @@ mod tests {
     #[test]
     fn legacy_no_geography_preserves_score_order() {
         let network = test_network("net");
-        let prov_local = test_provider_with_backend_kind("prov-local", "net", "local");
-        let prov_api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let prov_local = test_provider_with_backend_kind("prov-local", "net", BackendKind::Local);
+        let prov_api = test_provider_with_backend_kind("prov-api", "net", BackendKind::ApiProvider);
 
         let overlay = render_routing_overlay(
             &network,

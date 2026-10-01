@@ -19,9 +19,10 @@ use super::{
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis-proxy.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "AgentToAgentProvider",
     plural = "agenttoagentproviders",
+    shortname = "a2ap",
     status = "AgentToAgentProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Protocol","type":"string","jsonPath":".spec.protocol"}"#,
@@ -47,9 +48,9 @@ pub struct AgentToAgentProviderSpec {
     /// HTTP endpoint of the A2A agent.
     pub endpoint: String,
 
-    /// Protocol used (only "a2a" initially).
-    #[serde(default = "default_protocol")]
-    pub protocol: String,
+    /// Protocol the agent speaks.
+    #[serde(default)]
+    pub protocol: AgentProtocol,
 
     /// Which sites host this provider.
     #[serde(default)]
@@ -93,9 +94,13 @@ pub struct AgentToAgentProviderStatus {
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Default protocol for A2A providers.
-fn default_protocol() -> String {
-    "a2a".to_owned()
+/// Protocol an [`AgentToAgentProvider`] speaks.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentProtocol {
+    /// The `Agent2Agent` protocol.
+    #[default]
+    A2a,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +122,7 @@ mod tests {
             }
         });
         let spec: AgentToAgentProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(spec.protocol, "a2a", "default protocol");
+        assert_eq!(spec.protocol, AgentProtocol::A2a, "default protocol");
         let card = spec.agent_card.as_ref();
         assert!(card.is_some(), "should have agent card");
     }

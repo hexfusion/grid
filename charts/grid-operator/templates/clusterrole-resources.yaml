@@ -12,9 +12,6 @@ rules:
     verbs: ["get", "create", "patch"]
   - apiGroups: [""]
     resources: ["services"]
-    resourceNames:
-      - {{ .Values.gateway.serviceName | default "provider-gateway" | quote }}
-      - {{ printf "%s-swim" (include "grid-operator.fullname" .) | quote }}
     verbs: ["get"]
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]

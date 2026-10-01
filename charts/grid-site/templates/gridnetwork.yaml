@@ -1,6 +1,6 @@
 {{- include "grid-site.normalize" . }}
 {{- if .Values.gridNetwork.name }}
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridNetwork
 metadata:
   name: {{ .Values.gridNetwork.name }}

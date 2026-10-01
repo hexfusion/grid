@@ -9,6 +9,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::grid_network::TlsMode;
+
 // ---------------------------------------------------------------------------
 // Spec
 // ---------------------------------------------------------------------------
@@ -20,7 +22,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis-proxy.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "GridSite",
     plural = "gridsites",
     shortname = "gs",
@@ -60,11 +62,6 @@ pub struct GridSiteSpec {
 
 /// Trust policy controlling when a [`GridSite`] can advance to `Active`.
 ///
-/// Supports both legacy PEM-based fingerprinting (`certFingerprint`) and
-/// canonical DER-based fingerprinting (`canonicalFingerprints`).  New
-/// deployments should use `canonicalFingerprints`; the legacy field remains
-/// readable so the operator can reject it with a clear migration diagnostic.
-///
 /// # Security
 ///
 /// Fingerprint values must be verified out-of-band before configuration.
@@ -74,17 +71,6 @@ pub struct GridSiteSpec {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridSiteTrustPolicy {
-    /// Legacy SHA-256 fingerprint of the remote site's public certificate PEM.
-    ///
-    /// Format: colon-separated lowercase hex bytes, e.g. `"ab:cd:ef:..."`.
-    /// Computed as `sha256(pem_bytes)` where `pem_bytes` are the UTF-8 bytes of
-    /// `status.publicCertPem`.
-    ///
-    /// **Deprecated:** use `canonicalFingerprints` for new deployments.
-    /// The two fields must not both be set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_fingerprint: Option<String>,
-
     /// Canonical DER-certificate SHA-256 fingerprint pins.
     ///
     /// Each entry is a 64-character lowercase hex string computed as
@@ -112,18 +98,18 @@ pub struct EgressConfig {
 }
 
 /// TLS configuration for site egress.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressTls {
-    /// TLS transport mode.
-    #[serde(default)]
-    pub mode: EgressTlsMode,
+    /// TLS transport mode, `mutualTls` when absent.
+    #[serde(default = "default_egress_mode")]
+    pub mode: TlsMode,
 
     /// Expected DNS identity for TLS verification.
     ///
     /// Used as both the TLS SNI value and for certificate SAN
-    /// verification.  Required when `mode` is [`EgressTlsMode::Mutual`];
-    /// must be absent for [`EgressTlsMode::Plaintext`].
+    /// verification.  Required when `mode` is [`TlsMode::MutualTls`];
+    /// must be absent for [`TlsMode::Plaintext`].
     ///
     /// Must be a valid DNS name (not an IP address), at most 253
     /// characters.
@@ -132,18 +118,18 @@ pub struct EgressTls {
     pub server_name: Option<String>,
 }
 
-/// TLS transport mode for egress connections.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
-pub enum EgressTlsMode {
-    /// Mutual TLS with certificate-based client authentication.
-    #[default]
-    Mutual,
+impl Default for EgressTls {
+    fn default() -> Self {
+        Self {
+            mode: default_egress_mode(),
+            server_name: None,
+        }
+    }
+}
 
-    /// Explicit plaintext for reachability diagnostics only.
-    ///
-    /// A TCP-only endpoint cannot become `Active`; identity-verified TLS is
-    /// required for routing eligibility.
-    Plaintext,
+/// Egress defaults to mutual TLS; a plaintext egress cannot become `Active`.
+const fn default_egress_mode() -> TlsMode {
+    TlsMode::MutualTls
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +272,7 @@ mod tests {
             "gridNetworkRef": "production",
             "egress": {
                 "address": "egress.cluster-b:8443",
-                "tls": {"mode": "Mutual"}
+                "tls": {"mode": "mutualTls"}
             },
             "region": "us-east-1"
         });
@@ -347,40 +333,46 @@ mod tests {
     }
 
     #[test]
-    fn egress_tls_mode_defaults_to_mutual() {
+    fn egress_tls_mode_defaults_to_mutual_tls() {
+        let tls: EgressTls = serde_json::from_value(serde_json::json!({})).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(tls.mode, TlsMode::MutualTls, "an absent egress mode is mutual TLS");
         assert_eq!(
-            EgressTlsMode::default(),
-            EgressTlsMode::Mutual,
-            "default TLS mode must be Mutual"
+            EgressTls::default().mode,
+            TlsMode::MutualTls,
+            "the struct default matches"
         );
     }
 
     #[test]
-    fn egress_tls_mode_serde_round_trip() {
-        let mutual_json = serde_json::json!("Mutual");
-        let mutual: EgressTlsMode = serde_json::from_value(mutual_json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(mutual, EgressTlsMode::Mutual, "Mutual must round-trip");
-
-        let plaintext_json = serde_json::json!("Plaintext");
-        let pt: EgressTlsMode = serde_json::from_value(plaintext_json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(pt, EgressTlsMode::Plaintext, "Plaintext must round-trip");
+    fn tls_mode_is_camel_case_and_refuses_v1alpha1_values() {
+        for (json, mode) in [("mutualTls", TlsMode::MutualTls), ("plaintext", TlsMode::Plaintext)] {
+            let parsed: TlsMode =
+                serde_json::from_value(serde_json::json!(json)).unwrap_or_else(|_| std::process::abort());
+            assert_eq!(parsed, mode, "{json} parses");
+        }
+        for old in ["Mutual", "Plaintext", "mutual_tls"] {
+            assert!(
+                serde_json::from_value::<TlsMode>(serde_json::json!(old)).is_err(),
+                "{old} is refused"
+            );
+        }
     }
 
     #[test]
     fn unknown_tls_mode_rejected() {
         let unknown = serde_json::json!("Passthrough");
-        let result: Result<EgressTlsMode, _> = serde_json::from_value(unknown);
+        let result: Result<TlsMode, _> = serde_json::from_value(unknown);
         assert!(result.is_err(), "unknown TLS mode must fail closed");
     }
 
     #[test]
     fn egress_tls_with_server_name() {
         let json = serde_json::json!({
-            "mode": "Mutual",
+            "mode": "mutualTls",
             "serverName": "east-provider.grid.internal"
         });
         let tls: EgressTls = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(tls.mode, EgressTlsMode::Mutual, "mode");
+        assert_eq!(tls.mode, TlsMode::MutualTls, "mode");
         assert_eq!(
             tls.server_name.as_deref(),
             Some("east-provider.grid.internal"),
@@ -390,9 +382,9 @@ mod tests {
 
     #[test]
     fn egress_tls_without_server_name() {
-        let json = serde_json::json!({"mode": "Plaintext"});
+        let json = serde_json::json!({"mode": "plaintext"});
         let tls: EgressTls = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(tls.mode, EgressTlsMode::Plaintext, "mode");
+        assert_eq!(tls.mode, TlsMode::Plaintext, "mode");
         assert!(tls.server_name.is_none(), "serverName must be absent for Plaintext");
     }
 
@@ -405,45 +397,8 @@ mod tests {
             ]
         });
         let policy: GridSiteTrustPolicy = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert!(policy.cert_fingerprint.is_none(), "legacy fingerprint must be absent");
         let pins = policy.canonical_fingerprints.unwrap_or_else(|| std::process::abort());
         assert_eq!(pins.len(), 2, "must have 2 canonical pins");
-    }
-
-    #[test]
-    fn trust_policy_legacy_only() {
-        let json = serde_json::json!({
-            "certFingerprint": "ab:cd:ef"
-        });
-        let policy: GridSiteTrustPolicy = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert!(policy.cert_fingerprint.is_some(), "legacy fingerprint must be present");
-        assert!(policy.canonical_fingerprints.is_none(), "canonical must be absent");
-    }
-
-    #[test]
-    fn backward_compatible_spec_without_new_fields() {
-        let json = serde_json::json!({
-            "gridNetworkRef": "production",
-            "egress": {
-                "address": "egress.cluster-b:8443",
-                "tls": {"mode": "Mutual"}
-            },
-            "trust": {
-                "certFingerprint": "ab:cd:ef"
-            }
-        });
-        let spec: GridSiteSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(spec.grid_network_ref, "production", "network ref");
-        let egress = spec.egress.unwrap_or_else(|| std::process::abort());
-        assert_eq!(egress.tls.mode, EgressTlsMode::Mutual, "mode");
-        assert!(egress.tls.server_name.is_none(), "no server_name in legacy spec");
-        let trust = spec.trust.unwrap_or_else(|| std::process::abort());
-        assert_eq!(
-            trust.cert_fingerprint.as_deref(),
-            Some("ab:cd:ef"),
-            "legacy fingerprint"
-        );
-        assert!(trust.canonical_fingerprints.is_none(), "no canonical in legacy spec");
     }
 
     #[test]

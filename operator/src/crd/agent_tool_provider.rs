@@ -19,7 +19,7 @@ use super::{
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis-proxy.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "AgentToolProvider",
     plural = "agenttoolproviders",
     shortname = "atp",
@@ -45,9 +45,9 @@ pub struct AgentToolProviderSpec {
     /// HTTP endpoint of the MCP server.
     pub endpoint: String,
 
-    /// Protocol used (only "mcp" initially).
-    #[serde(default = "default_protocol")]
-    pub protocol: String,
+    /// Protocol the provider speaks.
+    #[serde(default)]
+    pub protocol: ToolProtocol,
 
     /// Which sites host this provider.
     #[serde(default)]
@@ -134,9 +134,13 @@ pub struct AgentToolProviderStatus {
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Default protocol for tool providers.
-fn default_protocol() -> String {
-    "mcp".to_owned()
+/// Protocol an [`AgentToolProvider`] speaks.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolProtocol {
+    /// Model Context Protocol.
+    #[default]
+    Mcp,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,8 +161,18 @@ mod tests {
             "tools": [{"name": "db-query", "description": "Query database"}]
         });
         let spec: AgentToolProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(spec.protocol, "mcp", "default protocol");
+        assert_eq!(spec.protocol, ToolProtocol::Mcp, "default protocol");
         assert_eq!(spec.tools.len(), 1, "tool count");
+    }
+
+    #[test]
+    fn an_unknown_protocol_is_refused() {
+        let json =
+            serde_json::json!({"gridNetworkRef": "production", "endpoint": "http://tools:8080", "protocol": "grpc"});
+        assert!(
+            serde_json::from_value::<AgentToolProviderSpec>(json).is_err(),
+            "only mcp is accepted"
+        );
     }
 
     // -----------------------------------------------------------------------

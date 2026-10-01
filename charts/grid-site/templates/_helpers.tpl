@@ -71,8 +71,8 @@ writes. inferenceProviders keyed by name become the list the template reads.
 {{- $list = append $list (merge $p (dict
   "name" $name
   "gridNetworkRef" $net.name
-  "providerKind" "vllm"
-  "backendKind" "local_model"
+  "providerKind" "openAi"
+  "backendKind" "local"
   "models" (list (dict "name" $model "capabilities" (list "text_generation"))))) }}
 {{- end }}
 {{- $_ := set $v "inferenceProviders" $list }}

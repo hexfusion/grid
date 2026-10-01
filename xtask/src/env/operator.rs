@@ -106,12 +106,10 @@ pub(crate) const API_PROVIDER_SECRET_NS: &str = "default";
 /// Key within the API-provider credential Secret that holds the bearer token.
 pub(crate) const API_PROVIDER_SECRET_KEY: &str = "token";
 
-/// Name of the operator-generated consumer Praxis `ConfigMap` in the consumer-config validation.
-///
-/// Distinct from `praxis-consumer-config` (the xtask-generated name) so the two can coexist
-/// during the transition while the operator-generated config is shape-validated without
-/// replacing the xtask-generated config used by the live consumer pod.
-pub(crate) const TEST_CONSUMER_CONFIGMAP_NAME: &str = "op-e2e-consumer-config";
+/// The operator-owned consumer Praxis `ConfigMap` name for the validation gateway.
+pub(crate) fn test_consumer_configmap_name() -> String {
+    format!("grid-consumer-{TEST_NETWORK}-{TEST_GATEWAY_NAME}")
+}
 
 // ---------------------------------------------------------------------------
 // Full-grid routing validation constants
@@ -656,7 +654,7 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
         &format!("grid-overlay-{TEST_NETWORK}-{TEST_GATEWAY_NAME}"),
     )?;
     // Best-effort: remove operator-generated consumer ConfigMap from previous runs.
-    let _unused = delete_namespaced_resource(context, TEST_GATEWAY_NS, "configmap", TEST_CONSUMER_CONFIGMAP_NAME);
+    let _unused = delete_namespaced_resource(context, TEST_GATEWAY_NS, "configmap", &test_consumer_configmap_name());
     delete_namespaced_resource(context, TEST_GATEWAY_NS, "service", ERROR_ENDPOINT_NAME)?;
     force_delete_pod(context, TEST_GATEWAY_NS, ERROR_ENDPOINT_NAME)?;
     force_delete_pod(context, TEST_GATEWAY_NS, TEST_METRICS_IDLE_PROVIDER)?;
@@ -982,7 +980,7 @@ pub(crate) fn apply_test_fixtures_for_cluster(
 /// resolve to `LocalityTier::SameSite`.
 fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str, local_site_name: &str) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": name },
         "spec": {
@@ -1009,7 +1007,7 @@ fn provider_fixture_json(
 ) -> String {
     let mut spec = serde_json::json!({
         "gridNetworkRef": network_ref,
-        "providerKind": "open_ai",
+        "providerKind": "openAi",
         "backendKind": "local",
         "endpoint": endpoint,
         "models": [{ "name": model }]
@@ -1020,7 +1018,7 @@ fn provider_fixture_json(
         s.insert("routingClusterRef".to_owned(), serde_json::Value::String(r.to_owned()));
     }
     serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": name },
         "spec": spec
@@ -1044,7 +1042,7 @@ fn provider_fixture_json(
 /// exists.
 pub(crate) fn apply_agent_tool_provider_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": AGENT_TOOL_TEST_NETWORK },
         "spec": {}
@@ -1054,7 +1052,7 @@ pub(crate) fn apply_agent_tool_provider_network_fixtures(context: &str) -> Resul
         std::process::exit(1);
     });
     let site = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridSite",
         "metadata": { "name": AGENT_TOOL_TEST_SITE },
         "spec": { "gridNetworkRef": AGENT_TOOL_TEST_NETWORK }
@@ -1075,7 +1073,7 @@ pub(crate) fn apply_agent_tool_provider(
     endpoint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "AgentToolProvider",
         "metadata": { "name": name },
         "spec": {
@@ -1704,7 +1702,7 @@ pub(crate) fn wait_for_swim_convergence(duration: Duration) {
 /// SWIM snapshot from the running operators.
 pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_TEST_NETWORK },
         "spec": { "seeds": [] }
@@ -1743,7 +1741,7 @@ pub(crate) fn apply_swim_test_network_with_seeds(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let seeds_json: Vec<String> = seeds.iter().map(SocketAddr::to_string).collect();
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": CRD_SEEDS_TEST_NETWORK },
         "spec": { "seeds": seeds_json }
@@ -1775,12 +1773,12 @@ pub(crate) fn cleanup_swim_crd_seeds_test_resources(context: &str) -> Result<(),
 /// reconciling the owning `GridNetwork`.
 pub(crate) fn apply_swim_test_provider(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SWIM_TEST_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_TEST_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-provider.default.svc:8080",
             "models": [{ "name": SWIM_TEST_PROVIDER_MODEL }]
@@ -2724,12 +2722,12 @@ pub(crate) fn apply_metrics_provider_fixtures(
         ),
     ] {
         let manifest = serde_json::to_string_pretty(&serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": TEST_NETWORK,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": endpoint,
                 "models": [{ "name": "model-metrics" }],
@@ -2813,7 +2811,7 @@ pub(crate) fn apply_metrics_routing_fixtures(
     west_metrics_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": METRICS_ROUTING_NETWORK },
         "spec": {
@@ -2832,12 +2830,12 @@ pub(crate) fn apply_metrics_routing_fixtures(
     ] {
         let endpoint = format!("http://127.0.0.1:{port}");
         let manifest = serde_json::to_string_pretty(&serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
                 "gridNetworkRef": METRICS_ROUTING_NETWORK,
-                "providerKind": "self_hosted",
+                "providerKind": "openAi",
                 "backendKind": "local",
                 "endpoint": endpoint,
                 "models": [{ "name": METRICS_ROUTING_MODEL }],
@@ -3002,12 +3000,12 @@ pub(crate) fn verify_metrics_routing_overlay(
 /// the non-2xx response to `Degraded`.
 pub(crate) fn apply_degraded_provider_fixture(context: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": TEST_PROVIDER_DEGRADED },
         "spec": {
             "gridNetworkRef": TEST_NETWORK,
-            "providerKind": "open_ai",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
             "healthCheck": { "path": "/health", "timeout": "5s" },
@@ -3060,12 +3058,12 @@ pub(crate) fn apply_provider_with_health_check_tls_key_missing_fixture(
     apply_tls_key_missing_ca_secret(context)?;
 
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": TEST_PROVIDER_TLS_KEY_MISSING },
         "spec": {
             "gridNetworkRef": TEST_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://127.0.0.1:1",
             "models": [{ "name": "model-tls-key-missing" }],
@@ -3087,23 +3085,23 @@ pub(crate) fn apply_provider_with_health_check_tls_key_missing_fixture(
 
 /// Apply the `api_provider` `InferenceProvider` fixture.
 ///
-/// Uses `backendKind: "api_provider"` so the scoring engine assigns it a lower
+/// Uses `backendKind: "apiProvider"` so the scoring engine assigns it a lower
 /// locality score (≈ 5.8) than local providers (≈ 7.0).  This fixture verifies
 /// that scoring-backed ordering places `api_provider` candidates after local ones
 /// regardless of the order they were applied.
 pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": TEST_PROVIDER_API },
         "spec": {
             "gridNetworkRef": TEST_NETWORK,
             "providerKind": "anthropic",
-            "backendKind": "api_provider",
+            "backendKind": "apiProvider",
             "endpoint": endpoint,
             "models": [{ "name": "model-z" }],
             "auth": {
-                "strategy": "bearer_token",
+                "strategy": "bearerToken",
                 "secretRef": {
                     "name": API_PROVIDER_SECRET_NAME,
                     "namespace": API_PROVIDER_SECRET_NS,
@@ -3119,7 +3117,7 @@ pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Resul
     kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] api provider fixture applied \
-         (auth.strategy=bearer_token, secretRef={API_PROVIDER_SECRET_NAME:?}/{API_PROVIDER_SECRET_KEY:?})"
+         (auth.strategy=bearerToken, secretRef={API_PROVIDER_SECRET_NAME:?}/{API_PROVIDER_SECRET_KEY:?})"
     );
     Ok(())
 }
@@ -3162,13 +3160,8 @@ pub(crate) fn apply_test_fixtures_with_consumer_config(
         TEST_PROVIDER_API,
     );
 
-    let network = network_fixture_with_consumer_config_json(
-        TEST_NETWORK,
-        TEST_GATEWAY_NAME,
-        TEST_GATEWAY_NS,
-        TEST_CONSUMER_CONFIGMAP_NAME,
-        &cluster_endpoints,
-    );
+    let network =
+        network_fixture_with_consumer_config_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, &cluster_endpoints);
     let healthy = provider_fixture_json(
         TEST_PROVIDER_HEALTHY,
         TEST_NETWORK,
@@ -3206,7 +3199,7 @@ fn discover_provider_cluster_endpoint(context: &str, cluster_name: &str) -> Opti
 
 /// Build the JSON value for `consumerConfig.clusterEndpoints`.
 ///
-/// - For the self-hosted provider (`provider_cluster`): uses `mutual_tls` transport when an address is available.
+/// - For the self-hosted provider (`provider_cluster`): uses `mutualTls` transport when an address is available.
 /// - For the API provider (`api_cluster`): uses explicit `plaintext` transport.
 fn build_consumer_cluster_endpoints(
     provider_address: Option<&str>,
@@ -3221,7 +3214,7 @@ fn build_consumer_cluster_endpoints(
             "cluster": provider_cluster,
             "address": addr,
             "transport": {
-                "mode": "mutual_tls",
+                "mode": "mutualTls",
                 "sni": format!("{provider_cluster}.grid.internal")
             }
         }));
@@ -3242,19 +3235,17 @@ fn build_consumer_cluster_endpoints(
 
 /// Build a `GridNetwork` JSON fixture with `consumerConfig` enabled.
 ///
-/// The gateway reference includes `consumerConfig.enabled: true`, the given
-/// `config_map_name`, and the provided `cluster_endpoints` so the operator
-/// generates a consumer Praxis `ConfigMap` with full load-balancer entries where
-/// endpoint information is available.
+/// The gateway reference includes `consumerConfig.enabled: true` and the provided
+/// `cluster_endpoints` so the operator generates its consumer Praxis `ConfigMap`
+/// with full load-balancer entries where endpoint information is available.
 fn network_fixture_with_consumer_config_json(
     name: &str,
     gw_name: &str,
     gw_ns: &str,
-    config_map_name: &str,
     cluster_endpoints: &serde_json::Value,
 ) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": name },
         "spec": {
@@ -3264,7 +3255,6 @@ fn network_fixture_with_consumer_config_json(
                 "namespace": gw_ns,
                 "consumerConfig": {
                     "enabled": true,
-                    "configMapName": config_map_name,
                     "clusterEndpoints": cluster_endpoints
                 }
             }]
@@ -3694,7 +3684,7 @@ pub(crate) fn apply_full_grid_fixtures(
     api_endpoint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": FULL_GRID_NETWORK },
         "spec": {
@@ -3708,12 +3698,12 @@ pub(crate) fn apply_full_grid_fixtures(
     });
 
     let east = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": FULL_GRID_PROVIDER_EAST },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
-            "providerKind": "open_ai",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": east_endpoint,
             "models": [{ "name": FULL_GRID_MODEL_EAST }],
@@ -3726,12 +3716,12 @@ pub(crate) fn apply_full_grid_fixtures(
     });
 
     let west = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": FULL_GRID_PROVIDER_WEST },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
-            "providerKind": "open_ai",
+            "providerKind": "openAi",
             "backendKind": "remote",
             "endpoint": west_endpoint,
             "models": [{ "name": FULL_GRID_MODEL_WEST }],
@@ -3744,13 +3734,13 @@ pub(crate) fn apply_full_grid_fixtures(
     });
 
     let cloud = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": FULL_GRID_PROVIDER_CLOUD },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
-            "providerKind": "open_ai",
-            "backendKind": "cloud_managed",
+            "providerKind": "openAi",
+            "backendKind": "cloudManaged",
             "endpoint": cloud_endpoint,
             "models": [{ "name": FULL_GRID_MODEL_CLOUD }]
         }
@@ -3761,17 +3751,17 @@ pub(crate) fn apply_full_grid_fixtures(
     });
 
     let api = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": FULL_GRID_PROVIDER_API },
         "spec": {
             "gridNetworkRef": FULL_GRID_NETWORK,
             "providerKind": "anthropic",
-            "backendKind": "api_provider",
+            "backendKind": "apiProvider",
             "endpoint": api_endpoint,
             "models": [{ "name": FULL_GRID_MODEL_API }],
             "auth": {
-                "strategy": "bearer_token",
+                "strategy": "bearerToken",
                 "secretRef": {
                     "name": API_PROVIDER_SECRET_NAME,
                     "namespace": API_PROVIDER_SECRET_NS,
@@ -3941,7 +3931,7 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
     primary_site_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_OVERLAY_NETWORK },
         "spec": {
@@ -3958,12 +3948,12 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SWIM_OVERLAY_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_OVERLAY_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": SWIM_OVERLAY_MODEL }]
@@ -4117,7 +4107,7 @@ pub(crate) fn patch_gridnetwork_tls_refs(
 
 /// Apply a `GridSite` configured for identity-aware TLS eligibility.
 ///
-/// Patches the `GridSite` with `mode: Mutual`, `serverName`, and
+/// Patches the `GridSite` with `mode: mutualTls`, `serverName`, and
 /// `canonicalFingerprints`, then seeds status to `Connecting/HarnessPreparation`.
 #[expect(
     clippy::too_many_arguments,
@@ -4137,7 +4127,7 @@ pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
             "gridNetworkRef": network_ref,
             "egress": {
                 "address": egress_addr,
-                "tls": { "mode": "Mutual", "serverName": server_name }
+                "tls": { "mode": "mutualTls", "serverName": server_name }
             },
             "trust": { "canonicalFingerprints": [canonical_fingerprint] }
         }
@@ -4156,14 +4146,14 @@ pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
         .output()?;
     if !patch_out.status.success() {
         let create_spec = serde_json::to_string_pretty(&serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": site_k8s_name },
             "spec": {
                 "gridNetworkRef": network_ref,
                 "egress": {
                     "address": egress_addr,
-                    "tls": { "mode": "Mutual", "serverName": server_name }
+                    "tls": { "mode": "mutualTls", "serverName": server_name }
                 },
                 "trust": { "canonicalFingerprints": [canonical_fingerprint] }
             }
@@ -4444,7 +4434,7 @@ pub(crate) fn restart_tls_probe_server(
 )]
 pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": ROTATION_NETWORK },
         "spec": {
@@ -4461,12 +4451,12 @@ pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Re
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": ROTATION_PROVIDER },
         "spec": {
             "gridNetworkRef": ROTATION_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-rotation.default.svc:8080",
             "models": [{ "name": ROTATION_MODEL }],
@@ -4492,12 +4482,12 @@ pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Re
 /// routing eligibility gate on the primary operator's overlay.
 pub(crate) fn apply_rotation_remote_provider(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": ROTATION_REMOTE_PROVIDER },
         "spec": {
             "gridNetworkRef": ROTATION_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-rotation-remote.default.svc:8080",
             "models": [{ "name": ROTATION_REMOTE_MODEL }],
@@ -4544,7 +4534,7 @@ pub(crate) fn apply_convergence_test_fixtures(
     site_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": CONVERGENCE_NETWORK },
         "spec": {
@@ -4561,12 +4551,12 @@ pub(crate) fn apply_convergence_test_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": CONVERGENCE_PROVIDER },
         "spec": {
             "gridNetworkRef": CONVERGENCE_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-convergence.default.svc:8080",
             "models": [{ "name": CONVERGENCE_MODEL }],
@@ -4812,7 +4802,7 @@ pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
         serde_json::json!({})
     };
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_ENCRYPT_NETWORK },
         "spec": {
@@ -4830,12 +4820,12 @@ pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SWIM_ENCRYPT_PROVIDER_A },
         "spec": {
             "gridNetworkRef": SWIM_ENCRYPT_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": SWIM_ENCRYPT_MODEL_A }]
@@ -5112,7 +5102,7 @@ pub(crate) fn apply_swim_mesh_test_fixtures(
     model_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_MESH_NETWORK },
         "spec": {
@@ -5129,12 +5119,12 @@ pub(crate) fn apply_swim_mesh_test_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": provider_name },
         "spec": {
             "gridNetworkRef": SWIM_MESH_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model_name }]
@@ -5164,7 +5154,7 @@ pub(crate) fn apply_swim_mesh_test_fixtures(
 )]
 pub(crate) fn apply_swim_mesh_wrong_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_MESH_WRONG_NETWORK },
         "spec": {
@@ -5181,12 +5171,12 @@ pub(crate) fn apply_swim_mesh_wrong_network_fixtures(context: &str) -> Result<()
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SWIM_MESH_WRONG_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_MESH_WRONG_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": SWIM_MESH_WRONG_MODEL }]
@@ -5273,7 +5263,7 @@ pub(crate) fn apply_swim_trust_test_fixtures(
     site_a_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": {
             "name": SWIM_TRUST_NETWORK,
@@ -5307,12 +5297,12 @@ pub(crate) fn apply_swim_trust_test_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SWIM_TRUST_PROVIDER_B },
         "spec": {
             "gridNetworkRef": SWIM_TRUST_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": SWIM_TRUST_MODEL_B }]
@@ -5400,11 +5390,11 @@ pub(crate) fn apply_gridsite_egress(
     server_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tls = match server_name {
-        Some(name) => serde_json::json!({ "mode": "Mutual", "serverName": name }),
-        None => serde_json::json!({ "mode": "Plaintext" }),
+        Some(name) => serde_json::json!({ "mode": "mutualTls", "serverName": name }),
+        None => serde_json::json!({ "mode": "plaintext" }),
     };
     let spec = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridSite",
         "metadata": { "name": site_k8s_name },
         "spec": {
@@ -5568,7 +5558,7 @@ pub(crate) fn apply_swim_routing_east_fixtures(
     east_model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_ROUTING_NETWORK },
         "spec": {
@@ -5585,12 +5575,12 @@ pub(crate) fn apply_swim_routing_east_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SWIM_ROUTING_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_ROUTING_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": east_model }],
@@ -5636,7 +5626,7 @@ pub(crate) fn apply_swim_routing_west_fixtures(
     west_model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_ROUTING_NETWORK },
         "spec": { "seeds": [] }
@@ -5646,12 +5636,12 @@ pub(crate) fn apply_swim_routing_west_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SWIM_ROUTING_WEST_PROVIDER },
         "spec": {
             "gridNetworkRef": SWIM_ROUTING_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": west_model }],
@@ -5776,12 +5766,12 @@ fn multi_provider_fixture_json(
 ) -> String {
     let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
     serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": name },
         "spec": {
             "gridNetworkRef": network_ref,
-            "providerKind": "open_ai",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": endpoint,
             "models": models_json,
@@ -6072,7 +6062,7 @@ fn delete_resource(
 /// `localSiteName` entry used by the operator to locate its own overlay slot.
 pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": {
             "name": SITE_JOIN_NETWORK,
@@ -6105,7 +6095,7 @@ pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> R
 /// referencing it stay isolated from [`SITE_JOIN_NETWORK`].
 pub(crate) fn apply_site_join_wrong_network(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": SITE_JOIN_WRONG_NETWORK },
         "spec": { "seeds": [] }
@@ -6135,7 +6125,7 @@ pub(crate) fn apply_gridsite(
     label_value: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridSite",
         "metadata": {
             "name": site_name,
@@ -6145,7 +6135,7 @@ pub(crate) fn apply_gridsite(
             "gridNetworkRef": network_ref,
             "egress": {
                 "address": egress_addr,
-                "tls": { "mode": "Mutual" }
+                "tls": { "mode": "mutualTls" }
             }
         }
     }))
@@ -6333,12 +6323,12 @@ pub(crate) fn apply_site_join_primary_provider(
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SITE_JOIN_PRIMARY_PROVIDER },
         "spec": {
             "gridNetworkRef": SITE_JOIN_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
@@ -6371,12 +6361,12 @@ pub(crate) fn apply_site_join_joining_provider(
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SITE_JOIN_JOINING_PROVIDER },
         "spec": {
             "gridNetworkRef": SITE_JOIN_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "remote",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
@@ -6404,12 +6394,12 @@ pub(crate) fn apply_site_join_joining_provider(
 /// as a candidate in the overlay for [`SITE_JOIN_NETWORK`].
 pub(crate) fn apply_site_join_wrong_provider(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": SITE_JOIN_WRONG_PROVIDER },
         "spec": {
             "gridNetworkRef": SITE_JOIN_WRONG_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": "model-sjd-wrong" }],
@@ -6901,7 +6891,7 @@ pub(crate) fn patch_gridsite_identity_trust(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let patch = serde_json::json!({
         "spec": {
-            "egress": { "tls": { "mode": "Mutual", "serverName": server_name } },
+            "egress": { "tls": { "mode": "mutualTls", "serverName": server_name } },
             "trust": { "canonicalFingerprints": [canonical_fp] }
         }
     })
@@ -6945,7 +6935,7 @@ pub(crate) fn apply_failover_east_fixtures(
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": FAILOVER_NETWORK },
         "spec": {
@@ -6962,12 +6952,12 @@ pub(crate) fn apply_failover_east_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": FAILOVER_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": FAILOVER_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
@@ -7161,12 +7151,12 @@ pub(crate) fn apply_failover_shared_east_provider(
     east_site: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": FAILOVER_SHARED_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": FAILOVER_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": FAILOVER_SHARED_MODEL }],
@@ -7196,7 +7186,7 @@ pub(crate) fn apply_failover_west_fixtures_with_shared(
     west_site: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": FAILOVER_NETWORK },
         "spec": { "seeds": [] }
@@ -7206,12 +7196,12 @@ pub(crate) fn apply_failover_west_fixtures_with_shared(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": FAILOVER_WEST_PROVIDER },
         "spec": {
             "gridNetworkRef": FAILOVER_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "remote",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [
@@ -7364,7 +7354,7 @@ pub(crate) fn apply_stale_gc_east_fixtures(
     ttl_secs: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": STALE_GC_NETWORK },
         "spec": {
@@ -7382,12 +7372,12 @@ pub(crate) fn apply_stale_gc_east_fixtures(
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": STALE_GC_EAST_PROVIDER },
         "spec": {
             "gridNetworkRef": STALE_GC_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": STALE_GC_LOCAL_MODEL }],
@@ -7414,7 +7404,7 @@ pub(crate) fn apply_stale_gc_east_fixtures(
 #[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
 pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": STALE_GC_NETWORK },
         "spec": { "seeds": [] }
@@ -7424,12 +7414,12 @@ pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Re
         std::process::exit(1);
     });
     let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": STALE_GC_WEST_PROVIDER },
         "spec": {
             "gridNetworkRef": STALE_GC_NETWORK,
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "remote",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": STALE_GC_REMOTE_MODEL }],
@@ -7573,7 +7563,7 @@ pub(crate) enum ApiCredentialPlan {
         expect(dead_code, reason = "constructed only by test-only parse_api_credential_plan")
     )]
     Absent,
-    /// `auth.strategy = bearer_token` with a resolved `SecretRef`.
+    /// `auth.strategy = bearerToken` with a resolved `SecretRef`.
     BearerToken {
         /// Secret name in the cluster.
         secret_name: String,
@@ -7596,8 +7586,8 @@ pub(crate) enum ApiCredentialPlan {
 /// |---|---|---|---|
 /// | `true` | any | any | `Ok(Manual)` |
 /// | absent/null | — | — | `Ok(Absent)` |
-/// | `false` | `bearer_token` | present | `Ok(BearerToken { … })` |
-/// | `false` | `bearer_token` | absent | `Err("missing secretRef")` |
+/// | `false` | `bearerToken` | present | `Ok(BearerToken { … })` |
+/// | `false` | `bearerToken` | absent | `Err("missing secretRef")` |
 /// | `false` | other | any | `Err("unsupported strategy …")` |
 #[cfg(test)]
 #[expect(
@@ -7621,10 +7611,10 @@ pub(crate) fn parse_api_credential_plan(
         .unwrap_or("");
 
     match strategy {
-        "bearer_token" => {
+        "bearerToken" => {
             let secret_ref = auth_json
                 .get("secretRef")
-                .ok_or("auth.strategy is bearer_token but spec.auth.secretRef is missing")?;
+                .ok_or("auth.strategy is bearerToken but spec.auth.secretRef is missing")?;
             let name = secret_ref
                 .get("name")
                 .and_then(serde_json::Value::as_str)
@@ -7644,7 +7634,7 @@ pub(crate) fn parse_api_credential_plan(
             })
         },
         other => Err(format!(
-            "unsupported auth strategy {other:?}: only bearer_token is supported \
+            "unsupported auth strategy {other:?}: only bearerToken is supported \
              for harness-driven credential projection"
         )
         .into()),
@@ -8672,7 +8662,7 @@ mod tests {
 
     #[test]
     fn credential_plan_manual_when_manual_is_true() {
-        let auth = serde_json::json!({ "manual": true, "strategy": "bearer_token" });
+        let auth = serde_json::json!({ "manual": true, "strategy": "bearerToken" });
         let plan = parse_api_credential_plan(&auth).unwrap();
         assert_eq!(
             plan,
@@ -8684,7 +8674,7 @@ mod tests {
     #[test]
     fn credential_plan_bearer_token_extracts_secret_ref() {
         let auth = serde_json::json!({
-            "strategy": "bearer_token",
+            "strategy": "bearerToken",
             "secretRef": { "name": "my-secret", "namespace": "default", "key": "token" }
         });
         let plan = parse_api_credential_plan(&auth).unwrap();
@@ -8700,7 +8690,7 @@ mod tests {
 
     #[test]
     fn credential_plan_bearer_token_missing_secret_ref_is_error() {
-        let auth = serde_json::json!({ "strategy": "bearer_token" });
+        let auth = serde_json::json!({ "strategy": "bearerToken" });
         assert!(
             parse_api_credential_plan(&auth).is_err(),
             "bearer_token without secretRef must fail"
@@ -8710,7 +8700,7 @@ mod tests {
     #[test]
     fn credential_plan_bearer_token_missing_key_is_error() {
         let auth = serde_json::json!({
-            "strategy": "bearer_token",
+            "strategy": "bearerToken",
             "secretRef": { "name": "s", "namespace": "default" }
         });
         assert!(
@@ -8721,7 +8711,7 @@ mod tests {
 
     #[test]
     fn credential_plan_unsupported_strategy_is_error() {
-        let auth = serde_json::json!({ "strategy": "api_key" });
+        let auth = serde_json::json!({ "strategy": "apiKey" });
         let err = parse_api_credential_plan(&auth).unwrap_err();
         assert!(
             err.to_string().contains("unsupported auth strategy"),
@@ -9032,11 +9022,11 @@ mod tests {
             "cluster": "gateway-site-a",
             "address": "10.0.0.10:30080",
             "transport": {
-                "mode": "mutual_tls",
+                "mode": "mutualTls",
                 "sni": "site-a.grid.internal"
             }
         }]);
-        let json_str = network_fixture_with_consumer_config_json("net", "gw", "ns", "my-cm", &endpoints);
+        let json_str = network_fixture_with_consumer_config_json("net", "gw", "ns", &endpoints);
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         let refs = &value["spec"]["gatewayRefs"];
         let first = &refs[0];
@@ -9045,10 +9035,9 @@ mod tests {
             Some(true),
             "consumerConfig.enabled must be true"
         );
-        assert_eq!(
-            first["consumerConfig"]["configMapName"].as_str(),
-            Some("my-cm"),
-            "configMapName must be the provided name"
+        assert!(
+            first["consumerConfig"].get("configMapName").is_none(),
+            "the operator owns the consumer ConfigMap name"
         );
         assert_eq!(
             first["consumerConfig"]["clusterEndpoints"][0]["cluster"].as_str(),
@@ -9076,8 +9065,8 @@ mod tests {
             .expect("provider endpoint must be present");
         assert_eq!(
             provider["transport"]["mode"].as_str(),
-            Some("mutual_tls"),
-            "provider endpoint must use explicit mutual_tls transport"
+            Some("mutualTls"),
+            "provider endpoint must use explicit mutualTls transport"
         );
         assert_eq!(
             provider["transport"]["sni"].as_str(),

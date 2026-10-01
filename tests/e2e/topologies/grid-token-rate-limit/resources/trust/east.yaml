@@ -1,4 +1,4 @@
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
   name: grid-token-rate-limit-west
@@ -10,13 +10,13 @@ spec:
   egress:
     address: "{{ captures.west.swim-lb-ip }}:8443"
     tls:
-      mode: Mutual
+      mode: mutualTls
       serverName: provider-a.grid.internal
   trust:
     canonicalFingerprints:
       - PEER_WEST_FINGERPRINT
 ---
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
   name: grid-token-rate-limit-central
@@ -28,7 +28,7 @@ spec:
   egress:
     address: "{{ captures.central.swim-lb-ip }}:8443"
     tls:
-      mode: Mutual
+      mode: mutualTls
       serverName: provider-b.grid.internal
   trust:
     canonicalFingerprints:

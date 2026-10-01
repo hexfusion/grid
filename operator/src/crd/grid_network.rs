@@ -555,7 +555,7 @@ pub fn resolve_budget_statuses(
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis-proxy.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "GridNetwork",
     plural = "gridnetworks",
     shortname = "gnw",
@@ -772,9 +772,9 @@ pub struct GatewayRef {
 /// # Security
 ///
 /// The generated `ConfigMap` never contains credential token bytes.  Credential
-/// entries use a `file:` source under `credentialMountBase`; the mounted
-/// Kubernetes Secret provides the token at runtime.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+/// entries use a `file:` source under the operator's credential mount base; the
+/// mounted Kubernetes Secret provides the token at runtime.
+#[derive(Clone, Default, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -782,21 +782,6 @@ pub struct ConsumerConfig {
     /// Default: `false`.  Set to `true` to opt in.
     #[serde(default)]
     pub enabled: bool,
-
-    /// Base directory for mounted credential Secret files inside the consumer pod.
-    ///
-    /// Each credential Secret is expected to be mounted at
-    /// `{credentialMountBase}/{secret-name}/{secret-key}`.
-    ///
-    /// Default: `/run/secrets/grid-credentials`.
-    #[serde(default = "default_credential_mount_base")]
-    pub credential_mount_base: String,
-
-    /// Name of the generated consumer Praxis `ConfigMap`.
-    ///
-    /// Default: `praxis-consumer-config`.
-    #[serde(default = "default_consumer_config_map_name")]
-    pub config_map_name: String,
 
     /// Endpoint topology for the generated `load_balancer` section.
     ///
@@ -818,48 +803,13 @@ pub struct ConsumerConfig {
     /// Default: empty — valid only when the rendered overlay has no candidates.
     #[serde(default)]
     pub cluster_endpoints: Vec<ClusterEndpointConfig>,
-
-    /// Mount path for TLS certificates inside the consumer pod.
-    ///
-    /// Used when rendering mTLS cluster entries from `clusterEndpoints`.
-    /// The operator expects the consumer pod to mount a TLS Secret at this path,
-    /// containing `ca.crt`, `tls.crt`, and `tls.key`.
-    ///
-    /// Default: `/etc/praxis/tls`.
-    #[serde(default = "default_tls_cert_mount_path")]
-    pub tls_cert_mount_path: String,
-
-    /// HTTP port for the generated Praxis listener.
-    ///
-    /// The rendered `listeners[0].address` is `0.0.0.0:{listenerPort}`.
-    ///
-    /// Default: `8080`.
-    #[serde(default = "default_listener_port")]
-    pub listener_port: u16,
 }
 
-impl Default for ConsumerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            credential_mount_base: default_credential_mount_base(),
-            config_map_name: default_consumer_config_map_name(),
-            cluster_endpoints: Vec::new(),
-            tls_cert_mount_path: default_tls_cert_mount_path(),
-            listener_port: default_listener_port(),
-        }
-    }
-}
 
-/// Transport mode for a consumer load-balancer cluster endpoint.
-///
-/// Determines whether the consumer connects to the provider gateway
-/// cluster over mutual TLS or plain HTTP.  This is an explicit security
-/// decision — the operator refuses to render a cluster entry without a
-/// declared transport mode, preventing accidental plaintext.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransportMode {
+/// TLS mode for a grid connection, shared by site egress and consumer cluster endpoints.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TlsMode {
     /// Mutual TLS with CA verification and client certificate.
     MutualTls,
     /// Plain HTTP — no TLS.  Explicit insecure/dev-only mode.
@@ -868,20 +818,19 @@ pub enum TransportMode {
 
 /// Transport configuration for a cluster endpoint.
 ///
-/// Bundles the [`TransportMode`] with an optional SNI field.
-/// When `mode` is [`MutualTls`](TransportMode::MutualTls), `sni` is
+/// Bundles the [`TlsMode`] with an optional SNI field.
+/// When `mode` is [`MutualTls`](TlsMode::MutualTls), `sni` is
 /// required and must match the Subject Alternative Name in the provider
 /// gateway's server certificate.  When `mode` is
-/// [`Plaintext`](TransportMode::Plaintext), `sni` must not be set —
+/// [`Plaintext`](TlsMode::Plaintext), `sni` must not be set —
 /// setting it is rejected as a likely misconfiguration.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointTransport {
-    /// Transport mode: `mutual_tls` or `plaintext`.
-    pub mode: TransportMode,
+    /// Transport mode, required with no default so plaintext is always a declared choice.
+    pub mode: TlsMode,
 
-    /// TLS Server Name Indication (required when mode is `mutual_tls`;
-    /// must not be set when mode is `plaintext`).
+    /// TLS Server Name Indication, required for `mutualTls` and refused for `plaintext`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
 }
@@ -896,7 +845,7 @@ pub struct EndpointTransport {
 ///
 /// The `transport` field is required.  Missing transport fails closed
 /// during config rendering with status reason `MissingTransport`.
-/// When `transport.mode` is `mutual_tls`, `transport.sni` must also
+/// When `transport.mode` is `mutualTls`, `transport.sni` must also
 /// be present and non-blank; otherwise rendering fails with status
 /// reason `MissingSni`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -910,35 +859,21 @@ pub struct ClusterEndpointConfig {
 
     /// Explicit transport configuration.
     ///
-    /// Required.  Use `mutual_tls` with `sni` for remote/provider-gateway
+    /// Required.  Use `mutualTls` with `sni` for remote/provider-gateway
     /// traffic.  Use `plaintext` only for local/dev-only endpoints.
     /// Missing transport fails closed during config rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<EndpointTransport>,
 }
 
-/// Default credential mount base path.
-fn default_credential_mount_base() -> String {
-    "/run/secrets/grid-credentials".to_owned()
-}
-
-/// Default consumer Praxis `ConfigMap` name.
-fn default_consumer_config_map_name() -> String {
-    "praxis-consumer-config".to_owned()
-}
-
 /// Default TLS certificate mount path inside the consumer pod.
-pub(crate) const DEFAULT_TLS_CERT_MOUNT_PATH: &str = "/etc/praxis/tls";
+pub const DEFAULT_TLS_CERT_MOUNT_PATH: &str = "/etc/praxis/tls";
 
-/// Default TLS certificate mount path inside the consumer pod.
-fn default_tls_cert_mount_path() -> String {
-    DEFAULT_TLS_CERT_MOUNT_PATH.to_owned()
-}
+/// Default credential mount base inside the consumer pod.
+pub const DEFAULT_CREDENTIAL_MOUNT_BASE: &str = "/run/secrets/grid-credentials";
 
 /// Default HTTP listener port for the generated consumer Praxis config.
-fn default_listener_port() -> u16 {
-    8080
-}
+pub const DEFAULT_CONSUMER_LISTENER_PORT: u16 = 8080;
 
 /// SWIM protocol tuning parameters.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -1089,7 +1024,7 @@ pub struct ConsumerConfigStatus {
 
     /// Name of the generated `ConfigMap`.
     ///
-    /// Populated from `consumerConfig.configMapName`; empty for `Disabled` entries.
+    /// The operator-owned consumer `ConfigMap` name, `grid-consumer-<network>-<gateway>`.
     #[serde(default)]
     pub config_map_name: String,
 
@@ -1098,7 +1033,8 @@ pub struct ConsumerConfigStatus {
 
     /// Machine-readable reason for the current phase.
     ///
-    /// `""` when `phase` is `Rendered`.
+    /// `""` when `phase` is `Rendered`, or `ListenerPortUnresolved` when the
+    /// gateway Service could not supply the listener port and the fallback was used.
     /// One of `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`,
     /// `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
     /// `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled` otherwise.
@@ -1459,21 +1395,17 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "round-trip test covers all ConsumerConfig fields")]
     fn consumer_config_enabled_round_trips() {
         let json = serde_json::json!({
             "name": "gw",
             "namespace": "ns",
             "consumerConfig": {
                 "enabled": true,
-                "credentialMountBase": "/run/secrets/grid",
-                "configMapName": "my-consumer-config",
-                "tlsCertMountPath": "/etc/custom-tls",
                 "clusterEndpoints": [{
                     "cluster": "gateway-site-a",
                     "address": "10.0.0.10:30080",
                     "transport": {
-                        "mode": "mutual_tls",
+                        "mode": "mutualTls",
                         "sni": "site-a.grid.internal"
                     }
                 }]
@@ -1482,28 +1414,12 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(cc.enabled, "enabled must round-trip");
-        assert_eq!(
-            cc.credential_mount_base, "/run/secrets/grid",
-            "credentialMountBase must round-trip"
-        );
-        assert_eq!(
-            cc.config_map_name, "my-consumer-config",
-            "configMapName must round-trip"
-        );
-        assert_eq!(
-            cc.tls_cert_mount_path, "/etc/custom-tls",
-            "tlsCertMountPath must round-trip"
-        );
         let endpoint = cc.cluster_endpoints.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(cc.cluster_endpoints.len(), 1, "clusterEndpoints must round-trip");
         assert_eq!(endpoint.cluster, "gateway-site-a");
         assert_eq!(endpoint.address, "10.0.0.10:30080");
         let transport = endpoint.transport.as_ref().unwrap_or_else(|| std::process::abort());
-        assert_eq!(
-            transport.mode,
-            TransportMode::MutualTls,
-            "transport mode must round-trip"
-        );
+        assert_eq!(transport.mode, TlsMode::MutualTls, "transport mode must round-trip");
         assert_eq!(
             transport.sni.as_deref(),
             Some("site-a.grid.internal"),
@@ -1520,11 +1436,7 @@ mod tests {
         });
         let ep: ClusterEndpointConfig = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let transport = ep.transport.as_ref().unwrap_or_else(|| std::process::abort());
-        assert_eq!(
-            transport.mode,
-            TransportMode::Plaintext,
-            "plaintext mode must round-trip"
-        );
+        assert_eq!(transport.mode, TlsMode::Plaintext, "plaintext mode must round-trip");
         assert!(transport.sni.is_none(), "plaintext must not require SNI");
     }
 
@@ -1551,21 +1463,9 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(!cc.enabled, "enabled must default to false");
-        assert_eq!(
-            cc.credential_mount_base, "/run/secrets/grid-credentials",
-            "credentialMountBase must use default"
-        );
-        assert_eq!(
-            cc.config_map_name, "praxis-consumer-config",
-            "configMapName must use default"
-        );
         assert!(
             cc.cluster_endpoints.is_empty(),
             "clusterEndpoints must default to empty"
-        );
-        assert_eq!(
-            cc.tls_cert_mount_path, "/etc/praxis/tls",
-            "tlsCertMountPath must use default"
         );
     }
 
@@ -1604,10 +1504,17 @@ mod tests {
             consumer_config_properties.contains_key("clusterEndpoints"),
             "CRD schema must include consumerConfig.clusterEndpoints"
         );
-        assert!(
-            consumer_config_properties.contains_key("tlsCertMountPath"),
-            "CRD schema must include consumerConfig.tlsCertMountPath"
-        );
+        for removed in [
+            "configMapName",
+            "credentialMountBase",
+            "tlsCertMountPath",
+            "listenerPort",
+        ] {
+            assert!(
+                !consumer_config_properties.contains_key(removed),
+                "{removed} is operator deployment config, not grid intent"
+            );
+        }
     }
 
     #[test]
@@ -1655,8 +1562,8 @@ mod tests {
         let mode_values: Vec<&str> = mode_enum.iter().filter_map(serde_json::Value::as_str).collect();
 
         assert!(
-            mode_values.contains(&"mutual_tls"),
-            "transport.mode enum must include mutual_tls: {mode_values:?}"
+            mode_values.contains(&"mutualTls"),
+            "transport.mode enum must include mutualTls: {mode_values:?}"
         );
         assert!(
             mode_values.contains(&"plaintext"),

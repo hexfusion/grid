@@ -701,8 +701,8 @@ pub(crate) enum Action {
     /// Print the SHA-256 fingerprint of a `GridSite.status.publicCertPem`.
     ///
     /// Reads the public certificate PEM from the named `GridSite` status and
-    /// prints the colon-separated SHA-256 fingerprint suitable for use as
-    /// `spec.trust.certFingerprint`.
+    /// prints the canonical DER SHA-256 fingerprint for
+    /// `spec.trust.canonicalFingerprints`.
     ///
     /// Never prints private key material.
     GridsiteFingerprint {
@@ -821,7 +821,7 @@ pub(crate) enum Action {
     /// through `Pending → Discovered → Connecting → Active`.  Only `Discovered`
     /// is harness-patched; `Connecting` and `Active` are driven by the
     /// `GridSite` controller.  `Active` requires the TCP probe to succeed and
-    /// the configured `spec.trust.certFingerprint` to match `status.publicCertPem`.
+    /// a `spec.trust.canonicalFingerprints` pin to match the peer's leaf certificate.
     ///
     /// Also verifies:
     /// - the joined site has routing-relevant spec fields (egress, network, identity)
@@ -1664,8 +1664,8 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
-        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_CONSUMER_CONFIGMAP_NAME, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
-        TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
+        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK,
+        TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY, test_consumer_configmap_name,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -1736,17 +1736,13 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
         // Wait for and validate the operator-generated consumer ConfigMap.
         // This ConfigMap is rendered because GatewayRef.consumerConfig.enabled = true.
         // The live consumer pod is deployed from this exact rendered config below.
-        eprintln!("  waiting for operator-generated consumer ConfigMap {TEST_CONSUMER_CONFIGMAP_NAME}...");
-        operator::wait_for_consumer_configmap(
-            &context,
-            TEST_CONSUMER_CONFIGMAP_NAME,
-            TEST_GATEWAY_NS,
-            CONFIGMAP_POLL_TIMEOUT,
-        )?;
+        let consumer_configmap = test_consumer_configmap_name();
+        eprintln!("  waiting for operator-generated consumer ConfigMap {consumer_configmap}...");
+        operator::wait_for_consumer_configmap(&context, &consumer_configmap, TEST_GATEWAY_NS, CONFIGMAP_POLL_TIMEOUT)?;
 
         let path = operator::export_overlay_to_file(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
         eprintln!("  overlay exported: {}", path.display());
-        Ok((path, TEST_CONSUMER_CONFIGMAP_NAME.to_owned()))
+        Ok((path, consumer_configmap))
     })();
 
     if let Some(c) = op_guard.0.take() {
@@ -4551,7 +4547,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// **Lifecycle proof (step 5):** a separate harness-created `GridSite` is advanced through
 /// `Pending → Discovered → Connecting → Active`.  Only `Discovered` is harness-patched;
 /// the controller drives `Connecting` (egress present) and `Active`
-/// (TCP probe succeeds + `spec.trust.certFingerprint` matches `status.publicCertPem`).
+/// (TCP probe succeeds + a `spec.trust.canonicalFingerprints` pin matches the peer leaf).
 #[expect(
     clippy::too_many_lines,
     reason = "sequential 8-step proof: auto-discovery + harness lifecycle + overlay isolation"
@@ -5902,7 +5898,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     let overlay_cm_name = format!("grid-overlay-{network_name}-{gw_name}");
 
     let network_manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": network_name },
         "spec": {
@@ -5931,14 +5927,14 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     eprintln!("  [OK] GridNetwork {network_name} applied (with TLS Secret refs)");
 
     let provider_manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": provider_name },
         "spec": {
             "gridNetworkRef": network_name,
             "models": [{ "name": "model-rbac-test" }],
-            "backendKind": "SelfHosted",
-            "providerKind": "SelfHosted",
+            "backendKind": "local",
+            "providerKind": "openAi",
             "routingClusterRef": test_site_name,
             "endpoint": "http://localhost:10099"
         }

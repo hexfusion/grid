@@ -18,7 +18,7 @@ spec:
   ports:
     - name: {{ include "praxis-gateway.portName" . }}
       port: {{ .Values.service.port }}
-      targetPort: {{ include "praxis-gateway.portName" . }}
+      targetPort: {{ .Values.port.containerPort }}
       protocol: {{ .Values.port.protocol | quote }}
   selector:
     {{- include "praxis-gateway.selectorLabels" . | nindent 4 }}

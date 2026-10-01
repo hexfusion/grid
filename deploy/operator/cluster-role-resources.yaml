@@ -36,11 +36,12 @@ rules:
   #   - Provider gateway LoadBalancer Service (self-discovery of the
   #     external address advertised via SWIM state broadcast)
   #   - SWIM LoadBalancer Service (advertised SWIM and signals address)
+  #   - Consumer gateway Service named by each gatewayRef (listener port
+  #     of the consumer config), so no fixed resourceNames
   #
   # Only get is required; no write, list, or watch.
   - apiGroups: [""]
     resources: ["services"]
-    resourceNames: ["provider-gateway", "grid-operator-swim"]
     verbs: ["get"]
 
   # ── Events (namespaced) ────────────────────────────────────────────
@@ -59,7 +60,7 @@ rules:
   #
   # Write paths:
   #   - Routing overlay ConfigMap (grid-overlay-{network}-{gateway})
-  #   - Consumer Praxis config ConfigMap (consumerConfig.configMapName)
+  #   - Consumer Praxis config ConfigMap (grid-consumer-{network}-{gateway})
   #   - SWIM revision reservation (read and resourceVersion update)
   #
   # Overlay/config writes use server-side apply. The revision reservation uses

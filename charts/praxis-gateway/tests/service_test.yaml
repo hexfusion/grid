@@ -1,0 +1,15 @@
+suite: Service
+templates:
+  - templates/service.yaml
+tests:
+  - it: targets the numeric container port, so the grid operator can read the listener port
+    set:
+      service.port: 80
+      port.containerPort: 9090
+    asserts:
+      - equal:
+          path: spec.ports[0].targetPort
+          value: 9090
+      - equal:
+          path: spec.ports[0].port
+          value: 80

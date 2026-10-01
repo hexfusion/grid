@@ -111,7 +111,7 @@ Add the InferenceProvider to the `inferenceProviders` array:
 inferenceProviders:
   - name: existing-mock-provider
     gridNetworkRef: my-grid
-    providerKind: self_hosted
+    providerKind: openAi
     backendKind: local
     endpoint: "http://mock-inference-existing.grid-system.svc.cluster.local:8080"
     siteSelector:
@@ -123,7 +123,7 @@ inferenceProviders:
 
   - name: my-new-provider                    # new
     gridNetworkRef: my-grid
-    providerKind: self_hosted
+    providerKind: openAi
     backendKind: local
     endpoint: "http://mock-inference-new-provider.grid-system.svc.cluster.local:8080"
     siteSelector:
@@ -335,8 +335,8 @@ directly to the external endpoint over HTTPS.
    ```yaml
    - name: openai-east1-provider
      gridNetworkRef: my-grid
-     providerKind: External
-     backendKind: OpenAI
+     providerKind: openAi
+     backendKind: apiProvider
      endpoint: "https://api.openai.com"
      models:
        - name: gpt-4o-mini

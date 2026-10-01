@@ -141,6 +141,11 @@ async fn main() {
     let ctx = Arc::new(
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)
+            .with_consumer_settings(grid_network::ConsumerSettings {
+                credential_mount_base: config.consumer.credential_mount_base.clone(),
+                tls_cert_mount_path: config.consumer.tls_cert_mount_path.clone(),
+                listener_port: config.consumer.listener_port,
+            })
             .hold_membership(),
     );
 

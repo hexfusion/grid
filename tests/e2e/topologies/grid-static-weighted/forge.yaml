@@ -243,7 +243,7 @@ spec:
             inferenceProviders:
               - name: vcr-provider-a-provider
                 gridNetworkRef: grid-static-weighted
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 capacityWeight: 50
                 endpoint: "http://vcr-inference-provider-a.grid-system.svc.cluster.local:8000"
@@ -309,7 +309,7 @@ spec:
             inferenceProviders:
               - name: vcr-provider-b-provider
                 gridNetworkRef: grid-static-weighted
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 capacityWeight: 30
                 endpoint: "http://vcr-inference-provider-b.grid-system.svc.cluster.local:8000"
@@ -375,7 +375,7 @@ spec:
             inferenceProviders:
               - name: vcr-provider-c-provider
                 gridNetworkRef: grid-static-weighted
-                providerKind: vllm-vcr
+                providerKind: openAi
                 backendKind: local
                 capacityWeight: 20
                 endpoint: "http://vcr-inference-provider-c.grid-system.svc.cluster.local:8000"

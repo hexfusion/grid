@@ -27,7 +27,7 @@ spec:
         - jsonPath: .status.phase
           name: Phase
           type: string
-      name: v1alpha1
+      name: v1beta1
       schema:
         openAPIV3Schema:
           description: Auto-generated derived type for InferenceProviderSpec via `CustomResource`
@@ -95,19 +95,24 @@ spec:
                     strategy:
                       description: How credentials are presented to the provider.
                       enum:
-                        - api_key
-                        - bearer_token
+                        - apiKey
+                        - bearerToken
                         - custom
-                        - mtls_only
+                        - mtlsOnly
                         - oauth2
-                        - service_account
+                        - serviceAccount
                         - sigv4
                       type: string
                   required:
                     - strategy
                   type: object
                 backendKind:
-                  description: Backend deployment category.
+                  description: Where the provider runs, which drives locality scoring.
+                  enum:
+                    - local
+                    - remote
+                    - cloudManaged
+                    - apiProvider
                   type: string
                 capacityWeight:
                   description: Relative capacity used by an opt-in placement policy.
@@ -624,7 +629,12 @@ spec:
                     type: object
                   type: array
                 providerKind:
-                  description: Inference provider type.
+                  description: The wire API the provider speaks. Self-hosted vLLM and llm-d speak `openAi`.
+                  enum:
+                    - openAi
+                    - anthropic
+                    - bedrock
+                    - vertex
                   type: string
                 routingClusterRef:
                   description: |-

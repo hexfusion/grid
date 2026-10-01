@@ -283,6 +283,15 @@
         }
       }
     },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "credentialMountBase": { "type": "string", "pattern": "^/.*\\S", "description": "Directory the consumer pod mounts credential Secrets under." },
+        "tlsCertMountPath": { "type": "string", "pattern": "^/.*\\S", "description": "Directory the gateway pod mounts its grid TLS Secret at." },
+        "listenerPort": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Consumer listener port when the gateway Service cannot be read." }
+      }
+    },
     "health": {
       "type": "object",
       "additionalProperties": false,

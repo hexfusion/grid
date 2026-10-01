@@ -238,14 +238,19 @@ overlays, status fields, or logs.
 | `ConfigMap` | Naming | Data key | Namespace |
 |---|---|---|---|
 | Routing overlay | `grid-overlay-{network}-{gateway}` | `routing-overlay.json`, `routing-config.json` | `GatewayRef.namespace` |
-| Consumer config | `consumerConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
+| Consumer config | `grid-consumer-<network>-<gateway>` | `praxis.yaml` | `GatewayRef.namespace` |
+
+The consumer config listener port comes from a `get` on the gateway Service
+`GatewayRef.name` in `GatewayRef.namespace`. The resources `ClusterRole` grants
+`get` on any Service in the namespaces it is bound to, so any release name works.
 
 ### What is not granted
 
 Neither `ClusterRole` grants:
 
 - `pods`, `pods/exec`, `pods/log`, `pods/portforward`
-- `deployments`, `services`, `ingresses`
+- `deployments`, `ingresses`
+- `services` `list` or `watch`, or any `services` write
 - `secrets` `delete`, `list`, `watch`
 - `configmaps` `get`, `delete`, `list`, `watch`
 - Any `update` verb (all mutations use SSA `patch`)
@@ -346,7 +351,7 @@ using only the installed `ServiceAccount`.
 ## 2. Create a GridNetwork
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridNetwork
 metadata:
   name: production
@@ -564,7 +569,7 @@ The trust bootstrap for a remote site progresses through these steps:
      egress:
        address: provider.example.com:8443
        tls:
-         mode: Mutual
+         mode: mutualTls
          serverName: provider.example.com
      trust:
        canonicalFingerprints:
@@ -650,19 +655,19 @@ See the [CRDs doc](crds.md) for full specs.
 
 Example — an API provider:
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: anthropic-api
 spec:
   gridNetworkRef: production
   providerKind: anthropic
-  backendKind: api_provider
+  backendKind: apiProvider
   endpoint: https://api.anthropic.com
   models:
     - name: claude-sonnet-4
   auth:
-    strategy: bearer_token
+    strategy: bearerToken
     secretRef:
       name: anthropic-token
       namespace: praxis-system
@@ -673,13 +678,13 @@ spec:
 
 Example — a local llm-d cluster:
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: local-vllm
 spec:
   gridNetworkRef: production
-  providerKind: self_hosted
+  providerKind: openAi
   backendKind: local
   endpoint: http://vllm-service.inference:8000
   models:
@@ -1006,10 +1011,10 @@ for the operator `ServiceAccount` to write the `ConfigMap` there.
 
 Every `clusterEndpoints[]` entry must declare explicit transport intent via the
 `transport` field.  Remote/provider-gateway clusters should use
-`transport.mode: mutual_tls` with a non-blank `transport.sni` matching the
+`transport.mode: mutualTls` with a non-blank `transport.sni` matching the
 provider certificate SAN.  Local dev-only clusters may use
 `transport.mode: plaintext`.  Missing transport fails closed with status reason
-`MissingTransport`; missing SNI on `mutual_tls` fails with `MissingSni`.
+`MissingTransport`; missing SNI on `mutualTls` fails with `MissingSni`.
 `transport.mode` is the security switch — not the presence of `sni`.
 
 ### Credential Secret access

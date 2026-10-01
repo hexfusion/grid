@@ -22,7 +22,7 @@ use super::{
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis-proxy.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "InferenceProvider",
     plural = "inferenceproviders",
     shortname = "infpvd",
@@ -45,8 +45,8 @@ pub struct InferenceProviderSpec {
     /// Authentication configuration.
     pub auth: Option<AuthConfig>,
 
-    /// Backend deployment category.
-    pub backend_kind: String,
+    /// Where the provider runs, which drives locality scoring.
+    pub backend_kind: BackendKind,
 
     /// Stable provider-gateway identity used by administrative operations.
     ///
@@ -85,8 +85,8 @@ pub struct InferenceProviderSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_discovery: Option<ModelDiscoveryConfig>,
 
-    /// Inference provider type.
-    pub provider_kind: String,
+    /// The wire API the provider speaks. Self-hosted vLLM and llm-d speak `openAi`.
+    pub provider_kind: ProviderKind,
 
     /// Optional routing identity used in overlay candidate `site` and `cluster` fields.
     ///
@@ -121,6 +121,83 @@ pub struct InferenceProviderSpec {
     /// Optional administrative traffic policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_policy: Option<TrafficPolicy>,
+}
+
+/// The wire API an [`InferenceProvider`] speaks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind {
+    /// `OpenAI` chat completions, also spoken by vLLM and llm-d.
+    OpenAi,
+    /// Anthropic Messages API.
+    Anthropic,
+    /// AWS Bedrock Converse API.
+    Bedrock,
+    /// Google Vertex AI `generateContent` API.
+    Vertex,
+}
+
+impl ProviderKind {
+    /// The scoring engine's equivalent.
+    #[must_use]
+    pub const fn to_scoring(self) -> scoring::ProviderKind {
+        match self {
+            Self::OpenAi => scoring::ProviderKind::OpenAi,
+            Self::Anthropic => scoring::ProviderKind::Anthropic,
+            Self::Bedrock => scoring::ProviderKind::Bedrock,
+            Self::Vertex => scoring::ProviderKind::Vertex,
+        }
+    }
+}
+
+/// Where an [`InferenceProvider`] runs.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendKind {
+    /// A model server on this cluster.
+    Local,
+    /// A model server on another grid cluster.
+    Remote,
+    /// A cloud-managed inference service such as Bedrock or Vertex.
+    CloudManaged,
+    /// A third-party API provider such as `OpenAI` or Anthropic.
+    ApiProvider,
+}
+
+impl BackendKind {
+    /// The scoring engine's equivalent.
+    #[must_use]
+    pub const fn to_scoring(self) -> scoring::BackendKind {
+        match self {
+            Self::Local => scoring::BackendKind::Local,
+            Self::Remote => scoring::BackendKind::Remote,
+            Self::CloudManaged => scoring::BackendKind::CloudManaged,
+            Self::ApiProvider => scoring::BackendKind::ApiProvider,
+        }
+    }
+
+    /// The name carried in gossip, unchanged since v1alpha1 so mixed-version sites agree.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+            Self::CloudManaged => "cloud_managed",
+            Self::ApiProvider => "api_provider",
+        }
+    }
+
+    /// Parse a gossiped backend kind, `None` for an unknown name.
+    #[must_use]
+    pub fn from_wire_name(name: &str) -> Option<scoring::BackendKind> {
+        match name {
+            "local" => Some(scoring::BackendKind::Local),
+            "remote" => Some(scoring::BackendKind::Remote),
+            "cloud_managed" => Some(scoring::BackendKind::CloudManaged),
+            "api_provider" => Some(scoring::BackendKind::ApiProvider),
+            _ => None,
+        }
+    }
 }
 
 /// Administrative policy for provider traffic.
@@ -608,19 +685,78 @@ mod tests {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
             "providerKind": "anthropic",
-            "backendKind": "api_provider",
+            "backendKind": "apiProvider",
             "endpoint": "https://api.anthropic.com",
             "models": [{"name": "claude-sonnet-4"}]
         });
         let spec: InferenceProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(spec.provider_kind, "anthropic", "provider kind");
+        assert_eq!(spec.provider_kind, ProviderKind::Anthropic, "provider kind");
+        assert_eq!(spec.backend_kind, BackendKind::ApiProvider, "backend kind");
         assert_eq!(spec.models.len(), 1, "model count");
+    }
+
+    #[test]
+    fn unknown_and_v1alpha1_kind_values_are_refused() {
+        for (provider_kind, backend_kind) in [
+            ("self_hosted", "local"),
+            ("vllm-vcr", "local"),
+            ("open_ai", "local"),
+            ("openAi", "local_model"),
+            ("openAi", "api_provider"),
+            ("openAi", "cloud_managed"),
+            ("openAi", ""),
+        ] {
+            let json = serde_json::json!({
+                "gridNetworkRef": "production",
+                "providerKind": provider_kind,
+                "backendKind": backend_kind,
+                "endpoint": "http://backend:8080"
+            });
+            assert!(
+                serde_json::from_value::<InferenceProviderSpec>(json).is_err(),
+                "{provider_kind}/{backend_kind} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_kind_gossip_names_round_trip_and_stay_snake_case() {
+        for (kind, wire) in [
+            (BackendKind::Local, "local"),
+            (BackendKind::Remote, "remote"),
+            (BackendKind::CloudManaged, "cloud_managed"),
+            (BackendKind::ApiProvider, "api_provider"),
+        ] {
+            assert_eq!(kind.wire_name(), wire, "gossip name for {kind:?}");
+            assert_eq!(
+                BackendKind::from_wire_name(wire),
+                Some(kind.to_scoring()),
+                "{wire} parses back"
+            );
+        }
+        assert_eq!(
+            BackendKind::from_wire_name("apiProvider"),
+            None,
+            "camelCase is not a gossip name"
+        );
+    }
+
+    #[test]
+    fn kinds_map_to_the_scoring_engine_without_serde() {
+        assert_eq!(ProviderKind::OpenAi.to_scoring(), scoring::ProviderKind::OpenAi);
+        assert_eq!(ProviderKind::Anthropic.to_scoring(), scoring::ProviderKind::Anthropic);
+        assert_eq!(ProviderKind::Bedrock.to_scoring(), scoring::ProviderKind::Bedrock);
+        assert_eq!(ProviderKind::Vertex.to_scoring(), scoring::ProviderKind::Vertex);
+        assert_eq!(
+            BackendKind::CloudManaged.to_scoring(),
+            scoring::BackendKind::CloudManaged
+        );
     }
 
     #[test]
     fn administrative_policy_round_trips_and_is_omitted_by_default() {
         let base = serde_json::json!({
-            "gridNetworkRef": "production", "providerKind": "self_hosted",
+            "gridNetworkRef": "production", "providerKind": "openAi",
             "backendKind": "local", "endpoint": "http://backend:8080"
         });
         let spec: InferenceProviderSpec = serde_json::from_value(base).unwrap_or_else(|_| std::process::abort());
@@ -629,7 +765,7 @@ mod tests {
         assert!(serialized.get("trafficPolicy").is_none());
 
         let drained: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
-            "gridNetworkRef": "production", "providerKind": "self_hosted",
+            "gridNetworkRef": "production", "providerKind": "openAi",
             "backendKind": "local", "endpoint": "http://backend:8080",
             "gatewayRef": "provider-gateway-a", "trafficPolicy": {"drain": true}
         }))
@@ -767,7 +903,7 @@ mod tests {
     fn metrics_config_absent_deserializes() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}]
@@ -787,7 +923,7 @@ mod tests {
     fn metrics_config_with_path_and_signal_names_deserializes() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -824,7 +960,7 @@ mod tests {
     fn metrics_config_defaults_apply_when_fields_absent() {
         let json = serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -844,7 +980,7 @@ mod tests {
     fn stale_metrics_seconds_defaults_to_none_when_absent() {
         let json = serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],
@@ -862,7 +998,7 @@ mod tests {
     fn stale_metrics_seconds_round_trips() {
         let json = serde_json::json!({
             "gridNetworkRef": "net",
-            "providerKind": "self_hosted",
+            "providerKind": "openAi",
             "backendKind": "local",
             "endpoint": "http://backend:8080",
             "models": [{"name": "model-a"}],

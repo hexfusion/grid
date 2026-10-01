@@ -19,7 +19,7 @@ spec:
         - jsonPath: .status.phase
           name: Phase
           type: string
-      name: v1alpha1
+      name: v1beta1
       schema:
         openAPIV3Schema:
           description: Auto-generated derived type for AgentToolProviderSpec via `CustomResource`
@@ -87,12 +87,12 @@ spec:
                     strategy:
                       description: How credentials are presented to the provider.
                       enum:
-                        - api_key
-                        - bearer_token
+                        - apiKey
+                        - bearerToken
                         - custom
-                        - mtls_only
+                        - mtlsOnly
                         - oauth2
-                        - service_account
+                        - serviceAccount
                         - sigv4
                       type: string
                   required:
@@ -109,7 +109,9 @@ spec:
                   type: string
                 protocol:
                   default: mcp
-                  description: Protocol used (only "mcp" initially).
+                  description: Protocol the provider speaks.
+                  enum:
+                    - mcp
                   type: string
                 siteSelector:
                   default:

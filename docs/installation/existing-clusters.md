@@ -230,7 +230,7 @@ InferenceProvider, produces zero overlay candidates, and never creates
 the overlay ConfigMap.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
   name: east2
@@ -442,13 +442,13 @@ Create one InferenceProvider per backend. Both can serve the same model
 between them:
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: mock-west1-a         # becomes overlay candidate cluster name
 spec:
   gridNetworkRef: my-grid
-  providerKind: self_hosted
+  providerKind: openAi
   backendKind: local
   endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
   siteSelector:
@@ -458,13 +458,13 @@ spec:
     - name: sim-model-v1
       capabilities: [text_generation]
 ---
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis-proxy.io/v1beta1
 kind: InferenceProvider
 metadata:
   name: mock-west1-b
 spec:
   gridNetworkRef: my-grid
-  providerKind: self_hosted
+  providerKind: openAi
   backendKind: local
   endpoint: "http://mock-inference-b.grid-system.svc.cluster.local:8080"
   siteSelector:
