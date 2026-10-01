@@ -2649,7 +2649,7 @@ mod tests {
     async fn get(conn: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> Vec<u8> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         if conn
-            .write_all(b"GET /v1/site/signals HTTP/1.1\r\nHost: east\r\n\r\n")
+            .write_all(format!("GET {} HTTP/1.1\r\nHost: east\r\n\r\n", operator::signals::SIGNALS_PATH).as_bytes())
             .await
             .is_err()
         {
@@ -2805,7 +2805,7 @@ mod tests {
         let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
         let (addr, server) = mesh.serve(mesh.west_is_local(), app, (&sources, &peers), 1).await;
         let mut conn = mesh.connect(addr).await;
-        conn.write_all(b"GET /v1/site/signals HTTP/1.1\r\nHost: east\r\n\r\n")
+        conn.write_all(format!("GET {} HTTP/1.1\r\nHost: east\r\n\r\n", operator::signals::SIGNALS_PATH).as_bytes())
             .await
             .expect("request");
         tokio::time::pause();

@@ -28,7 +28,7 @@ use crate::{
 ///
 /// One path for peers and the local gateway. Scope comes from the caller's
 /// certificate, never the path, so no second path can widen a caller's view.
-pub const SIGNALS_PATH: &str = "/v1/site/signals";
+pub const SIGNALS_PATH: &str = "/v1beta1/site/signals";
 
 /// Label naming the site a sample was observed at.
 pub const SITE_LABEL: &str = "grid_site";
@@ -1307,6 +1307,12 @@ fn reexpress_peer_ages(observations: &mut [Observation], date: Option<SystemTime
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_signals_path_is_pinned_to_the_shared_literal() {
+        // grid-signals-client::SIGNALS_PATH pins the same literal for the gateway.
+        assert_eq!(SIGNALS_PATH, "/v1beta1/site/signals");
+    }
+
     /// Addresses the dial classifier must refuse.
     const REFUSED_PEERS: &[&str] = &[
         "127.0.0.1",
@@ -1382,9 +1388,9 @@ mod tests {
         assert_eq!(
             urls,
             [
-                "https://203.0.113.7:9443/v1/site/signals",
-                "https://[fd00::2]:9191/v1/site/signals",
-                "https://east.example:9091/v1/site/signals"
+                format!("https://203.0.113.7:9443{SIGNALS_PATH}"),
+                format!("https://[fd00::2]:9191{SIGNALS_PATH}"),
+                format!("https://east.example:9091{SIGNALS_PATH}")
             ]
         );
     }
@@ -1520,12 +1526,9 @@ mod tests {
 
     #[test]
     fn a_collect_query_is_rebuilt_through_the_uri_parser() {
-        let url = "https://[fd00::1]:9091/v1/site/signals";
-        assert_eq!(
-            with_query(url, "collect[]=a").as_deref(),
-            Some("https://[fd00::1]:9091/v1/site/signals?collect[]=a")
-        );
-        assert_eq!(with_query(url, "a b"), None, "an invalid query is refused");
+        let url = format!("https://[fd00::1]:9091{SIGNALS_PATH}");
+        assert_eq!(with_query(&url, "collect[]=a"), Some(format!("{url}?collect[]=a")));
+        assert_eq!(with_query(&url, "a b"), None, "an invalid query is refused");
     }
 
     #[test]
@@ -1643,30 +1646,32 @@ mod tests {
         // target names one provider, and a peer serves from a store keyed by
         // provider. A site name matches nothing, so the peer answers empty and
         // no site relays another's data.
+        let url = format!("http://10.0.0.2:9091{SIGNALS_PATH}");
         let sites = vec![PeerSite {
             name: "pool-b".to_owned(),
-            url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
+            url: url.clone(),
             pins: Vec::new(),
         }];
         let urls = peer_urls(&sites, "");
         assert_eq!(
             urls.first().map(|(_, u, _)| u.as_str()),
-            Some("http://10.0.0.2:9091/v1/site/signals"),
+            Some(url.as_str()),
             "the whole site is asked for, with no target"
         );
     }
 
     #[test]
     fn requested_signal_names_still_reach_the_peer() {
+        let url = format!("http://10.0.0.2:9091{SIGNALS_PATH}");
         let sites = vec![PeerSite {
             name: "pool-b".to_owned(),
-            url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
+            url: url.clone(),
             pins: Vec::new(),
         }];
         let urls = peer_urls(&sites, "collect[]=queue");
         assert_eq!(
             urls.first().map(|(_, u, _)| u.as_str()),
-            Some("http://10.0.0.2:9091/v1/site/signals?collect[]=queue")
+            Some(format!("{url}?collect[]=queue").as_str())
         );
     }
 

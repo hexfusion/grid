@@ -24,7 +24,7 @@ use std::{
 
 use futures::{StreamExt as _, stream};
 use kube::{
-    Client,
+    Client, Resource as _,
     api::{Api, ListParams, Patch, PatchParams},
 };
 
@@ -285,23 +285,27 @@ async fn patch_discovery_status(
     name: &str,
     error: Option<&str>,
 ) -> Result<(), OperatorError> {
+    api.patch_status(
+        name,
+        &PatchParams::apply(DISCOVERY_FIELD_MANAGER).force(),
+        &Patch::Apply(discovery_status_patch(name, error)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The server-side apply body for the discovery-owned status field, at the served version.
+fn discovery_status_patch(name: &str, error: Option<&str>) -> serde_json::Value {
     let discovery_status = match error {
         Some(error) => serde_json::json!({ "modelDiscoveryError": error }),
         None => serde_json::json!({}),
     };
-    let patch = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-        "kind": "InferenceProvider",
+    serde_json::json!({
+        "apiVersion": InferenceProvider::api_version(&()),
+        "kind": InferenceProvider::kind(&()),
         "metadata": { "name": name },
         "status": discovery_status
-    });
-    api.patch_status(
-        name,
-        &PatchParams::apply(DISCOVERY_FIELD_MANAGER).force(),
-        &Patch::Apply(patch),
-    )
-    .await?;
-    Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -556,13 +560,32 @@ mod tests {
         assert_eq!(url("http://h/api", "/v1/models"), "http://h/api/v1/models", "base path");
     }
 
+    #[test]
+    fn discovery_status_patch_targets_the_served_version() {
+        let patch = discovery_status_patch("p", Some("unreachable"));
+        assert_eq!(
+            patch.get("apiVersion"),
+            Some(&serde_json::json!("grid.praxis.fast/v1beta1")),
+            "only v1beta1 is served"
+        );
+        assert_eq!(patch.get("kind"), Some(&serde_json::json!("InferenceProvider")));
+        assert_eq!(
+            patch.get("status"),
+            Some(&serde_json::json!({ "modelDiscoveryError": "unreachable" }))
+        );
+        assert_eq!(
+            discovery_status_patch("p", None).get("status"),
+            Some(&serde_json::json!({}))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------
 
     fn test_provider(name: &str, discovery_error: Option<&str>) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": InferenceProvider::api_version(&()),
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {

@@ -21,7 +21,7 @@ use super::grid_network::TlsMode;
 /// grid membership.
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
-    group = "grid.praxis-proxy.io",
+    group = "grid.praxis.fast",
     version = "v1beta1",
     kind = "GridSite",
     plural = "gridsites",
@@ -300,7 +300,7 @@ mod tests {
                 .and_then(|spec| spec.get("group"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_else(|| std::process::abort()),
-            "grid.praxis-proxy.io",
+            "grid.praxis.fast",
             "wrong CRD group"
         );
         assert_eq!(

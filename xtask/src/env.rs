@@ -592,11 +592,11 @@ pub(crate) enum Action {
     /// of `cargo run -p operator --bin generate_crds`.
     VerifyCrdSchema,
 
-    /// Prove the `v1alpha1` to `v1beta1` upgrade on a throwaway kind cluster.
+    /// Prove the `grid.praxis-proxy.io/v1alpha1` to `grid.praxis.fast/v1beta1` upgrade on a throwaway kind cluster.
     ///
-    /// Stores a `v1alpha1` object, shows the `v1beta1` CRD apply is refused,
-    /// deletes the objects and CRDs, reinstalls them, and confirms only
-    /// `v1beta1` is served. Creates and deletes its own cluster.
+    /// Stores an old-group object, deletes it and the old-group CRDs, installs
+    /// the new ones, and confirms the old group is gone and the new group
+    /// serves `v1beta1`. Creates and deletes its own cluster.
     VerifyCrdUpgrade,
 
     /// Prove that SWIM transport AES-256-GCM encryption is enforced.
@@ -5771,16 +5771,16 @@ fn env_verify_crd_schema() -> Result<(), Box<dyn std::error::Error>> {
 /// Positive `kubectl auth can-i` checks for the installed operator RBAC.
 fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let checks: &[(&str, &str, Option<&str>)] = &[
-        ("patch", "gridnetworks.grid.praxis-proxy.io", None),
-        ("patch", "gridnetworks.grid.praxis-proxy.io/status", None),
-        ("get", "gridnetworks.grid.praxis-proxy.io", None),
-        ("list", "gridnetworks.grid.praxis-proxy.io", None),
-        ("watch", "gridnetworks.grid.praxis-proxy.io", None),
-        ("patch", "gridsites.grid.praxis-proxy.io", None),
-        ("patch", "gridsites.grid.praxis-proxy.io/status", None),
-        ("delete", "gridsites.grid.praxis-proxy.io", None),
-        ("list", "inferenceproviders.grid.praxis-proxy.io", None),
-        ("patch", "inferenceproviders.grid.praxis-proxy.io/status", None),
+        ("patch", "gridnetworks.grid.praxis.fast", None),
+        ("patch", "gridnetworks.grid.praxis.fast/status", None),
+        ("get", "gridnetworks.grid.praxis.fast", None),
+        ("list", "gridnetworks.grid.praxis.fast", None),
+        ("watch", "gridnetworks.grid.praxis.fast", None),
+        ("patch", "gridsites.grid.praxis.fast", None),
+        ("patch", "gridsites.grid.praxis.fast/status", None),
+        ("delete", "gridsites.grid.praxis.fast", None),
+        ("list", "inferenceproviders.grid.praxis.fast", None),
+        ("patch", "inferenceproviders.grid.praxis.fast/status", None),
         ("get", "secrets", Some("default")),
         ("create", "secrets", Some("default")),
         ("create", "configmaps", Some("default")),
@@ -5811,7 +5811,7 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
         ("create", "pods", Some("default")),
         ("get", "pods", Some("default")),
         ("create", "events", Some("default")),
-        ("delete", "gridnetworks.grid.praxis-proxy.io", None),
+        ("delete", "gridnetworks.grid.praxis.fast", None),
         ("get", "secrets", Some("kube-system")),
         ("patch", "configmaps", Some("kube-system")),
         ("list", "services", Some("default")),
@@ -5894,7 +5894,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     let overlay_cm_name = format!("grid-overlay-{network_name}-{gw_name}");
 
     let network_manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1beta1",
+        "apiVersion": "grid.praxis.fast/v1beta1",
         "kind": "GridNetwork",
         "metadata": { "name": network_name },
         "spec": {
@@ -5923,7 +5923,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     eprintln!("  [OK] GridNetwork {network_name} applied (with TLS Secret refs)");
 
     let provider_manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1beta1",
+        "apiVersion": "grid.praxis.fast/v1beta1",
         "kind": "InferenceProvider",
         "metadata": { "name": provider_name },
         "spec": {

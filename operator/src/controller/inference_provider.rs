@@ -719,7 +719,7 @@ async fn update_status(
     }
 
     let patch = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1beta1",
+        "apiVersion": "grid.praxis.fast/v1beta1",
         "kind": "InferenceProvider",
         "status": status
     });
@@ -809,7 +809,7 @@ mod tests {
 
     fn test_site(name: &str, network: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": name },
             "spec": { "gridNetworkRef": network }
@@ -823,7 +823,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "GridSite",
             "metadata": { "name": name, "labels": labels_map },
             "spec": { "gridNetworkRef": network }
@@ -909,7 +909,7 @@ mod tests {
     fn test_provider(name: &str, network: &str, models: &[&str]) -> InferenceProvider {
         let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
@@ -930,7 +930,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
@@ -1014,13 +1014,13 @@ mod tests {
                         .map_or_else(|| json_not_found(&format!("secrets {name:?}")), json_ok)
                 } else if path.ends_with("/gridsites") {
                     json_ok(&serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1beta1",
+                        "apiVersion": "grid.praxis.fast/v1beta1",
                         "kind": "GridSiteList",
                         "items": [],
                     }))
                 } else if path.contains("/gridnetworks/") && name == grid_network_name {
                     json_ok(&serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1beta1",
+                        "apiVersion": "grid.praxis.fast/v1beta1",
                         "kind": "GridNetwork",
                         "metadata": { "name": grid_network_name },
                         "spec": {},
@@ -1047,7 +1047,7 @@ mod tests {
     /// at `ca_secret_name` in the `default` namespace.
     fn provider_with_health_check_tls(network: &str, ca_secret_name: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
@@ -1113,7 +1113,7 @@ mod tests {
     fn blank_endpoint_maps_to_unavailable() {
         // Item 1: blank endpoint
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
@@ -1140,7 +1140,7 @@ mod tests {
     fn whitespace_only_endpoint_maps_to_unavailable() {
         // Item 2: whitespace-only endpoint
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
@@ -1163,7 +1163,7 @@ mod tests {
     fn blank_model_name_maps_to_unavailable() {
         // Item 3: blank model name
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
@@ -1188,7 +1188,7 @@ mod tests {
     fn second_model_blank_maps_to_unavailable() {
         // Item 4: first model valid, second blank
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov" },
             "spec": {
@@ -1486,7 +1486,7 @@ mod tests {
         // validate_provider_config catches the config error AND that
         // phase_from_probe does not participate in that path.
         let provider_with_blank_endpoint: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "bad" },
             "spec": {
@@ -1643,7 +1643,7 @@ mod tests {
     #[test]
     fn empty_selector_with_no_sites_returns_empty() {
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": {"name": "p"},
             "spec": {
@@ -2701,7 +2701,7 @@ mod tests {
         // probe_url_for_provider would also return None for a blank endpoint,
         // but the static validation check runs first in resolve_phase_and_sites.
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": { "name": "bad" },
             "spec": {

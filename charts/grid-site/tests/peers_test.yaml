@@ -127,4 +127,4 @@ tests:
       peers.hub: {}
     asserts:
       - notExists:
-          path: metadata.labels["grid.praxis-proxy.io/provider-site"]
+          path: metadata.labels["grid.praxis.fast/provider-site"]

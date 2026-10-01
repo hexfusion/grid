@@ -52,7 +52,7 @@ no discovery mode, since manual discovery fills them from SWIM. inferenceProvide
 {{- define "grid-site.localHostSelector" -}}
 {{- with .Values.gridSite.name }}
 matchLabels:
-  grid.praxis-proxy.io/provider-site: {{ $.Values.gridSite.providerSiteLabel | default . | quote }}
+  grid.praxis.fast/provider-site: {{ $.Values.gridSite.providerSiteLabel | default . | quote }}
 {{- end }}
 {{- end }}
 

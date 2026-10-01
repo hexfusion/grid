@@ -6,14 +6,14 @@
 {{- fail (printf "peers: %q is this site's own gridSite.name" $name) }}
 {{- end }}
 ---
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridSite
 metadata:
   {{- /* The bare site name, so this declared GridSite is the one SWIM discovery fills. */}}
   name: {{ $name }}
   labels:
     {{- include "grid-site.labels" $ | nindent 4 }}
-    grid.praxis-proxy.io/network: {{ $network | quote }}
+    grid.praxis.fast/network: {{ $network | quote }}
 spec:
   gridNetworkRef: {{ $network }}
   {{- with $p.region }}

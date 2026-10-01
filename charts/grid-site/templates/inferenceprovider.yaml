@@ -4,7 +4,7 @@
 {{- fail (printf "inferenceProviders %s: siteSelector was renamed hostSelector" (.name | default "")) }}
 {{- end }}
 ---
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: InferenceProvider
 metadata:
   name: {{ required "inferenceProviders[].name is required" .name }}

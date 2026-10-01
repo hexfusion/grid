@@ -711,7 +711,7 @@ mod tests {
             );
         }
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": {"name": name},
             "spec": spec
@@ -945,7 +945,7 @@ mod tests {
         let body = "my_queue 0.3\n";
         let base_url = start_test_server(ok_response(body)).await;
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "InferenceProvider",
             "metadata": {"name": "prov-a"},
             "spec": {

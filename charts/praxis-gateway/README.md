@@ -379,13 +379,13 @@ gateway's Service name. When using `fullnameOverride`, set
 
 With `gridServing.enabled`, the consumer gateway reads the serving config the
 grid operator writes (under `signalTransport: poll`) and polls each peer's
-`/v1/site/signals` over mTLS with the grid identity at `tls.mountPath`. It routes
+`/v1beta1/site/signals` over mTLS with the grid identity at `tls.mountPath`. It routes
 each model to the least-loaded admitted site. The chosen candidate's cluster must
 name a `gatewayConfig.backends` cluster, so give each backend the operator's
 candidate cluster (the provider's `routingClusterRef`, else its name).
 
 The gateway reads the file only at start. When the ConfigMap's
-`grid.praxis-proxy.io/serving-digest` annotation changes, restart the gateway
+`grid.praxis.fast/serving-digest` annotation changes, restart the gateway
 (`kubectl rollout restart`).
 
 Known limits:

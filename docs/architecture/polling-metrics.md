@@ -17,7 +17,7 @@ one verified identity.
 
 | Step | What happens |
 |---|---|
-| Dial | The poller opens a mutual-TLS connection to the peer's `/v1/site/signals`. Both ends present Grid site certificates. |
+| Dial | The poller opens a mutual-TLS connection to the peer's `/v1beta1/site/signals`. Both ends present Grid site certificates. |
 | Verify | The peer's certificate is checked against the Grid CA and its SPIFFE identity, then the verified identity is compared to the site the poller intended to reach. A valid Grid peer answering for a site the poller did not dial is refused. |
 | Read | The exposition body is read under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
 | Store | Each reading is keyed on the verified peer identity, never a value the response body carries. A body label that disagrees with the verified owner is dropped. |

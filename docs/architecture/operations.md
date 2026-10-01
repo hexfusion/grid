@@ -351,7 +351,7 @@ using only the installed `ServiceAccount`.
 ## 2. Create a GridNetwork
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridNetwork
 metadata:
   name: production
@@ -658,7 +658,7 @@ See the [CRDs doc](crds.md) for full specs.
 
 Example — an API provider:
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: InferenceProvider
 metadata:
   name: anthropic-api
@@ -682,7 +682,7 @@ spec:
 
 Example — a local llm-d cluster:
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: InferenceProvider
 metadata:
   name: local-vllm

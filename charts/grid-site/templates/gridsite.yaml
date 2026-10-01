@@ -1,12 +1,12 @@
 {{- include "grid-site.normalize" . }}
 {{- if .Values.gridSite.name }}
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridSite
 metadata:
   name: {{ .Values.gridSite.name }}
   labels:
     {{- include "grid-site.labels" . | nindent 4 }}
-    grid.praxis-proxy.io/provider-site: {{ .Values.gridSite.providerSiteLabel | default .Values.gridSite.name | quote }}
+    grid.praxis.fast/provider-site: {{ .Values.gridSite.providerSiteLabel | default .Values.gridSite.name | quote }}
 spec:
   gridNetworkRef: {{ required "gridNetwork.name is required when gridSite is defined" .Values.gridNetwork.name }}
   {{- with .Values.gridSite.region }}

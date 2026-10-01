@@ -302,7 +302,7 @@ Praxis AI validates required values and bounds before accepting the envelope.
 Provenance supports audit and diagnosis but is not an authorization credential.
 
 The `ConfigMap` repeats the schema version, semantic revision, and content
-digest in `grid.praxis-proxy.io/*` annotations so Kubernetes tooling can inspect
+digest in `grid.praxis.fast/*` annotations so Kubernetes tooling can inspect
 the contract without decoding the data value.
 
 ### Revision lifecycle
@@ -728,8 +728,8 @@ routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
 | `Left` | No |
 
 The matching rule: for a remote CRDT provider with `site_id = S` in network `N`,
-the operator looks for a `GridSite` resource whose Kubernetes name equals
-`discovered_site_k8s_name(S)` (the sanitized bare site name) and whose
+the operator looks for a `GridSite` resource whose Kubernetes name equals `S`
+(site IDs must be DNS-1123 labels) and whose
 `spec.gridNetworkRef == N` and `status.phase == Active`.
 
 `Active` indicates control-plane eligibility: the operator has verified the remote

@@ -1,6 +1,6 @@
 # Custom Resource Definitions
 
-API group: `grid.praxis-proxy.io/v1beta1`
+API group: `grid.praxis.fast/v1beta1`
 
 The AI Grid Network (AGN) Operator defines these resources to describe sites,
 provider capacity, and routing policy. The established API identities remain
@@ -15,7 +15,7 @@ cluster can host multiple `GridNetworks` for
 multi-tenancy.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridNetwork
 metadata:
   name: production
@@ -281,12 +281,12 @@ Represents another site in the grid. Created manually
 for seed peers or automatically by SWIM discovery.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridSite
 metadata:
   name: cluster-b
   labels:
-    grid.praxis-proxy.io/network: production
+    grid.praxis.fast/network: production
 spec:
   gridNetworkRef: production
   egress:
@@ -309,8 +309,9 @@ spec:
 (inference, agentTools, agentToAgent), and `lastProbeTime`. The reason and
 message for the current phase live on the `Connected` condition.
 
-The GridSite name is the sanitized SWIM site name, with no network prefix, so a
-declared GridSite and the site SWIM discovers are the same object.
+The GridSite name is the SWIM site ID, with no network prefix, so a declared
+GridSite and the site SWIM discovers are the same object. The ID must already be
+a DNS-1123 label. Discovery refuses any other ID rather than rewriting it.
 
 ### Field ownership
 
@@ -318,7 +319,7 @@ Spec is user intent, written by Helm, Argo CD, or `kubectl`. The operator writes
 status. It writes the spec of a GridSite only when it creates that GridSite, and
 it creates one only when `spec.siteDiscovery.mode` on the GridNetwork is `auto`
 and no GridSite with that name exists. Created GridSites carry the label
-`grid.praxis-proxy.io/auto-discovered=true`, and the operator owns them end to
+`grid.praxis.fast/auto-discovered=true`, and the operator owns them end to
 end.
 
 Gossip fills `status.discovered` on the matching GridSite in both modes. In
@@ -363,23 +364,23 @@ With Argo CD, ignore operator-written state:
 
 ```yaml
 ignoreDifferences:
-  - group: grid.praxis-proxy.io
+  - group: grid.praxis.fast
     kind: GridNetwork
     jsonPointers: [/status]
-  - group: grid.praxis-proxy.io
+  - group: grid.praxis.fast
     kind: GridSite
     jsonPointers: [/status]
-  - group: grid.praxis-proxy.io
+  - group: grid.praxis.fast
     kind: InferenceProvider
     jsonPointers: [/status]
-  - group: grid.praxis-proxy.io
+  - group: grid.praxis.fast
     kind: AgentToolProvider
     jsonPointers: [/status]
 ```
 
 Argo CD does not manage auto-created GridSites. Exclude them from the
 Application, for example with a resource exclusion on the
-`grid.praxis-proxy.io/auto-discovered=true` label, so a prune never deletes
+`grid.praxis.fast/auto-discovered=true` label, so a prune never deletes
 them.
 
 ### Conditions
@@ -434,7 +435,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `CertificateExpired` / `CertificateNotYetValid` | Connecting | Server certificate is outside its validity period |
 | `PinMismatch` | Connecting | Canonical fingerprint does not match a configured pin |
 | `AdvertisedCertMismatch` | Active | SWIM-advertised certificate does not match a configured pin; recorded only, since the live leaf verified |
-| `TrustMaterialMissing` | Connecting | CA, client certificate, key, server name, or pin policy is absent |
+| `TrustMaterialMissing` | Connecting | CA, client certificate, key, or pin policy is absent. An empty `serverName` defaults to `<name>.grid.internal` |
 | `TrustMaterialInvalid` | Connecting | The probe found malformed or oversized trust material |
 | `TrustConflictsWithPeerTrust` | Held, never Active | `spec.trust` sets pins while the GridNetwork `peerTrust.mode` is `spiffe` |
 | `ServerNameForbidden` | Held, never Active | Declared `spec.egress` uses `plaintext` with a `serverName` |
@@ -619,7 +620,7 @@ Represents an inference backend available over the
 grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: InferenceProvider
 metadata:
   name: openai-api
@@ -906,7 +907,7 @@ Each poll increments `grid_model_discovery_total{provider,outcome}`, where
 Represents MCP tool servers available over the grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: AgentToolProvider
 metadata:
   name: db-tools
@@ -926,7 +927,7 @@ spec:
   accessPolicy:
     siteSelector:
       matchLabels:
-        grid.praxis-proxy.io/site: cluster-a
+        grid.praxis.fast/site: cluster-a
 ```
 
 **Phases**: Pending → Available → Unavailable
@@ -971,7 +972,7 @@ condition reason is `Available` or `Pending` in those phases.
 Represents A2A agents available over the grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: AgentToAgentProvider
 metadata:
   name: claims-agent
@@ -988,7 +989,7 @@ spec:
   accessPolicy:
     siteSelector:
       matchLabels:
-        grid.praxis-proxy.io/site: cluster-a
+        grid.praxis.fast/site: cluster-a
 ```
 
 **Phases**: Pending → Available → Degraded → Unavailable

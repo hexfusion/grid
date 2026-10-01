@@ -10,7 +10,7 @@ modes are `gossip` and `poll` rather than `swim`.
 flowchart LR
   P[Provider metrics] --> M{signalTransport.mode}
   M -->|gossip| G[Local scrape and scoring] --> C[SWIM and CRDT overlay] --> O[Routing overlay]
-  M -->|poll| S[Serve /v1/site/signals over mTLS] --> D[Peers pull, scoring off] --> O
+  M -->|poll| S[Serve /v1beta1/site/signals over mTLS] --> D[Peers pull, scoring off] --> O
 ```
 
 ```yaml
@@ -20,10 +20,13 @@ signalTransport:
 
 `gossip` is the established path: each site scrapes and scores locally and the
 samples ride the SWIM and CRDT overlay. `poll` instead serves the scraped
-signals on a mutual-TLS `/v1/site/signals` endpoint, polls peers, and turns
+signals on a mutual-TLS `/v1beta1/site/signals` endpoint, polls peers, and turns
 local scoring off so the gateway ranks from what it pulls. A peer's poll URL is
 its SWIM-advertised host at the signals port, so a reachable member is a
 reachable signals endpoint.
+
+The path is `/v1beta1/site/signals`, versioned with the grid API. It moved from
+the `v1` prefix with no alias, so peers must run matching builds.
 
 The field is optional. Absent, the grid gossips, so existing deployments are
 unaffected. The mode is read once at operator start, so changing it is a

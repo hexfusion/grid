@@ -154,7 +154,7 @@ fn scraper(
         addr,
         ServerName::try_from(format!("{site}.grid.internal")).expect("sni"),
         &format!("{site}.grid.internal"),
-        "/v1/site/signals",
+        grid_signals_client::SIGNALS_PATH,
         &spiffe_id(site),
         Duration::from_millis(500),
         Duration::from_millis(500),

@@ -45,7 +45,7 @@ falling back to another strategy.
 ### No metrics (default)
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridNetwork
 metadata:
   name: production
@@ -67,7 +67,7 @@ group without an unavailable metric creating an artificial preference.
 ### Queue depth
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridNetwork
 metadata:
   name: production

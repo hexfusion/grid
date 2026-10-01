@@ -1475,7 +1475,7 @@ mod tests {
 
     fn tls_network() -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": "net" },
             "spec": { "tls": { "caSecretRef": { "name": "ca", "namespace": "grid" } } }
@@ -1508,7 +1508,7 @@ mod tests {
 
     fn network_with_discovery(site_discovery: &serde_json::Value) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "apiVersion": "grid.praxis.fast/v1beta1",
             "kind": "GridNetwork",
             "metadata": { "name": "net" },
             "spec": { "siteDiscovery": site_discovery }

@@ -1,4 +1,5 @@
-//! Prove the `v1alpha1` to `v1beta1` upgrade on a throwaway kind cluster.
+//! Prove the upgrade from `grid.praxis-proxy.io/v1alpha1` to `grid.praxis.fast/v1beta1` on a throwaway kind
+//! cluster.
 //!
 //! The cluster is created and deleted here, so the check never touches an existing install.
 
@@ -13,10 +14,19 @@ const CLUSTER: &str = "grid-crd-upgrade";
 /// `GridNetwork` the check stores at each version.
 const NETWORK: &str = "crd-upgrade";
 
+/// API group the previous release served.
+const LEGACY_GROUP: &str = "grid.praxis-proxy.io";
+
+/// API group this release serves.
+const GROUP: &str = "grid.praxis.fast";
+
+/// Plural of every grid CRD.
+const KINDS: [&str; 4] = ["gridnetworks", "gridsites", "inferenceproviders", "agenttoolproviders"];
+
 /// Run the upgrade scenario, deleting the cluster afterwards whatever the outcome.
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let crds = super::operator::generate_crd_json()?;
-    let legacy = as_v1alpha1(&crds)?;
+    let legacy = as_legacy(&crds)?;
 
     eprintln!("verify-crd-upgrade: creating kind cluster {CLUSTER}...");
     run_ok("kind", &["create", "cluster", "--name", CLUSTER, "--wait", "60s"], None)?;
@@ -29,19 +39,23 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// The upgrade steps against `context`, which must hold no grid CRDs yet.
 fn scenario(context: &str, crds: &str, legacy: &str) -> Result<(), Box<dyn std::error::Error>> {
-    store_legacy_and_expect_refusal(context, crds, legacy)?;
+    store_legacy(context, legacy)?;
     upgrade(context, crds, legacy)?;
     verify_upgraded(context)?;
     eprintln!("verify-crd-upgrade: [OK] upgrade path verified");
     Ok(())
 }
 
-/// Store a `v1alpha1` object, then show the `v1beta1` CRDs cannot be applied over it.
-fn store_legacy_and_expect_refusal(context: &str, crds: &str, legacy: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("  [1/5] install v1alpha1 CRDs and store a v1alpha1 GridNetwork");
+/// Install the previous release's CRDs and store a `GridNetwork` under them.
+fn store_legacy(context: &str, legacy: &str) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("  [1/4] install {LEGACY_GROUP}/v1alpha1 CRDs and store a v1alpha1 GridNetwork");
     kubectl_ok(context, &["apply", "-f", "-"], Some(legacy))?;
-    wait_established(context)?;
-    kubectl_ok(context, &["apply", "-f", "-"], Some(&network_manifest("v1alpha1")))?;
+    wait_established(context, LEGACY_GROUP)?;
+    kubectl_ok(
+        context,
+        &["apply", "-f", "-"],
+        Some(&network_manifest(LEGACY_GROUP, "v1alpha1")),
+    )?;
     kubectl_ok(
         context,
         &["apply", "-f", "-"],
@@ -51,34 +65,23 @@ fn store_legacy_and_expect_refusal(context: &str, crds: &str, legacy: &str) -> R
         context,
         &["apply", "-f", "-"],
         Some(&consumer_config_map("kube-public", false)),
-    )?;
-
-    eprintln!("  [2/5] applying v1beta1 CRDs over stored v1alpha1 objects is refused");
-    let refused = kubectl(context, &["apply", "-f", "-"], Some(crds))?;
-    if refused.status.success() {
-        return Err("v1beta1 CRDs applied over stored v1alpha1 objects; expected storedVersions refusal".into());
-    }
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    if !stderr.contains("storedVersions") {
-        return Err(format!("unexpected refusal: {stderr}").into());
-    }
-
-    Ok(())
+    )
+    .map(drop)
 }
 
-/// The upgrade: delete grid objects, delete the CRDs, install `v1beta1`.
+/// The upgrade: delete grid objects, delete the old-group CRDs, install the new ones.
 fn upgrade(context: &str, crds: &str, legacy: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("  [3/5] upgrade: delete grid objects, delete CRDs, install v1beta1 CRDs");
-    for kind in ["gridnetworks", "gridsites", "inferenceproviders", "agenttoolproviders"] {
+    eprintln!("  [2/4] upgrade: delete grid objects, delete {LEGACY_GROUP} CRDs, install {GROUP} CRDs");
+    for kind in KINDS {
         kubectl_ok(
             context,
-            &["delete", &format!("{kind}.grid.praxis-proxy.io"), "--all", "--wait"],
+            &["delete", &format!("{kind}.{LEGACY_GROUP}"), "--all", "--wait"],
             None,
         )?;
     }
     kubectl_ok(context, &["delete", "-f", "-", "--wait"], Some(legacy))?;
     kubectl_ok(context, &["apply", "-f", "-"], Some(crds))?;
-    wait_established(context)?;
+    wait_established(context, GROUP)?;
     kubectl_ok(
         context,
         &[
@@ -95,15 +98,19 @@ fn upgrade(context: &str, crds: &str, legacy: &str) -> Result<(), Box<dyn std::e
     .map(drop)
 }
 
-/// Confirm a `v1beta1` object round-trips and `v1alpha1` is no longer served.
+/// Confirm a `v1beta1` object round-trips under the new group and the old group is gone.
 fn verify_upgraded(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("  [4/5] a v1beta1 GridNetwork applies, reads back, and keeps its gridId");
-    kubectl_ok(context, &["apply", "-f", "-"], Some(&network_manifest("v1beta1")))?;
+    eprintln!("  [3/4] a {GROUP}/v1beta1 GridNetwork applies, reads back, and keeps its gridId");
+    kubectl_ok(
+        context,
+        &["apply", "-f", "-"],
+        Some(&network_manifest(GROUP, "v1beta1")),
+    )?;
     let read = kubectl_ok(
         context,
         &[
             "get",
-            &format!("gridnetworks.v1beta1.grid.praxis-proxy.io/{NETWORK}"),
+            &format!("gridnetworks.v1beta1.{GROUP}/{NETWORK}"),
             "-o",
             "jsonpath={.spec.gridId}",
         ],
@@ -114,30 +121,63 @@ fn verify_upgraded(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     verify_grid_id_immutable(context)?;
 
-    eprintln!("  [5/5] the v1alpha1 version is no longer served; only the operator's old consumer ConfigMap is gone");
+    eprintln!("  [4/4] {LEGACY_GROUP} is no longer served; only the operator's old consumer ConfigMap is gone");
     verify_consumer_config_maps(context)?;
-    let legacy_apply = kubectl(context, &["apply", "-f", "-"], Some(&network_manifest("v1alpha1")))?;
+    verify_legacy_gone(context)
+}
+
+/// The old-group CRDs are deleted, the group is not served, and an old-group object is refused.
+fn verify_legacy_gone(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for kind in KINDS {
+        let crd = kubectl(context, &["get", "crd", &format!("{kind}.{LEGACY_GROUP}")], None)?;
+        if crd.status.success() || !String::from_utf8_lossy(&crd.stderr).contains("NotFound") {
+            return Err(format!("CRD {kind}.{LEGACY_GROUP} survived the upgrade").into());
+        }
+    }
+    let served = kubectl_ok(
+        context,
+        &["api-resources", "--api-group", LEGACY_GROUP, "-o", "name"],
+        None,
+    )?;
+    if !String::from_utf8_lossy(&served.stdout).trim().is_empty() {
+        return Err(format!("{LEGACY_GROUP} is still served after the upgrade").into());
+    }
+    let legacy_apply = kubectl(
+        context,
+        &["apply", "-f", "-"],
+        Some(&network_manifest(LEGACY_GROUP, "v1alpha1")),
+    )?;
     if legacy_apply.status.success() {
-        return Err("a v1alpha1 GridNetwork was accepted after the upgrade".into());
+        return Err(format!("a {LEGACY_GROUP}/v1alpha1 GridNetwork was accepted after the upgrade").into());
     }
     Ok(())
 }
 
-/// The generated CRD list with every version renamed to `v1alpha1`, standing in for the previous release.
-fn as_v1alpha1(crds: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// The generated CRD list moved to the previous release's group, with every version renamed to `v1alpha1`.
+fn as_legacy(crds: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut list: serde_json::Value = serde_json::from_str(crds)?;
     let items = list
         .get_mut("items")
         .and_then(serde_json::Value::as_array_mut)
         .ok_or("generate_crds output has no items")?;
-    for version in items
-        .iter_mut()
-        .filter_map(|crd| crd.pointer_mut("/spec/versions"))
-        .filter_map(serde_json::Value::as_array_mut)
-        .flatten()
-    {
-        if let Some(name) = version.get_mut("name") {
-            *name = serde_json::json!("v1alpha1");
+    for crd in items.iter_mut() {
+        if let Some(name) = crd.pointer_mut("/metadata/name")
+            && let Some(plural) = name.as_str().and_then(|n| n.strip_suffix(&format!(".{GROUP}")))
+        {
+            *name = serde_json::json!(format!("{plural}.{LEGACY_GROUP}"));
+        }
+        if let Some(group) = crd.pointer_mut("/spec/group") {
+            *group = serde_json::json!(LEGACY_GROUP);
+        }
+        for version in crd
+            .pointer_mut("/spec/versions")
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = version.get_mut("name") {
+                *name = serde_json::json!("v1alpha1");
+            }
         }
     }
     Ok(serde_json::to_string(&list)?)
@@ -149,7 +189,7 @@ fn verify_grid_id_immutable(context: &str) -> Result<(), Box<dyn std::error::Err
         context,
         &[
             "patch",
-            &format!("gridnetworks.grid.praxis-proxy.io/{NETWORK}"),
+            &format!("gridnetworks.{GROUP}/{NETWORK}"),
             "--type",
             "merge",
             "-p",
@@ -203,10 +243,10 @@ fn consumer_config_map(namespace: &str, operator_owned: bool) -> String {
     .to_string()
 }
 
-/// A minimal `GridNetwork` at `version`.
-fn network_manifest(version: &str) -> String {
+/// A minimal `GridNetwork` at `group`/`version`.
+fn network_manifest(group: &str, version: &str) -> String {
     serde_json::json!({
-        "apiVersion": format!("grid.praxis-proxy.io/{version}"),
+        "apiVersion": format!("{group}/{version}"),
         "kind": "GridNetwork",
         "metadata": { "name": NETWORK },
         "spec": { "gridId": NETWORK }
@@ -214,22 +254,12 @@ fn network_manifest(version: &str) -> String {
     .to_string()
 }
 
-/// Wait until every grid CRD is established.
-fn wait_established(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    kubectl_ok(
-        context,
-        &[
-            "wait",
-            "--for=condition=Established",
-            "--timeout=60s",
-            "crd/gridnetworks.grid.praxis-proxy.io",
-            "crd/gridsites.grid.praxis-proxy.io",
-            "crd/inferenceproviders.grid.praxis-proxy.io",
-            "crd/agenttoolproviders.grid.praxis-proxy.io",
-        ],
-        None,
-    )
-    .map(drop)
+/// Wait until every grid CRD in `group` is established.
+fn wait_established(context: &str, group: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let crds: Vec<String> = KINDS.iter().map(|kind| format!("crd/{kind}.{group}")).collect();
+    let mut args = vec!["wait", "--for=condition=Established", "--timeout=60s"];
+    args.extend(crds.iter().map(String::as_str));
+    kubectl_ok(context, &args, None).map(drop)
 }
 
 /// Run `kubectl --context context args`, feeding `stdin` when given.
@@ -281,16 +311,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn as_v1alpha1_renames_every_version_and_keeps_the_schema() {
+    fn as_legacy_moves_the_group_renames_every_version_and_keeps_the_schema() {
         let crds = serde_json::json!({
             "apiVersion": "v1",
             "kind": "List",
-            "items": [{ "spec": { "versions": [{ "name": "v1beta1", "served": true, "storage": true }] } }]
+            "items": [{
+                "metadata": { "name": format!("gridnetworks.{GROUP}") },
+                "spec": {
+                    "group": GROUP,
+                    "versions": [{ "name": "v1beta1", "served": true, "storage": true }]
+                }
+            }]
         })
         .to_string();
         let legacy: serde_json::Value =
-            serde_json::from_str(&as_v1alpha1(&crds).unwrap_or_else(|_| std::process::abort()))
+            serde_json::from_str(&as_legacy(&crds).unwrap_or_else(|_| std::process::abort()))
                 .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            legacy.pointer("/items/0/metadata/name"),
+            Some(&serde_json::json!("gridnetworks.grid.praxis-proxy.io"))
+        );
+        assert_eq!(
+            legacy.pointer("/items/0/spec/group"),
+            Some(&serde_json::json!("grid.praxis-proxy.io"))
+        );
         assert_eq!(
             legacy.pointer("/items/0/spec/versions/0"),
             Some(&serde_json::json!({ "name": "v1alpha1", "served": true, "storage": true }))
@@ -298,7 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn network_manifest_targets_the_requested_version() {
-        assert!(network_manifest("v1alpha1").contains("grid.praxis-proxy.io/v1alpha1"));
+    fn network_manifest_targets_the_requested_group_and_version() {
+        assert!(network_manifest(LEGACY_GROUP, "v1alpha1").contains("grid.praxis-proxy.io/v1alpha1"));
+        assert!(network_manifest(GROUP, "v1beta1").contains("grid.praxis.fast/v1beta1"));
     }
 }

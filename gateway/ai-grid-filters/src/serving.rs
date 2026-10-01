@@ -24,7 +24,7 @@ use crate::{
 
 /// Default signals endpoint path.
 fn default_path() -> String {
-    "/v1/site/signals".to_owned()
+    grid_signals_client::SIGNALS_PATH.to_owned()
 }
 
 /// Default poll interval, milliseconds.
@@ -369,7 +369,11 @@ peers:
 ";
         let config: GridServingConfig = serde_yaml::from_str(yaml).expect("serving config parses");
         assert_eq!(config.peers.len(), 1);
-        assert_eq!(config.peers[0].path, "/v1/site/signals", "the path default applies");
+        assert_eq!(
+            config.peers[0].path,
+            grid_signals_client::SIGNALS_PATH,
+            "the path default applies"
+        );
         assert_eq!(config.candidates.len(), 1);
     }
 

@@ -1,7 +1,7 @@
 //! Background poll loop that fills the live-signal [`LoadStore`].
 //!
 //! A grid gateway is co-located with its operator, so it polls one local
-//! endpoint (`/v1/site/signals`) that already carries this site plus every
+//! endpoint ([`crate::SIGNALS_PATH`]) that already carries this site plus every
 //! peer the operator relays. The loop owns no transport: it takes a
 //! [`SignalSource`], so the pinned-mTLS client and the test fake share one
 //! path. The operator's response `Date` is the freshness reference passed to
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn defaults_fill_when_only_endpoint_is_given() {
-        let c = cfg("endpoint: https://operator:9091/v1/site/signals\n").expect("parses");
+        let c = cfg(&format!("endpoint: https://operator:9091{}\n", crate::SIGNALS_PATH)).expect("parses");
         assert_eq!(c.interval_ms, DEFAULT_INTERVAL_MS);
         assert_eq!(c.window_secs, DEFAULT_WINDOW_SECS);
         assert_eq!(c.max_age_ms, DEFAULT_MAX_AGE_MS);
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn tls_paths_and_pins_parse() {
         let c = cfg(
-            "endpoint: https://operator:9091/v1/site/signals\ntls:\n  ca_path: /tls/ca.crt\n  cert_path: /tls/tls.crt\n  key_path: /tls/tls.key\n  pins:\n    - abc123\n",
+            &format!("endpoint: https://operator:9091{}\ntls:\n  ca_path: /tls/ca.crt\n  cert_path: /tls/tls.crt\n  key_path: /tls/tls.key\n  pins:\n    - abc123\n", crate::SIGNALS_PATH),
         )
         .expect("parses");
         let tls = c.tls.expect("tls present");
@@ -509,8 +509,11 @@ mod tests {
             })]),
             calls: AtomicUsize::new(0),
         };
-        let cfg: PollerConfig =
-            serde_yaml::from_str("endpoint: https://operator:9091/v1/site/signals\ninterval_ms: 5\n").expect("cfg");
+        let cfg: PollerConfig = serde_yaml::from_str(&format!(
+            "endpoint: https://operator:9091{}\ninterval_ms: 5\n",
+            crate::SIGNALS_PATH
+        ))
+        .expect("cfg");
         let handle = spawn_on_thread(Arc::clone(&store), &cfg, source, |_store| {}).expect("poller thread spawns");
         // Poll until the sample lands, bounded by a deadline and yielding to the
         // poller thread rather than sleeping a fixed span.

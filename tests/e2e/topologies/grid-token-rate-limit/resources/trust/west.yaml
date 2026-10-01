@@ -1,9 +1,9 @@
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridSite
 metadata:
   name: central
   labels:
-    grid.praxis-proxy.io/network: grid-token-rate-limit
+    grid.praxis.fast/network: grid-token-rate-limit
 spec:
   gridNetworkRef: grid-token-rate-limit
   egress:
@@ -15,12 +15,12 @@ spec:
     canonicalFingerprints:
       - PEER_CENTRAL_FINGERPRINT
 ---
-apiVersion: grid.praxis-proxy.io/v1beta1
+apiVersion: grid.praxis.fast/v1beta1
 kind: GridSite
 metadata:
   name: east
   labels:
-    grid.praxis-proxy.io/network: grid-token-rate-limit
+    grid.praxis.fast/network: grid-token-rate-limit
 spec:
   gridNetworkRef: grid-token-rate-limit
   egress:

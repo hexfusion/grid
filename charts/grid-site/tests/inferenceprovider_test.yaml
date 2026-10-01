@@ -24,7 +24,7 @@ tests:
           path: spec.hostSelector
           value:
             matchLabels:
-              grid.praxis-proxy.io/provider-site: site-a
+              grid.praxis.fast/provider-site: site-a
       - equal:
           path: spec.models
           value:
@@ -136,7 +136,7 @@ tests:
           path: spec.hostSelector
           value:
             matchLabels:
-              grid.praxis-proxy.io/provider-site: east-provider
+              grid.praxis.fast/provider-site: east-provider
 
   - it: a keyed provider keeps its own hostSelector without the site label merged in
     set:
