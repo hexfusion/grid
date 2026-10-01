@@ -183,10 +183,12 @@ async fn serve(reply: Reply) -> (Arc<Mock>, Settings) {
     (mock, settings)
 }
 
-/// An address nothing listens on.
-async fn closed_addr() -> SocketAddr {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    listener.local_addr().expect("addr")
+/// A socket bound but not listening: connects are refused and the port cannot be reused.
+fn refusing_socket() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+    let addr = socket.local_addr().expect("addr");
+    (socket, addr)
 }
 
 /// In-memory Secrets, with scripted create failures.
@@ -378,7 +380,7 @@ async fn an_oversized_response_is_refused() {
 #[tokio::test]
 async fn a_refused_connection_is_retried_until_the_service_is_up() {
     let mock = Mock::new(Reply::Sign);
-    let addr = closed_addr().await;
+    let (socket, addr) = refusing_socket();
     let mut settings = mock.settings(addr.port());
     settings.backoff = Backoff {
         attempts: 400,
@@ -388,7 +390,7 @@ async fn a_refused_connection_is_retried_until_the_service_is_up() {
     let late = Arc::clone(&mock);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
-        serve_on(&late, tokio::net::TcpListener::bind(addr).await.expect("rebind"));
+        serve_on(&late, socket.listen(1024).expect("listen"));
     });
     let outcome = run_flow(&FakeStore::invited(), &settings).await;
     assert!(
@@ -401,7 +403,8 @@ async fn a_refused_connection_is_retried_until_the_service_is_up() {
 #[tokio::test]
 async fn an_unreachable_service_exhausts_the_retry_budget() {
     let mock = Mock::new(Reply::Sign);
-    let settings = mock.settings(closed_addr().await.port());
+    let (_socket, addr) = refusing_socket();
+    let settings = mock.settings(addr.port());
     let outcome = run_flow(&FakeStore::invited(), &settings).await;
     assert!(
         matches!(outcome, Err(EnrollError::Exhausted { attempts: 3, .. })),
