@@ -25,12 +25,19 @@ fn main() {
     // the pollers refresh. The runtime is bound for the process's life: dropping
     // it stops the pollers, and run_server never returns, so the binding lives as
     // long as the server.
-    let _grid_runtime = std::env::var("GRID_SERVING_CONFIG").ok().map(|path| {
+    let _grid_runtime = std::env::var("GRID_SERVING_CONFIG").ok().and_then(|path| {
+        // The operator writes it once a candidate exists; until then the optional mount is empty.
+        if !std::path::Path::new(&path).exists() {
+            warn_grid_routing_off(&path);
+            ai_grid_filters::register_grid_filters_without_serving(&mut registry)
+                .unwrap_or_else(|err| praxis::fatal(&err));
+            return None;
+        }
         let config = ai_grid_filters::load_serving_config(&path).unwrap_or_else(|err| praxis::fatal(&err));
         let runtime = ai_grid_filters::spawn_grid_routing(&config).unwrap_or_else(|err| praxis::fatal(&err));
         ai_grid_filters::register_grid_filters(&mut registry, runtime.snapshot())
             .unwrap_or_else(|err| praxis::fatal(&err));
-        runtime
+        Some(runtime)
     });
 
     // The operator writes the config. The path is `--config <path>` or the
@@ -41,6 +48,15 @@ fn main() {
 
     // Runs the Pingora server and never returns.
     praxis::run_server_with_registry(config, registry, config_path, None);
+}
+
+/// Say once, at startup, that grid routing is off until the serving config exists.
+#[expect(clippy::print_stderr, reason = "runs before praxis has a tracing subscriber")]
+fn warn_grid_routing_off(path: &str) {
+    eprintln!(
+        "WARN grid-gateway: grid routing is off: serving config {path} does not exist yet. The operator writes \
+         it once a routing candidate exists; restart the pod then to enable grid routing."
+    );
 }
 
 /// Usage line for a malformed command line.

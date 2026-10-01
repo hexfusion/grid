@@ -341,7 +341,8 @@ spec:
         - name: grid-serving
           configMap:
             name: {{ include "praxis-gateway.servingConfigMap" . | quote }}
-            optional: false
+            # Absent until the grid has a routing candidate; the gateway starts with grid routing off.
+            optional: true
         {{- end }}
         {{- if .Values.gatewayConfig.upstreamCA.secretName }}
         - name: upstream-ca

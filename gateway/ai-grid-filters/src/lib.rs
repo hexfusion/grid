@@ -45,3 +45,15 @@ pub fn register_grid_filters(
     };
     registry.register("grid_site_route", FilterFactory::Http(Arc::new(factory)))
 }
+
+/// Register `grid_site_route` over an empty snapshot, for a gateway started before its serving config exists.
+///
+/// Every request then misses, as for an unknown model, until the pod restarts with the config.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the filter name is already registered.
+pub fn register_grid_filters_without_serving(registry: &mut FilterRegistry) -> Result<(), FilterError> {
+    let empty = RouteSnapshot::from_static(Vec::new(), Arc::from(""));
+    register_grid_filters(registry, Arc::new(ArcSwap::from_pointee(empty)))
+}

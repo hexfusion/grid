@@ -391,6 +391,11 @@ The gateway reads the file only at start. When the ConfigMap's
 `grid.praxis.fast/serving-digest` annotation changes, restart the gateway
 (`kubectl rollout restart`).
 
+The operator writes the ConfigMap once the grid has a routing candidate, and the
+gateway reports `EmptyCandidates` on its `overlayStatus` entry until then. The
+mount is optional, so the gateway starts without it, logs a WARN that grid routing
+is off, and answers model requests 404. Restart it after the ConfigMap appears.
+
 Known limits:
 
 - `grid_site_route` does not check provider health, so it can pick a site whose

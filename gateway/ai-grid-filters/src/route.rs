@@ -175,4 +175,24 @@ mod tests {
         let candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
         assert!(select_admitted(&candidates, CapabilityKind::McpTool, "llama").is_none());
     }
+
+    #[test]
+    fn an_empty_snapshot_selects_nothing() {
+        assert!(select_admitted(&[], CapabilityKind::InferenceModel, "llama").is_none());
+    }
+
+    #[test]
+    fn a_gateway_without_serving_config_still_builds_grid_site_route() {
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        crate::register_grid_filters_without_serving(&mut registry).expect("register");
+        let config: serde_yaml::Value = serde_yaml::from_str("model_header: X-Gateway-Model-Name").expect("yaml");
+        assert!(
+            registry.create("grid_site_route", &config).is_ok(),
+            "the chain still loads"
+        );
+        assert!(
+            crate::register_grid_filters_without_serving(&mut registry).is_err(),
+            "the name registers once"
+        );
+    }
 }

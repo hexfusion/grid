@@ -44,7 +44,7 @@ tests:
             name: grid-serving
             configMap:
               name: grid-serving-grid-gw-praxis-gateway
-              optional: false
+              optional: true
 
   - it: an explicit configMap overrides the derived name
     template: templates/deployment.yaml
@@ -57,7 +57,7 @@ tests:
             name: grid-serving
             configMap:
               name: custom
-              optional: false
+              optional: true
 
   - it: needs the grid-gateway flavor
     template: templates/deployment.yaml
