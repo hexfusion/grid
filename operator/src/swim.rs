@@ -79,7 +79,7 @@ pub struct MemberRecord {
     /// Data-plane gateway address advertised by this peer.
     ///
     /// When present, this is the address that should be used for the
-    /// `GridSite.spec.egress.address` field instead of the SWIM UDP
+    /// `GridSite.status.discovered.egressAddress` field instead of the SWIM UDP
     /// endpoint.  `None` when the peer has not configured a gateway address.
     pub gateway_address: Option<String>,
 

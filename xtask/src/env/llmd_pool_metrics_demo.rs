@@ -2228,7 +2228,7 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
             if *remote == *local {
                 continue;
             }
-            let site_name = format!("{GRID_NETWORK}-{remote}");
+            let site_name = (*remote).to_owned();
             operator::wait_for_auto_gridsite(&context, &site_name, GRID_NETWORK, TRUST_TIMEOUT)?;
             let canonical_fp = certs::site_certificate_fingerprint(remote)?;
             operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;

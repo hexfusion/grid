@@ -456,18 +456,18 @@ configured.  Before storage, the receiving operator runs a structural check:
 - Input without a `-----BEGIN CERTIFICATE-----` header is rejected and recorded
   as `TrustMaterialInvalid` in `GridSite.status.reason`.
 - Input with a valid `CERTIFICATE` header passes the structural check and is
-  stored in `GridSite.status.publicCertPem`.
+  stored in `GridSite.status.discovered.advertisedCertPem`.
 
 This structural check is **not** cryptographic verification.  It does not parse
 DER bytes as X.509, check the issuer or validity period, or validate the signature
 against a CA.
 
-A non-empty `publicCertPem` with no private-key rejection indicates:
+A non-empty `advertisedCertPem` with no private-key rejection indicates:
 - The remote site shared a PEM with a `CERTIFICATE` header.
 - No private-key markers were detected.
 - The structural check passed.
 
-`publicCertPem` does **not** indicate:
+`advertisedCertPem` does **not** indicate:
 - The certificate has been chain-verified against a trusted CA.
 - The remote site is authenticated or authorized for routing.
 - The mTLS handshake has succeeded.

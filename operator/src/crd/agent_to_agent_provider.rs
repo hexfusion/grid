@@ -77,6 +77,11 @@ pub struct AgentCardInfo {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentToAgentProviderStatus {
+    /// Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<super::condition::Condition>,
+
     /// Sites matched by the site selector.
     #[serde(default)]
     pub matching_sites: Vec<String>,

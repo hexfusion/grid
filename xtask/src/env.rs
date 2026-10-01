@@ -4,6 +4,7 @@ pub(crate) mod certs;
 pub(crate) mod combined_site_demo;
 pub(crate) mod config;
 pub(crate) mod consumer;
+pub(crate) mod crd_upgrade;
 pub(crate) mod external_provider;
 pub(crate) mod forge_config;
 pub(crate) mod gateway;
@@ -591,6 +592,13 @@ pub(crate) enum Action {
     /// of `cargo run -p operator --bin generate_crds`.
     VerifyCrdSchema,
 
+    /// Prove the `v1alpha1` to `v1beta1` upgrade on a throwaway kind cluster.
+    ///
+    /// Stores a `v1alpha1` object, shows the `v1beta1` CRD apply is refused,
+    /// deletes the objects and CRDs, reinstalls them, and confirms only
+    /// `v1beta1` is served. Creates and deletes its own cluster.
+    VerifyCrdUpgrade,
+
     /// Prove that SWIM transport AES-256-GCM encryption is enforced.
     ///
     /// Five scenarios: (A) env-keyed peers converge, (B) SecretRef-keyed
@@ -698,7 +706,7 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
-    /// Print the SHA-256 fingerprint of a `GridSite.status.publicCertPem`.
+    /// Print the SHA-256 fingerprint of a `GridSite.status.discovered.advertisedCertPem`.
     ///
     /// Reads the public certificate PEM from the named `GridSite` status and
     /// prints the canonical DER SHA-256 fingerprint for
@@ -1264,6 +1272,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyApiFallback { config, site } => env_verify_api_fallback(config, site.as_deref()),
         Action::VerifyApiFallbackNative { config, site } => env_verify_api_fallback_native(config, site.as_deref()),
         Action::VerifyCrdSchema => env_verify_crd_schema(),
+        Action::VerifyCrdUpgrade => crd_upgrade::run(),
         Action::VerifySwimEncryption { config, site } => env_verify_swim_encryption(config, site.as_deref()),
         Action::VerifySwimOverlay { config, site } => env_verify_swim_overlay(config, site.as_deref()),
         Action::VerifySwimMeshThreeNode { config, site } => env_verify_swim_mesh_three_node(config, site.as_deref()),
@@ -3148,7 +3157,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
     // Step 9: Configure identity-aware TLS trust for the secondary site so the controller
     // promotes it to Active/TlsVerified. Spawns a local mTLS probe server and configures
     // the full identity trust chain (CA, client cert, canonical DER pin).
-    let secondary_k8s_name = operator::auto_discovered_gridsite_name(SWIM_OVERLAY_NETWORK, SWIM_NODE_SECONDARY_NAME);
+    let secondary_k8s_name = operator::auto_discovered_gridsite_name(SWIM_NODE_SECONDARY_NAME);
     let tls_fixture_result = before_result.and_then(|()| {
         eprintln!("  configuring TLS identity trust for GridSite {secondary_k8s_name:?}...");
         operator::setup_tls_verified_gridsite(&context, &secondary_k8s_name, SWIM_OVERLAY_NETWORK)
@@ -3499,7 +3508,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     // ── Step 10: Apply Active GridSite for C via identity-aware TLS and verify candidate ──
     // Spawn a local mTLS probe server and configure the full identity trust chain so the
     // controller promotes C to Active/TlsVerified naturally.
-    let c_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_MESH_NETWORK, SWIM_MESH_SITE_C);
+    let c_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_MESH_SITE_C);
     let tls_fixture_result = isolation_result.and_then(|()| {
         eprintln!(
             "verify-swim-mesh-three-node: [10] configuring TLS identity trust for GridSite \
@@ -4542,7 +4551,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// **Auto-discovery proof (step 3):** after SWIM convergence, the primary operator creates
 /// a `GridSite` for the joining SWIM member without any harness-assisted `kubectl apply`.
 /// The created `GridSite` is named after the SWIM `site_id` and has `spec.gridNetworkRef` and
-/// `spec.egress.address` populated from the SWIM membership record.
+/// `status.discovered.egressAddress` populated from the SWIM membership record.
 ///
 /// **Lifecycle proof (step 5):** a separate harness-created `GridSite` is advanced through
 /// `Pending → Discovered → Connecting → Active`.  Only `Discovered` is harness-patched;
@@ -4640,7 +4649,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     // Assert the primary operator auto-created a GridSite for the joining SWIM member.
     // The name is {network}-{site_id} — composite to avoid collisions when the operator
     // reconciles multiple GridNetworks and the same SWIM peer appears in all of them.
-    let auto_site_name = operator::auto_discovered_gridsite_name(SITE_JOIN_NETWORK, west_site);
+    let auto_site_name = operator::auto_discovered_gridsite_name(west_site);
     operator::bump_gridnetwork(&east_ctx, SITE_JOIN_NETWORK)?;
     operator::wait_for_auto_gridsite(
         &east_ctx,
@@ -4654,7 +4663,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::wait_for_gridsite_phase(&east_ctx, &auto_site_name, "Connecting", SITE_JOIN_PHASE_POLL_TIMEOUT)?;
     operator::verify_auto_gridsite_fields(&east_ctx, &auto_site_name, SITE_JOIN_NETWORK, "Connecting")?;
 
-    // Hard assertion: spec.egress.address must equal the gateway address, NOT the SWIM UDP address.
+    // Hard assertion: status.discovered.egressAddress must equal the gateway address, NOT the SWIM UDP address.
     // This proves that auto-discovered GridSites carry the data-plane gateway address
     // separately from the SWIM membership endpoint.
     operator::verify_auto_gridsite_egress(&east_ctx, &auto_site_name, &joining_gw_addr, &bind_joining)?;
@@ -4713,7 +4722,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Discovered")?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
     // The GridSite controller now drives Discovered → Connecting automatically when
-    // spec.egress.address is non-empty and reachable by TCP.
+    // status.discovered.egressAddress is non-empty and reachable by TCP.
     // Wait for Connecting — do NOT wait for Discovered, which would be immediately
     // superseded by the operator's automated transition.
     operator::wait_for_gridsite_phase(
@@ -6308,14 +6317,14 @@ mod validate_all_tests {
 // Fingerprint trust promotion E2E
 // ---------------------------------------------------------------------------
 
-/// Print the canonical DER-based SHA-256 fingerprint of a `GridSite.status.publicCertPem`.
+/// Print the canonical DER-based SHA-256 fingerprint of a `GridSite.status.discovered.advertisedCertPem`.
 fn env_gridsite_fingerprint(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let pem = operator::read_gridsite_public_cert_pem(context, site_name)
-        .ok_or_else(|| format!("GridSite {site_name:?} has no publicCertPem in status"))?;
+    let pem = operator::read_gridsite_advertised_cert_pem(context, site_name)
+        .ok_or_else(|| format!("GridSite {site_name:?} has no advertisedCertPem in status"))?;
     let fp = certs::pem_to_canonical_fingerprint(&pem);
     if fp.is_empty() {
         return Err(
-            format!("GridSite {site_name:?}: failed to compute canonical fingerprint from publicCertPem").into(),
+            format!("GridSite {site_name:?}: failed to compute canonical fingerprint from advertisedCertPem").into(),
         );
     }
     eprintln!("GridSite: {site_name:?}  context: {context}");
@@ -6448,7 +6457,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
     let mut op_remote_guard = ProcGuard(Some(op_remote), "rotation-op-remote");
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
 
-    let remote_site_name = operator::auto_discovered_gridsite_name(ROTATION_NETWORK, ROTATION_REMOTE_SWIM_ID);
+    let remote_site_name = operator::auto_discovered_gridsite_name(ROTATION_REMOTE_SWIM_ID);
     operator::apply_rotation_remote_provider(&context)?;
 
     // ── Step 4: Apply GridSite with [fp-A] → Active/TlsVerified ─────────────
@@ -7248,7 +7257,7 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
     eprintln!("  fixtures applied; waiting for B's CRDT state via SWIM...");
 
     // ── Step 4: Wait for distributedProviderCount > 0 ─────────────────────────
-    let b_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_TRUST_NETWORK, SWIM_TRUST_SITE_B);
+    let b_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_TRUST_SITE_B);
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
         operator::wait_for_distributed_state_count(&context, SWIM_TRUST_NETWORK, 1, SWIM_STATUS_POLL_TIMEOUT)?;
         eprintln!("  [OK] CRDT from B received by A (distributedProviderCount >= 1)");

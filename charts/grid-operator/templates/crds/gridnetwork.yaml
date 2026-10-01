@@ -415,6 +415,19 @@ spec:
                   required:
                     - mode
                   type: object
+                siteDiscovery:
+                  default:
+                    mode: manual
+                  description: How the operator turns SWIM members into `GridSite` objects.
+                  properties:
+                    mode:
+                      default: manual
+                      description: Whether the operator creates `GridSite` objects for unknown SWIM members.
+                      enum:
+                        - manual
+                        - auto
+                      type: string
+                  type: object
                 staleCandidateTtlSeconds:
                   description: |-
                     Maximum age in seconds before a stale (`fresh=false`) remote routing
@@ -609,6 +622,46 @@ spec:
                       - tenantId
                     type: object
                   type: array
+                conditions:
+                  description: Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+                  items:
+                    description: One observed condition, keyed by `type`.
+                    properties:
+                      lastTransitionTime:
+                        description: RFC 3339 time the status last changed.
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        default: 0
+                        description: The `metadata.generation` this condition was computed from.
+                        format: int64
+                        type: integer
+                      reason:
+                        description: Machine-readable reason.
+                        type: string
+                      status:
+                        description: Whether the condition holds.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: Condition type, unique within the list.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
                 connectedSites:
                   default: 0
                   description: Number of connected (Active) sites.

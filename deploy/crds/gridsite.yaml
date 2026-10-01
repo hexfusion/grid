@@ -36,7 +36,7 @@ spec:
                   nullable: true
                   properties:
                     address:
-                      description: Address of the egress gateway (host:port).
+                      description: Egress gateway `host:port`, overriding discovery; empty uses `status.discovered.egressAddress`.
                       type: string
                     tls:
                       default:
@@ -55,8 +55,9 @@ spec:
                             Expected DNS identity for TLS verification.
 
                             Used as both the TLS SNI value and for certificate SAN
-                            verification.  Required when `mode` is [`TlsMode::MutualTls`];
-                            must be absent for [`TlsMode::Plaintext`].
+                            verification.  Defaults to `<site>.grid.internal`, the DNS name
+                            enrollment issues, for [`TlsMode::MutualTls`]; must be absent for
+                            [`TlsMode::Plaintext`].
 
                             Must be a valid DNS name (not an IP address), at most 253
                             characters.
@@ -65,8 +66,6 @@ spec:
                           nullable: true
                           type: string
                       type: object
-                  required:
-                    - address
                   type: object
                 gridNetworkRef:
                   description: |-
@@ -142,6 +141,59 @@ spec:
                       description: Site offers inference access.
                       type: boolean
                   type: object
+                conditions:
+                  description: Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+                  items:
+                    description: One observed condition, keyed by `type`.
+                    properties:
+                      lastTransitionTime:
+                        description: RFC 3339 time the status last changed.
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        default: 0
+                        description: The `metadata.generation` this condition was computed from.
+                        format: int64
+                        type: integer
+                      reason:
+                        description: Machine-readable reason.
+                        type: string
+                      status:
+                        description: Whether the condition holds.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: Condition type, unique within the list.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                discovered:
+                  description: What SWIM gossip reports about this site; observed, never authored.
+                  nullable: true
+                  properties:
+                    advertisedCertPem:
+                      description: Certificate PEM the remote operator advertised; never a trust anchor on its own.
+                      nullable: true
+                      type: string
+                    egressAddress:
+                      description: Gateway address the remote operator advertised.
+                      nullable: true
+                      type: string
+                  type: object
                 lastProbeTime:
                   description: |-
                     Timestamp of the last probe whose resulting status was persisted.
@@ -177,12 +229,6 @@ spec:
                     - Active
                     - Unreachable
                     - Left
-                  type: string
-                publicCertPem:
-                  description: |-
-                    Remote site's public certificate PEM (received
-                    via SWIM state broadcast from the remote operator).
-                  nullable: true
                   type: string
                 reason:
                   default: ""

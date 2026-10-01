@@ -41,10 +41,6 @@
         "gridId": {
           "type": "string"
         },
-        "autoDiscoverSites": {
-          "type": ["boolean", "null"],
-          "description": "Create a GridSite for each SWIM peer and route to them."
-        },
         "region": {
           "type": "string"
         },
@@ -135,6 +131,17 @@
             "mode": {
               "type": "string",
               "enum": ["pin", "spiffe"]
+            }
+          }
+        },
+        "siteDiscovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["manual", "auto"]
             }
           }
         },

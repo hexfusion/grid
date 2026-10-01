@@ -23,7 +23,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     crd::{
-        grid_network::{GridNetwork, TlsMode},
+        condition::{self, Rejection},
+        grid_network::{GridNetwork, PeerTrustMode, TlsMode},
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
     },
     error::OperatorError,
@@ -33,8 +34,8 @@ use crate::{
         },
         secret::read_secret_bytes,
         tls_probe::{
-            build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs, parse_private_key,
-            probe_gateway,
+            PeerIdentity, build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs,
+            parse_private_key, probe_gateway,
         },
     },
 };
@@ -90,10 +91,11 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
     let network = fetch_network(&site, client.as_ref()).await?;
     let current_phase = site.status.as_ref().map_or(&GridSitePhase::Pending, |s| &s.phase);
 
-    let outcome = if needs_probe(current_phase) {
+    let rejection = site_spec_rejection(&site, &network);
+    let outcome = if rejection.is_none() && needs_probe(current_phase) {
         let start = std::time::Instant::now();
         let result = evaluate_gateway(&site, client.as_ref(), &network).await;
-        let tls_mode = if is_plaintext_transport(&site) {
+        let tls_mode = if egress_tls_mode(&site, &network) == TlsMode::Plaintext {
             "Plaintext"
         } else {
             "Mutual"
@@ -105,7 +107,14 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
     };
 
     let probed = outcome.is_some();
-    let (next_phase, reason, message) = site_phase_next(current_phase, &site, outcome.as_ref());
+    let (next_phase, reason, message) = match rejection {
+        Some(rejection) => (
+            rejected_phase(current_phase),
+            rejection.reason.to_owned(),
+            rejection.message,
+        ),
+        None => site_phase_next(current_phase, &site, outcome.as_ref()),
+    };
     Box::pin(update_status(
         &site,
         client.as_ref(),
@@ -170,7 +179,7 @@ pub(crate) fn site_phase_next(
     site: &GridSite,
     outcome: Option<&GatewayProbeOutcome>,
 ) -> (GridSitePhase, String, String) {
-    let has_egress_address = site.spec.egress.as_ref().is_some_and(|e| !e.address.trim().is_empty());
+    let has_egress_address = egress_address(site).is_some();
 
     match current {
         GridSitePhase::Pending => (
@@ -179,7 +188,13 @@ pub(crate) fn site_phase_next(
             "site record created; waiting for SWIM discovery to advance to Discovered".to_owned(),
         ),
         GridSitePhase::Discovered => {
-            if has_egress_address {
+            if gossip_address_refused(site) {
+                (
+                    GridSitePhase::Discovered,
+                    "GossipedAddressRefused".to_owned(),
+                    "gossiped gateway address is not a dialable literal IP:port; set spec.egress.address".to_owned(),
+                )
+            } else if has_egress_address {
                 (
                     GridSitePhase::Connecting,
                     "GatewayAddressKnown".to_owned(),
@@ -219,19 +234,11 @@ pub(crate) fn site_phase_next(
 ///
 /// Never leaks private key material in the returned outcome.
 async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwork) -> GatewayProbeOutcome {
-    let probe_addr = site.spec.egress.as_ref().and_then(|e| {
-        if e.address.trim().is_empty() {
-            None
-        } else {
-            Some(e.address.as_str())
-        }
-    });
-
-    let Some(addr) = probe_addr else {
+    let Some(addr) = egress_address(site) else {
         return GatewayProbeOutcome::AddressMissing;
     };
 
-    if is_plaintext_transport(site) {
+    if egress_tls_mode(site, network) == TlsMode::Plaintext {
         return if tcp_probe(addr).await {
             GatewayProbeOutcome::PlaintextReachable
         } else {
@@ -251,7 +258,8 @@ async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwor
 fn advertised_leaf_der(site: &GridSite) -> Option<Vec<u8>> {
     site.status
         .as_ref()
-        .and_then(|s| s.public_cert_pem.as_ref())
+        .and_then(|s| s.discovered.as_ref())
+        .and_then(|d| d.advertised_cert_pem.as_ref())
         .and_then(|pem| match first_cert_der_from_pem(pem) {
             Ok(der) => Some(der),
             Err(e) => {
@@ -318,17 +326,16 @@ async fn build_probe_config_from_secrets(
     let tls_config =
         build_tls_config(roots, Some(client_certs), Some(client_key)).map_err(|_err| O::TrustMaterialInvalid)?;
 
-    let server_name_str = site
-        .spec
-        .egress
-        .as_ref()
-        .and_then(|e| e.tls.server_name.as_deref())
-        .ok_or(O::TrustMaterialMissing)?;
-    validate_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
+    let server_name_str = probe_server_name(site);
+    validate_server_name(&server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
     let server_name =
-        crate::resources::tls_backend::parse_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
+        crate::resources::tls_backend::parse_server_name(&server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
 
-    let pins = resolve_pins(site)?;
+    let identity = if spiffe_peer_trust(network) {
+        PeerIdentity::Spiffe(certs::spiffe_id(site.metadata.name.as_deref().unwrap_or_default()))
+    } else {
+        PeerIdentity::Pins(resolve_pins(site)?)
+    };
 
     let advertised = advertised_leaf_der(site);
 
@@ -336,9 +343,31 @@ async fn build_probe_config_from_secrets(
         address: addr.to_owned(),
         tls_config,
         server_name,
-        pins,
+        identity,
         advertised_leaf_der: advertised,
     })
+}
+
+/// The declared `serverName`, else `<site>.grid.internal`, the DNS SAN enrollment issues.
+fn probe_server_name(site: &GridSite) -> String {
+    site.spec
+        .egress
+        .as_ref()
+        .and_then(|egress| egress.tls.server_name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .map_or_else(
+            || format!("{}.grid.internal", site.metadata.name.as_deref().unwrap_or_default()),
+            ToOwned::to_owned,
+        )
+}
+
+/// Whether the network verifies peers by SPIFFE ID rather than pins.
+fn spiffe_peer_trust(network: &GridNetwork) -> bool {
+    network
+        .spec
+        .peer_trust
+        .as_ref()
+        .is_some_and(|trust| trust.mode == PeerTrustMode::Spiffe)
 }
 
 /// Resolve the canonical fingerprint pins from the [`GridSite`] trust policy.
@@ -373,12 +402,92 @@ fn phase_label(phase: &GridSitePhase) -> &'static str {
     }
 }
 
-/// Whether the site's egress transport is plaintext (no TLS).
-fn is_plaintext_transport(site: &GridSite) -> bool {
+/// The first spec rule `site` breaks against its `network`; a rejected site is never probed.
+pub(crate) fn site_spec_rejection(site: &GridSite, network: &GridNetwork) -> Option<Rejection> {
+    let spiffe = spiffe_peer_trust(network);
+    let pinned = site
+        .spec
+        .trust
+        .as_ref()
+        .and_then(|trust| trust.canonical_fingerprints.as_ref())
+        .is_some_and(|pins| !pins.is_empty());
+    if spiffe && pinned {
+        return Some(Rejection::new(
+            "TrustConflictsWithPeerTrust",
+            "spec.trust pins are ignored while the GridNetwork peerTrust.mode is spiffe; remove them",
+        ));
+    }
+    site.spec.egress.as_ref().and_then(egress_rejection)
+}
+
+/// The SNI rule a declared `spec.egress` breaks, if any.
+fn egress_rejection(egress: &crate::crd::grid_site::EgressConfig) -> Option<Rejection> {
+    let server_name = egress.tls.server_name.as_deref().filter(|name| !name.trim().is_empty());
+    match (egress.tls.mode, server_name) {
+        (TlsMode::Plaintext, Some(_)) => Some(Rejection::new(
+            "ServerNameForbidden",
+            "spec.egress.tls.mode plaintext refuses spec.egress.tls.serverName",
+        )),
+        (TlsMode::MutualTls, Some(name)) if validate_server_name(name).is_err() => Some(Rejection::new(
+            "ServerNameInvalid",
+            "spec.egress.tls.serverName is not a valid DNS name",
+        )),
+        (TlsMode::MutualTls, Some(_) | None) | (TlsMode::Plaintext, None) => None,
+    }
+}
+
+/// The phase a rejected site holds: never `Active`, so it never routes.
+fn rejected_phase(current: &GridSitePhase) -> GridSitePhase {
+    match current {
+        GridSitePhase::Active | GridSitePhase::Unreachable => GridSitePhase::Connecting,
+        GridSitePhase::Pending | GridSitePhase::Discovered | GridSitePhase::Connecting | GridSitePhase::Left => {
+            current.clone()
+        },
+    }
+}
+
+/// Probe target: the declared `spec.egress` address, else a dialable gossiped one.
+fn egress_address(site: &GridSite) -> Option<&str> {
+    declared_egress_address(site).or_else(|| gossiped_egress_address(site).filter(|addr| is_dialable_gossip(addr)))
+}
+
+/// The non-blank `spec.egress.address`, which may name a host.
+fn declared_egress_address(site: &GridSite) -> Option<&str> {
     site.spec
         .egress
         .as_ref()
-        .is_some_and(|e| e.tls.mode == TlsMode::Plaintext)
+        .map(|egress| egress.address.as_str())
+        .filter(|addr| !addr.trim().is_empty())
+}
+
+/// The non-blank `status.discovered.egressAddress`, as gossiped.
+fn gossiped_egress_address(site: &GridSite) -> Option<&str> {
+    site.status
+        .as_ref()
+        .and_then(|status| status.discovered.as_ref())
+        .and_then(|discovered| discovered.egress_address.as_deref())
+        .filter(|addr| !addr.trim().is_empty())
+}
+
+/// Whether a gossiped address is a literal `IP:port` off loopback, link-local, unspecified, and metadata.
+fn is_dialable_gossip(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .is_ok_and(|socket| socket.port() != 0 && crate::signals::is_dialable_ip(socket.ip()))
+}
+
+/// Whether the only address on offer is a gossiped one the dial guard refuses.
+fn gossip_address_refused(site: &GridSite) -> bool {
+    declared_egress_address(site).is_none()
+        && gossiped_egress_address(site).is_some_and(|addr| !is_dialable_gossip(addr))
+}
+
+/// Egress TLS mode: the declared one, else the network default.
+fn egress_tls_mode(site: &GridSite, network: &GridNetwork) -> TlsMode {
+    match site.spec.egress.as_ref() {
+        Some(egress) => egress.tls.mode,
+        None if super::grid_network::network_uses_plaintext_egress(network) => TlsMode::Plaintext,
+        None => TlsMode::MutualTls,
+    }
 }
 
 /// Attempt a TCP connection to `addr` with [`PROBE_TIMEOUT`].
@@ -398,7 +507,7 @@ async fn tcp_probe(addr: &str) -> bool {
 /// Patch the `GridSite` status subresource.
 ///
 /// Patches only fields owned by this controller. `capabilities` and
-/// `public_cert_pem` are owned by SWIM reconciliation and are deliberately
+/// `discovered` are owned by SWIM reconciliation and are deliberately
 /// omitted. Updates `last_probe_time` when a probe was executed and
 /// `last_transition_time` when the phase changes.
 #[expect(
@@ -440,16 +549,23 @@ async fn update_status(
         existing.and_then(|s| s.last_transition_time.clone())
     };
 
+    let observed_generation = site.metadata.generation.unwrap_or(0);
+    let conditions = condition::refresh(
+        existing.map(|s| s.conditions.as_slice()),
+        condition::site_conditions(phase, reason),
+        observed_generation,
+    );
     let api: Api<GridSite> = Api::all(client.clone());
     let status = GridSiteStatus {
+        conditions,
         phase: phase.clone(),
-        observed_generation: site.metadata.generation.unwrap_or(0),
+        observed_generation,
         reason: reason.to_owned(),
         message: message.to_owned(),
         capabilities: existing.map_or_else(Default::default, |s| s.capabilities.clone()),
         last_probe_time: probe_time,
         last_transition_time: transition_time,
-        public_cert_pem: existing.and_then(|s| s.public_cert_pem.clone()),
+        discovered: existing.and_then(|s| s.discovered.clone()),
     };
 
     if !grid_site_status_needs_update(existing, &status) {
@@ -457,7 +573,7 @@ async fn update_status(
     }
 
     // Patch only fields owned by this controller. The GridNetwork controller
-    // updates capabilities and publicCertPem independently; replacing the
+    // updates capabilities and discovered independently; replacing the
     // complete status object here could overwrite a newer SWIM observation.
     //
     // Include metadata.resourceVersion as a CAS precondition so the API
@@ -560,12 +676,13 @@ fn truncate_event_note(message: &str) -> String {
 ///
 /// `last_probe_time` and `last_transition_time` are rewritten every probed
 /// reconcile, so comparing them would re-patch each pass into a hot loop.
-/// `capabilities` and `public_cert_pem` are SWIM-owned and not patched here.
+/// `capabilities` and `discovered` are SWIM-owned and not patched here.
 fn grid_site_status_needs_update(current: Option<&GridSiteStatus>, desired: &GridSiteStatus) -> bool {
     let Some(current) = current else {
         return true;
     };
     current.phase != desired.phase
+        || current.conditions != desired.conditions
         || current.reason != desired.reason
         || current.message != desired.message
         || current.observed_generation != desired.observed_generation
@@ -579,6 +696,7 @@ fn grid_site_owned_status_patch(status: &GridSiteStatus, resource_version: Optio
             "resourceVersion": resource_version
         },
         "status": {
+            "conditions": status.conditions,
             "phase": status.phase,
             "observedGeneration": status.observed_generation,
             "reason": status.reason,
@@ -655,7 +773,10 @@ mod tests {
                 inference: true,
                 ..Default::default()
             },
-            public_cert_pem: Some("sentinel-public-cert".to_owned()),
+            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                advertised_cert_pem: Some("sentinel-public-cert".to_owned()),
+                ..Default::default()
+            }),
             phase: GridSitePhase::Active,
             reason: "TlsVerified".to_owned(),
             ..Default::default()
@@ -666,7 +787,47 @@ mod tests {
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(!owned.contains_key("capabilities"));
-        assert!(!owned.contains_key("publicCertPem"));
+        assert!(!owned.contains_key("discovered"));
+    }
+
+    #[test]
+    fn status_patch_carries_the_site_conditions() {
+        let conditions = condition::reconcile_conditions(
+            &[],
+            condition::site_conditions(&GridSitePhase::Active, "Verified"),
+            4,
+            "2026-10-01T00:00:00Z",
+        );
+        let status = GridSiteStatus {
+            conditions,
+            phase: GridSitePhase::Active,
+            ..Default::default()
+        };
+        let patch = grid_site_owned_status_patch(&status, None);
+        let types: Vec<&str> = patch
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort())
+            .iter()
+            .filter_map(|c| c.get("type").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(types, ["Accepted", "Discovered", "Connected", "Ready"]);
+    }
+
+    #[test]
+    fn a_condition_change_alone_triggers_a_status_write() {
+        let current = GridSiteStatus::default();
+        let desired = GridSiteStatus {
+            conditions: condition::reconcile_conditions(
+                &[],
+                condition::site_conditions(&GridSitePhase::Pending, ""),
+                0,
+                "t",
+            ),
+            ..Default::default()
+        };
+        assert!(grid_site_status_needs_update(Some(&current), &desired));
+        assert!(!grid_site_status_needs_update(Some(&desired), &desired));
     }
 
     #[test]
@@ -1031,7 +1192,10 @@ mod tests {
     fn site_with_advertised(pem: Option<&str>) -> GridSite {
         GridSite {
             status: Some(GridSiteStatus {
-                public_cert_pem: pem.map(ToOwned::to_owned),
+                discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                    advertised_cert_pem: pem.map(ToOwned::to_owned),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..site_no_egress(None)
@@ -1308,16 +1472,235 @@ mod tests {
     // Helper tests
     // -----------------------------------------------------------------------
 
+    fn tls_network() -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": { "tls": { "caSecretRef": { "name": "ca", "namespace": "grid" } } }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn site_with_gossiped_egress(address: &str) -> GridSite {
+        GridSite {
+            status: Some(GridSiteStatus {
+                discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                    egress_address: Some(address.to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..site_no_egress(Some(GridSitePhase::Discovered))
+        }
+    }
+
     #[test]
-    fn is_plaintext_transport_detects_mode() {
+    fn egress_tls_mode_follows_the_declared_egress() {
+        let network = tls_network();
         let plaintext = site_with_plaintext_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8080");
-        assert!(is_plaintext_transport(&plaintext), "Plaintext mode must be detected");
+        assert_eq!(egress_tls_mode(&plaintext, &network), TlsMode::Plaintext);
 
         let mutual = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8080");
-        assert!(!is_plaintext_transport(&mutual), "Mutual mode must not be plaintext");
+        assert_eq!(egress_tls_mode(&mutual, &network), TlsMode::MutualTls);
+    }
 
-        let no_egress = site_no_egress(Some(GridSitePhase::Connecting));
-        assert!(!is_plaintext_transport(&no_egress), "no egress must not be plaintext");
+    #[test]
+    fn a_gossiped_egress_takes_the_network_tls_mode() {
+        let site = site_with_gossiped_egress("10.0.0.9:8443");
+        assert_eq!(egress_tls_mode(&site, &tls_network()), TlsMode::MutualTls);
+        let no_tls: GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": {}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(egress_tls_mode(&site, &no_tls), TlsMode::Plaintext);
+    }
+
+    #[test]
+    fn a_declared_egress_without_an_address_keeps_its_tls_and_uses_the_gossiped_address() {
+        let mut site = site_with_gossiped_egress("10.0.0.9:8443");
+        site.spec.egress = serde_json::from_value(serde_json::json!({ "tls": { "mode": "plaintext" } })).ok();
+        assert_eq!(egress_address(&site), Some("10.0.0.9:8443"));
+        assert_eq!(egress_tls_mode(&site, &tls_network()), TlsMode::Plaintext);
+    }
+
+    #[test]
+    fn declared_tls_intent_without_any_address_holds_without_probing() {
+        let mut site = site_no_egress(Some(GridSitePhase::Discovered));
+        site.spec.egress = serde_json::from_value(serde_json::json!({
+            "tls": { "mode": "mutualTls", "serverName": "west.grid.internal" }
+        }))
+        .ok();
+        assert_eq!(egress_address(&site), None);
+        let (phase, reason, _) = site_phase_next(&GridSitePhase::Discovered, &site, None);
+        assert_eq!(phase, GridSitePhase::Discovered);
+        assert_eq!(reason, "GatewayAddressMissing");
+        let (probed, ..) = site_phase_next(&GridSitePhase::Connecting, &site, None);
+        assert_ne!(probed, GridSitePhase::Active, "no address can never promote");
+    }
+
+    fn site_with_tls(mode: &str, server_name: Option<&str>) -> GridSite {
+        let mut site = site_no_egress(Some(GridSitePhase::Connecting));
+        let tls = server_name.map_or_else(
+            || serde_json::json!({ "mode": mode }),
+            |name| serde_json::json!({ "mode": mode, "serverName": name }),
+        );
+        site.spec.egress = serde_json::from_value(serde_json::json!({ "address": "10.0.0.1:8443", "tls": tls })).ok();
+        site
+    }
+
+    fn rejection_reason(site: &GridSite, network: &GridNetwork) -> Option<&'static str> {
+        site_spec_rejection(site, network).map(|r| r.reason)
+    }
+
+    #[test]
+    fn mutual_tls_egress_without_a_server_name_defaults_to_the_enrolled_dns_name() {
+        let site = site_with_tls("mutualTls", None);
+        assert_eq!(rejection_reason(&site, &tls_network()), None);
+        let name = site.metadata.name.clone().unwrap_or_default();
+        assert_eq!(probe_server_name(&site), format!("{name}.grid.internal"));
+        assert_eq!(
+            probe_server_name(&site_with_tls("mutualTls", Some(" "))),
+            format!("{name}.grid.internal")
+        );
+        assert_eq!(
+            probe_server_name(&site_with_tls("mutualTls", Some("gw.example.com"))),
+            "gw.example.com"
+        );
+    }
+
+    #[test]
+    fn spiffe_peer_trust_follows_the_network_mode() {
+        let mut network = tls_network();
+        assert!(!spiffe_peer_trust(&network));
+        network.spec.peer_trust = serde_json::from_value(serde_json::json!({ "mode": "spiffe" })).ok();
+        assert!(spiffe_peer_trust(&network));
+    }
+
+    #[test]
+    fn plaintext_egress_refuses_a_server_name() {
+        assert_eq!(
+            rejection_reason(&site_with_tls("plaintext", Some("west.grid.internal")), &tls_network()),
+            Some("ServerNameForbidden")
+        );
+        assert_eq!(
+            rejection_reason(&site_with_tls("plaintext", None), &tls_network()),
+            None
+        );
+    }
+
+    #[test]
+    fn an_invalid_server_name_is_rejected() {
+        assert_eq!(
+            rejection_reason(&site_with_tls("mutualTls", Some("not a name")), &tls_network()),
+            Some("ServerNameInvalid")
+        );
+    }
+
+    #[test]
+    fn pins_conflict_with_spiffe_peer_trust() {
+        let mut network = tls_network();
+        network.spec.peer_trust = serde_json::from_value(serde_json::json!({ "mode": "spiffe" })).ok();
+        let mut site = site_with_tls("mutualTls", Some("west.grid.internal"));
+        site.spec.trust = serde_json::from_value(serde_json::json!({ "canonicalFingerprints": ["a".repeat(64)] })).ok();
+        assert_eq!(rejection_reason(&site, &network), Some("TrustConflictsWithPeerTrust"));
+        assert_eq!(rejection_reason(&site, &tls_network()), None, "pin mode reads the pins");
+    }
+
+    #[test]
+    fn a_site_without_declared_egress_is_not_rejected() {
+        assert_eq!(rejection_reason(&site_no_egress(None), &tls_network()), None);
+    }
+
+    #[test]
+    fn a_rejected_site_never_holds_active() {
+        assert_eq!(rejected_phase(&GridSitePhase::Active), GridSitePhase::Connecting);
+        assert_eq!(rejected_phase(&GridSitePhase::Unreachable), GridSitePhase::Connecting);
+        assert_eq!(rejected_phase(&GridSitePhase::Discovered), GridSitePhase::Discovered);
+    }
+
+    #[test]
+    fn an_advertised_certificate_alone_never_makes_a_site_active() {
+        let mut site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        site.status = site_with_advertised(Some("-----BEGIN CERTIFICATE-----")).status;
+        for outcome in [
+            GatewayProbeOutcome::PinMismatch,
+            GatewayProbeOutcome::UntrustedIssuer,
+            GatewayProbeOutcome::IdentityMismatch,
+            GatewayProbeOutcome::TrustMaterialMissing,
+        ] {
+            let (phase, ..) = site_phase_next(&GridSitePhase::Connecting, &site, Some(&outcome));
+            assert_ne!(phase, GridSitePhase::Active, "{outcome:?}");
+        }
+        let (unprobed, ..) = site_phase_next(&GridSitePhase::Connecting, &site, None);
+        assert_ne!(unprobed, GridSitePhase::Active, "no probe, no promotion");
+    }
+
+    #[test]
+    fn the_verified_probe_alone_promotes_without_an_advertised_certificate() {
+        let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        let (phase, ..) = site_phase_next(&GridSitePhase::Connecting, &site, Some(&GatewayProbeOutcome::Verified));
+        assert_eq!(phase, GridSitePhase::Active);
+    }
+
+    #[test]
+    fn gossiped_addresses_must_be_dialable_literal_ips() {
+        for refused in [
+            "127.0.0.1:8443",
+            "[::1]:8443",
+            "0.0.0.0:8443",
+            "169.254.169.254:80",
+            "100.100.100.200:80",
+            "[fd00:ec2::254]:80",
+            "[fe80::1]:8443",
+            "10.0.0.9:0",
+            "gateway.example.com:8443",
+            "x@169.254.169.254:80",
+            "10.0.0.9",
+        ] {
+            let site = site_with_gossiped_egress(refused);
+            assert_eq!(egress_address(&site), None, "{refused}");
+            assert!(gossip_address_refused(&site), "{refused}");
+            let (phase, reason, _) = site_phase_next(&GridSitePhase::Discovered, &site, None);
+            assert_eq!(
+                (phase, reason.as_str()),
+                (GridSitePhase::Discovered, "GossipedAddressRefused"),
+                "{refused}"
+            );
+        }
+        for allowed in ["10.0.0.9:8443", "[2001:db8::1]:8443"] {
+            assert_eq!(egress_address(&site_with_gossiped_egress(allowed)), Some(allowed));
+        }
+    }
+
+    #[test]
+    fn a_declared_egress_may_name_a_host() {
+        let site = site_with_egress(Some(GridSitePhase::Connecting), "gateway.example.com:8443");
+        assert_eq!(egress_address(&site), Some("gateway.example.com:8443"));
+        assert!(!gossip_address_refused(&site));
+    }
+
+    #[test]
+    fn the_declared_egress_wins_over_the_gossiped_one() {
+        let mut site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        site.status = site_with_gossiped_egress("10.0.0.9:8443").status;
+        assert_eq!(egress_address(&site), Some("10.0.0.1:8443"));
+        assert_eq!(
+            egress_address(&site_with_gossiped_egress("10.0.0.9:8443")),
+            Some("10.0.0.9:8443")
+        );
+        assert_eq!(egress_address(&site_no_egress(None)), None);
+    }
+
+    #[test]
+    fn a_gossiped_address_advances_a_discovered_site() {
+        let site = site_with_gossiped_egress("10.0.0.9:8443");
+        let (phase, reason, _) = site_phase_next(&GridSitePhase::Discovered, &site, None);
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "GatewayAddressKnown");
     }
 
     #[test]

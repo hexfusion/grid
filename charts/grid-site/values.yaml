@@ -1,9 +1,6 @@
 gridNetwork:
   name: grid
   gridId: ""
-  # -- Create a GridSite for each SWIM peer and route to them. Unset, it is on when peers
-  # are listed, else off, which keeps the routingClusterRef overlay of existing networks.
-  # autoDiscoverSites: true
   region: ""
   zone: ""
   seeds: []
@@ -35,6 +32,10 @@ gridNetwork:
   # -- Grid-wide peer trust: pin (default) or spiffe. Read at operator start.
   # peerTrust:
   #   mode: spiffe
+  # manual (default) fills declared GridSites from SWIM; auto also creates one
+  # per undeclared member, named by its bare site name.
+  # siteDiscovery:
+  #   mode: auto
 
 gridSite:
   name: ""

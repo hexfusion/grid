@@ -201,7 +201,7 @@ pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn
 
 /// Compute the canonical fingerprint from a PEM certificate string.
 ///
-/// Used to compare a SWIM-advertised `publicCertPem` against a staged identity.
+/// Used to compare a SWIM-advertised `advertisedCertPem` against a staged identity.
 pub(crate) fn pem_to_canonical_fingerprint(pem: &str) -> String {
     let tmp = match tempfile::NamedTempFile::new() {
         Ok(f) => f,

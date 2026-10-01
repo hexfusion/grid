@@ -511,7 +511,7 @@ pub(crate) const SITE_JOIN_LABEL_KEY: &str = "grid.praxis-proxy.io/sjd-site";
 
 /// Egress address for the primary site (Kind east-cluster node IP + TLS port).
 ///
-/// This is metadata used to populate `GridSite.spec.egress.address` in the
+/// This is metadata used to populate `GridSite.status.discovered.egressAddress` in the
 /// validation harness.  It is not connected to during the test.
 pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
 
@@ -913,7 +913,7 @@ pub(crate) fn kubectl_auth_can_i(
 }
 
 /// Run the `generate_crds` binary and return its stdout as a `String`.
-fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
     let out = Command::new("cargo")
         .args(["run", "--quiet", "-p", "operator", "--bin", "generate_crds"])
         .output()?;
@@ -4517,7 +4517,7 @@ pub(crate) fn cleanup_rotation_test_resources(context: &str) -> Result<(), Box<d
         ROTATION_REMOTE_PROVIDER,
     ));
     drop(delete_cluster_resource(context, "gridsite", ROTATION_SITE));
-    let remote_site = auto_discovered_gridsite_name(ROTATION_NETWORK, ROTATION_REMOTE_SWIM_ID);
+    let remote_site = auto_discovered_gridsite_name(ROTATION_REMOTE_SWIM_ID);
     drop(delete_cluster_resource(context, "gridsite", &remote_site));
     drop(delete_cluster_resource(context, "gridnetwork", ROTATION_NETWORK));
     cleanup_tls_fixture_secrets(context, ROTATION_SITE)?;
@@ -4761,7 +4761,7 @@ pub(crate) fn validate_gridsite_events(
 /// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     cleanup_test_network_resources(context, SWIM_OVERLAY_NETWORK, SWIM_OVERLAY_GW, &[SWIM_OVERLAY_PROVIDER])?;
-    let secondary_k8s_name = auto_discovered_gridsite_name(SWIM_OVERLAY_NETWORK, SWIM_NODE_SECONDARY_NAME);
+    let secondary_k8s_name = auto_discovered_gridsite_name(SWIM_NODE_SECONDARY_NAME);
     cleanup_tls_fixture_secrets(context, &secondary_k8s_name)?;
     eprintln!("  [OK] stale SWIM overlay test resources removed");
     Ok(())
@@ -5242,7 +5242,7 @@ pub(crate) fn cleanup_swim_mesh_test_resources(context: &str) -> Result<(), Box<
     delete_cluster_resource(context, "gridnetwork", SWIM_MESH_WRONG_NETWORK)?;
     cleanup_auto_discovered_gridsites_for_network(context, SWIM_MESH_NETWORK);
     cleanup_auto_discovered_gridsites_for_network(context, SWIM_MESH_WRONG_NETWORK);
-    let c_site_k8s_name = auto_discovered_gridsite_name(SWIM_MESH_NETWORK, SWIM_MESH_SITE_C);
+    let c_site_k8s_name = auto_discovered_gridsite_name(SWIM_MESH_SITE_C);
     cleanup_tls_fixture_secrets(context, &c_site_k8s_name)?;
     eprintln!("  [OK] stale SWIM mesh test resources removed");
     Ok(())
@@ -5267,13 +5267,9 @@ pub(crate) fn apply_swim_trust_test_fixtures(
         "kind": "GridNetwork",
         "metadata": {
             "name": SWIM_TRUST_NETWORK,
-            "labels": {
-                // Enable auto-discovery so the operator creates auto-discovered GridSites
-                // and populates publicCertPem when cert broadcasts are received.
-                "grid.praxis-proxy.io/auto-discover-sites": "true"
-            }
         },
         "spec": {
+            "siteDiscovery": { "mode": "auto" },
             "seeds": [],
             "gatewayRefs": [{
                 "name": SWIM_TRUST_GW,
@@ -5352,10 +5348,10 @@ pub(crate) fn cleanup_swim_trust_test_resources(context: &str) -> Result<(), Box
     Ok(())
 }
 
-/// Read `status.publicCertPem` from a `GridSite` resource.
+/// Read `status.discovered.advertisedCertPem` from a `GridSite` resource.
 ///
 /// Returns `None` when the field is absent or empty, `Some(pem)` otherwise.
-pub(crate) fn read_gridsite_public_cert_pem(context: &str, site_name: &str) -> Option<String> {
+pub(crate) fn read_gridsite_advertised_cert_pem(context: &str, site_name: &str) -> Option<String> {
     let out = Command::new("kubectl")
         .args([
             "--context",
@@ -5364,7 +5360,7 @@ pub(crate) fn read_gridsite_public_cert_pem(context: &str, site_name: &str) -> O
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.status.publicCertPem}",
+            "jsonpath={.status.discovered.advertisedCertPem}",
             "--ignore-not-found",
         ])
         .output()
@@ -6066,11 +6062,9 @@ pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> R
         "kind": "GridNetwork",
         "metadata": {
             "name": SITE_JOIN_NETWORK,
-            // Opt-in label: enables automatic GridSite discovery for Alive SWIM members.
-            // Only networks with this label run reconcile_discovered_sites in the controller.
-            "labels": { "grid.praxis-proxy.io/auto-discover-sites": "true" }
         },
         "spec": {
+            "siteDiscovery": { "mode": "auto" },
             "seeds": [],
             "gatewayRefs": [{
                 "name": SITE_JOIN_GW,
@@ -6259,7 +6253,7 @@ pub(crate) fn wait_for_gridsite_phase(
 
 /// Verify that a `GridSite` has the expected routing-relevant spec fields set.
 ///
-/// Checks `spec.gridNetworkRef` and `spec.egress.address`, which together
+/// Checks `spec.gridNetworkRef` and `status.discovered.egressAddress`, which together
 /// provide the network identity and data-plane endpoint needed for routing.
 /// The `status.phase` value is reported but not asserted here — call
 /// [`wait_for_gridsite_phase`] separately to assert the lifecycle state.
@@ -6281,7 +6275,7 @@ pub(crate) fn verify_gridsite_routing_data(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+            "jsonpath={.spec.gridNetworkRef}/{.status.discovered.egressAddress}/{.status.phase}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6527,34 +6521,9 @@ pub(crate) fn wait_for_site_join_overlay(
     }
 }
 
-/// Derive the Kubernetes resource name for an auto-discovered `GridSite`.
-///
-/// Mirrors the logic in `operator::controller::grid_network::discovered_site_k8s_name`.
-/// Both must stay in sync: the operator uses this to name the resource; the xtask uses
-/// it to look up and verify the created resource.
-pub(crate) fn auto_discovered_gridsite_name(network_name: &str, site_id: &str) -> String {
-    let sanitise = |s: &str| -> String {
-        let raw: String = s
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        raw.trim_matches('-').to_owned()
-    };
-    let net = sanitise(network_name);
-    let site = sanitise(site_id);
-    let candidate = match (net.is_empty(), site.is_empty()) {
-        (false, false) => format!("{net}-{site}"),
-        (false, true) => net,
-        (true, false) => site,
-        (true, true) => "discovered-site".to_owned(),
-    };
-    candidate.chars().take(253).collect()
+/// The `GridSite` name for a SWIM site: the operator names it after the site ID itself.
+pub(crate) fn auto_discovered_gridsite_name(site_id: &str) -> String {
+    site_id.to_owned()
 }
 
 /// Poll until a `GridSite` named `site_name` exists and has `spec.gridNetworkRef = expected_network`.
@@ -6581,7 +6550,7 @@ pub(crate) fn wait_for_auto_gridsite(
                 "gridsites",
                 site_name,
                 "-o",
-                "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
+                "jsonpath={.spec.gridNetworkRef}/{.status.discovered.egressAddress}",
                 "--ignore-not-found",
             ])
             .output()
@@ -6612,7 +6581,7 @@ pub(crate) fn wait_for_auto_gridsite(
 
 /// Verify spec and status fields of an auto-discovered `GridSite`.
 ///
-/// Checks `spec.gridNetworkRef`, `spec.egress.address`, and `status.phase`.
+/// Checks `spec.gridNetworkRef`, `status.discovered.egressAddress`, and `status.phase`.
 /// The expected phase is supplied by the caller; use [`wait_for_gridsite_phase`]
 /// before calling this to ensure the operator has had time to advance the phase.
 ///
@@ -6638,7 +6607,7 @@ pub(crate) fn verify_auto_gridsite_fields(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+            "jsonpath={.spec.gridNetworkRef}/{.status.discovered.egressAddress}/{.status.phase}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6663,7 +6632,7 @@ pub(crate) fn verify_auto_gridsite_fields(
     }
     if egress.is_empty() {
         return Err(format!(
-            "auto-discovered GridSite {site_name:?}: spec.egress.address is empty; \
+            "auto-discovered GridSite {site_name:?}: status.discovered.egressAddress is empty; \
              expected the advertised gateway address"
         )
         .into());
@@ -6682,7 +6651,7 @@ pub(crate) fn verify_auto_gridsite_fields(
     Ok(())
 }
 
-/// Assert that a `GridSite`'s `spec.egress.address` equals the expected gateway address
+/// Assert that a `GridSite`'s `status.discovered.egressAddress` equals the expected gateway address
 /// and is distinct from the SWIM UDP bind address.
 ///
 /// Hard-fails if the egress address equals the SWIM UDP address — that would indicate
@@ -6706,7 +6675,7 @@ pub(crate) fn verify_auto_gridsite_egress(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.egress.address}",
+            "jsonpath={.status.discovered.egressAddress}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6719,14 +6688,14 @@ pub(crate) fn verify_auto_gridsite_egress(
     let actual = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if actual.is_empty() {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address is empty; \
+            "GridSite {site_name:?}: status.discovered.egressAddress is empty; \
              expected gateway address {expected_gateway_addr:?}"
         )
         .into());
     }
     if actual == swim_udp_addr {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address={actual:?} equals the SWIM UDP address; \
+            "GridSite {site_name:?}: status.discovered.egressAddress={actual:?} equals the SWIM UDP address; \
              expected gateway address {expected_gateway_addr:?} — \
              the data-plane gateway address was not propagated through SWIM"
         )
@@ -6734,7 +6703,7 @@ pub(crate) fn verify_auto_gridsite_egress(
     }
     if actual != expected_gateway_addr {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address={actual:?}; \
+            "GridSite {site_name:?}: status.discovered.egressAddress={actual:?}; \
              expected {expected_gateway_addr:?}"
         )
         .into());
@@ -6863,7 +6832,7 @@ pub(crate) fn wait_for_expected_site_certificate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if read_gridsite_public_cert_pem(context, site_name)
+        if read_gridsite_advertised_cert_pem(context, site_name)
             .is_some_and(|pem| super::certs::pem_to_canonical_fingerprint(&pem) == expected_canonical_fp)
         {
             eprintln!("  [OK] GridSite {site_name:?}: advertised certificate matches the staged identity");

@@ -188,7 +188,7 @@ granted for `secrets` and `configmaps`.  `delete` and
 | `gridnetworks` | `get`, `list`, `watch`, `patch` | Controller watch loop; SSA spec/status writes |
 | `gridnetworks/status` | `get`, `patch` | Phase, connectedSites, distributedProviderCount |
 | `gridsites` | `get`, `list`, `watch`, `patch` | Controller watch; auto-creation from SWIM Alive members |
-| `gridsites/status` | `get`, `patch` | Phase, reason, publicCertPem, observedGeneration |
+| `gridsites/status` | `get`, `patch` | Phase, reason, conditions, discovered, observedGeneration |
 | `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch; site-selector matching |
 | `inferenceproviders/status` | `get`, `patch` | Phase, matchingSites, observedGeneration |
 
@@ -546,12 +546,12 @@ The trust bootstrap for a remote site progresses through these steps:
 2. **Gateway address known** — the remote operator advertises its resolved gateway
    address via SWIM state broadcast.  The address is resolved by the self-discovery
    poller (Service LoadBalancer lookup) or from the `GRID_GATEWAY_ADDRESS` override.
-   The local operator stores it in `GridSite.spec.egress.address`.
+   The local operator stores it in `GridSite.status.discovered.egressAddress`.
    Phase: `Connecting`.  No trust established.
 
 3. **Public cert material received** — the remote operator broadcasts its public site
    certificate PEM.  The operator validates the PEM structure (rejects private-key markers;
-   checks for `CERTIFICATE` header) and stores it in `GridSite.status.publicCertPem`.
+   checks for `CERTIFICATE` header) and stores it in `GridSite.status.discovered.advertisedCertPem`.
 
 4. **Identity policy configured** — set `spec.egress.tls.serverName` to the
    expected DNS SAN and set `spec.trust.canonicalFingerprints` to one or two
@@ -597,14 +597,14 @@ it gossiped successfully.
 
 - SWIM membership is discovery, not authorization.
 - TCP reachability proves an address accepts connections, not identity.
-- `publicCertPem` present means the PEM structure is valid and no private-key markers
+- `advertisedCertPem` present means the PEM structure is valid and no private-key markers
   were detected.  It does not prove the cert is signed by a trusted CA or that
   the peer is authorized.
 - Private keys, credential tokens, and Secret data must never be written to
   `GridSite` status, `GridNetwork` status, overlays, generated ConfigMaps, or logs.
 - The operator does not copy Kubernetes Secrets across clusters as part of site discovery.
 - The provider gateway still enforces peer identity on every request with mTLS,
-  independently of `publicCertPem` status.
+  independently of `advertisedCertPem` status.
 
 ### Routing eligibility
 
@@ -625,12 +625,12 @@ gateway independently authorizes peer identity on every data-plane request.
 ## 5. Connectivity Verification
 
 The `GridSite` controller verifies gateway reachability and identity against
-`spec.egress.address`.
+`spec.egress.address`, or `status.discovered.egressAddress` when the spec sets none.
 
 | Condition | Current check |
 |-----------|---------------|
 | `SWIMReachable` | SWIM membership reports the peer Alive |
-| `GatewayAddressKnown` | `spec.egress.address` is non-empty |
+| `GatewayAddressKnown` | `spec.egress.address` or `status.discovered.egressAddress` is non-empty |
 | `TlsVerified` | Mutual TLS handshake, chain, SAN, and live-leaf pin all verify |
 | `IdentityVerificationRequired` | Plaintext endpoint accepts TCP, but remains ineligible because its identity is not verified |
 
@@ -838,12 +838,12 @@ patterns and authentication strategies.
 When a `GridNetwork` has `spec.tls.siteSecretRef` configured, the operator reads
 the public site certificate (`tls.crt`) from that Secret on each reconcile and
 broadcasts it to SWIM peers.  Remote peers store the received certificate in
-`GridSite.status.publicCertPem`.
+`GridSite.status.discovered.advertisedCertPem`.
 
 To verify that a remote site's public certificate has been received:
 
 ```console
-kubectl get gridsite <site-name> -o jsonpath='{.status.publicCertPem}'
+kubectl get gridsite <site-name> -o jsonpath='{.status.discovered.advertisedCertPem}'
 ```
 
 A non-empty value means the remote operator is advertising structurally valid
@@ -858,7 +858,7 @@ advertisement, but do not derive trust solely from the advertised value.
 
 ### Security rules
 
-The public certificate recorded in `status.publicCertPem` is **not** automatically
+The public certificate recorded in `status.discovered.advertisedCertPem` is **not** automatically
 trusted.  The control plane records received trust material for operator visibility.
 The provider gateway enforces mTLS peer identity and certificate validation on every
 request — the control plane record does not bypass that check.
@@ -870,7 +870,7 @@ public certificate (`tls.crt`) from the site Secret, not the private key (`tls.k
 
 The operator resolves and advertises its data-plane gateway address to SWIM
 peers. This address is propagated through SWIM state broadcasts and used by
-receiving operators to populate `GridSite.spec.egress.address` for
+receiving operators to populate `GridSite.status.discovered.egressAddress` for
 auto-discovered sites.
 
 **Self-discovery (default):** A background poller periodically looks up the
@@ -893,9 +893,9 @@ GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
 
 **Requirements:**
 - Format: `host:port` or `IP:port` (any non-empty string is accepted; the remote
-  operator stores it verbatim in `GridSite.spec.egress.address`)
+  operator stores it verbatim in `GridSite.status.discovered.egressAddress`)
 - When absent or empty and no LoadBalancer Service exists: auto-discovered
-  `GridSite` records have empty `spec.egress.address` and stay in `Discovered`
+  `GridSite` records have no egress address and stay in `Discovered`
   phase until the Service appears
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
   and the data-plane gateway address are distinct
@@ -906,7 +906,7 @@ validated by host, named port, protocol, SNI, address scope, and generation;
 arbitrary or ambiguous advertised strings do not become routable endpoints.
 
 **Probe behavior:** In Mutual mode, the `GridSite` controller performs a bounded
-mTLS connection to `spec.egress.address`. It verifies the configured CA,
+mTLS connection to the egress address. It verifies the configured CA,
 `serverName`, and the canonical live-certificate pin. A successful probe reports
 `reason: TlsVerified`. Connection failures move an Active site to `Unreachable`;
 identity or trust failures move it to `Connecting`.
@@ -947,7 +947,7 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.sta
 |---|---|---|
 | (new) | Pending | Resource created |
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
-| Discovered | Connecting | `GridSite` controller: `spec.egress.address` non-empty |
+| Discovered | Connecting | `GridSite` controller: egress address known |
 | Connecting | Active | `GridSite` controller: configured Mutual TLS identity probe succeeds |
 | Active | Connecting | TLS identity or trust verification fails, or the endpoint is changed to plaintext |
 | Active | Unreachable | Gateway address is missing, times out, or refuses the connection |
@@ -960,13 +960,13 @@ separate steps.
 
 **Phase stays Pending after SWIM convergence**
 
-- Check the `GridNetwork` has the label `grid.praxis-proxy.io/auto-discover-sites: "true"`.
+- Check the `GridNetwork` sets `spec.siteDiscovery.mode: auto`, or declare the `GridSite` under the bare site name.
 - Check that the `GridNetwork` controller has SWIM running (`GRID_SWIM_BIND_ADDR` env var set).
 - Check `kubectl get gridnetwork <name> -o jsonpath='{.status.connectedSites}'` — must be > 0.
 
 **Phase stays Discovered (not advancing to Connecting)**
 
-- The site has no `spec.egress.address`.  Verify the remote operator's
+- The site has no egress address in spec or `status.discovered`.  Verify the remote operator's
   `provider-gateway` LoadBalancer Service exists and has an external IP assigned,
   or set `GRID_GATEWAY_ADDRESS` as an explicit override.  The self-discovery poller
   will propagate the address through SWIM once discovered.
@@ -991,7 +991,7 @@ separate steps.
 
 **Phase is Active, site became Unreachable**
 
-- The connection to `spec.egress.address` failed. When connectivity returns,
+- The connection to the egress address failed. When connectivity returns,
   the complete configured identity probe must pass before the site returns to
   Active.
 

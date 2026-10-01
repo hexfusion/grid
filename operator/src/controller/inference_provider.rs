@@ -59,7 +59,7 @@ use bytes::Bytes;
 use http_body_util::Empty;
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
 use kube::{
-    Client,
+    Client, Resource as _,
     api::{Api, ListParams, Patch, PatchParams},
     runtime::controller::Action,
 };
@@ -67,11 +67,12 @@ use tracing::info;
 
 use crate::{
     crd::{
+        condition::{self, Rejection},
         grid_network::GridNetwork,
         grid_site::GridSite,
         inference_provider::{
-            HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus, ModelDiscoveryConfig,
-            ProviderPhase,
+            HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus, MetricsConfig,
+            ModelDiscoveryConfig, ProviderPhase,
         },
     },
     error::OperatorError,
@@ -124,7 +125,19 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) ->
 
     info!(name, "reconciling InferenceProvider");
 
-    let (phase, matching_sites, reason) = resolve_phase_and_sites(&provider, &client).await?;
+    if let Some(rejection) = validate_provider_config(&provider) {
+        let previous = provider.status.as_ref().map_or(&[][..], |s| s.conditions.as_slice());
+        let object_ref = provider.object_ref(&());
+        Box::pin(super::publish_rejection(
+            &client,
+            "inference-provider-controller",
+            &object_ref,
+            previous,
+            &rejection,
+        ))
+        .await;
+    }
+    let (phase, matching_sites, reason) = Box::pin(resolve_phase_and_sites(&provider, &client)).await?;
     let generation = provider.metadata.generation.unwrap_or(0);
     update_status(&provider, &client, phase, matching_sites, generation, reason).await?;
 
@@ -155,16 +168,28 @@ pub fn error_policy(_provider: Arc<InferenceProvider>, error: &OperatorError, _c
 ///
 /// The `gridNetworkRef` existence check is not included here because it
 /// requires a Kubernetes API call.
-pub(crate) fn validate_provider_config(provider: &InferenceProvider) -> Option<&'static str> {
-    if provider.spec.endpoint.trim().is_empty() {
-        return Some("blank endpoint");
+pub(crate) fn validate_provider_config(provider: &InferenceProvider) -> Option<Rejection> {
+    let spec = &provider.spec;
+    if let Some(rejection) = super::endpoint_rejection("spec.endpoint", "EndpointInvalid", &spec.endpoint, true) {
+        return Some(rejection);
     }
-    for model in &provider.spec.models {
-        if model.name.trim().is_empty() {
-            return Some("blank model name");
-        }
+    if let Some(endpoint) = spec
+        .metrics_config
+        .as_ref()
+        .and_then(|mc| mc.metrics_endpoint.as_deref())
+        && let Some(rejection) = super::endpoint_rejection(
+            "spec.metricsConfig.metricsEndpoint",
+            "MetricsEndpointInvalid",
+            endpoint,
+            false,
+        )
+    {
+        return Some(rejection);
     }
-    None
+    spec.models
+        .iter()
+        .any(|model| model.name.trim().is_empty())
+        .then(|| Rejection::new("ModelNameInvalid", "spec.models[].name must not be blank"))
 }
 
 /// The outcome of a health probe against an [`InferenceProvider`] endpoint.
@@ -488,9 +513,13 @@ async fn resolve_phase_and_sites(
     let name = provider.metadata.name.as_deref().unwrap_or("?");
 
     // Static validation: config errors map immediately to Unavailable.
-    if let Some(config_error) = validate_provider_config(provider) {
-        tracing::warn!(name, reason = config_error, "InferenceProvider config invalid");
-        return Ok((ProviderPhase::Unavailable, Vec::new(), None));
+    if let Some(rejection) = validate_provider_config(provider) {
+        tracing::warn!(name, reason = rejection.reason, "InferenceProvider config invalid");
+        return Ok((
+            ProviderPhase::Unavailable,
+            Vec::new(),
+            Some(rejection.reason.to_owned()),
+        ));
     }
 
     // Credential plan validation: parse spec.auth without I/O.
@@ -646,10 +675,6 @@ pub(crate) fn sites_matching_selector(provider: &InferenceProvider, sites: &[Gri
     clippy::too_many_arguments,
     reason = "all parameters are distinct reconcile outputs; no logical grouping reduces them"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "constructing and comparing reconcile-owned status fields belongs with the patch"
-)]
 async fn update_status(
     provider: &InferenceProvider,
     client: &Client,
@@ -665,17 +690,7 @@ async fn update_status(
         .unwrap_or_else(|| std::process::abort());
 
     let api: Api<InferenceProvider> = Api::all(client.clone());
-    let model_discovery_url = provider.spec.model_discovery.as_ref().map(|source| match source {
-        ModelDiscoveryConfig::OpenAiModels(openai) => openai.effective_url(&provider.spec.endpoint),
-    });
-    let status = InferenceProviderStatus {
-        matching_sites,
-        model_discovery_error: None,
-        model_discovery_url,
-        observed_generation,
-        phase,
-        reason,
-    };
+    let status = desired_status(provider, phase, matching_sites, observed_generation, reason);
 
     if provider
         .status
@@ -698,6 +713,37 @@ async fn update_status(
     Ok(())
 }
 
+/// The status `update_status` writes, conditions included.
+fn desired_status(
+    provider: &InferenceProvider,
+    phase: ProviderPhase,
+    matching_sites: Vec<String>,
+    observed_generation: i64,
+    reason: Option<String>,
+) -> InferenceProviderStatus {
+    let metrics_config = provider.spec.metrics_config.as_ref();
+    let mut observed = condition::provider_conditions(&phase, reason.as_deref());
+    observed.extend(metrics_config.map(|mc| condition::metrics_signals_condition(mc.signal_names_issue())));
+    let conditions = condition::refresh(
+        provider.status.as_ref().map(|s| s.conditions.as_slice()),
+        observed,
+        observed_generation,
+    );
+    InferenceProviderStatus {
+        conditions,
+        matching_sites,
+        metrics_signals: metrics_config.map(MetricsConfig::effective_signal_names),
+        model_discovery_error: None,
+        model_discovery_url: provider.spec.model_discovery.as_ref().map(|source| match source {
+            ModelDiscoveryConfig::OpenAiModels(openai) => openai.effective_url(&provider.spec.endpoint),
+        }),
+        observed_generation,
+        phase,
+        reason,
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -711,12 +757,14 @@ mod tests {
     #[test]
     fn reconciler_status_matches_only_reconciler_fields() {
         let baseline = InferenceProviderStatus {
+            metrics_signals: None,
             matching_sites: vec!["site-a".to_owned()],
             model_discovery_error: None,
             model_discovery_url: None,
             observed_generation: 2,
             phase: ProviderPhase::Available,
             reason: None,
+            conditions: Vec::new(),
         };
         assert!(baseline.matches_reconciler_status(&baseline));
 
@@ -765,6 +813,81 @@ mod tests {
             "spec": { "gridNetworkRef": network }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn provider_with_metrics(metrics_config: serde_json::Value) -> InferenceProvider {
+        let mut provider = test_provider("p", "net", &["m"]);
+        provider.spec.metrics_config = Some(serde_json::from_value(metrics_config).unwrap());
+        provider
+    }
+
+    fn condition_of<'status>(
+        status: &'status InferenceProviderStatus,
+        type_: &str,
+    ) -> Option<&'status condition::Condition> {
+        condition::find(&status.conditions, type_)
+    }
+
+    #[test]
+    fn status_reflects_the_resolved_preset_names() {
+        let provider = provider_with_metrics(serde_json::json!({ "preset": "vllm", "queueCapacity": 64 }));
+        let status = desired_status(&provider, ProviderPhase::Available, Vec::new(), 3, None);
+        let names = status.metrics_signals.as_ref().unwrap();
+        assert_eq!(names.queue_depth.as_deref(), Some("vllm:num_requests_waiting"));
+        assert_eq!(names.kv_cache_utilization.as_deref(), Some("vllm:kv_cache_usage_perc"));
+        let signals = condition_of(&status, condition::METRICS_SIGNALS).unwrap();
+        assert_eq!(signals.status, condition::ConditionStatus::True);
+        assert_eq!(signals.observed_generation, 3);
+    }
+
+    #[test]
+    fn a_preset_without_queue_capacity_reports_missing_capacity() {
+        let provider = provider_with_metrics(serde_json::json!({ "preset": "llmdEpp" }));
+        let status = desired_status(&provider, ProviderPhase::Available, Vec::new(), 1, None);
+        let signals = condition_of(&status, condition::METRICS_SIGNALS).unwrap();
+        assert_eq!(signals.status, condition::ConditionStatus::False);
+        assert_eq!(signals.reason, "MissingQueueCapacity");
+        let names = status.metrics_signals.as_ref().unwrap();
+        assert!(names.queue_depth.is_none(), "the raw queue metric is not in effect");
+        assert_eq!(
+            names.kv_cache_utilization.as_deref(),
+            Some("llm_d_epp_average_kv_cache_utilization"),
+            "the rest of the scrape still runs"
+        );
+    }
+
+    #[test]
+    fn metrics_config_without_names_reports_no_signal_names() {
+        let provider = provider_with_metrics(serde_json::json!({}));
+        let status = desired_status(&provider, ProviderPhase::Available, Vec::new(), 1, None);
+        let signals = condition_of(&status, condition::METRICS_SIGNALS).unwrap();
+        assert_eq!(signals.reason, "NoSignalNames");
+    }
+
+    #[test]
+    fn a_provider_without_metrics_config_has_no_metrics_signals_condition() {
+        let provider = test_provider("p", "net", &["m"]);
+        let status = desired_status(&provider, ProviderPhase::Available, Vec::new(), 1, None);
+        assert!(condition_of(&status, condition::METRICS_SIGNALS).is_none());
+        assert!(status.metrics_signals.is_none());
+    }
+
+    #[test]
+    fn status_reflects_generation_phase_sites_and_reason() {
+        let provider = test_provider("p", "net", &["m"]);
+        let status = desired_status(
+            &provider,
+            ProviderPhase::Unavailable,
+            vec!["site-a".to_owned()],
+            7,
+            Some("UnsupportedAuthStrategy".to_owned()),
+        );
+        assert_eq!(status.observed_generation, 7);
+        assert_eq!(status.phase, ProviderPhase::Unavailable);
+        assert_eq!(status.matching_sites, ["site-a"]);
+        let accepted = condition_of(&status, condition::ACCEPTED).unwrap();
+        assert_eq!(accepted.reason, "UnsupportedAuthStrategy");
+        assert!(status.conditions.iter().all(|c| c.observed_generation == 7));
     }
 
     fn test_provider(name: &str, network: &str, models: &[&str]) -> InferenceProvider {
@@ -985,7 +1108,9 @@ mod tests {
         let err = validate_provider_config(&provider);
         assert!(err.is_some(), "blank endpoint must fail static validation");
         assert!(
-            err.unwrap_or_else(|| std::process::abort()).contains("endpoint"),
+            err.unwrap_or_else(|| std::process::abort())
+                .message
+                .contains("endpoint"),
             "error must mention endpoint"
         );
     }
@@ -1031,7 +1156,7 @@ mod tests {
         let err = validate_provider_config(&provider);
         assert!(err.is_some(), "blank model name must fail static validation");
         assert!(
-            err.unwrap_or_else(|| std::process::abort()).contains("model"),
+            err.unwrap_or_else(|| std::process::abort()).message.contains("model"),
             "error must mention model"
         );
     }

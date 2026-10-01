@@ -19,8 +19,8 @@ use k8s_openapi::{
     apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::{
-    Client,
-    api::{Api, ListParams, Patch, PatchParams},
+    Client, Resource as _,
+    api::{Api, ListParams, Patch, PatchParams, PostParams},
     runtime::{controller::Action, reflector::ObjectRef},
 };
 use tokio::{sync::Mutex, time::Duration};
@@ -28,9 +28,10 @@ use tracing::info;
 
 use crate::{
     crd::{
+        condition::{self, Rejection},
         grid_network::{
             ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus,
-            OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TlsMode,
+            OverlayPhase, OverlayRevisionStatus, SignalMode, SiteDiscoveryMode, TenantBudgetStatus, TlsMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -513,16 +514,8 @@ const TLS_REQUEUE_INTERVAL: Duration = Duration::from_secs(60);
 /// Field manager name for server-side apply.
 const FIELD_MANAGER: &str = "grid-operator";
 
-/// Label key that opts a `GridNetwork` into automatic `GridSite` discovery.
-///
-/// When this label is present with value `"true"`, the `GridNetwork` controller
-/// creates `GridSite` resources for remote Alive SWIM members automatically.
-/// Networks without this label are unaffected — their overlay generation uses
-/// the existing `routingClusterRef`-based (Phase 1) fallback.
-///
-/// This opt-in gate prevents auto-discovery from changing the overlay generation
-/// semantics for networks that were not designed with it in mind.
-pub const LABEL_AUTO_DISCOVER_SITES: &str = "grid.praxis-proxy.io/auto-discover-sites";
+/// Label the operator sets on each `GridSite` it creates.
+pub const LABEL_AUTO_DISCOVERED: &str = "grid.praxis-proxy.io/auto-discovered";
 
 // ---------------------------------------------------------------------------
 // Cross-resource watch mappers
@@ -580,22 +573,41 @@ fn grid_network_name(network: &GridNetwork) -> Result<&str, OperatorError> {
         .ok_or_else(|| OperatorError::InvalidResource("GridNetwork missing metadata.name".into()))
 }
 
-/// Reject a [`GridNetwork`] whose `budgetPolicy` fails validation, before any
-/// other reconcile work begins.
+/// The network-wide spec rule `network` breaks; checked before any reconcile work so a bad spec never runs.
 ///
-/// Pure and I/O-free (network fields only), so the reconcile-time wiring this
-/// guards is exercised directly by unit tests without a live or mocked
-/// Kubernetes client, per this repo's convention of preferring pure decision
-/// functions for reconciliation logic (`docs/conventions.md`). The CRD
-/// schema's numeric minimum on `capUsd` already rejects negative values at
-/// admission time; this is the defensive second layer for `NaN`/infinite
-/// caps and blank/duplicate `tenantId`s that the schema cannot express.
-fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorError> {
-    let Some(policy) = network.spec.budget_policy.as_ref() else {
-        return Ok(());
-    };
+/// Per-gateway endpoint transport problems fail only that gateway's consumer config.
+pub(crate) fn network_spec_rejection(network: &GridNetwork) -> Option<Rejection> {
+    let policy = network.spec.budget_policy.as_ref()?;
     crate::crd::grid_network::validate_budget_policy(policy)
-        .map_err(|error| OperatorError::InvalidResource(format!("invalid budgetPolicy: {error}")))
+        .err()
+        .map(|error| Rejection::new("BudgetPolicyInvalid", format!("budgetPolicy: {error}")))
+}
+
+/// Report `rejection` in status and as an event, then wait for a spec change instead of reconciling.
+#[expect(clippy::large_stack_frames, reason = "async future over Kubernetes API types")]
+async fn reject_network(
+    network: &GridNetwork,
+    client: &Client,
+    rejection: &Rejection,
+) -> Result<Action, OperatorError> {
+    let name = grid_network_name(network)?;
+    let previous = network.status.as_ref().map_or(&[][..], |s| s.conditions.as_slice());
+    let phase = network.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
+    let generation = network.metadata.generation.unwrap_or(0);
+    let conditions = condition::refresh(
+        Some(previous),
+        condition::network_conditions(&phase, Some(rejection), &[]),
+        generation,
+    );
+    let object_ref = network.object_ref(&());
+    super::publish_rejection(client, "grid-network-controller", &object_ref, previous, rejection).await;
+    if previous != conditions.as_slice() {
+        let patch = serde_json::json!({ "status": { "conditions": conditions, "observedGeneration": generation } });
+        Api::<GridNetwork>::all(client.clone())
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+    }
+    Ok(Action::requeue(REQUEUE_INTERVAL))
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +631,9 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
 )]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = grid_network_name(&network)?;
-    reject_invalid_budget_policy(&network)?;
+    if let Some(rejection) = network_spec_rejection(&network) {
+        return Box::pin(reject_network(&network, &ctx.client, &rejection)).await;
+    }
 
     info!(name, "reconciling GridNetwork");
 
@@ -667,7 +681,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         announce_crd_seeds(&network, swim, &ctx.last_seeds).await;
 
         // Broadcast the local site's public certificate PEM so remote peers can
-        // populate GridSite.status.publicCertPem.  Only the public cert is read —
+        // populate GridSite.status.discovered.advertisedCertPem.  Only the public cert is read —
         // the private key (tls.key) is never accessed by this code path.
         if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await
         {
@@ -755,14 +769,12 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
                     .spec
                     .metrics_config
                     .as_ref()
-                    .and_then(|config| config.signal_names.queue_depth.as_ref())
-                    .is_some(),
+                    .is_some_and(|config| config.effective_signal_names().queue_depth.is_some()),
                 crate::crd::grid_network::ScoringStrategy::KvCachePressure => provider
                     .spec
                     .metrics_config
                     .as_ref()
-                    .and_then(|config| config.signal_names.kv_cache_utilization.as_ref())
-                    .is_some(),
+                    .is_some_and(|config| config.effective_signal_names().kv_cache_utilization.is_some()),
                 crate::crd::grid_network::ScoringStrategy::NoMetrics => false,
             };
             let observation = if signal_configured {
@@ -857,6 +869,20 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let budget_statuses =
         crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
 
+    // Gossip fills declared GridSite status; auto mode also creates missing ones.
+    let mut discovery_conflicts = Vec::new();
+    if let (Some(swim), Some(snapshot)) = (ctx.swim(), membership.as_ref()) {
+        reconcile_local_site(name, swim.site_name(), client).await?;
+        discovery_conflicts = Box::pin(reconcile_discovered_sites(
+            name,
+            swim.site_name(),
+            snapshot,
+            client,
+            network.spec.site_discovery.mode,
+        ))
+        .await?;
+    }
+
     update_status(
         &network,
         client,
@@ -867,24 +893,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         consumer_config_statuses,
         overlay_statuses,
         budget_statuses,
+        &discovery_conflicts,
     )
     .await?;
-
-    // Auto-create or update GridSite records for remote Alive SWIM members.
-    // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
-    // This gate prevents auto-discovery from changing overlay generation semantics
-    // for networks that use the existing routingClusterRef-based (Phase 1) path.
-    let auto_discover_enabled = network
-        .metadata
-        .labels
-        .as_ref()
-        .and_then(|l| l.get(LABEL_AUTO_DISCOVER_SITES))
-        .is_some_and(|v| v == "true");
-    if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim(), membership.as_ref()) {
-        let plaintext = network_uses_plaintext_egress(&network);
-        reconcile_local_site(name, swim.site_name(), client).await?;
-        reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
-    }
 
     // A deferred serving write lands as soon as its spacing allows.
     Ok(Action::requeue(
@@ -1777,7 +1788,21 @@ fn retained_overlay_status(
 async fn list_all_inference_providers(client: &Client) -> Result<Vec<InferenceProvider>, OperatorError> {
     let api: Api<InferenceProvider> = Api::all(client.clone());
     let list = api.list(&ListParams::default()).await?;
-    Ok(list.items)
+    Ok(list.items.into_iter().filter(provider_accepted).collect())
+}
+
+/// Whether the provider controller accepted this spec at its current generation.
+///
+/// A provider with no verdict yet, or a verdict on an older generation, is left out of routing and scrapes.
+fn provider_accepted(provider: &InferenceProvider) -> bool {
+    let generation = provider.metadata.generation.unwrap_or(0);
+    provider
+        .status
+        .as_ref()
+        .and_then(|status| condition::find(&status.conditions, condition::ACCEPTED))
+        .is_some_and(|accepted| {
+            accepted.status == condition::ConditionStatus::True && accepted.observed_generation == generation
+        })
 }
 
 /// List all [`GridSite`] resources cluster-wide.
@@ -2468,6 +2493,7 @@ pub(crate) fn apply_swim_staleness_override(
 /// [`Alive`]: MemberStatus::Alive
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "all arguments are distinct status fields; a wrapper struct would obscure the data flow"
 )]
 async fn update_status(
@@ -2480,17 +2506,25 @@ async fn update_status(
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
+    discovery_conflicts: &[String],
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
     let connected_sites = membership.map_or(0, MembershipSnapshot::connected_count);
 
     let api: Api<GridNetwork> = Api::all(client.clone());
+    let observed_generation = network.metadata.generation.unwrap_or(0);
+    let conditions = condition::refresh(
+        network.status.as_ref().map(|s| s.conditions.as_slice()),
+        condition::network_conditions(phase, None, discovery_conflicts),
+        observed_generation,
+    );
     let status = GridNetworkStatus {
+        conditions,
         connected_sites,
         distributed_provider_count,
         grid_id: grid_id.to_owned(),
-        observed_generation: network.metadata.generation.unwrap_or(0),
+        observed_generation,
         phase: phase.clone(),
         consumer_config_status: consumer_config_statuses,
         overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
@@ -2639,7 +2673,7 @@ fn network_site_name(network: &GridNetwork) -> String {
 /// routing-eligible.
 ///
 /// A remote provider is eligible when a `GridSite` with:
-/// - resource name matching `discovered_site_k8s_name(provider.network_id, provider.site_id)`
+/// - resource name equal to `provider.site_id`
 /// - `spec.gridNetworkRef == network_name`
 /// - `status.phase == Active`
 ///
@@ -2679,9 +2713,8 @@ pub(crate) fn is_crdt_provider_routing_eligible(
     if provider.network_id != network_name {
         return false;
     }
-    let expected_name = discovered_site_k8s_name(&provider.network_id, &provider.site_id);
     sites.iter().any(|s| {
-        s.metadata.name.as_deref() == Some(expected_name.as_str())
+        s.metadata.name.as_deref() == Some(provider.site_id.as_str())
             && s.spec.grid_network_ref == network_name
             && s.status.as_ref().is_some_and(|st| st.phase == GridSitePhase::Active)
     })
@@ -2736,9 +2769,9 @@ pub(crate) fn discovered_sites_from_swim(
         .members
         .iter()
         .filter(|m| m.status == MemberStatus::Alive && m.site_id != local_site)
-        .filter(|m| !m.site_id.trim().is_empty())
+        .filter(|m| is_dns1123_label(&m.site_id))
         .map(|m| DiscoveredSite {
-            name: discovered_site_k8s_name(network_name, &m.site_id),
+            name: m.site_id.clone(),
             grid_network_ref: network_name.to_owned(),
             egress_address: m.gateway_address.clone().unwrap_or_default(),
             site_cert_pem: m.site_cert_pem.clone(),
@@ -2746,40 +2779,16 @@ pub(crate) fn discovered_sites_from_swim(
         .collect()
 }
 
-/// Derive a Kubernetes resource name for an auto-discovered `GridSite`.
+/// Whether a SWIM site ID is already a DNS-1123 label, the only IDs discovery names a `GridSite` after.
 ///
-/// The name is `"{network}-{site_id}"` (both sanitised).  Using the composite
-/// `(network, site_id)` key avoids name collisions when the same SWIM peer
-/// appears as a member across multiple `GridNetwork` objects.  Each
-/// `(network, site)` pair gets its own distinct `GridSite` resource.
-///
-/// Rules: lowercase, non-alphanumeric characters replaced with `-`,
-/// leading/trailing hyphens stripped, truncated at 253 characters.
-pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> String {
-    let sanitise = |s: &str| -> String {
-        let raw: String = s
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        raw.trim_matches('-').to_owned()
-    };
-
-    let net = sanitise(network_name);
-    let site = sanitise(site_id);
-
-    let candidate = match (net.is_empty(), site.is_empty()) {
-        (false, false) => format!("{net}-{site}"),
-        (false, true) => net,
-        (true, false) => site,
-        (true, true) => "discovered-site".to_owned(),
-    };
-    candidate.chars().take(253).collect()
+/// Refusing rather than normalising keeps distinct IDs such as `HUB` and `hub` from landing on one object.
+pub(crate) fn is_dns1123_label(site_id: &str) -> bool {
+    (1..=63).contains(&site_id.len())
+        && site_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !site_id.starts_with('-')
+        && !site_id.ends_with('-')
 }
 
 /// Whether auto-discovered remote `GridSite` egress should use plaintext.
@@ -2793,7 +2802,7 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
 /// When no explicit plaintext endpoint exists, fall back to the top-level grid
 /// TLS references: a network with no CA or site certificate refs is treated as
 /// plaintext, while a network with either TLS ref keeps mutual TLS.
-fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
+pub(crate) fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
     let has_plaintext_endpoint = network.spec.gateway_refs.iter().any(|gw| {
         gw.consumer_config.as_ref().is_some_and(|cc| {
             cc.cluster_endpoints.iter().any(|ep| {
@@ -2859,7 +2868,7 @@ fn decide_cert_pem_write(
 ) -> CertPemWrite {
     match check {
         CertPemStatus::ValidStructure => {
-            if existing_status.and_then(|s| s.public_cert_pem.as_deref()) == Some(cert_pem) {
+            if advertised_cert_pem(existing_status) == Some(cert_pem) {
                 CertPemWrite::NoOp
             } else {
                 CertPemWrite::StoreValid
@@ -2890,12 +2899,19 @@ fn decide_reject_invalid(
     }
 }
 
+/// The advertised certificate already recorded in `status.discovered`.
+fn advertised_cert_pem(status: Option<&GridSiteStatus>) -> Option<&str> {
+    status
+        .and_then(|s| s.discovered.as_ref())
+        .and_then(|d| d.advertised_cert_pem.as_deref())
+}
+
 /// True when `existing` already records the given invalid-cert `message` with
-/// no stored `publicCertPem`, meaning a re-patch with the same content would
+/// no stored `advertisedCertPem`, meaning a re-patch with the same content would
 /// be a redundant write.
 fn already_recorded_invalid(existing: Option<&GridSiteStatus>, message: &str) -> bool {
     existing.is_some_and(|s| {
-        s.public_cert_pem.is_none() && s.reason == REASON_TRUST_MATERIAL_INVALID && s.message == message
+        advertised_cert_pem(Some(s)).is_none() && s.reason == REASON_TRUST_MATERIAL_INVALID && s.message == message
     })
 }
 
@@ -2925,10 +2941,10 @@ async fn reconcile_site_cert_pem(
             tracing::debug!(name = %site_name, "cert PEM status already up to date; skipping no-op status patch");
         },
         CertPemWrite::StoreValid => {
-            // Use strategic merge patch (not SSA) so only publicCertPem is
+            // Use strategic merge patch (not SSA) so only advertisedCertPem is
             // updated; SSA with a partial payload would clear other status
             // fields managed by "grid-operator" (e.g., reason, message).
-            let cert_merge = serde_json::json!({ "status": { "publicCertPem": cert_pem } });
+            let cert_merge = serde_json::json!({ "status": { "discovered": { "advertisedCertPem": cert_pem } } });
             api.patch_status(site_name, &PatchParams::default(), &Patch::Merge(&cert_merge))
                 .await?;
             tracing::info!(
@@ -2946,7 +2962,7 @@ async fn reconcile_site_cert_pem(
                 "apiVersion": "grid.praxis-proxy.io/v1beta1",
                 "kind": "GridSite",
                 "status": {
-                    "publicCertPem": null,
+                    "discovered": { "advertisedCertPem": null },
                     "reason": REASON_TRUST_MATERIAL_INVALID,
                     "message": message
                 }
@@ -2967,142 +2983,185 @@ async fn reconcile_site_cert_pem(
     Ok(())
 }
 
-/// Create or update `GridSite` resources for remote Alive SWIM members.
+/// What discovery does with a SWIM member's `GridSite` name.
+#[derive(Debug, Eq, PartialEq)]
+enum Adoption {
+    /// A `GridSite` of this network exists; fill its status.
+    Adopt,
+    /// None exists and the mode is auto; create one.
+    Create,
+    /// None exists and the mode is manual; leave it.
+    Skip,
+    /// The name belongs to another network's `GridSite`; leave that object untouched.
+    Conflict(String),
+}
+
+/// Decide how discovery treats `name` given the object already holding it, if any.
+fn adoption(network_name: &str, mode: SiteDiscoveryMode, name: &str, existing: Option<&GridSite>) -> Adoption {
+    match existing {
+        Some(site) if site.spec.grid_network_ref == network_name => Adoption::Adopt,
+        Some(site) => Adoption::Conflict(format!(
+            "SWIM member {name} not adopted: GridSite {name} belongs to network {}",
+            site.spec.grid_network_ref
+        )),
+        None if mode == SiteDiscoveryMode::Auto => Adoption::Create,
+        None => Adoption::Skip,
+    }
+}
+
+/// Most `GridSite` objects auto discovery creates for one network, bounding what a gossiping peer can mint.
+const MAX_AUTO_CREATED_SITES: usize = 256;
+
+/// Auto-created `GridSite` objects that already belong to `network_name`.
+async fn count_auto_created_sites(api: &Api<GridSite>, network_name: &str) -> Result<usize, OperatorError> {
+    let params = ListParams::default().labels(&format!("{LABEL_AUTO_DISCOVERED}=true"));
+    let sites = api.list(&params).await?;
+    Ok(sites
+        .items
+        .iter()
+        .filter(|site| site.spec.grid_network_ref == network_name)
+        .count())
+}
+
+/// The `GridSite` the operator creates for an undeclared member: network ref and label only.
+fn auto_created_site(name: &str, network_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1beta1",
+        "kind": "GridSite",
+        "metadata": {
+            "name": name,
+            "labels": {
+                "grid.praxis-proxy.io/network": network_name,
+                LABEL_AUTO_DISCOVERED: "true"
+            }
+        },
+        "spec": { "gridNetworkRef": network_name }
+    })
+}
+
+/// Merge patch recording the gossiped egress address, clearing it once withdrawn; `None` when status agrees.
+fn discovered_egress_patch(existing: Option<&GridSiteStatus>, address: &str) -> Option<serde_json::Value> {
+    let current = existing
+        .and_then(|s| s.discovered.as_ref())
+        .and_then(|d| d.egress_address.as_deref());
+    let advertised = Some(address).filter(|addr| !addr.trim().is_empty());
+    (current != advertised).then(|| serde_json::json!({ "status": { "discovered": { "egressAddress": advertised } } }))
+}
+
+/// Fill `status.discovered` on each remote Alive member's `GridSite`, creating it first in auto mode.
 ///
-/// Uses server-side apply, so the call is idempotent: applying an already-existing
-/// `GridSite` with the same spec is a no-op.  After the spec is applied, the
-/// `status.phase` is set to `Discovered` **only if the current phase is `Pending`**,
-/// preventing this controller from regressing a site that the `GridSite` controller
-/// has already advanced to `Connecting` or beyond.
-///
-/// Phase ownership:
-/// - Pending → Discovered: this function (`GridNetwork` controller), based on SWIM Alive
-/// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
-/// - Connecting → Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
-///   but remain in Connecting.
+/// Never writes an existing object's spec; returns one message per member whose name another network holds.
+/// Phase ownership: Pending to Discovered here, everything after in the `GridSite` controller.
 #[expect(
-    clippy::too_many_lines,
-    reason = "sequential spec-apply + conditional status-patch per discovered site"
-)]
-#[expect(
+    clippy::cognitive_complexity,
     clippy::large_stack_frames,
-    reason = "async future over Kubernetes API types with serde_json values"
+    clippy::too_many_lines,
+    reason = "flat per-member loop; tracing macros and API futures inflate the scores"
 )]
 async fn reconcile_discovered_sites(
     network_name: &str,
     local_site: &str,
     snapshot: &MembershipSnapshot,
     client: &Client,
-    plaintext: bool,
-) -> Result<(), OperatorError> {
-    let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
-    if sites.is_empty() {
-        return Ok(());
-    }
-
+    mode: SiteDiscoveryMode,
+) -> Result<Vec<String>, OperatorError> {
     let api: Api<GridSite> = Api::all(client.clone());
+    let mut conflicts = Vec::new();
+    let mut auto_created = if mode == SiteDiscoveryMode::Auto {
+        count_auto_created_sites(&api, network_name).await?
+    } else {
+        0
+    };
 
-    for site in &sites {
-        // Server-side apply the spec.  Creating on first call; updating on subsequent
-        // calls is a no-op when the spec has not changed.
-        let mut spec_obj = serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1beta1",
-            "kind": "GridSite",
-            "metadata": {
-                "name": site.name,
-                "labels": {
-                    "grid.praxis-proxy.io/network": network_name,
-                    "grid.praxis-proxy.io/auto-discovered": "true"
-                }
+    for site in discovered_sites_from_swim(network_name, local_site, snapshot) {
+        let found = api.get_opt(&site.name).await?;
+        let existing = match adoption(network_name, mode, &site.name, found.as_ref()) {
+            Adoption::Adopt => found,
+            Adoption::Create if auto_created >= MAX_AUTO_CREATED_SITES => {
+                tracing::warn!(name = %site.name, network = %network_name, "auto-created GridSite limit reached; declare the site");
+                continue;
             },
-            "spec": {
-                "gridNetworkRef": site.grid_network_ref,
-            }
-        });
-        if !site.egress_address.is_empty() {
-            let tls_mode = if plaintext {
-                TlsMode::Plaintext
-            } else {
-                TlsMode::MutualTls
-            };
-            spec_obj.get_mut("spec").and_then(|s| {
-                s.as_object_mut().map(|o| {
-                    o.insert(
-                        "egress".to_owned(),
-                        serde_json::json!({
-                            "address": site.egress_address,
-                            "tls": { "mode": tls_mode }
-                        }),
-                    );
-                })
-            });
-        }
-        let spec_doc = spec_obj;
-
-        api.patch(
-            &site.name,
-            &PatchParams::apply(FIELD_MANAGER).force(),
-            &Patch::Apply(&spec_doc),
-        )
-        .await?;
-
-        // Fetch current status once and reuse it below for every write in this
-        // iteration. Every status patch bumps the GridSite's resourceVersion,
-        // which fires a watch event that re-triggers a GridNetwork reconcile
-        // (related object updated) — re-entering this same loop. Writing
-        // unconditionally therefore turns a stable, unchanged site into an
-        // infinite reconcile hot-loop; checking against current state first
-        // makes each write idempotent in practice, not just in intent (see
-        // grid#42).
-        let existing_status = api.get(&site.name).await.ok().and_then(|s| s.status);
-
-        // Only write Discovered when the current phase is Pending.
-        // If the GridSite controller has already advanced the phase (e.g. to
-        // Connecting), we must not regress it.
-        let should_write_discovered = matches!(
-            existing_status.as_ref().map(|s| &s.phase),
-            None | Some(GridSitePhase::Pending)
-        );
-
-        if should_write_discovered {
-            let status_doc = serde_json::json!({
-                "apiVersion": "grid.praxis-proxy.io/v1beta1",
-                "kind": "GridSite",
-                "status": {
-                    "phase": "Discovered",
-                    "reason": "SWIMDiscovered",
-                    "message": "site observed as Alive SWIM member"
-                }
-            });
-
-            api.patch_status(
-                &site.name,
-                &PatchParams::apply(FIELD_MANAGER).force(),
-                &Patch::Apply(&status_doc),
-            )
-            .await?;
-        }
-
-        // Write received public cert PEM to status after structure validation.
-        // Private key material must never be written to status; invalid PEM is
-        // also rejected and recorded as TrustMaterialInvalid. Skips any patch
-        // that would be a no-op given `existing_status` — otherwise every
-        // reconcile re-issues an unconditional write, which (per the comment
-        // above `existing_status`) becomes an infinite reconcile hot-loop even
-        // when the remote site's cert hasn't changed (grid#42).
-        if let Some(cert_pem) = &site.site_cert_pem {
-            reconcile_site_cert_pem(&api, &site.name, existing_status.as_ref(), cert_pem).await?;
-        }
-
+            Adoption::Create => {
+                auto_created += 1;
+                create_discovered_site(&api, &site.name, network_name).await?
+            },
+            Adoption::Skip => {
+                tracing::debug!(name = %site.name, network = %network_name, "no declared GridSite for SWIM member");
+                continue;
+            },
+            Adoption::Conflict(message) => {
+                tracing::warn!(network = %network_name, %message, "discovered site name conflict");
+                conflicts.push(message);
+                continue;
+            },
+        };
+        let Some(existing) = existing else { continue };
+        record_discovery(&api, &site, existing.status.as_ref()).await?;
         tracing::info!(
             name = %site.name,
             network = %network_name,
             egress = %site.egress_address,
             cert = site.site_cert_pem.is_some(),
-            "reconciled auto-discovered GridSite from SWIM Alive member"
+            "reconciled discovered GridSite from SWIM Alive member"
         );
     }
 
+    Ok(conflicts)
+}
+
+/// Create the operator-owned `GridSite` for `name`, or `None` when a concurrent writer created it first.
+async fn create_discovered_site(
+    api: &Api<GridSite>,
+    name: &str,
+    network_name: &str,
+) -> Result<Option<GridSite>, OperatorError> {
+    let doc: GridSite = serde_json::from_value(auto_created_site(name, network_name))?;
+    match api.create(&PostParams::default(), &doc).await {
+        Ok(created) => Ok(Some(created)),
+        // The next reconcile adopts it or reports the conflict.
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write gossip-derived state to one adopted `GridSite`, skipping writes `existing` already reflects (grid#42).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async future over Kubernetes API types with serde_json values"
+)]
+async fn record_discovery(
+    api: &Api<GridSite>,
+    site: &DiscoveredSite,
+    existing: Option<&GridSiteStatus>,
+) -> Result<(), OperatorError> {
+    if let Some(patch) = discovered_egress_patch(existing, &site.egress_address) {
+        api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+    }
+
+    // Never regress a site the GridSite controller already advanced.
+    if matches!(existing.map(|s| &s.phase), None | Some(GridSitePhase::Pending)) {
+        let status_doc = serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "kind": "GridSite",
+            "status": {
+                "phase": "Discovered",
+                "reason": "SWIMDiscovered",
+                "message": "site observed as Alive SWIM member"
+            }
+        });
+        api.patch_status(
+            &site.name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&status_doc),
+        )
+        .await?;
+    }
+
+    // Private keys and malformed PEM are rejected as TrustMaterialInvalid, never stored.
+    if let Some(cert_pem) = &site.site_cert_pem {
+        reconcile_site_cert_pem(api, &site.name, existing, cert_pem).await?;
+    }
     Ok(())
 }
 
@@ -3116,7 +3175,7 @@ async fn reconcile_discovered_sites(
 /// An explicit `spec.metricsRefreshInterval` is used when valid. TLS
 /// networks are capped at [`TLS_REQUEUE_INTERVAL`] so certificate rotation is
 /// not delayed by an unsafe long custom interval. An absent value uses the
-/// appropriate safe default; an invalid value fails reconciliation.
+/// appropriate safe default; an invalid value logs a warning and uses the default.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 fn requeue_interval_for_network(
@@ -3133,12 +3192,15 @@ fn requeue_interval_for_network(
     } else {
         REQUEUE_INTERVAL
     };
-    let configured = network
-        .spec
-        .metrics_refresh_interval
-        .as_deref()
-        .map(parse_metrics_refresh_interval)
-        .transpose()?;
+    let configured = network.spec.metrics_refresh_interval.as_deref().and_then(|value| {
+        match parse_metrics_refresh_interval(value) {
+            Ok(interval) => Some(interval),
+            Err(error) => {
+                tracing::warn!(network = network_name, %error, "ignoring invalid metricsRefreshInterval");
+                None
+            },
+        }
+    });
 
     Ok(match (configured, any_has_tls) {
         (Some(interval), true) => interval.min(TLS_REQUEUE_INTERVAL),
@@ -3434,65 +3496,132 @@ mod tests {
     }
 
     #[test]
-    fn reject_invalid_budget_policy_accepts_absent_policy() {
+    fn network_spec_rejection_budget_accepts_absent_policy() {
         let network = base_network();
         assert!(
-            reject_invalid_budget_policy(&network).is_ok(),
+            network_spec_rejection(&network).is_none(),
             "a GridNetwork with no budgetPolicy at all must not be rejected"
         );
     }
 
     #[test]
-    fn reject_invalid_budget_policy_accepts_valid_policy() {
+    fn network_spec_rejection_budget_accepts_valid_policy() {
         let network = network_with_budget_policy(vec![tenant("tenant-a", 100.0), tenant("tenant-b", 250.0)]);
         assert!(
-            reject_invalid_budget_policy(&network).is_ok(),
+            network_spec_rejection(&network).is_none(),
             "distinct positive caps and non-empty tenant ids must be accepted"
         );
     }
 
     #[test]
-    fn reject_invalid_budget_policy_rejects_blank_tenant_id() {
+    fn network_spec_rejection_budget_rejects_blank_tenant_id() {
         let network = network_with_budget_policy(vec![tenant("", 100.0)]);
-        let Err(error) = reject_invalid_budget_policy(&network) else {
+        let Some(error) = network_spec_rejection(&network).map(|r| r.message) else {
             std::process::abort()
         };
         assert!(
-            error.to_string().contains("budgetPolicy"),
+            error.contains("budgetPolicy"),
             "error must identify the budgetPolicy as the invalid field, got: {error}"
         );
     }
 
     #[test]
-    fn reject_invalid_budget_policy_rejects_duplicate_tenant_id() {
+    fn network_spec_rejection_budget_rejects_duplicate_tenant_id() {
         let network = network_with_budget_policy(vec![tenant("tenant-a", 100.0), tenant("tenant-a", 200.0)]);
-        let Err(error) = reject_invalid_budget_policy(&network) else {
+        let Some(error) = network_spec_rejection(&network).map(|r| r.message) else {
             std::process::abort()
         };
         assert!(
-            error.to_string().contains("tenant-a"),
+            error.contains("tenant-a"),
             "error must name the offending tenant_id, got: {error}"
         );
     }
 
     #[test]
-    fn reject_invalid_budget_policy_rejects_negative_cap() {
+    fn network_spec_rejection_budget_rejects_negative_cap() {
         let network = network_with_budget_policy(vec![tenant("tenant-a", -5.0)]);
         assert!(
-            reject_invalid_budget_policy(&network).is_err(),
+            network_spec_rejection(&network).is_some(),
             "negative capUsd must be rejected even though the CRD schema minimum should already catch this before reconcile"
         );
     }
 
     #[test]
-    fn reject_invalid_budget_policy_rejects_non_finite_cap() {
+    fn network_spec_rejection_budget_rejects_non_finite_cap() {
         for bad_cap in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let network = network_with_budget_policy(vec![tenant("tenant-a", bad_cap)]);
             assert!(
-                reject_invalid_budget_policy(&network).is_err(),
+                network_spec_rejection(&network).is_some(),
                 "non-finite capUsd ({bad_cap}) must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn network_spec_rejection_names_the_budget_reason() {
+        let network = network_with_budget_policy(vec![tenant("", 1.0)]);
+        assert_eq!(
+            network_spec_rejection(&network).map(|r| r.reason),
+            Some("BudgetPolicyInvalid")
+        );
+    }
+
+    #[test]
+    fn network_spec_rejection_leaves_interval_and_endpoint_problems_to_their_scope() {
+        let mut network = network_with_endpoint_transport("mutualTls", None);
+        network.spec.metrics_refresh_interval = Some("5m".to_owned());
+        assert!(
+            network_spec_rejection(&network).is_none(),
+            "a bad interval or one gateway's endpoint must not reject the whole network"
+        );
+        for gateway in &mut network.spec.gateway_refs {
+            for endpoint in gateway
+                .consumer_config
+                .iter_mut()
+                .flat_map(|c| c.cluster_endpoints.iter_mut())
+            {
+                endpoint.transport = None;
+            }
+        }
+        assert!(network_spec_rejection(&network).is_none());
+    }
+
+    #[test]
+    fn an_invalid_refresh_interval_falls_back_to_the_default() {
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("5m".to_owned());
+        assert_eq!(requeue_interval_for_network(&network, &[]).ok(), Some(REQUEUE_INTERVAL));
+    }
+
+    #[test]
+    fn only_accepted_providers_reach_routing() {
+        let mut provider = make_inference_provider("p", "net");
+        provider.metadata.generation = Some(2);
+        provider.status = None;
+        assert!(!provider_accepted(&provider), "no verdict yet");
+        let verdict = |holds: bool, generation: i64| crate::crd::inference_provider::InferenceProviderStatus {
+            conditions: condition::reconcile_conditions(
+                &[],
+                vec![condition::Observed::new(condition::ACCEPTED, holds.into(), "R")],
+                generation,
+                "t",
+            ),
+            ..Default::default()
+        };
+        provider.status = Some(verdict(true, 2));
+        assert!(provider_accepted(&provider));
+        provider.status = Some(verdict(false, 2));
+        assert!(!provider_accepted(&provider));
+        provider.status = Some(verdict(true, 1));
+        assert!(
+            !provider_accepted(&provider),
+            "an Accepted verdict on an older spec admits nothing"
+        );
+    }
+
+    #[test]
+    fn a_valid_network_spec_is_accepted() {
+        assert!(network_spec_rejection(&base_network()).is_none());
     }
 
     fn alive_snapshot(count: usize) -> MembershipSnapshot {
@@ -4245,6 +4374,7 @@ mod tests {
     #[test]
     fn grid_network_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = GridNetworkStatus {
+            conditions: Vec::new(),
             connected_sites: 2,
             distributed_provider_count: 2,
             grid_id: "grid-id".to_owned(),
@@ -4334,10 +4464,7 @@ mod tests {
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert_eq!(sites.len(), 1, "exactly one remote Alive member");
         let site = sites.first().unwrap_or_else(|| std::process::abort());
-        assert_eq!(
-            site.name, "net-remote",
-            "site name must be composite network-site to avoid collisions across networks"
-        );
+        assert_eq!(site.name, "remote", "site name is the bare SWIM site name");
         assert_eq!(
             site.grid_network_ref, "net",
             "grid_network_ref must match the network name"
@@ -4496,46 +4623,123 @@ mod tests {
     }
 
     #[test]
-    fn discovered_site_k8s_name_lowercases_and_sanitises_underscores() {
-        assert_eq!(discovered_site_k8s_name("net", "Site_West"), "net-site-west");
-        assert_eq!(discovered_site_k8s_name("net", "SITE.EAST"), "net-site-east");
+    fn only_dns1123_label_site_ids_name_a_grid_site() {
+        for valid in ["site-west", "a", "east2", &"s".repeat(63)] {
+            assert!(is_dns1123_label(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "HUB",
+            "Site_West",
+            "site.east",
+            "-west",
+            "west-",
+            &"s".repeat(64),
+            "we st",
+        ] {
+            assert!(!is_dns1123_label(invalid), "{invalid}");
+        }
     }
 
     #[test]
-    fn discovered_site_k8s_name_strips_leading_trailing_hyphens() {
-        assert_eq!(discovered_site_k8s_name("net", "--valid--"), "net-valid");
+    fn discovery_skips_members_whose_id_is_not_a_label() {
+        let mut snap = alive_snapshot(3);
+        for (member, id) in snap.members.iter_mut().zip(["hub", "HUB", "Site_West"]) {
+            id.clone_into(&mut member.site_id);
+        }
+        let names: Vec<String> = discovered_sites_from_swim("net", "local", &snap)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["hub"], "HUB must not land on GridSite hub");
+    }
+
+    fn declared_site(name: &str, network: &str, status: Option<GridSiteStatus>) -> GridSite {
+        let mut site: GridSite = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1beta1",
+            "kind": "GridSite",
+            "metadata": { "name": name },
+            "spec": { "gridNetworkRef": network }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        site.status = status;
+        site
     }
 
     #[test]
-    fn discovered_site_k8s_name_both_empty_yields_fallback() {
+    fn discovery_adopts_a_declared_site_of_the_same_network_in_either_mode() {
+        let site = declared_site("west", "net", None);
+        for mode in [SiteDiscoveryMode::Manual, SiteDiscoveryMode::Auto] {
+            assert_eq!(adoption("net", mode, "west", Some(&site)), Adoption::Adopt);
+        }
+    }
+
+    #[test]
+    fn discovery_creates_a_site_only_when_absent_in_auto_mode() {
+        assert_eq!(adoption("net", SiteDiscoveryMode::Auto, "west", None), Adoption::Create);
+        assert_eq!(adoption("net", SiteDiscoveryMode::Manual, "west", None), Adoption::Skip);
+    }
+
+    #[test]
+    fn a_name_held_by_another_network_is_a_conflict_never_an_overwrite() {
+        let other = declared_site("west", "other", None);
+        for mode in [SiteDiscoveryMode::Manual, SiteDiscoveryMode::Auto] {
+            let Adoption::Conflict(message) = adoption("net", mode, "west", Some(&other)) else {
+                std::process::abort()
+            };
+            assert!(message.contains("network other"), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_auto_created_site_carries_only_the_network_ref_and_label() {
+        let doc = auto_created_site("west", "net");
         assert_eq!(
-            discovered_site_k8s_name("", ""),
-            "discovered-site",
-            "both empty must produce the safe fallback name"
+            doc.pointer("/metadata/labels/grid.praxis-proxy.io~1auto-discovered"),
+            Some(&serde_json::json!("true"))
         );
         assert_eq!(
-            discovered_site_k8s_name("---", "---"),
-            "discovered-site",
-            "all-hyphen input must produce the safe fallback name"
+            doc.pointer("/spec"),
+            Some(&serde_json::json!({ "gridNetworkRef": "net" }))
         );
+        let site: GridSite = serde_json::from_value(doc).unwrap_or_else(|_| std::process::abort());
+        assert!(site.spec.egress.is_none(), "learned egress belongs in status");
     }
 
     #[test]
-    fn discovered_site_k8s_name_truncates_at_253_chars() {
-        let long_net = "n".repeat(150);
-        let long_site = "s".repeat(150);
-        let result = discovered_site_k8s_name(&long_net, &long_site);
-        assert_eq!(result.len(), 253, "composite name must be truncated to 253 chars");
+    fn a_gossiped_address_lands_in_status_discovered_once() {
+        let patch = discovered_egress_patch(None, "10.0.0.9:8443").unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            patch,
+            serde_json::json!({ "status": { "discovered": { "egressAddress": "10.0.0.9:8443" } } })
+        );
+        let recorded = GridSiteStatus {
+            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                egress_address: Some("10.0.0.9:8443".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            discovered_egress_patch(Some(&recorded), "10.0.0.9:8443").is_none(),
+            "no-op write"
+        );
+        assert_eq!(
+            discovered_egress_patch(Some(&recorded), ""),
+            Some(serde_json::json!({ "status": { "discovered": { "egressAddress": null } } })),
+            "a withdrawn address is cleared"
+        );
+        assert!(
+            discovered_egress_patch(None, "").is_none(),
+            "nothing recorded, nothing to clear"
+        );
+        assert!(discovered_egress_patch(Some(&recorded), "10.0.0.10:8443").is_some());
     }
 
     #[test]
-    fn discovered_site_k8s_name_is_unique_per_network() {
-        let name_net1 = discovered_site_k8s_name("network-a", "site-west");
-        let name_net2 = discovered_site_k8s_name("network-b", "site-west");
-        assert_ne!(
-            name_net1, name_net2,
-            "same site_id in different networks must produce different names"
-        );
+    fn a_declared_site_spec_is_untouched_by_discovery_writes() {
+        let patch = discovered_egress_patch(None, "10.0.0.9:8443").unwrap_or_else(|| std::process::abort());
+        assert!(patch.get("spec").is_none(), "discovery writes status only");
     }
 
     fn network_with_endpoint_transport(mode: &str, sni: Option<&str>) -> GridNetwork {
@@ -4604,7 +4808,7 @@ mod tests {
 
     fn invalid_cert_status(message: &str) -> GridSiteStatus {
         GridSiteStatus {
-            public_cert_pem: None,
+            discovered: None,
             reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
             message: message.to_owned(),
             ..Default::default()
@@ -4640,7 +4844,7 @@ mod tests {
     #[test]
     fn already_recorded_invalid_false_when_reason_is_not_trust_material_invalid() {
         let existing = Some(GridSiteStatus {
-            public_cert_pem: None,
+            discovered: None,
             reason: "AwaitingDiscovery".to_owned(),
             message: "private key detected".to_owned(),
             ..Default::default()
@@ -4652,16 +4856,19 @@ mod tests {
     }
 
     #[test]
-    fn already_recorded_invalid_false_when_public_cert_pem_still_present() {
+    fn already_recorded_invalid_false_when_advertised_cert_pem_still_present() {
         let existing = Some(GridSiteStatus {
-            public_cert_pem: Some("stale cert".to_owned()),
+            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                advertised_cert_pem: Some("stale cert".to_owned()),
+                ..Default::default()
+            }),
             reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
             message: "private key detected".to_owned(),
             ..Default::default()
         });
         assert!(
             !already_recorded_invalid(existing.as_ref(), "private key detected"),
-            "a leftover publicCertPem means the invalid status was never actually applied yet"
+            "a leftover advertisedCertPem means the invalid status was never actually applied yet"
         );
     }
 
@@ -4679,9 +4886,12 @@ mod tests {
 
     #[test]
     fn decide_cert_pem_write_is_noop_for_every_outcome_when_site_is_already_stable() {
-        // ValidStructure: publicCertPem already stored verbatim.
+        // ValidStructure: advertisedCertPem already stored verbatim.
         let stored = Some(GridSiteStatus {
-            public_cert_pem: Some("cert-a".to_owned()),
+            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                advertised_cert_pem: Some("cert-a".to_owned()),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         assert_eq!(
@@ -4717,7 +4927,10 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_stores_valid_cert_when_it_rotates() {
         let stale = Some(GridSiteStatus {
-            public_cert_pem: Some("cert-old".to_owned()),
+            discovered: Some(crate::crd::grid_site::DiscoveredStatus {
+                advertised_cert_pem: Some("cert-old".to_owned()),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         assert_eq!(
@@ -5856,8 +6069,8 @@ mod tests {
 
     #[test]
     fn active_grid_site_makes_crdt_provider_eligible() {
-        // GridSite name = discovered_site_k8s_name("net", "site-west") = "net-site-west"
-        let sites = vec![make_active_grid_site("net-site-west", "net")];
+        // GridSite name = the SWIM site ID
+        let sites = vec![make_active_grid_site("site-west", "net")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
             is_crdt_provider_routing_eligible("net", &sites, &provider),
@@ -5867,7 +6080,7 @@ mod tests {
 
     #[test]
     fn connecting_grid_site_excludes_crdt_provider() {
-        let sites = vec![make_phase_grid_site("net-site-west", "net", "Connecting")];
+        let sites = vec![make_phase_grid_site("site-west", "net", "Connecting")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
             !is_crdt_provider_routing_eligible("net", &sites, &provider),
@@ -5877,7 +6090,7 @@ mod tests {
 
     #[test]
     fn discovered_grid_site_excludes_crdt_provider() {
-        let sites = vec![make_phase_grid_site("net-site-west", "net", "Discovered")];
+        let sites = vec![make_phase_grid_site("site-west", "net", "Discovered")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
             !is_crdt_provider_routing_eligible("net", &sites, &provider),
@@ -5887,7 +6100,7 @@ mod tests {
 
     #[test]
     fn pending_grid_site_excludes_crdt_provider() {
-        let sites = vec![make_phase_grid_site("net-site-west", "net", "Pending")];
+        let sites = vec![make_phase_grid_site("site-west", "net", "Pending")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
             !is_crdt_provider_routing_eligible("net", &sites, &provider),
@@ -5897,7 +6110,7 @@ mod tests {
 
     #[test]
     fn unreachable_grid_site_excludes_crdt_provider() {
-        let sites = vec![make_phase_grid_site("net-site-west", "net", "Unreachable")];
+        let sites = vec![make_phase_grid_site("site-west", "net", "Unreachable")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
             !is_crdt_provider_routing_eligible("net", &sites, &provider),
@@ -5918,7 +6131,7 @@ mod tests {
     #[test]
     fn wrong_network_grid_site_excludes_crdt_provider() {
         // GridSite is for a different network
-        let sites = vec![make_active_grid_site("net-site-west", "other-net")];
+        let sites = vec![make_active_grid_site("site-west", "other-net")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
             !is_crdt_provider_routing_eligible("net", &sites, &provider),
@@ -5939,8 +6152,8 @@ mod tests {
     #[test]
     fn filter_keeps_only_active_site_providers() {
         let sites = vec![
-            make_active_grid_site("net-site-a", "net"),
-            make_phase_grid_site("net-site-b", "net", "Connecting"),
+            make_active_grid_site("site-a", "net"),
+            make_phase_grid_site("site-b", "net", "Connecting"),
         ];
         let providers = vec![
             make_eligible_crdt_provider("net", "site-a"), // Active → eligible
@@ -5955,7 +6168,7 @@ mod tests {
 
     #[test]
     fn filter_is_deterministic() {
-        let sites = vec![make_active_grid_site("net-site-a", "net")];
+        let sites = vec![make_active_grid_site("site-a", "net")];
         let providers = vec![make_eligible_crdt_provider("net", "site-a")];
         let r1 = filter_eligible_remote_crdt_providers("net", &sites, &providers);
         let r2 = filter_eligible_remote_crdt_providers("net", &sites, &providers);
@@ -5966,7 +6179,7 @@ mod tests {
     fn crdt_provider_identity_preserved_through_filter() {
         // Remote CRDT providers never carry credential data (ProviderState has no credential field).
         // The filter must not alter provider identity.
-        let sites = vec![make_active_grid_site("net-site-a", "net")];
+        let sites = vec![make_active_grid_site("site-a", "net")];
         let providers = vec![make_eligible_crdt_provider("net", "site-a")];
         let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers);
         assert_eq!(eligible.len(), 1, "eligible provider must pass filter");
@@ -6089,17 +6302,6 @@ mod tests {
         assert_eq!(
             requeue_interval_for_network(&network, &providers).ok(),
             Some(Duration::from_millis(1_500))
-        );
-    }
-
-    #[test]
-    fn network_requeue_invalid_config_fails() {
-        let providers = vec![make_inference_provider("p1", "net")];
-        let mut network = base_network();
-        network.spec.metrics_refresh_interval = Some("5m".to_owned());
-        assert!(
-            requeue_interval_for_network(&network, &providers).is_err(),
-            "unsupported duration unit '5m' must be rejected"
         );
     }
 

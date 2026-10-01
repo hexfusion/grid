@@ -206,9 +206,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-static-weighted
               gridId: grid-static-weighted-v1
               region: provider-a
@@ -272,9 +272,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-static-weighted
               gridId: grid-static-weighted-v1
               region: provider-b
@@ -338,9 +338,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-static-weighted
               gridId: grid-static-weighted-v1
               region: provider-c

@@ -588,6 +588,10 @@ pub struct GridNetworkSpec {
     /// Region where this site is deployed.
     pub region: Option<String>,
 
+    /// How the operator turns SWIM members into `GridSite` objects.
+    #[serde(default)]
+    pub site_discovery: SiteDiscovery,
+
     /// SWIM protocol configuration.
     #[serde(default)]
     pub swim: SwimConfig,
@@ -805,7 +809,6 @@ pub struct ConsumerConfig {
     pub cluster_endpoints: Vec<ClusterEndpointConfig>,
 }
 
-
 /// TLS mode for a grid connection, shared by site egress and consumer cluster endpoints.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -875,6 +878,26 @@ pub const DEFAULT_CREDENTIAL_MOUNT_BASE: &str = "/run/secrets/grid-credentials";
 /// Default HTTP listener port for the generated consumer Praxis config.
 pub const DEFAULT_CONSUMER_LISTENER_PORT: u16 = 8080;
 
+/// `GridSite` discovery settings.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteDiscovery {
+    /// Whether the operator creates `GridSite` objects for unknown SWIM members.
+    #[serde(default)]
+    pub mode: SiteDiscoveryMode,
+}
+
+/// Whether the operator creates `GridSite` objects from SWIM membership.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SiteDiscoveryMode {
+    /// No `GridSite` is created; gossip still fills declared ones and advances them to `Discovered`.
+    #[default]
+    Manual,
+    /// The operator also creates a `GridSite` for each member with no declared one.
+    Auto,
+}
+
 /// SWIM protocol tuning parameters.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -939,6 +962,11 @@ pub struct SecretRef {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkStatus {
+    /// Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<super::condition::Condition>,
+
     /// Number of connected (Active) sites.
     #[serde(default)]
     pub connected_sites: u32,

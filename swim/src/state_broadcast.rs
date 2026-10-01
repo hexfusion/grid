@@ -94,7 +94,7 @@ pub struct StateBroadcast {
     /// Public site certificate PEM advertised by this site.
     ///
     /// Contains only the public certificate (never a private key).  Used to
-    /// populate `GridSite.status.publicCertPem` on the receiving operator.
+    /// populate `GridSite.status.discovered.advertisedCertPem` on the receiving operator.
     /// `None` when the originating operator has no TLS certificate configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_cert_pem: Option<String>,

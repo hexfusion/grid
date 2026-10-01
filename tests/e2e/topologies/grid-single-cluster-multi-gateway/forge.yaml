@@ -144,9 +144,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-single-cluster-multi-gateway
               gridId: grid-single-cluster-multi-gateway-v1
               region: provider-a

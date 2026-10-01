@@ -203,9 +203,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-combined-site
               gridId: grid-combined-site-v1
               region: west
@@ -266,9 +266,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-combined-site
               gridId: grid-combined-site-v1
               region: central
@@ -329,9 +329,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-combined-site
               gridId: grid-combined-site-v1
               region: east

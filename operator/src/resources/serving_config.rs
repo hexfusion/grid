@@ -16,7 +16,7 @@ use crate::{
         routing_overlay::{RoutingCandidate, RoutingOverlay, overlay_labels, scoped_configmap_name},
         tls_backend::sha256,
     },
-    signals::{PeerIdentities, PeerTrustMode, SIGNALS_PATH, SignalsEndpoint, dialable_signals_endpoint},
+    signals::{PeerIdentities, PeerTrustMode, SIGNALS_PATH, SignalsEndpoint, dialable_signals_endpoint_with},
     swim::{MemberStatus, MembershipSnapshot},
 };
 
@@ -162,6 +162,9 @@ where
 }
 
 /// Alive members worth dialing at their signals endpoint, with pins, none over unencrypted gossip.
+///
+/// Every member needs a `GridSite`, pinned in pin mode. In spiffe mode auto discovery creates that `GridSite`
+/// from gossip, so there a gossiped signals endpoint must also be a literal IP, never a name gossip chose.
 pub(crate) fn dialable_members<'snap>(
     snapshot: &'snap MembershipSnapshot,
     identities: &PeerIdentities,
@@ -180,9 +183,9 @@ pub(crate) fn dialable_members<'snap>(
             // One read admits the peer and supplies its pins.
             let pins = match trust {
                 PeerTrustMode::Pin => Some(identities.pins_for(&member.site_id)).filter(|pins| !pins.is_empty())?,
-                PeerTrustMode::Spiffe => Vec::new(),
+                PeerTrustMode::Spiffe => identities.knows(&member.site_id).then(Vec::new)?,
             };
-            let endpoint = dialable_signals_endpoint(member, fallback_port)?;
+            let endpoint = dialable_signals_endpoint_with(member, fallback_port, trust == PeerTrustMode::Spiffe)?;
             Some((member.site_id.as_str(), endpoint.authority(), pins))
         })
         .collect()
@@ -603,7 +606,14 @@ mod tests {
         let snapshot = MembershipSnapshot {
             members: vec![advertised, member("older", MemberStatus::Alive), v6, junk, smuggled],
         };
-        let got = dialable_members(&snapshot, &PeerIdentities::new(), PeerTrustMode::Spiffe, true, 9091);
+        let identities = PeerIdentities::new();
+        identities.set(
+            ["lb", "older", "v6", "junk", "smuggled"]
+                .into_iter()
+                .map(|site| (site.to_owned(), crate::signals::PeerRecord::default()))
+                .collect(),
+        );
+        let got = dialable_members(&snapshot, &identities, PeerTrustMode::Spiffe, true, 9091);
         assert_eq!(
             got,
             [
@@ -612,6 +622,35 @@ mod tests {
                 ("v6", "[2001:db8::9]:9091".to_owned(), Vec::new()),
             ]
         );
+    }
+
+    #[test]
+    fn spiffe_mode_never_dials_a_member_without_a_grid_site() {
+        let snapshot = MembershipSnapshot {
+            members: vec![
+                member("pinned", MemberStatus::Alive),
+                member("stranger", MemberStatus::Alive),
+            ],
+        };
+        let got: Vec<&str> = dialable_members(&snapshot, &one_pinned_site(), PeerTrustMode::Spiffe, true, 9091)
+            .into_iter()
+            .map(|(site, ..)| site)
+            .collect();
+        assert_eq!(got, ["pinned"]);
+    }
+
+    #[test]
+    fn spiffe_mode_refuses_a_gossiped_signals_endpoint_that_names_a_host() {
+        let mut named = member("pinned", MemberStatus::Alive);
+        named.signals_address = Some("signals.example.net:9443".to_owned());
+        let snapshot = MembershipSnapshot { members: vec![named] };
+        let spiffe = dialable_members(&snapshot, &one_pinned_site(), PeerTrustMode::Spiffe, true, 9091);
+        assert!(
+            spiffe.is_empty(),
+            "gossip must not choose a name to dial in spiffe mode"
+        );
+        let pinned = dialable_members(&snapshot, &one_pinned_site(), PeerTrustMode::Pin, true, 9091);
+        assert_eq!(pinned.len(), 1, "pin mode verifies the pinned leaf whatever the name");
     }
 
     #[test]
@@ -634,7 +673,12 @@ mod tests {
         let (pin, spiffe) = (PeerTrustMode::Pin, PeerTrustMode::Spiffe);
         let cases: [(&str, PeerTrustMode, bool, &[&str]); 4] = [
             ("pin mode keeps only pinned sites", pin, true, &["pinned"]),
-            ("spiffe mode reads no pins", spiffe, true, &["pinned", "unpinned"]),
+            (
+                "spiffe mode reads no pins but needs a GridSite",
+                spiffe,
+                true,
+                &["pinned", "unpinned"],
+            ),
             ("unencrypted gossip yields none", pin, false, &[]),
             ("unencrypted gossip yields none in spiffe mode", spiffe, false, &[]),
         ];

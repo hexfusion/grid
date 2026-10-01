@@ -35,7 +35,7 @@ pub enum CertPemStatus {
 
     /// Input contains a `PRIVATE KEY` marker.
     ///
-    /// Private key material must never appear in `GridSite.status.publicCertPem`,
+    /// Private key material must never appear in `GridSite.status.discovered.advertisedCertPem`,
     /// trust bundles, SWIM broadcasts, or status fields.  This outcome is a
     /// security violation indicator: the caller must discard the input and log at
     /// error level.
@@ -70,7 +70,7 @@ pub enum CertPemStatus {
 /// - The certificate is signed by a trusted CA.
 /// - The peer holding this cert is authorized for routing.
 ///
-/// Use the result to gate storage in `publicCertPem` and trust bundles, but
+/// Use the result to gate storage in `advertisedCertPem` and trust bundles, but
 /// treat [`CertPemStatus::ValidStructure`] as structural validity only — never as trust or authorization.
 #[must_use]
 pub fn check_cert_pem(pem_str: &str) -> CertPemStatus {

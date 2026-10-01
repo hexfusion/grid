@@ -1,10 +1,9 @@
 apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
-  name: grid-token-rate-limit-west
+  name: west
   labels:
     grid.praxis-proxy.io/network: grid-token-rate-limit
-    grid.praxis-proxy.io/auto-discovered: "true"
 spec:
   gridNetworkRef: grid-token-rate-limit
   egress:
@@ -19,10 +18,9 @@ spec:
 apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
-  name: grid-token-rate-limit-central
+  name: central
   labels:
     grid.praxis-proxy.io/network: grid-token-rate-limit
-    grid.praxis-proxy.io/auto-discovered: "true"
 spec:
   gridNetworkRef: grid-token-rate-limit
   egress:

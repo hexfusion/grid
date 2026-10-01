@@ -729,7 +729,7 @@ routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
 
 The matching rule: for a remote CRDT provider with `site_id = S` in network `N`,
 the operator looks for a `GridSite` resource whose Kubernetes name equals
-`discovered_site_k8s_name(N, S)` (the auto-discovered name derivation) and whose
+`discovered_site_k8s_name(S)` (the sanitized bare site name) and whose
 `spec.gridNetworkRef == N` and `status.phase == Active`.
 
 `Active` indicates control-plane eligibility: the operator has verified the remote

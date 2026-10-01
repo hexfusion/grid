@@ -182,7 +182,7 @@ fn signal_scrape_plan(provider: &InferenceProvider) -> Option<(&str, String, std
     if endpoint.is_empty() || mc.metrics_endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
         return None;
     }
-    let wanted = signal_metric_names(&mc.signal_names);
+    let wanted = signal_metric_names(&mc.effective_signal_names());
     if wanted.is_empty() {
         return None;
     }
@@ -407,7 +407,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         let base = mc.metrics_endpoint.as_deref().unwrap_or(endpoint);
         let url = metrics_url(base, &mc.path);
         let timeout = parse_metrics_timeout(&mc.timeout);
-        let names = metric_names_from_config(&mc.signal_names, mc.pool_name.as_deref(), mc.queue_capacity);
+        let names = metric_names_from_config(&mc.effective_signal_names(), mc.pool_name.as_deref(), mc.queue_capacity);
 
         if refresh_interval > Duration::ZERO
             && let Some(cached) = cache_snapshot.get(identity)
@@ -722,10 +722,11 @@ mod tests {
         MetricsConfig {
             path: "/metrics".to_owned(),
             timeout: "2s".to_owned(),
-            signal_names: MetricSignalNames {
+            preset: None,
+            signal_names: Some(MetricSignalNames {
                 queue_depth: Some(metric_name.to_owned()),
                 ..Default::default()
-            },
+            }),
             stale_metrics_seconds: None,
             metrics_endpoint: None,
             pool_name: None,
@@ -738,10 +739,11 @@ mod tests {
         MetricsConfig {
             path: "/metrics".to_owned(),
             timeout: "2s".to_owned(),
-            signal_names: MetricSignalNames {
+            preset: None,
+            signal_names: Some(MetricSignalNames {
                 queue_depth: Some(metric_name.to_owned()),
                 ..Default::default()
-            },
+            }),
             stale_metrics_seconds: Some(ttl),
             metrics_endpoint: None,
             pool_name: None,

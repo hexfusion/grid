@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    net::{IpAddr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -286,6 +286,12 @@ impl PeerIdentities {
             return Vec::new();
         };
         held.get(site).map(|record| record.pins.clone()).unwrap_or_default()
+    }
+
+    /// Whether a `GridSite` record exists for `site`, pinned or not.
+    #[must_use]
+    pub fn knows(&self, site: &str) -> bool {
+        self.inner.read().is_ok_and(|held| held.contains_key(site))
     }
 
     /// Whether this site refuses `site` outright: no record, or a record with no
@@ -642,6 +648,12 @@ impl SignalsEndpoint {
         }
     }
 
+    /// Whether the host is an IP literal rather than a DNS name.
+    #[must_use]
+    pub const fn is_ip(&self) -> bool {
+        matches!(self.host, EndpointHost::Ip(_))
+    }
+
     /// Whether it stays off loopback, link-local, and cloud metadata addresses.
     #[must_use]
     pub fn is_dialable(&self) -> bool {
@@ -683,8 +695,21 @@ fn is_dns_name(host: &str) -> bool {
 /// A member's dialable signals endpoint, gossiped else its SWIM host on `fallback_port`, refusals warned once.
 #[must_use]
 pub fn dialable_signals_endpoint(member: &MemberRecord, fallback_port: u16) -> Option<SignalsEndpoint> {
+    dialable_signals_endpoint_with(member, fallback_port, false)
+}
+
+/// [`dialable_signals_endpoint`], refusing a gossiped endpoint that names a host when `literal_ip_only`.
+#[must_use]
+pub fn dialable_signals_endpoint_with(
+    member: &MemberRecord,
+    fallback_port: u16,
+    literal_ip_only: bool,
+) -> Option<SignalsEndpoint> {
     let (text, endpoint) = match &member.signals_address {
-        Some(advertised) => (advertised.as_str(), SignalsEndpoint::parse(advertised)),
+        Some(advertised) => (
+            advertised.as_str(),
+            SignalsEndpoint::parse(advertised).filter(|endpoint| !literal_ip_only || endpoint.is_ip()),
+        ),
         None => (
             member.endpoint.as_str(),
             SignalsEndpoint::parse(&member.endpoint).map(|swim| swim.with_port(fallback_port)),
@@ -721,21 +746,47 @@ fn warn_refused_once(site: &str, endpoint: &str) -> bool {
     first
 }
 
-/// AWS instance metadata over IPv6, inside the unique-local range peers may use.
-const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
+/// Cloud metadata and credential endpoints over IPv6, inside the unique-local range peers may use.
+const METADATA_V6: [Ipv6Addr; 3] = [
+    Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254), // AWS instance metadata
+    Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0023), // AWS EKS Pod Identity
+    Ipv6Addr::new(0xFD20, 0x00CE, 0, 0, 0, 0, 0, 0x0254), // GCP metadata
+];
 
-/// Whether a peer IP may be dialed: anything but local and metadata addresses.
-fn is_dialable_ip(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            !(v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4 == crate::resources::mcp_probe::ALIBABA_CLOUD_METADATA_V4)
-        },
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() || v6 == AWS_METADATA_V6)
-        },
+/// Whether a peer IP may be dialed: anything but local, multicast, and metadata addresses.
+///
+/// Private ranges stay dialable because grid peers sit on them. IPv6 forms that embed an IPv4
+/// target (mapped, compatible, and NAT64 `64:ff9b::/96`) are judged by that target.
+pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_dialable_v4(v4),
+        IpAddr::V6(v6) => is_dialable_v6(v6),
+    }
+}
+
+/// Whether an IPv4 peer may be dialed.
+fn is_dialable_v4(v4: Ipv4Addr) -> bool {
+    !(v4.is_loopback()
+        || v4.is_link_local()
+        || v4.octets()[0] == 0
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || v4 == crate::resources::mcp_probe::ALIBABA_CLOUD_METADATA_V4)
+}
+
+/// Whether an IPv6 peer may be dialed.
+fn is_dialable_v6(v6: Ipv6Addr) -> bool {
+    if v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() || v6.is_multicast() {
+        return false;
+    }
+    let segments = v6.segments();
+    let embedded = || Ipv4Addr::from(u32::from_be_bytes(v6.octets()[12..].try_into().unwrap_or_default()));
+    match segments {
+        // IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), and well-known NAT64 (64:ff9b::/96).
+        [0, 0, 0, 0, 0, 0xFFFF | 0, _, _] | [0x0064, 0xFF9B, 0, 0, 0, 0, _, _] => is_dialable_v4(embedded()),
+        // Local-use NAT64 (64:ff9b:1::/48) reaches IPv4 we cannot see.
+        [0x0064, 0xFF9B, 0x0001, ..] => false,
+        _ => !METADATA_V6.contains(&v6),
     }
 }
 
@@ -1255,6 +1306,54 @@ fn reexpress_peer_ages(observations: &mut [Observation], date: Option<SystemTime
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    /// Addresses the dial classifier must refuse.
+    const REFUSED_PEERS: &[&str] = &[
+        "127.0.0.1",
+        "0.0.0.0",
+        "0.1.2.3",
+        "169.254.169.254",
+        "100.100.100.200",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::1",
+        "::",
+        "fe80::1",
+        "ff02::1",
+        "::7f00:1",
+        "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254",
+        "64:ff9b::7f00:1",
+        "64:ff9b::a9fe:a9fe",
+        "64:ff9b:1::a00:9",
+        "fd00:ec2::254",
+        "fd00:ec2::23",
+        "fd20:ce::254",
+    ];
+
+    #[test]
+    fn the_dial_classifier_refuses_local_metadata_and_embedded_forms() {
+        for refused in REFUSED_PEERS {
+            let ip: IpAddr = refused.parse().unwrap_or_else(|_| std::process::abort());
+            assert!(!is_dialable_ip(ip), "{refused} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_dial_classifier_keeps_private_and_public_peers() {
+        for allowed in [
+            "10.0.0.9",
+            "192.168.1.5",
+            "100.64.0.1",
+            "2001:db8::1",
+            "fd00::9",
+            "64:ff9b::a00:9",
+        ] {
+            let ip: IpAddr = allowed.parse().unwrap_or_else(|_| std::process::abort());
+            assert!(is_dialable_ip(ip), "{allowed} must stay dialable");
+        }
+    }
+
 
     #[test]
     fn peers_are_dialed_at_a_dialable_signals_endpoint() {

@@ -137,7 +137,8 @@ spec:
                       type: number
                   type: object
                 endpoint:
-                  description: HTTP endpoint URL.
+                  description: HTTP endpoint URL, or a bare `host:port`.
+                  pattern: ^(https?://\S+|[^\s/@]+:[0-9]{1,5})$
                   type: string
                 gatewayRef:
                   description: |-
@@ -293,6 +294,7 @@ spec:
                         When absent, the scrape URL uses `spec.endpoint` as before.
                       minLength: 1
                       nullable: true
+                      pattern: ^https?://\S+$
                       type: string
                     path:
                       default: /metrics
@@ -319,6 +321,13 @@ spec:
                       minLength: 1
                       nullable: true
                       type: string
+                    preset:
+                      description: An exporter with well-known metric names.
+                      enum:
+                        - vllm
+                        - llmdEpp
+                      nullable: true
+                      type: string
                     queueCapacity:
                       description: |-
                         Maximum queue slot count for normalising a raw queue-size metric to
@@ -326,7 +335,7 @@ spec:
 
                         When set, the `queue_depth` signal value is divided by this capacity
                         and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
-                        average queue-size metrics (such as `llm_d_router_epp_average_queue_size`)
+                        average queue-size metrics (such as `llm_d_epp_average_queue_size`)
                         without requiring the exporter to pre-normalise.
 
                         When absent, the `queue_depth` signal must already be normalised to
@@ -336,18 +345,11 @@ spec:
                       nullable: true
                       type: integer
                     signalNames:
-                      default:
-                        errorRate: null
-                        healthy: null
-                        kvCacheUtilization: null
-                        latencyP99Ms: null
-                        prefixCacheHitRatio: null
-                        queueDepth: null
                       description: |-
-                        Mapping from scoring signal names to Prometheus metric names.
+                        Mapping from scoring signal names to Prometheus metric names; each set name overrides the preset.
 
-                        Signals without a configured name are skipped during parsing and receive the
-                        neutral default value (`0.5`) in scoring.
+                        Signals with no name from either source score neutrally (`0.5`).
+                      nullable: true
                       properties:
                         errorRate:
                           description: Metric name for normalised error rate (0.0–1.0).
@@ -623,6 +625,7 @@ spec:
                         type: integer
                       name:
                         description: Model name.
+                        pattern: \S
                         type: string
                     required:
                       - name
@@ -685,12 +688,81 @@ spec:
               description: Observed status of an [`InferenceProvider`].
               nullable: true
               properties:
+                conditions:
+                  description: Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+                  items:
+                    description: One observed condition, keyed by `type`.
+                    properties:
+                      lastTransitionTime:
+                        description: RFC 3339 time the status last changed.
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        default: 0
+                        description: The `metadata.generation` this condition was computed from.
+                        format: int64
+                        type: integer
+                      reason:
+                        description: Machine-readable reason.
+                        type: string
+                      status:
+                        description: Whether the condition holds.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: Condition type, unique within the list.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
                 matchingSites:
                   default: []
                   description: Sites matched by the site selector.
                   items:
                     type: string
                   type: array
+                metricsSignals:
+                  description: Signal metric names the scrape uses after `metricsConfig.preset`, absent without `metricsConfig`.
+                  nullable: true
+                  properties:
+                    errorRate:
+                      description: Metric name for normalised error rate (0.0–1.0).
+                      nullable: true
+                      type: string
+                    healthy:
+                      description: Metric name for a health gauge (any positive value = healthy).
+                      nullable: true
+                      type: string
+                    kvCacheUtilization:
+                      description: Metric name for KV-cache utilisation (0.0–1.0).
+                      nullable: true
+                      type: string
+                    latencyP99Ms:
+                      description: Metric name for P99 request latency in milliseconds (pre-computed gauge).
+                      nullable: true
+                      type: string
+                    prefixCacheHitRatio:
+                      description: Metric name for prefix-cache hit ratio (0.0–1.0).
+                      nullable: true
+                      type: string
+                    queueDepth:
+                      description: Metric name for normalised queue depth (0.0–1.0).
+                      nullable: true
+                      type: string
+                  type: object
                 modelDiscoveryError:
                   description: Bounded reason for the latest model-discovery failure, absent after a successful poll.
                   nullable: true
@@ -725,6 +797,7 @@ spec:
                     provider is `Available`, `Pending`, or the reason is unknown.
 
                     Stable reason values:
+                    - `EndpointInvalid`, `MetricsEndpointInvalid`, `ModelNameInvalid`
                     - `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`, `CredentialSecretMissing`,
                       `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
                     - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`

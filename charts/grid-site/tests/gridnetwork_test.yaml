@@ -108,20 +108,20 @@ tests:
           path: spec.peerTrust.mode
           value: spiffe
 
-  - it: opts the network into site discovery
-    set:
-      gridNetwork.name: prod-grid
-      gridSite.name: prod-site
-      gridNetwork.autoDiscoverSites: true
-    asserts:
-      - equal:
-          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
-          value: "true"
-
-  - it: leaves discovery off by default
+  - it: omits siteDiscovery by default so the CRD default of manual applies
     set:
       gridNetwork.name: prod-grid
       gridSite.name: prod-site
     asserts:
       - notExists:
-          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
+          path: spec.siteDiscovery
+
+  - it: renders siteDiscovery.mode when set
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.siteDiscovery.mode: auto
+    asserts:
+      - equal:
+          path: spec.siteDiscovery.mode
+          value: auto

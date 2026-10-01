@@ -316,8 +316,11 @@ install_site() {
   else
     fail "copied invite lacks its grid.praxis-proxy.io/site label"
   fi
+  # spiffe trust verifies the peer's SPIFFE ID, and a GridSite that also pins is rejected.
+  peer=(--set "peers.hub.digest=$HUB_DIGEST")
+  [[ $MODE == pin ]] || peer=(--set-json 'peers={"hub":{}}')
   helm_on "$SITE_CTX" "$NS" grid-site grid-site \
-    --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" --set "peers.hub.digest=$HUB_DIGEST" \
+    --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" "${peer[@]}" \
     --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000" \
     --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$MODE" || die "install site grid-site"
   trust=(--set "gatewayConfig.peerTrust.digest=$HUB_DIGEST")
@@ -330,8 +333,10 @@ install_site() {
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" \
-    --set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")" || die "pin the site on the hub"
+  if [[ $MODE == pin ]]; then
+    helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" \
+      --set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")" || die "pin the site on the hub"
+  fi
   snapshot_logs "$SITE_CTX" site || true
 }
 
@@ -374,9 +379,9 @@ assert_membership() {
       fail "$name identity SPIFFE ID: $(spiffe_id_of "$ctx")"
     fi
   done
-  eventually "hub GridSite grid-$SITE Active (identity-verified probe)" site_phase_in "$HUB_CTX" "grid-$SITE" Active || true
+  eventually "hub GridSite $SITE Active (identity-verified probe)" site_phase_in "$HUB_CTX" "$SITE" Active || true
   # The hub gateway is ClusterIP, so the hub gossips no gateway address and stays Discovered on the site.
-  eventually "site GridSite grid-hub Discovered over SWIM" site_phase_in "$SITE_CTX" grid-hub Discovered || true
+  eventually "site GridSite hub Discovered over SWIM" site_phase_in "$SITE_CTX" hub Discovered || true
   eventually "hub GridNetwork Active with >=1 connected site" network_active "$HUB_CTX" || true
   # Operator state only: the hub gateway routes on its static backends, not this overlay.
   eventually "operator renders the hub overlay with a remote candidate" overlay_distributed || true

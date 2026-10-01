@@ -13,6 +13,9 @@ pub mod agent_tool_provider;
 /// Authentication strategy types shared across providers.
 pub mod auth;
 
+/// Status conditions shared by every grid resource.
+pub mod condition;
+
 /// [`GridNetwork`] — the grid itself, top-level tenancy boundary.
 ///
 /// [`GridNetwork`]: grid_network::GridNetwork

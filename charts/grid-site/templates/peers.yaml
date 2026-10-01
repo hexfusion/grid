@@ -9,8 +9,8 @@
 apiVersion: grid.praxis-proxy.io/v1beta1
 kind: GridSite
 metadata:
-  {{- /* The name the operator gives the peer it discovers over SWIM. */}}
-  name: {{ printf "%s-%s" (regexReplaceAll "[^a-z0-9]" ($network | lower) "-" | trimAll "-") $name }}
+  {{- /* The bare site name, so this declared GridSite is the one SWIM discovery fills. */}}
+  name: {{ $name }}
   labels:
     {{- include "grid-site.labels" $ | nindent 4 }}
     grid.praxis-proxy.io/network: {{ $network | quote }}

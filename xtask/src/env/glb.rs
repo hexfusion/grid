@@ -3185,7 +3185,7 @@ fn find_gridsite_egress<'cfg>(
     items: &'cfg [serde_json::Value],
     provider: &str,
 ) -> Result<&'cfg str, Box<dyn std::error::Error>> {
-    let expected_name = format!("{GRID_NETWORK_NAME}-{provider}");
+    let expected_name = provider;
     let site = items.iter().find(|item| {
         item.get("metadata")
             .and_then(|m| m.get("name"))
@@ -3196,7 +3196,7 @@ fn find_gridsite_egress<'cfg>(
         return Err(format!("GridSite for {provider} not found on edge cluster").into());
     };
     Ok(site
-        .pointer("/spec/egress/address")
+        .pointer("/status/discovered/egressAddress")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(""))
 }
@@ -5384,12 +5384,12 @@ clusters:
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
+                    "metadata": {"name": "west-provider"},
+                    "status": {"discovered": {"egressAddress": "172.18.0.5:8443"}}
                 },
                 {
-                    "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "metadata": {"name": "east-provider"},
+                    "status": {"discovered": {"egressAddress": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -5413,8 +5413,8 @@ clusters:
                     "spec": {"egress": {"address": ""}}
                 },
                 {
-                    "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "metadata": {"name": "east-provider"},
+                    "status": {"discovered": {"egressAddress": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -5434,12 +5434,12 @@ clusters:
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
+                    "metadata": {"name": "west-provider"},
+                    "status": {"discovered": {"egressAddress": "172.18.0.5:8443"}}
                 },
                 {
-                    "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "metadata": {"name": "east-provider"},
+                    "status": {"discovered": {"egressAddress": "172.18.0.6:8443"}}
                 }
             ]
         });

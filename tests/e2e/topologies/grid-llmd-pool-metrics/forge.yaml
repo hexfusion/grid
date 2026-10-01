@@ -226,9 +226,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-llmd-pool-metrics
               gridId: grid-llmd-pool-metrics-v1
               region: pool-a
@@ -303,9 +303,9 @@ spec:
           version: "0.1.0"
           namespace: grid-system
           values:
-            commonLabels:
-              grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
+              siteDiscovery:
+                mode: auto
               name: grid-llmd-pool-metrics
               gridId: grid-llmd-pool-metrics-v1
               region: pool-b

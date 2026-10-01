@@ -65,7 +65,8 @@ pub struct InferenceProviderSpec {
     /// Cost information.
     pub cost: Option<CostConfig>,
 
-    /// HTTP endpoint URL.
+    /// HTTP endpoint URL, or a bare `host:port`.
+    #[schemars(regex(pattern = r"^(https?://\S+|[^\s/@]+:[0-9]{1,5})$"))]
     pub endpoint: String,
 
     /// Health check configuration.
@@ -230,7 +231,7 @@ pub struct MetricsConfig {
     /// points at the pool's request path.
     ///
     /// When absent, the scrape URL uses `spec.endpoint` as before.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1), regex(pattern = r"^https?://\S+$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_endpoint: Option<String>,
 
@@ -248,12 +249,15 @@ pub struct MetricsConfig {
     #[serde(default = "default_metrics_timeout")]
     pub timeout: String,
 
-    /// Mapping from scoring signal names to Prometheus metric names.
+    /// Exporter whose well-known metric names fill any signal `signalNames` leaves unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<MetricsPreset>,
+
+    /// Mapping from scoring signal names to Prometheus metric names; each set name overrides the preset.
     ///
-    /// Signals without a configured name are skipped during parsing and receive the
-    /// neutral default value (`0.5`) in scoring.
-    #[serde(default)]
-    pub signal_names: MetricSignalNames,
+    /// Signals with no name from either source score neutrally (`0.5`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_names: Option<MetricSignalNames>,
 
     /// Expected Prometheus `name` label value for pool-level metric selection.
     ///
@@ -276,7 +280,7 @@ pub struct MetricsConfig {
     ///
     /// When set, the `queue_depth` signal value is divided by this capacity
     /// and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
-    /// average queue-size metrics (such as `llm_d_router_epp_average_queue_size`)
+    /// average queue-size metrics (such as `llm_d_epp_average_queue_size`)
     /// without requiring the exporter to pre-normalise.
     ///
     /// When absent, the `queue_depth` signal must already be normalised to
@@ -416,26 +420,125 @@ fn default_private_key_key() -> String {
 ///
 /// Every field is optional.  A signal left as `None` is not extracted from the
 /// Prometheus text output and receives the neutral default (`0.5`) in scoring.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricSignalNames {
     /// Metric name for normalised queue depth (0.0–1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_depth: Option<String>,
 
     /// Metric name for KV-cache utilisation (0.0–1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_cache_utilization: Option<String>,
 
     /// Metric name for P99 request latency in milliseconds (pre-computed gauge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_p99_ms: Option<String>,
 
     /// Metric name for prefix-cache hit ratio (0.0–1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cache_hit_ratio: Option<String>,
 
     /// Metric name for normalised error rate (0.0–1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_rate: Option<String>,
 
     /// Metric name for a health gauge (any positive value = healthy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthy: Option<String>,
+}
+
+impl MetricSignalNames {
+    /// Whether no signal has a metric name.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.queue_depth.is_none()
+            && self.kv_cache_utilization.is_none()
+            && self.latency_p99_ms.is_none()
+            && self.prefix_cache_hit_ratio.is_none()
+            && self.error_rate.is_none()
+            && self.healthy.is_none()
+    }
+}
+
+/// An exporter with well-known metric names.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetricsPreset {
+    /// vLLM; its queue metric is a raw request count, so it needs `queueCapacity`.
+    Vllm,
+    /// llm-d EPP pool averages; its queue metric is a raw average, so it needs `queueCapacity`.
+    LlmdEpp,
+}
+
+impl MetricsPreset {
+    /// The preset's `(queueDepth, kvCacheUtilization)` metric names.
+    #[must_use]
+    pub const fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Vllm => ("vllm:num_requests_waiting", "vllm:kv_cache_usage_perc"),
+            Self::LlmdEpp => ("llm_d_epp_average_queue_size", "llm_d_epp_average_kv_cache_utilization"),
+        }
+    }
+}
+
+/// Why a provider's metric signals cannot be used as declared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalNamesIssue {
+    /// Neither a preset nor `signalNames` names any signal.
+    NoSignalNames,
+    /// The preset's raw queue metric has no `queueCapacity` to normalise against.
+    MissingQueueCapacity,
+}
+
+impl SignalNamesIssue {
+    /// The `MetricsSignals` condition reason.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NoSignalNames => "NoSignalNames",
+            Self::MissingQueueCapacity => "MissingQueueCapacity",
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Signal names after applying `preset`, with each explicit `signalNames` entry winning.
+    #[must_use]
+    pub fn resolved_signal_names(&self) -> MetricSignalNames {
+        let mut names = self.signal_names.clone().unwrap_or_default();
+        if let Some(preset) = self.preset {
+            let (queue, kv) = preset.names();
+            names.queue_depth.get_or_insert_with(|| queue.to_owned());
+            names.kv_cache_utilization.get_or_insert_with(|| kv.to_owned());
+        }
+        names
+    }
+
+    /// Signal names the scrape uses: resolved, minus a preset raw queue metric with no `queueCapacity`.
+    ///
+    /// An unnormalised count would clamp to full saturation, so that signal scores neutrally instead.
+    #[must_use]
+    pub fn effective_signal_names(&self) -> MetricSignalNames {
+        let mut names = self.resolved_signal_names();
+        if self.signal_names_issue() == Some(SignalNamesIssue::MissingQueueCapacity) {
+            names.queue_depth = None;
+        }
+        names
+    }
+
+    /// Whether the resolved names are unusable as declared.
+    #[must_use]
+    pub fn signal_names_issue(&self) -> Option<SignalNamesIssue> {
+        let resolved = self.resolved_signal_names();
+        if resolved.is_empty() {
+            return Some(SignalNamesIssue::NoSignalNames);
+        }
+        let queue_from_preset = self
+            .preset
+            .is_some_and(|preset| resolved.queue_depth.as_deref() == Some(preset.names().0));
+        (queue_from_preset && self.queue_capacity.is_none()).then_some(SignalNamesIssue::MissingQueueCapacity)
+    }
 }
 
 /// Returns the default metrics scrape path.
@@ -466,6 +569,7 @@ pub struct CostConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     /// Model name.
+    #[schemars(regex(pattern = r"\S"))]
     pub name: String,
 
     /// Supported capabilities.
@@ -582,9 +686,18 @@ fn default_models_path() -> String {
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceProviderStatus {
+    /// Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<super::condition::Condition>,
+
     /// Sites matched by the site selector.
     #[serde(default)]
     pub matching_sites: Vec<String>,
+
+    /// Signal metric names the scrape uses after `metricsConfig.preset`, absent without `metricsConfig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_signals: Option<MetricSignalNames>,
 
     /// Bounded reason for the latest model-discovery failure, absent after a successful poll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -611,6 +724,7 @@ pub struct InferenceProviderStatus {
     /// provider is `Available`, `Pending`, or the reason is unknown.
     ///
     /// Stable reason values:
+    /// - `EndpointInvalid`, `MetricsEndpointInvalid`, `ModelNameInvalid`
     /// - `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`, `CredentialSecretMissing`,
     ///   `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
     /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
@@ -623,7 +737,9 @@ pub struct InferenceProviderStatus {
 impl InferenceProviderStatus {
     /// Compare the fields written by provider reconciliation, excluding the discovery poller's error.
     pub(crate) fn matches_reconciler_status(&self, desired: &Self) -> bool {
-        self.matching_sites == desired.matching_sites
+        self.conditions == desired.conditions
+            && self.matching_sites == desired.matching_sites
+            && self.metrics_signals == desired.metrics_signals
             && self.model_discovery_url == desired.model_discovery_url
             && self.observed_generation == desired.observed_generation
             && self.phase == desired.phase
@@ -941,18 +1057,100 @@ mod tests {
         assert_eq!(mc.path, "/custom/metrics", "path must round-trip");
         assert_eq!(mc.timeout, "500ms", "timeout must round-trip");
         assert_eq!(
-            mc.signal_names.queue_depth.as_deref(),
+            mc.resolved_signal_names().queue_depth.as_deref(),
             Some("provider_queue_depth"),
             "queueDepth must round-trip"
         );
         assert_eq!(
-            mc.signal_names.kv_cache_utilization.as_deref(),
+            mc.resolved_signal_names().kv_cache_utilization.as_deref(),
             Some("provider_kv_cache"),
             "kvCacheUtilization must round-trip"
         );
         assert!(
-            mc.signal_names.latency_p99_ms.is_none(),
+            mc.resolved_signal_names().latency_p99_ms.is_none(),
             "unconfigured signal must be None"
+        );
+    }
+
+    fn metrics(json: serde_json::Value) -> MetricsConfig {
+        serde_json::from_value(json).unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn presets_resolve_to_the_upstream_metric_names() {
+        let vllm = metrics(serde_json::json!({ "preset": "vllm" })).resolved_signal_names();
+        assert_eq!(vllm.queue_depth.as_deref(), Some("vllm:num_requests_waiting"));
+        assert_eq!(vllm.kv_cache_utilization.as_deref(), Some("vllm:kv_cache_usage_perc"));
+        let epp = metrics(serde_json::json!({ "preset": "llmdEpp" })).resolved_signal_names();
+        assert_eq!(epp.queue_depth.as_deref(), Some("llm_d_epp_average_queue_size"));
+        assert_eq!(
+            epp.kv_cache_utilization.as_deref(),
+            Some("llm_d_epp_average_kv_cache_utilization")
+        );
+    }
+
+    #[test]
+    fn an_explicit_signal_name_overrides_the_preset_for_that_signal_only() {
+        let names = metrics(serde_json::json!({
+            "preset": "vllm",
+            "signalNames": { "queueDepth": "custom_queue" }
+        }))
+        .resolved_signal_names();
+        assert_eq!(names.queue_depth.as_deref(), Some("custom_queue"));
+        assert_eq!(names.kv_cache_utilization.as_deref(), Some("vllm:kv_cache_usage_perc"));
+    }
+
+    #[test]
+    fn signal_names_issues_follow_the_preset_and_capacity() {
+        assert_eq!(
+            metrics(serde_json::json!({})).signal_names_issue(),
+            Some(SignalNamesIssue::NoSignalNames)
+        );
+        assert_eq!(
+            metrics(serde_json::json!({ "preset": "vllm" })).signal_names_issue(),
+            Some(SignalNamesIssue::MissingQueueCapacity)
+        );
+        assert_eq!(
+            metrics(serde_json::json!({ "preset": "vllm", "queueCapacity": 8 })).signal_names_issue(),
+            None
+        );
+        assert_eq!(
+            metrics(serde_json::json!({ "preset": "vllm", "signalNames": { "queueDepth": "normalised" } }))
+                .signal_names_issue(),
+            None,
+            "an explicit queue metric is the user's to normalise"
+        );
+        assert_eq!(
+            metrics(serde_json::json!({ "signalNames": { "kvCacheUtilization": "kv" } })).signal_names_issue(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_preset_queue_without_capacity_is_left_out_of_the_scrape() {
+        let names = metrics(serde_json::json!({ "preset": "vllm" })).effective_signal_names();
+        assert!(
+            names.queue_depth.is_none(),
+            "a raw count must not reach scoring unnormalised"
+        );
+        assert_eq!(names.kv_cache_utilization.as_deref(), Some("vllm:kv_cache_usage_perc"));
+        let capped = metrics(serde_json::json!({ "preset": "vllm", "queueCapacity": 8 })).effective_signal_names();
+        assert_eq!(capped.queue_depth.as_deref(), Some("vllm:num_requests_waiting"));
+    }
+
+    #[test]
+    fn an_unknown_preset_is_refused() {
+        let parsed: Result<MetricsConfig, _> = serde_json::from_value(serde_json::json!({ "preset": "triton" }));
+        assert!(parsed.ok().is_none(), "triton is not a preset");
+    }
+
+    #[test]
+    fn unset_signal_names_serialize_without_nulls() {
+        let json = serde_json::to_value(metrics(serde_json::json!({ "signalNames": { "queueDepth": "q" } })))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            json.pointer("/signalNames"),
+            Some(&serde_json::json!({ "queueDepth": "q" }))
         );
     }
 
@@ -970,10 +1168,8 @@ mod tests {
         let mc = spec.metrics_config.unwrap_or_else(|| std::process::abort());
         assert_eq!(mc.path, "/metrics", "path must default to /metrics");
         assert_eq!(mc.timeout, "2s", "timeout must default to 2s");
-        assert!(
-            mc.signal_names.queue_depth.is_none(),
-            "signal_names must default to all-None"
-        );
+        assert!(mc.signal_names.is_none(), "signalNames must default to absent");
+        assert!(mc.preset.is_none(), "preset must default to absent");
     }
 
     #[test]
@@ -1018,7 +1214,8 @@ mod tests {
         let mc = MetricsConfig {
             path: "/metrics".to_owned(),
             timeout: "2s".to_owned(),
-            signal_names: MetricSignalNames::default(),
+            preset: None,
+            signal_names: None,
             stale_metrics_seconds: None,
             metrics_endpoint: None,
             pool_name: None,

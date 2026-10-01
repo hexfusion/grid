@@ -138,10 +138,7 @@ spec:
     poolName: llama-70b-east
     queueCapacity: 64
     staleMetricsSeconds: 30
-    signalNames:
-      queueDepth: inference_pool_average_queue_size
-      kvCacheUtilization: inference_pool_average_kv_cache_utilization
-      healthy: inference_pool_ready_pods
+    preset: llmdEpp
 ```
 
 | Field | Purpose |
@@ -151,7 +148,8 @@ spec:
 | `timeout` | Per-scrape timeout. |
 | `poolName` | Selects samples for the intended EPP pool. |
 | `queueCapacity` | Normalizes an absolute queue count to `0.0..1.0`. |
-| `signalNames` | Maps AGN signals to exporter metric names. |
+| `preset` | Fills the queue and KV-cache metric names for `vllm` or `llmdEpp`. |
+| `signalNames` | Maps AGN signals to exporter metric names, overriding the preset per signal. |
 | `staleMetricsSeconds` | Grace period for reusing the last successful local scrape. |
 
 One `InferenceProvider` represents a schedulable pool. AGN does not rank the

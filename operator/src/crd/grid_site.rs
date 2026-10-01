@@ -89,7 +89,8 @@ pub struct GridSiteTrustPolicy {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressConfig {
-    /// Address of the egress gateway (host:port).
+    /// Egress gateway `host:port`, overriding discovery; empty uses `status.discovered.egressAddress`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub address: String,
 
     /// TLS mode for the connection.
@@ -108,8 +109,9 @@ pub struct EgressTls {
     /// Expected DNS identity for TLS verification.
     ///
     /// Used as both the TLS SNI value and for certificate SAN
-    /// verification.  Required when `mode` is [`TlsMode::MutualTls`];
-    /// must be absent for [`TlsMode::Plaintext`].
+    /// verification.  Defaults to `<site>.grid.internal`, the DNS name
+    /// enrollment issues, for [`TlsMode::MutualTls`]; must be absent for
+    /// [`TlsMode::Plaintext`].
     ///
     /// Must be a valid DNS name (not an IP address), at most 253
     /// characters.
@@ -140,6 +142,11 @@ const fn default_egress_mode() -> TlsMode {
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridSiteStatus {
+    /// Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<super::condition::Condition>,
+
     /// Capabilities offered by this site.
     #[serde(default)]
     pub capabilities: SiteCapabilities,
@@ -168,9 +175,9 @@ pub struct GridSiteStatus {
     #[serde(default)]
     pub phase: GridSitePhase,
 
-    /// Remote site's public certificate PEM (received
-    /// via SWIM state broadcast from the remote operator).
-    pub public_cert_pem: Option<String>,
+    /// What SWIM gossip reports about this site; observed, never authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovered: Option<DiscoveredStatus>,
 
     /// Machine-readable reason for the current phase.
     ///
@@ -178,6 +185,19 @@ pub struct GridSiteStatus {
     /// `"TlsVerified"`, and `"IdentityVerificationRequired"`.
     #[serde(default)]
     pub reason: String,
+}
+
+/// Site state learned from SWIM gossip.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredStatus {
+    /// Certificate PEM the remote operator advertised; never a trust anchor on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_cert_pem: Option<String>,
+
+    /// Gateway address the remote operator advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_address: Option<String>,
 }
 
 /// Capabilities a site advertises over the grid.

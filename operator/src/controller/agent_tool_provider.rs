@@ -33,6 +33,7 @@ use tracing::info;
 use crate::{
     crd::{
         agent_tool_provider::{AgentToolProvider, AgentToolProviderStatus},
+        condition::{self, Rejection},
         grid_network::GridNetwork,
         grid_site::GridSite,
         inference_provider::ProviderPhase,
@@ -98,7 +99,7 @@ pub async fn reconcile(provider: Arc<AgentToolProvider>, client: Arc<Client>) ->
     let (phase, matching_sites, reason, discovered_tools) =
         Box::pin(resolve_phase_and_sites(&provider, &client)).await?;
     let generation = provider.metadata.generation.unwrap_or(0);
-    update_status(
+    Box::pin(update_status(
         &provider,
         &client,
         phase,
@@ -108,7 +109,7 @@ pub async fn reconcile(provider: Arc<AgentToolProvider>, client: Arc<Client>) ->
         reason,
         &recorder,
         &object_ref,
-    )
+    ))
     .await?;
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
@@ -134,14 +135,18 @@ pub fn error_policy(_provider: Arc<AgentToolProvider>, error: &OperatorError, _c
 /// `gridNetworkRef` *existence* check (does the referenced `GridNetwork`
 /// actually exist) requires a Kubernetes API call and is not part of this
 /// pure function — see resolution in `resolve_phase_and_sites`.
-pub(crate) fn validate_provider_config(provider: &AgentToolProvider) -> Option<&'static str> {
-    if provider.spec.endpoint.trim().is_empty() {
-        return Some("blank endpoint");
+pub(crate) fn validate_provider_config(provider: &AgentToolProvider) -> Option<Rejection> {
+    if let Some(rejection) =
+        super::endpoint_rejection("spec.endpoint", "EndpointInvalid", &provider.spec.endpoint, false)
+    {
+        return Some(rejection);
     }
-    if provider.spec.grid_network_ref.trim().is_empty() {
-        return Some("blank gridNetworkRef");
-    }
-    None
+    provider
+        .spec
+        .grid_network_ref
+        .trim()
+        .is_empty()
+        .then(|| Rejection::new("GridNetworkRefInvalid", "spec.gridNetworkRef must not be blank"))
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +230,9 @@ async fn static_config_failure_reason(
     client: &Client,
     name: &str,
 ) -> Result<Option<&'static str>, OperatorError> {
-    if let Some(config_error) = validate_provider_config(provider) {
-        tracing::warn!(name, reason = config_error, "AgentToolProvider config invalid");
-        return Ok(Some("ProviderConfigInvalid"));
+    if let Some(rejection) = validate_provider_config(provider) {
+        tracing::warn!(name, reason = rejection.reason, message = %rejection.message, "AgentToolProvider config invalid");
+        return Ok(Some(rejection.reason));
     }
 
     let network_ref = &provider.spec.grid_network_ref;
@@ -428,7 +433,13 @@ async fn update_status(
     let reason_changed = existing.map(|s| &s.reason) != Some(&reason);
 
     let api: Api<AgentToolProvider> = Api::all(client.clone());
+    let conditions = condition::refresh(
+        existing.map(|s| s.conditions.as_slice()),
+        condition::provider_conditions(&phase, reason.as_deref()),
+        observed_generation,
+    );
     let status = AgentToolProviderStatus {
+        conditions,
         discovered_tools,
         matching_sites,
         observed_generation,
@@ -600,7 +611,9 @@ mod tests {
         let err = validate_provider_config(&provider);
         assert!(err.is_some(), "blank endpoint must fail static validation");
         assert!(
-            err.unwrap_or_else(|| std::process::abort()).contains("endpoint"),
+            err.unwrap_or_else(|| std::process::abort())
+                .message
+                .contains("endpoint"),
             "error must mention endpoint"
         );
     }
@@ -620,7 +633,9 @@ mod tests {
         let err = validate_provider_config(&provider);
         assert!(err.is_some(), "blank gridNetworkRef must fail static validation");
         assert!(
-            err.unwrap_or_else(|| std::process::abort()).contains("gridNetworkRef"),
+            err.unwrap_or_else(|| std::process::abort())
+                .message
+                .contains("gridNetworkRef"),
             "error must mention gridNetworkRef"
         );
     }
@@ -718,8 +733,8 @@ mod tests {
         let result = static_config_failure_reason(&provider, &unused_kube_client(), "prov").await;
         assert_eq!(
             result.unwrap_or_else(|_| std::process::abort()),
-            Some("ProviderConfigInvalid"),
-            "an invalid static config must short-circuit to ProviderConfigInvalid before any GridNetwork lookup"
+            Some("EndpointInvalid"),
+            "an invalid static config must short-circuit to EndpointInvalid before any GridNetwork lookup"
         );
     }
 
@@ -927,6 +942,7 @@ mod tests {
             observed_generation: 2,
             phase: ProviderPhase::Available,
             reason: None,
+            conditions: Vec::new(),
         }
     }
 
@@ -1007,8 +1023,8 @@ mod tests {
     #[test]
     fn telemetry_label_passes_through_status_reason_when_set() {
         assert_eq!(
-            telemetry_reason_label(&ProviderPhase::Unavailable, Some("ProviderConfigInvalid")),
-            "ProviderConfigInvalid",
+            telemetry_reason_label(&ProviderPhase::Unavailable, Some("EndpointInvalid")),
+            "EndpointInvalid",
             "an explicit status.reason must be used verbatim as the telemetry label"
         );
     }
@@ -1064,10 +1080,7 @@ mod tests {
 
     #[test]
     fn provider_config_invalid_reason_is_a_warning_event() {
-        assert!(matches!(
-            event_type_for_reason("ProviderConfigInvalid"),
-            EventType::Warning
-        ));
+        assert!(matches!(event_type_for_reason("EndpointInvalid"), EventType::Warning));
     }
 
     #[test]
@@ -1241,7 +1254,7 @@ mod tests {
             "a blank endpoint must surface as Unavailable all the way through to the persisted status"
         );
         assert_eq!(
-            patched["status"]["reason"], "ProviderConfigInvalid",
+            patched["status"]["reason"], "EndpointInvalid",
             "the specific static-validation failure reason must reach the persisted status"
         );
         assert_eq!(

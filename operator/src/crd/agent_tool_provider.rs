@@ -43,6 +43,7 @@ pub struct AgentToolProviderSpec {
     pub auth: Option<AuthConfig>,
 
     /// HTTP endpoint of the MCP server.
+    #[schemars(regex(pattern = r"^https?://\S+$"))]
     pub endpoint: String,
 
     /// Protocol the provider speaks.
@@ -93,7 +94,8 @@ pub struct ToolInfo {
 ///
 /// | Reason | Meaning |
 /// |--------|---------|
-/// | `ProviderConfigInvalid` | `spec.endpoint` or `spec.gridNetworkRef` is blank or whitespace-only. |
+/// | `EndpointInvalid` | `spec.endpoint` is not an http(s) URL with a host. |
+/// | `GridNetworkRefInvalid` | `spec.gridNetworkRef` is blank or whitespace-only. |
 /// | `GridNetworkNotFound` | The `GridNetwork` referenced by `spec.gridNetworkRef` does not exist. |
 /// | `McpEndpointUnreachable` | The MCP probe could not connect (transport failure, timeout, DNS error). |
 /// | `McpToolsListInvalidResponse` | The endpoint responded but the `tools/list` response was malformed. |
@@ -107,6 +109,11 @@ pub struct ToolInfo {
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentToolProviderStatus {
+    /// Observed conditions, `metav1.Condition` shaped and keyed by `type`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<super::condition::Condition>,
+
     /// Tools discovered via MCP `tools/list`.
     #[serde(default)]
     pub discovered_tools: Vec<String>,

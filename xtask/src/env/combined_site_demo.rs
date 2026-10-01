@@ -1127,7 +1127,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                         "-l", "grid.praxis-proxy.io/auto-discovered=true",
                         "--context", &context,
                         "-n", GRID_SYSTEM_NS,
-                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.egress.address}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
+                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.status.discovered.egressAddress}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
                     ])
                     .output()?;
                 if !output.status.success() {
@@ -4783,7 +4783,7 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
             if *remote == *local {
                 continue;
             }
-            let site_name = format!("{GRID_NETWORK}-{remote}");
+            let site_name = (*remote).to_owned();
             operator::wait_for_auto_gridsite(&context, &site_name, GRID_NETWORK, TRUST_TIMEOUT)?;
             let canonical_fp = certs::site_certificate_fingerprint(remote)?;
             operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
@@ -4815,7 +4815,7 @@ fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(),
                 if local == remote {
                     continue;
                 }
-                let name = format!("{network}-{remote}");
+                let name = (*remote).to_owned();
                 let output = Command::new("kubectl")
                     .args([
                         "--context",
@@ -4824,7 +4824,7 @@ fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(),
                         "gridsites",
                         &name,
                         "-o",
-                        "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
+                        "jsonpath={.spec.gridNetworkRef}/{.status.discovered.egressAddress}",
                         "--ignore-not-found",
                     ])
                     .output()?;

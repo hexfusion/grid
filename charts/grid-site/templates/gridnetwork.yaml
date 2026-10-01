@@ -6,9 +6,6 @@ metadata:
   name: {{ .Values.gridNetwork.name }}
   labels:
     {{- include "grid-site.labels" . | nindent 4 }}
-    {{- if .Values.gridNetwork.autoDiscoverSites }}
-    grid.praxis-proxy.io/auto-discover-sites: "true"
-    {{- end }}
 spec:
   {{- /*
   gridId is always rendered (even when empty) so `spec` is never a null
@@ -60,6 +57,12 @@ spec:
   {{- with (.Values.gridNetwork.peerTrust).mode }}
   peerTrust:
     mode: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gridNetwork.siteDiscovery }}
+  {{- if .mode }}
+  siteDiscovery:
+    mode: {{ .mode | quote }}
+  {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}

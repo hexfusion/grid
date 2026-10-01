@@ -25,7 +25,7 @@ tests:
           count: 2
       - equal:
           path: metadata.name
-          value: grid-hub
+          value: hub
         documentIndex: 0
       - equal:
           path: spec
@@ -81,16 +81,15 @@ tests:
     asserts:
       - equal:
           path: metadata.name
-          value: prod-grid-hub
+          value: hub
 
-  - it: listing peers turns on discovery and the operator's TLS Secrets
+  - it: listing peers turns on the operator's TLS Secrets and keeps manual discovery
     template: templates/gridnetwork.yaml
     set:
       peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     asserts:
-      - equal:
-          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
-          value: "true"
+      - notExists:
+          path: spec.siteDiscovery
       - equal:
           path: spec.tls
           value:
@@ -102,11 +101,12 @@ tests:
     template: templates/gridnetwork.yaml
     set:
       peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      gridNetwork.autoDiscoverSites: false
+      gridNetwork.siteDiscovery.mode: auto
       gridNetwork.tls.swimKeyRef: { name: k, namespace: other }
     asserts:
-      - notExists:
-          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
+      - equal:
+          path: spec.siteDiscovery.mode
+          value: auto
       - equal:
           path: spec.tls
           value:
@@ -118,4 +118,4 @@ tests:
       - notExists:
           path: spec.tls
       - notExists:
-          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
+          path: spec.siteDiscovery
