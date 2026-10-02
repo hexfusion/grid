@@ -177,6 +177,7 @@ where
         if n < backoff.attempts {
             let delay = backoff.delay(n);
             tracing::warn!(what, attempt = n, retry_in_ms = delay.as_millis(), error = %last, "retrying");
+            crate::controller::grid_operator::enrollment_retry(format!("{what}: {last}"));
             tokio::time::sleep(delay).await;
         }
     }
@@ -819,8 +820,15 @@ fn http_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client, Enro
 
 /// Resolve the target, then enroll into it.
 async fn run(client: &Client, settings: &Settings) -> Result<(), EnrollError> {
+    use crate::controller::grid_operator::{Enrollment, set_enrollment};
+    set_enrollment(Some(Enrollment::WaitingForGridNetwork { last: None }));
     let namespace = client.default_namespace().to_owned();
     let target = Box::pin(resolve_target(client, &namespace, settings.backoff)).await?;
+    set_enrollment(Some(Enrollment::Enrolling {
+        site: settings.site_name.clone(),
+        url: settings.base.to_string(),
+        last: None,
+    }));
     let store = KubeStore(Api::namespaced(client.clone(), &namespace));
     let site = &target.site_secret;
     match Box::pin(enroll(&store, settings, &target)).await? {
@@ -828,6 +836,7 @@ async fn run(client: &Client, settings: &Settings) -> Result<(), EnrollError> {
         Outcome::Enrolled(spiffe_id) => tracing::info!(%spiffe_id, secret = %site, "site enrolled"),
         Outcome::Discarded => tracing::info!(secret = %site, "site identity stored by another writer"),
     }
+    crate::controller::grid_operator::set_enrolled(certs::spiffe_id(&settings.site_name));
     Ok(())
 }
 
