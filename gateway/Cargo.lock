@@ -1475,10 +1475,12 @@ name = "gateway"
 version = "0.1.4"
 dependencies = [
  "ai-grid-filters",
+ "certs",
  "praxis-ai-filters",
  "praxis-proxy",
  "praxis-proxy-core",
  "praxis-proxy-filter",
+ "rustls",
  "tracing",
 ]
 
