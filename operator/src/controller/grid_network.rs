@@ -487,7 +487,7 @@ const FIELD_MANAGER: &str = "grid-operator";
 ///
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
 /// semantics for networks that were not designed with it in mind.
-pub const LABEL_AUTO_DISCOVER_SITES: &str = "grid.praxis-proxy.io/auto-discover-sites";
+pub const LABEL_AUTO_DISCOVER_SITES: &str = "grid.praxis.fast/auto-discover-sites";
 
 // ---------------------------------------------------------------------------
 // Cross-resource watch mappers
@@ -883,7 +883,7 @@ async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Cli
         return Ok(());
     }
     let status_doc = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridSite",
         "status": {
             "phase": "Discovered",
@@ -2411,7 +2411,7 @@ async fn update_status(
     }
 
     let patch = serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridNetwork",
         "status": status
     });
@@ -2834,7 +2834,7 @@ async fn reconcile_site_cert_pem(
             // Write a status marker so operators can see the invalid material.
             // Do not store the raw PEM; record only the invalid status.
             let invalid_status_doc = serde_json::json!({
-                "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                "apiVersion": "grid.praxis.fast/v1alpha1",
                 "kind": "GridSite",
                 "status": {
                     "publicCertPem": null,
@@ -2897,13 +2897,13 @@ async fn reconcile_discovered_sites(
         // Server-side apply the spec.  Creating on first call; updating on subsequent
         // calls is a no-op when the spec has not changed.
         let mut spec_obj = serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridSite",
             "metadata": {
                 "name": site.name,
                 "labels": {
-                    "grid.praxis-proxy.io/network": network_name,
-                    "grid.praxis-proxy.io/auto-discovered": "true"
+                    "grid.praxis.fast/network": network_name,
+                    "grid.praxis.fast/auto-discovered": "true"
                 }
             },
             "spec": {
@@ -2953,7 +2953,7 @@ async fn reconcile_discovered_sites(
 
         if should_write_discovered {
             let status_doc = serde_json::json!({
-                "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                "apiVersion": "grid.praxis.fast/v1alpha1",
                 "kind": "GridSite",
                 "status": {
                     "phase": "Discovered",
@@ -3128,7 +3128,7 @@ mod tests {
 
     fn make_inference_provider(name: &str, network_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
@@ -3144,7 +3144,7 @@ mod tests {
 
     fn make_grid_site(name: &str, network_ref: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridSite",
             "metadata": { "name": name },
             "spec": { "gridNetworkRef": network_ref }
@@ -3242,7 +3242,7 @@ mod tests {
 
     fn base_network() -> GridNetwork {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridNetwork",
             "metadata": { "name": "net" },
             "spec": { "seeds": [], "gridId": "test-id" }
@@ -3697,7 +3697,7 @@ mod tests {
 
     fn make_provider(name: &str, network: &str, backend_kind: &str, generation: i64) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name, "generation": generation },
             "spec": {
@@ -3713,7 +3713,7 @@ mod tests {
 
     fn make_provider_with_routing_ref(name: &str, network: &str, routing_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
@@ -3730,7 +3730,7 @@ mod tests {
 
     fn make_provider_with_status(name: &str, network: &str, phase: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
@@ -3782,7 +3782,7 @@ mod tests {
     #[test]
     fn provider_state_from_kube_returns_none_for_missing_name() {
         let p: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": {},
             "spec": {
@@ -3891,7 +3891,7 @@ mod tests {
     #[test]
     fn revision_defaults_to_zero_when_no_generation() {
         let p: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": "prov-no-gen" },
             "spec": {
@@ -4178,7 +4178,7 @@ mod tests {
     #[test]
     fn network_site_name_falls_back_to_unknown_site_when_metadata_name_absent() {
         let network: GridNetwork = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridNetwork",
             "metadata": {},
             "spec": { "seeds": [] }
@@ -4431,7 +4431,7 @@ mod tests {
             None => serde_json::json!({"mode": mode}),
         };
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridNetwork",
             "metadata": { "name": "glb-demo" },
             "spec": {
@@ -5592,7 +5592,7 @@ mod tests {
 
     fn make_active_grid_site(k8s_name: &str, network_ref: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridSite",
             "metadata": { "name": k8s_name },
             "spec": { "gridNetworkRef": network_ref },
@@ -5603,7 +5603,7 @@ mod tests {
 
     fn make_phase_grid_site(k8s_name: &str, network_ref: &str, phase: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridSite",
             "metadata": { "name": k8s_name },
             "spec": { "gridNetworkRef": network_ref },
@@ -5739,7 +5739,7 @@ mod tests {
 
     fn make_provider_with_tls(name: &str, network_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
@@ -5761,7 +5761,7 @@ mod tests {
 
     fn make_provider_with_tls_and_health_interval(name: &str, network_ref: &str, interval: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
             "spec": {
