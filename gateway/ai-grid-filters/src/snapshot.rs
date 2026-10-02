@@ -26,6 +26,9 @@ pub struct RouteSnapshot {
 
     /// This gateway's own site identifier.
     pub local_site: Arc<str>,
+
+    /// Each candidate's score, parallel to `candidates`; equal scores share traffic.
+    pub scores: Vec<f64>,
 }
 
 impl RouteSnapshot {
@@ -34,7 +37,12 @@ impl RouteSnapshot {
     /// The order is whatever the caller supplies (config order). Used before
     /// any signals exist and as the cold-start fallback.
     pub fn from_static(candidates: Vec<RouteCandidate>, local_site: Arc<str>) -> Self {
-        Self { candidates, local_site }
+        let scores = vec![f64::INFINITY; candidates.len()];
+        Self {
+            candidates,
+            local_site,
+            scores,
+        }
     }
 
     /// Order candidates least-loaded-first from the live store, then wrap them.
@@ -54,15 +62,16 @@ impl RouteSnapshot {
     ) -> Self {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
-        let mut scored: Vec<(f64, RouteCandidate)> = candidates
+        let mut ranked: Vec<(f64, RouteCandidate)> = candidates
             .into_iter()
             .map(|candidate| (Self::load_of(store, &candidate, now_ms, window_ms), candidate))
             .collect();
-        scored.sort_by(|(left, _), (right, _)| left.total_cmp(right));
-        let ordered = scored.into_iter().map(|(_, candidate)| candidate).collect();
+        ranked.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+        let (scores, ordered) = ranked.into_iter().unzip();
         Self {
             candidates: ordered,
             local_site,
+            scores,
         }
     }
 

@@ -1,11 +1,15 @@
 //! The `grid_site_route` filter: pick a cross-site cluster for a request.
 //!
 //! Reads the model header, finds the front admitted candidate for that model in
-//! the current snapshot, and sets `ctx.cluster` for the downstream load
-//! balancer. Selection is `select_admitted` over a pre-ordered list. The
-//! ordering by live load happens off the request path in `snapshot`.
+//! the current snapshot, rotating among candidates tied on the best score, and
+//! sets `ctx.cluster` for the downstream load balancer. Selection is
+//! `select_spread` over a pre-ordered list. The ordering by live load happens
+//! off the request path in `snapshot`.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -44,6 +48,9 @@ pub(crate) struct GridSiteRouteFilter {
 
     /// Header the request carries the model name in.
     model_header: http::header::HeaderName,
+
+    /// Rotates requests across candidates tied on the best score.
+    turn: AtomicUsize,
 }
 
 impl GridSiteRouteFilter {
@@ -61,7 +68,11 @@ impl GridSiteRouteFilter {
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: GridSiteRouteConfig = parse_filter_config("grid_site_route", config)?;
         let model_header = validate_model_header(&cfg.model_header)?;
-        Ok(Box::new(Self { snapshot, model_header }))
+        Ok(Box::new(Self {
+            snapshot,
+            model_header,
+            turn: AtomicUsize::new(0),
+        }))
     }
 }
 
@@ -93,7 +104,8 @@ impl HttpFilter for GridSiteRouteFilter {
         };
 
         let snapshot = self.snapshot.load();
-        let Some(candidate) = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, model) else {
+        let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+        let Some(candidate) = select_spread(&snapshot, CapabilityKind::InferenceModel, model, turn) else {
             tracing::debug!(model = %model, "grid_site_route: no admitted candidate");
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
@@ -102,19 +114,31 @@ impl HttpFilter for GridSiteRouteFilter {
     }
 }
 
-/// The front candidate matching `kind` and `name` that admits new requests.
-///
-/// The list is pre-ordered (least-loaded first), so the front match is the
-/// chosen target. This is the reused selection: a linear first-match, never a
-/// score computed here.
-pub(crate) fn select_admitted<'list>(
-    candidates: &'list [RouteCandidate],
+/// The admitted match for `kind` and `name`, rotating by `turn` among the front
+/// matches that share the best score. A strictly better score always wins.
+pub(crate) fn select_spread<'snap>(
+    snapshot: &'snap RouteSnapshot,
     kind: CapabilityKind,
     name: &str,
-) -> Option<&'list RouteCandidate> {
-    candidates.iter().find(|candidate| {
-        candidate.kind == kind && &*candidate.name == name && is_admitted_for_new_request(candidate.admission_state)
-    })
+    turn: usize,
+) -> Option<&'snap RouteCandidate> {
+    let matches = || {
+        snapshot
+            .candidates
+            .iter()
+            .zip(&snapshot.scores)
+            .filter(move |(candidate, _)| {
+                candidate.kind == kind
+                    && &*candidate.name == name
+                    && is_admitted_for_new_request(candidate.admission_state)
+            })
+    };
+    let (_, best) = matches().next()?;
+    // Scores ascend, so the tied matches are a prefix.
+    let tied = || matches().take_while(|(_, score)| score.total_cmp(best).is_eq());
+    tied()
+        .nth(turn.checked_rem(tied().count())?)
+        .map(|(candidate, _)| candidate)
 }
 
 /// Whether a candidate in this admission state accepts a new request.
@@ -136,6 +160,12 @@ mod tests {
     use super::*;
     use crate::descriptor::{CandidateConfig, validate_candidates};
 
+    /// The pick for `kind` and `name` over `candidates` in their given order.
+    fn front(candidates: Vec<RouteCandidate>, kind: CapabilityKind, name: &str) -> Option<String> {
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("east"));
+        select_spread(&snapshot, kind, name, 0).map(|chosen| chosen.cluster.to_string())
+    }
+
     /// A validated one-candidate list for `model` at `site`/`cluster`.
     fn one(model: &str, site: &str, cluster: &str, admission: AdmissionState) -> Vec<RouteCandidate> {
         let mut candidates = validate_candidates(vec![CandidateConfig {
@@ -154,25 +184,84 @@ mod tests {
     #[test]
     fn front_match_is_selected() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
-        let chosen = select_admitted(&candidates, CapabilityKind::InferenceModel, "llama").expect("a match");
-        assert_eq!(&*chosen.cluster, "pool-a");
+        assert_eq!(
+            front(candidates, CapabilityKind::InferenceModel, "llama").as_deref(),
+            Some("pool-a")
+        );
     }
 
     #[test]
     fn a_different_model_does_not_match() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
-        assert!(select_admitted(&candidates, CapabilityKind::InferenceModel, "granite").is_none());
+        assert!(front(candidates, CapabilityKind::InferenceModel, "granite").is_none());
     }
 
     #[test]
     fn an_excluded_candidate_is_skipped() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::Excluded);
-        assert!(select_admitted(&candidates, CapabilityKind::InferenceModel, "llama").is_none());
+        assert!(front(candidates, CapabilityKind::InferenceModel, "llama").is_none());
     }
 
     #[test]
     fn an_mcp_kind_does_not_match_an_inference_query() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
-        assert!(select_admitted(&candidates, CapabilityKind::McpTool, "llama").is_none());
+        assert!(front(candidates, CapabilityKind::McpTool, "llama").is_none());
+    }
+
+    /// A snapshot of `llama` on east and west, with the given queue depths.
+    fn two_sites(east: Option<f64>, west: Option<f64>) -> RouteSnapshot {
+        let store = grid_signals::LoadStore::new(std::time::Duration::from_secs(60));
+        for (site, cluster, load) in [("east", "pool-a", east), ("west", "pool-b", west)] {
+            if let Some(value) = load {
+                let line = format!(
+                    r#"{}{{grid_site="{site}",grid_provider="{cluster}"}} {value} 1000"#,
+                    crate::snapshot::LOAD_METRIC
+                );
+                store.ingest_at(&line, 1_000, 1_000, site);
+            }
+        }
+        let mut candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
+        candidates.extend(one("llama", "west", "pool-b", AdmissionState::NewAndExisting));
+        RouteSnapshot::from_store(candidates, Arc::from("east"), &store, 1_000, 30_000)
+    }
+
+    fn picks(snapshot: &RouteSnapshot) -> Vec<String> {
+        (0..4)
+            .map(|turn| {
+                let chosen = select_spread(snapshot, CapabilityKind::InferenceModel, "llama", turn).unwrap();
+                chosen.site.to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn equal_scores_spread_across_the_tied_candidates() {
+        assert_eq!(
+            picks(&two_sites(None, None)),
+            ["east", "west", "east", "west"],
+            "unmeasured"
+        );
+        assert_eq!(
+            picks(&two_sites(Some(5.0), Some(5.0))),
+            ["east", "west", "east", "west"],
+            "measured"
+        );
+    }
+
+    #[test]
+    fn a_better_score_always_wins() {
+        assert_eq!(picks(&two_sites(Some(9.0), Some(1.0))), ["west"; 4]);
+        assert_eq!(
+            picks(&two_sites(Some(1.0), None)),
+            ["east"; 4],
+            "measured beats unmeasured"
+        );
+    }
+
+    #[test]
+    fn an_excluded_tie_is_never_picked() {
+        let mut snapshot = two_sites(None, None);
+        snapshot.candidates[1].admission_state = AdmissionState::Excluded;
+        assert_eq!(picks(&snapshot), ["east"; 4]);
     }
 }
