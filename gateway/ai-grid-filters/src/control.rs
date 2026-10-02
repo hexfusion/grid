@@ -175,7 +175,8 @@ impl Control {
         if self.applied.as_ref() == Some(config) && !renewed {
             return Ok(None);
         }
-        let topology = Arc::new(Topology::from_config(config)?);
+        // Validated before any poller starts, so an invalid config starts and drops nothing.
+        let topology = Arc::new(validate_config(config)?);
         if config.window_secs != self.window_secs {
             tracing::warn!(
                 current = self.window_secs,
@@ -206,10 +207,7 @@ impl Control {
         let mut next = HashMap::with_capacity(config.peers.len());
         let mut started = Vec::new();
         for peer in &config.peers {
-            validate_peer(peer)?;
-            if next.insert(peer.site.as_str(), peer).is_some() {
-                return Err(format!("grid: peer site {} appears twice", peer.site).into());
-            }
+            next.insert(peer.site.as_str(), peer);
             let keep = self
                 .peers
                 .get(&peer.site)
@@ -278,6 +276,19 @@ impl Control {
             now_ms,
         )
     }
+}
+
+/// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, or duplicate site.
+fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> {
+    let topology = Topology::from_config(config)?;
+    let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
+    for peer in &config.peers {
+        validate_peer(peer)?;
+        if !sites.insert(peer.site.as_str()) {
+            return Err(format!("grid: peer site {} appears twice", peer.site).into());
+        }
+    }
+    Ok(topology)
 }
 
 /// Order the current topology and swap it in, unless a reload replaced it meanwhile.
@@ -385,18 +396,24 @@ pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration
     std::thread::Builder::new()
         .name("grid-serving-watch".to_owned())
         .spawn(move || {
-            let mut seen: Option<Vec<u8>> = None;
+            // The last file applied or refused for good. A file that failed for a
+            // reason a retry can fix stays pending and is applied again next tick.
+            let mut settled: Option<Vec<u8>> = None;
             while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
                 // The kubelet swaps the mounted ..data symlink, so a plain read sees the new file.
-                let Ok(bytes) = std::fs::read(&path) else {
-                    tracing::warn!(path = %path.display(), "grid: serving config unreadable; keeping the last good config");
-                    continue;
-                };
-                if seen.as_ref() == Some(&bytes) {
-                    renew_identity(&control, &tally);
-                } else if apply_file(&control, &path, &bytes, &tally) {
-                    seen = Some(bytes);
+                match std::fs::read(&path) {
+                    Ok(bytes) if settled.as_ref() != Some(&bytes) => {
+                        if apply_file(&control, &path, &bytes, &tally) {
+                            settled = Some(bytes);
+                        }
+                    },
+                    Ok(_) => {},
+                    Err(_) => {
+                        tracing::warn!(path = %path.display(), "grid: serving config unreadable; keeping the last good config");
+                    },
                 }
+                // The running config renews its identity whatever the pending file does.
+                renew_identity(&control, &tally);
             }
         })?;
     Ok(Watcher { _stop: stop, counts })
@@ -404,16 +421,20 @@ pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration
 
 /// Parse and apply one changed file, logging and counting the result.
 ///
-/// Returns whether the file is settled: applied, or unparseable. Any other
-/// failure, such as identity files mid-rotation, is retried on the next tick.
+/// Returns whether the file is settled: applied, or refused for good because it
+/// does not parse or validate. Any other failure, such as identity files
+/// mid-rotation, is retried on the next tick.
 fn apply_file(control: &Mutex<Control>, path: &std::path::Path, bytes: &[u8], tally: &WatchCounts) -> bool {
-    let (result, settled) = match serde_yaml::from_slice::<GridServingConfig>(bytes) {
+    let parsed = serde_yaml::from_slice::<GridServingConfig>(bytes)
+        .map_err(|error| -> FilterError { format!("grid: parsing {}: {error}", path.display()).into() })
+        .and_then(|config| validate_config(&config).map(|_| config));
+    let (result, settled) = match parsed {
         Ok(config) => {
             let result = control.lock().unwrap_or_else(PoisonError::into_inner).apply(&config);
             let settled = result.is_ok();
             (result, settled)
         },
-        Err(error) => (Err(format!("grid: parsing {}: {error}", path.display()).into()), true),
+        Err(error) => (Err(error), true),
     };
     report(&result, tally, "grid: serving config reloaded");
     settled
@@ -942,6 +963,61 @@ mod tests {
         std::fs::write(&cert, "issued").expect("issue");
         eventually("the pending change applied", || counts().applied() == 1);
         assert_eq!(sites(&grid.snapshot().load()), ["west", "east"]);
+
+        drop(grid);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_refused_file_neither_blocks_renewal_nor_repeats_its_rejection() {
+        let dir = std::env::temp_dir().join(format!("grid-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        for name in ["ca.pem", "tls.crt", "tls.key"] {
+            std::fs::write(file(name), "old").expect("write");
+        }
+        let mut serving = config(&["east"]);
+        serving.peers[0].grid_ca_path = file("ca.pem");
+        serving.peers[0].client_cert_path = file("tls.crt");
+        serving.peers[0].client_key_path = file("tls.key");
+        let path = dir.join("serving.yaml");
+        let write = |config: &GridServingConfig| {
+            std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(config)).expect("yaml")).expect("write");
+        };
+        write(&serving);
+
+        let peers = Peers::default();
+        let mut grid = runtime(&peers, &serving);
+        grid.watch(&path, Duration::from_millis(20)).expect("watch");
+        let counts = || grid.watcher().expect("watching").counts();
+        eventually("the startup file seen", || counts().reused() == 1);
+
+        let mut twice = config(&["east", "west"]);
+        twice.peers[1].site = "east".to_owned();
+        write(&twice);
+        eventually("the duplicate site refused", || counts().rejected() == 1);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            counts().rejected(),
+            1,
+            "a refused file is rejected once, not every tick"
+        );
+        assert_eq!(peers.starts("east"), 1, "a refused file starts and drops no poller");
+
+        for name in ["tls.crt", "tls.key"] {
+            std::fs::write(file(name), "renewed").expect("renew");
+        }
+        eventually("the running config renewed", || counts().applied() == 1);
+        assert_eq!(
+            peers.starts("east"),
+            2,
+            "the running poller restarted on the renewed identity"
+        );
+        assert_eq!(
+            sites(&grid.snapshot().load()),
+            ["east"],
+            "the refused file never applied"
+        );
 
         drop(grid);
         std::fs::remove_dir_all(&dir).expect("cleanup");
