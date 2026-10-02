@@ -112,6 +112,9 @@ pub(crate) struct Control {
     /// The last applied config, so an unchanged file is a no-op.
     applied: Option<GridServingConfig>,
 
+    /// Digest of the identity files the applied config names, so a renewed Secret restarts the pollers.
+    identity: Option<[u8; 32]>,
+
     /// Builds and spawns a peer's poller.
     start: StartPeer,
 }
@@ -133,6 +136,7 @@ impl Control {
             window_secs: config.window_secs,
             peers: HashMap::new(),
             applied: None,
+            identity: None,
             start,
         })
     }
@@ -148,7 +152,17 @@ impl Control {
     ///
     /// Returns [`FilterError`] for an invalid config or a poller that cannot start, changing nothing.
     pub(crate) fn apply(&mut self, config: &GridServingConfig) -> Result<Option<ReloadOutcome>, FilterError> {
-        if self.applied.as_ref() == Some(config) {
+        self.apply_with(config, identity_digest(config))
+    }
+
+    /// [`Self::apply`] with the identity digest already computed.
+    fn apply_with(
+        &mut self,
+        config: &GridServingConfig,
+        identity: [u8; 32],
+    ) -> Result<Option<ReloadOutcome>, FilterError> {
+        let renewed = self.identity.is_some_and(|applied| applied != identity);
+        if self.applied.as_ref() == Some(config) && !renewed {
             return Ok(None);
         }
         let topology = Arc::new(Topology::from_config(config)?);
@@ -159,8 +173,8 @@ impl Control {
                 "grid: window_secs changes take effect on restart"
             );
         }
-        let (next, started) = self.start_changed(config)?;
-        let outcome = self.reconcile(&next, started);
+        let (next, started) = self.start_changed(config, renewed)?;
+        let outcome = self.reconcile(&next, started, renewed);
         let ordered = Arc::new(topology.order(&self.store, now_ms()));
         {
             let _swapping = self.swap.lock().unwrap_or_else(PoisonError::into_inner);
@@ -168,11 +182,17 @@ impl Control {
             self.snapshot.store(ordered);
         }
         self.applied = Some(config.clone());
+        self.identity = Some(identity);
         Ok(Some(outcome))
     }
 
-    /// Start pollers for new or changed peers before any swap, so an error keeps the old set.
-    fn start_changed<'config>(&self, config: &'config GridServingConfig) -> Result<Planned<'config>, FilterError> {
+    /// Start pollers for new or changed peers, or every peer once the identity renewed,
+    /// before any swap, so an error keeps the old set.
+    fn start_changed<'config>(
+        &self,
+        config: &'config GridServingConfig,
+        renewed: bool,
+    ) -> Result<Planned<'config>, FilterError> {
         let mut next = HashMap::with_capacity(config.peers.len());
         let mut started = Vec::new();
         for peer in &config.peers {
@@ -180,7 +200,7 @@ impl Control {
             if next.insert(peer.site.as_str(), peer).is_some() {
                 return Err(format!("grid: peer site {} appears twice", peer.site).into());
             }
-            if self.peers.get(&peer.site).is_none_or(|running| running.config != *peer) {
+            if renewed || self.peers.get(&peer.site).is_none_or(|running| running.config != *peer) {
                 let poller = self.poller_config(peer, config.load_window_ms);
                 let handle = (self.start)(peer, &poller, Arc::clone(&self.store), self.refresh())?;
                 started.push(RunningPeer {
@@ -192,11 +212,17 @@ impl Control {
         Ok((next, started))
     }
 
-    /// Stop the pollers of removed or changed peers and adopt the started ones.
-    fn reconcile(&mut self, next: &HashMap<&str, &PeerServingConfig>, started: Vec<RunningPeer>) -> ReloadOutcome {
+    /// Stop the pollers of removed or changed peers, or all of them once the identity
+    /// renewed, and adopt the started ones.
+    fn reconcile(
+        &mut self,
+        next: &HashMap<&str, &PeerServingConfig>,
+        started: Vec<RunningPeer>,
+        renewed: bool,
+    ) -> ReloadOutcome {
         let before = self.peers.len();
         self.peers
-            .retain(|site, running| next.get(site.as_str()).is_some_and(|peer| running.config == **peer));
+            .retain(|site, running| !renewed && next.get(site.as_str()).is_some_and(|peer| running.config == **peer));
         let kept = self.peers.len();
         let outcome = ReloadOutcome {
             started: started.len(),
@@ -254,6 +280,32 @@ where
     })
 }
 
+/// A change detector over every identity file `config` names: the grid CA,
+/// client certificate, and key. Not a security function.
+///
+/// Each file is hashed on its own, so no buffer holds the concatenated key.
+fn identity_digest(config: &GridServingConfig) -> [u8; 32] {
+    let paths: std::collections::BTreeSet<&str> = config
+        .peers
+        .iter()
+        .flat_map(|peer| [&peer.grid_ca_path, &peer.client_cert_path, &peer.client_key_path])
+        .map(String::as_str)
+        .collect();
+    let mut material = Vec::new();
+    for path in paths {
+        material.extend_from_slice(&path.len().to_be_bytes());
+        material.extend_from_slice(path.as_bytes());
+        match std::fs::read(path).map(zeroize::Zeroizing::new) {
+            Ok(content) => {
+                material.push(1);
+                material.extend_from_slice(&certs::sha256(&content));
+            },
+            Err(_) => material.push(0),
+        }
+    }
+    certs::sha256(&material)
+}
+
 /// Re-reads the serving config file on an interval and applies changes.
 pub(crate) struct Watcher {
     /// Dropping it stops the watch thread.
@@ -264,11 +316,14 @@ pub(crate) struct Watcher {
     counts: Arc<WatchCounts>,
 }
 
-/// Changed files the watch applied or rejected.
+/// Reloads the watch applied, reused, or rejected.
 #[derive(Debug, Default)]
 pub(crate) struct WatchCounts {
-    /// Files applied, including ones equal to the running config.
+    /// Reloads that changed the running config or identity.
     applied: AtomicUsize,
+
+    /// Changed files equal to the running config.
+    reused: AtomicUsize,
 
     /// Files that failed to parse or validate.
     rejected: AtomicUsize,
@@ -279,6 +334,12 @@ impl WatchCounts {
     #[cfg(test)]
     pub(crate) fn applied(&self) -> usize {
         self.applied.load(Ordering::SeqCst)
+    }
+
+    /// Files equal to the running config so far.
+    #[cfg(test)]
+    pub(crate) fn reused(&self) -> usize {
+        self.reused.load(Ordering::SeqCst)
     }
 
     /// Files rejected so far.
@@ -311,8 +372,9 @@ pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration
                     tracing::warn!(path = %path.display(), "grid: serving config unreadable; keeping the last good config");
                     continue;
                 };
-                if seen.as_ref() != Some(&bytes) {
-                    apply_file(&control, &path, &bytes, &tally);
+                if seen.as_ref() == Some(&bytes) {
+                    renew_identity(&control, &tally);
+                } else if apply_file(&control, &path, &bytes, &tally) {
                     seen = Some(bytes);
                 }
             }
@@ -321,24 +383,55 @@ pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration
 }
 
 /// Parse and apply one changed file, logging and counting the result.
-fn apply_file(control: &Mutex<Control>, path: &std::path::Path, bytes: &[u8], tally: &WatchCounts) {
-    let result = serde_yaml::from_slice::<GridServingConfig>(bytes)
-        .map_err(|error| -> FilterError { format!("grid: parsing {}: {error}", path.display()).into() })
-        .and_then(|config| control.lock().unwrap_or_else(PoisonError::into_inner).apply(&config));
-    let counter = if result.is_ok() {
-        &tally.applied
-    } else {
-        &tally.rejected
+///
+/// Returns whether the file is settled: applied, or unparseable. Any other
+/// failure, such as identity files mid-rotation, is retried on the next tick.
+fn apply_file(control: &Mutex<Control>, path: &std::path::Path, bytes: &[u8], tally: &WatchCounts) -> bool {
+    let (result, settled) = match serde_yaml::from_slice::<GridServingConfig>(bytes) {
+        Ok(config) => {
+            let result = control.lock().unwrap_or_else(PoisonError::into_inner).apply(&config);
+            let settled = result.is_ok();
+            (result, settled)
+        },
+        Err(error) => (Err(format!("grid: parsing {}: {error}", path.display()).into()), true),
+    };
+    report(&result, tally, "grid: serving config reloaded");
+    settled
+}
+
+/// Re-apply the last good config, which restarts the pollers once its identity files change.
+fn renew_identity(control: &Mutex<Control>, tally: &WatchCounts) {
+    let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some((config, identity)) = control.applied.as_ref().and_then(|config| {
+        let identity = identity_digest(config);
+        (control.identity != Some(identity)).then(|| (config.clone(), identity))
+    }) else {
+        return;
+    };
+    let result = control.apply_with(&config, identity);
+    drop(control);
+    if !matches!(result, Ok(None)) {
+        report(&result, tally, "grid: identity renewed; peer pollers restarted");
+    }
+}
+
+/// Count, log, and export one reload attempt.
+fn report(result: &Result<Option<ReloadOutcome>, FilterError>, tally: &WatchCounts, applied: &str) {
+    let (counter, label) = match result {
+        Ok(Some(_)) => (&tally.applied, "applied"),
+        Ok(None) => (&tally.reused, "reused"),
+        Err(_) => (&tally.rejected, "rejected"),
     };
     counter.fetch_add(1, Ordering::SeqCst);
+    metrics::counter!("grid_serving_config_reload_total", "result" => label).increment(1);
     match result {
         Ok(Some(outcome)) => tracing::info!(
             started = outcome.started,
             stopped = outcome.stopped,
             kept = outcome.kept,
-            "grid: serving config reloaded"
+            "{applied}"
         ),
-        Ok(None) => {},
+        Ok(None) => tracing::info!("grid: serving config unchanged; peer pollers reused"),
         Err(error) => tracing::warn!(%error, "grid: serving config rejected; keeping the last good config"),
     }
 }
@@ -720,11 +813,11 @@ mod tests {
         grid.watch(&path, Duration::from_millis(20)).expect("watch");
         let snapshot = grid.snapshot();
         let counts = || grid.watcher().expect("watching").counts();
-        eventually("the startup file seen", || counts().applied() == 1);
+        eventually("the startup file seen", || counts().reused() == 1);
 
         write("local_site: [not, a, site\n");
         eventually("the bad file handled", || counts().rejected() == 1);
-        assert_eq!(counts().applied(), 1, "the bad file was not applied");
+        assert_eq!(counts().applied(), 0, "the bad file was not applied");
         assert_eq!(
             sites(&snapshot.load()),
             ["east"],
@@ -732,12 +825,83 @@ mod tests {
         );
 
         write(&yaml(&["east", "west"]));
-        eventually("the rewrite handled", || counts().applied() == 2);
+        eventually("the rewrite handled", || counts().applied() == 1);
         assert_eq!(sites(&snapshot.load()), ["east", "west"], "the rewrite applied");
         eventually("west polled", || peers.fetches("west") > 0);
 
         drop(grid);
         std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn a_renewed_identity_restarts_the_pollers_with_no_config_change() {
+        let dir = std::env::temp_dir().join(format!("grid-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        for name in ["ca.pem", "tls.crt", "tls.key"] {
+            std::fs::write(file(name), "old").expect("write");
+        }
+        let mut serving = config(&["east"]);
+        serving.peers[0].grid_ca_path = file("ca.pem");
+        serving.peers[0].client_cert_path = file("tls.crt");
+        serving.peers[0].client_key_path = file("tls.key");
+        let path = dir.join("serving.yaml");
+        std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml")).expect("write");
+
+        let peers = Peers::default();
+        let mut grid = runtime(&peers, &serving);
+        assert_eq!(
+            grid.reload(&serving).expect("reload"),
+            None,
+            "the same identity reuses the pollers"
+        );
+        grid.watch(&path, Duration::from_millis(20)).expect("watch");
+        let counts = || grid.watcher().expect("watching").counts();
+        eventually("the startup file seen", || counts().reused() == 1);
+
+        for name in ["tls.crt", "tls.key"] {
+            std::fs::write(file(name), "renewed").expect("renew");
+        }
+        eventually("the renewal applied", || counts().applied() == 1);
+        assert_eq!(peers.starts("east"), 2, "the poller restarted on the renewed identity");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(counts().applied(), 1, "a settled identity restarts nothing more");
+
+        drop(grid);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_change_that_fails_on_unreadable_identity_is_retried_until_it_applies() {
+        let dir = std::env::temp_dir().join(format!("grid-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let cert = dir.join("tls.crt");
+        let peers = Peers::default();
+        let ok = peers.starter();
+        let watched = cert.clone();
+        let start: StartPeer = Box::new(move |peer, poller, store, refresh| {
+            if peer.client_cert_path == watched.to_string_lossy() && std::fs::metadata(&watched).is_err() {
+                return Err(format!("grid: reading {}", peer.client_cert_path).into());
+            }
+            ok(peer, poller, store, refresh)
+        });
+        let mut grid = crate::serving::start_runtime(&config(&["west"]), start).expect("runtime starts");
+        let mut serving = config(&["west", "east"]);
+        serving.peers[1].client_cert_path = cert.to_string_lossy().into_owned();
+        let path = dir.join("serving.yaml");
+        std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml")).expect("write");
+
+        grid.watch(&path, Duration::from_millis(20)).expect("watch");
+        let counts = || grid.watcher().expect("watching").counts();
+        eventually("the change retried", || counts().rejected() >= 2);
+        assert_eq!(sites(&grid.snapshot().load()), ["west"], "the old config stays");
+
+        std::fs::write(&cert, "issued").expect("issue");
+        eventually("the pending change applied", || counts().applied() == 1);
+        assert_eq!(sites(&grid.snapshot().load()), ["west", "east"]);
+
+        drop(grid);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// `config` in the operator's serving-config shape.
