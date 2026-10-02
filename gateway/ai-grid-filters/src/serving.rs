@@ -220,6 +220,17 @@ pub(crate) fn validate_peer(peer: &PeerServingConfig) -> Result<(), FilterError>
     if peer.connect_timeout_ms == 0 || peer.request_timeout_ms == 0 {
         return Err(format!("grid: peer {} timeouts must be greater than zero", peer.site).into());
     }
+    ServerName::try_from(peer.server_name.as_str()).map_err(|error| -> FilterError {
+        format!("grid: peer {} server_name {}: {error}", peer.site, peer.server_name).into()
+    })?;
+    // A SHA-256 leaf digest, colons allowed.
+    let hex_digest = |pin: &String| {
+        let digits: Vec<char> = pin.chars().filter(|ch| *ch != ':').collect();
+        digits.len() == 64 && digits.iter().all(char::is_ascii_hexdigit)
+    };
+    if let Some(pin) = peer.pins.iter().find(|pin| !hex_digest(pin)) {
+        return Err(format!("grid: peer {} pin {pin} is not a SHA-256 hex digest", peer.site).into());
+    }
     Ok(())
 }
 
@@ -337,6 +348,27 @@ peers:
             client_key_path: "/etc/grid/tls.key".to_owned(),
             pins: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_peer_with_a_bad_server_name_or_pin_is_refused_before_any_poller_starts() {
+        let mut bad_name = valid_peer();
+        bad_name.server_name = "not a name".to_owned();
+        assert!(
+            validate_peer(&bad_name).is_err(),
+            "server_name is checked from the config alone"
+        );
+
+        let mut short_pin = valid_peer();
+        short_pin.pins = vec!["ab:cd".to_owned()];
+        assert!(validate_peer(&short_pin).is_err(), "a truncated pin");
+
+        let mut pinned = valid_peer();
+        pinned.pins = vec!["AB".repeat(32), format!("{}ab", "ab:".repeat(31))];
+        assert!(
+            validate_peer(&pinned).is_ok(),
+            "hex digests with or without colons, any case"
+        );
     }
 
     #[test]
