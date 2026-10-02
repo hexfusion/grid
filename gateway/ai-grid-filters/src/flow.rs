@@ -2,7 +2,7 @@
 //!
 //! The pieces have unit tests in their own crates. These stitch the real
 //! `PeerScraper`, the `LoadStore`, and `RouteSnapshot::from_store` plus
-//! `select_admitted` into one path so the composition is exercised, including
+//! `select_spread` into one path so the composition is exercised, including
 //! the failure cases where a peer is unreachable or untrusted and the router
 //! must still produce a sound decision.
 
@@ -33,7 +33,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     descriptor::{CandidateConfig, CapabilityKind, RouteCandidate, validate_candidates},
-    route::select_admitted,
+    route::select_spread,
     snapshot::{LOAD_METRIC, RouteSnapshot},
 };
 
@@ -214,7 +214,7 @@ async fn scrape_store_route_picks_the_least_loaded_site() {
         1_000,
         30_000,
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(&snapshot, CapabilityKind::InferenceModel, "llama", 0).expect("a route");
     assert_eq!(&*chosen.cluster, "pool-b", "the idle site wins end to end");
 }
 
@@ -256,7 +256,7 @@ async fn the_scrape_hop_is_mutually_authenticated_then_routes() {
         1_000,
         30_000,
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(&snapshot, CapabilityKind::InferenceModel, "llama", 0).expect("a route");
     assert_eq!(&*chosen.cluster, "pool-a");
 }
 
@@ -312,7 +312,7 @@ async fn loss_of_signal_sorts_the_unmeasured_site_last() {
     );
     // Even though east is busy (90), west has no signal at all, so it sorts
     // last and the measured site is chosen. Loss of signal is "least preferred".
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(&snapshot, CapabilityKind::InferenceModel, "llama", 0).expect("a route");
     assert_eq!(
         &*chosen.cluster, "pool-a",
         "a measured busy site beats an unmeasured one"
@@ -346,7 +346,7 @@ async fn an_unreachable_peer_leaves_no_reading_and_the_reachable_one_routes() {
         1_000,
         30_000,
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(&snapshot, CapabilityKind::InferenceModel, "llama", 0).expect("a route");
     assert_eq!(&*chosen.cluster, "pool-b", "the reachable site is chosen");
 }
 
@@ -383,7 +383,7 @@ async fn an_untrusted_peer_is_refused_and_contributes_no_reading() {
         1_000,
         30_000,
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(&snapshot, CapabilityKind::InferenceModel, "llama", 0).expect("a route");
     assert_eq!(&*chosen.cluster, "pool-b", "only the trusted, measured peer routes");
 }
 

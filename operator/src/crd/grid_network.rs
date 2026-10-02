@@ -187,7 +187,7 @@ pub enum SignalMode {
 ///
 /// A property of the grid, not of one operator: every site propagates the same
 /// way. Absent, the grid gossips, which is non-breaking. A mode change takes
-/// effect at operator start, so flipping it is an operator restart.
+/// effect at operator start, so the operator restarts itself when it flips.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -1157,7 +1157,7 @@ pub enum OverlayPhase {
 /// `rendered_revision`, `distributed_revision`, and `content_digest` are
 /// SHA-256 hex digests — they do not contain credential token bytes.
 /// `message` must never contain credential bytes.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayRevisionStatus {
     /// Name of the `GatewayRef` this status entry corresponds to.

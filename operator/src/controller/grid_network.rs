@@ -27,7 +27,8 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, TenantBudgetStatus,
+            TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -127,13 +128,50 @@ pub struct OperatorCtx {
     membership_ready: std::sync::atomic::AtomicBool,
 }
 
+/// Grid-wide modes, fixed for the life of the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridModes {
+    /// Signal propagation.
+    pub signal: SignalMode,
+    /// Peer authorization on the signals path.
+    pub trust: PeerTrustMode,
+}
+
+impl GridModes {
+    /// Without a `GridNetwork`: SPIFFE trust in the Grid CA identity, never an implicit pin.
+    pub const WITHOUT_NETWORK: Self = Self {
+        signal: SignalMode::Gossip,
+        trust: PeerTrustMode::Spiffe,
+    };
+
+    /// The modes `network` declares, defaults for absent fields.
+    #[must_use]
+    pub fn of(network: &GridNetwork) -> Self {
+        Self {
+            signal: network
+                .spec
+                .signal_transport
+                .as_ref()
+                .map(|t| t.mode)
+                .unwrap_or_default(),
+            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
+        }
+    }
+
+    /// The modes to restart into when `network` declares other than `self`, the running modes.
+    #[must_use]
+    pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
+        network.map(Self::of).filter(|declared| *declared != self)
+    }
+}
+
 /// Peer addressing and trust, resolved once at startup.
 #[derive(Clone, Debug)]
 pub struct PeerSettings {
     /// This site's own signals endpoint, for its gateway.
     pub local_signals_addr: Option<String>,
     /// How peers prove their identity.
-    pub trust: signals::PeerTrustMode,
+    pub trust: PeerTrustMode,
     /// Port dialed for a peer that gossips no signals endpoint.
     pub peer_port: u16,
 }
@@ -142,7 +180,7 @@ impl Default for PeerSettings {
     fn default() -> Self {
         Self {
             local_signals_addr: None,
-            trust: signals::PeerTrustMode::default(),
+            trust: PeerTrustMode::default(),
             peer_port: signals::DEFAULT_PEER_PORT,
         }
     }
@@ -309,9 +347,9 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
 /// The labels are the local object's for the same reason.
 fn peer_identities(
     sites: &[GridSite],
-    trust: signals::PeerTrustMode,
+    trust: PeerTrustMode,
 ) -> std::collections::BTreeMap<String, signals::PeerRecord> {
-    let pinned = trust == signals::PeerTrustMode::Pin;
+    let pinned = trust == PeerTrustMode::Pin;
     sites
         .iter()
         .filter_map(|site| {
@@ -583,35 +621,28 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
     reason = "sequential reconcile steps with cert broadcast; extracting cert into a helper would obscure the security boundary"
 )]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
+    if crate::controller::grid_operator::unmanaged() {
+        return Ok(Action::requeue(crate::controller::grid_operator::REFRESH_INTERVAL));
+    }
     let name = grid_network_name(&network)?;
     reject_invalid_budget_policy(&network)?;
 
     info!(name, "reconciling GridNetwork");
 
-    // Mode is resolved once at start and never re-resolved live, so warn on a
-    // spec-versus-running divergence rather than diverge silently.
-    let desired = network
-        .spec
-        .signal_transport
-        .as_ref()
-        .map(|t| t.mode)
-        .unwrap_or_default();
-    if desired != ctx.signal_mode {
-        tracing::warn!(
-            network = name,
-            ?desired,
-            running = ?ctx.signal_mode,
-            "signalTransport.mode differs from the mode resolved at startup; restart the operator to apply"
+    // Modes are fixed at startup, so a change restarts the pod to apply it.
+    let running = GridModes {
+        signal: ctx.signal_mode,
+        trust: ctx.peer_settings.trust,
+    };
+    if let Some(next) = running.restart_for(Some(&network)) {
+        let message = format!(
+            "GridNetwork {name} sets signalTransport={:?} peerTrust={:?}; running {:?}/{:?}; restarting to apply",
+            next.signal, next.trust, running.signal, running.trust
         );
-    }
-    let desired_trust = network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default();
-    if desired_trust != ctx.peer_settings.trust {
-        tracing::warn!(
-            network = name,
-            desired = ?desired_trust,
-            running = ?ctx.peer_settings.trust,
-            "peerTrust.mode differs from the mode resolved at startup; restart the operator to apply"
-        );
+        tracing::info!("{message}");
+        super::grid_operator::restarting_for_modes(&ctx.client, message).await;
+        #[expect(clippy::exit, reason = "modes apply only at startup; Kubernetes restarts the pod")]
+        std::process::exit(0);
     }
 
     let client = &ctx.client;
@@ -783,6 +814,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         consumer_statuses: consumer_config_statuses,
         overlay_statuses,
         serving_retry,
+        site_readiness,
     } = reconcile_routing_overlay_inner(
         &network,
         client,
@@ -821,6 +853,42 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let budget_statuses =
         crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
 
+    // Computed once: the same values feed this network's status and the GridOperator's.
+    let cert_expiring = match &network.spec.tls.site_secret_ref {
+        Some(site) => read_signals_pem(client, site, "tls.crt")
+            .await
+            .ok()
+            .and_then(|pem| String::from_utf8(pem).ok())
+            .is_some_and(|pem| {
+                certs::cert_expires_within(&pem, super::grid_operator::CERT_EXPIRY_WARNING).unwrap_or(false)
+            }),
+        None => false,
+    };
+    super::grid_operator::observe(
+        name,
+        super::grid_operator::NetworkObservation {
+            phase: phase.clone(),
+            overlays: overlay_statuses.clone(),
+            consumers: consumer_config_statuses.clone(),
+            gateways: network
+                .spec
+                .gateway_refs
+                .iter()
+                .map(|gw| (gw.namespace.clone(), gw.name.clone()))
+                .collect(),
+            sites: site_readiness,
+            providers: providers
+                .iter()
+                .filter(|p| p.spec.grid_network_ref == name)
+                .filter_map(|p| {
+                    let provider_phase = p.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
+                    p.metadata.name.clone().map(|n| (n, provider_phase))
+                })
+                .collect(),
+            gossip_lost: !swim_runtime_running,
+            cert_expiring,
+        },
+    );
     update_status(
         &network,
         client,
@@ -833,6 +901,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
+    if let Err(error) = super::grid_operator::publish(client).await {
+        tracing::warn!(network = name, %error, "GridOperator status publish failed");
+    }
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
@@ -1498,10 +1569,27 @@ async fn reconcile_routing_overlay_inner(
             consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
+    // A local site is never probed, so it never turns Active.
+    let local: Vec<&str> = network
+        .spec
+        .gateway_refs
+        .iter()
+        .map(|gw| gw.local_site_name.as_deref().unwrap_or(network_name))
+        .collect();
+    let site_readiness = sites
+        .iter()
+        .filter(|site| site.spec.grid_network_ref == network_name)
+        .filter_map(|site| {
+            let name = site.metadata.name.clone()?;
+            let phase = site.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
+            (!local.contains(&name.as_str())).then_some((name, phase))
+        })
+        .collect();
     Ok(OverlayOutcome {
         consumer_statuses,
         overlay_statuses,
         serving_retry,
+        site_readiness,
     })
 }
 
@@ -1516,6 +1604,8 @@ struct OverlayOutcome {
     overlay_statuses: Vec<OverlayRevisionStatus>,
     /// Soonest a deferred serving config write can land.
     serving_retry: Option<Duration>,
+    /// Each remote site of the network and whether it is `Active`.
+    site_readiness: Vec<(String, GridSitePhase)>,
 }
 
 /// Gossip the serving config renders from, present only under poll.
@@ -3076,6 +3166,42 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_with_modes(spec: &serde_json::Value) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": {"name": "grid"},
+            "spec": spec,
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn modes_restart_only_when_a_grid_network_declares_others() {
+        let running = GridModes::WITHOUT_NETWORK;
+        assert_eq!(running.restart_for(None), None, "no GridNetwork, no restart");
+
+        let same = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "spiffe"}}));
+        assert_eq!(running.restart_for(Some(&same)), None, "same modes, no restart");
+
+        let poll = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "spiffe"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            running.restart_for(Some(&poll)),
+            Some(GridModes {
+                signal: SignalMode::Poll,
+                trust: PeerTrustMode::Spiffe,
+            })
+        );
+        assert_eq!(
+            GridModes::of(&poll).restart_for(Some(&poll)),
+            None,
+            "the restarted process runs what it declares, so it never loops"
+        );
+    }
     use crate::swim_endpoint::EndpointResolutionFailure;
 
     fn seed_addr(value: &str) -> SocketAddr {

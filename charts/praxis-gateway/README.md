@@ -109,8 +109,9 @@ A few things to keep in mind:
   rules out the full `my-app.my-namespace.svc.cluster.local` form. Write
   Service names as `my-app.my-namespace.svc`; the pod's DNS search path
   completes them.
-- Changing `config.inline` and running `helm upgrade` rolls the pods onto the
-  new configuration without refusing requests (see `shutdownDelaySeconds`).
+- Changing `config.inline` or the `gatewayConfig` values the chart renders and
+  running `helm upgrade` rolls the pods onto the new configuration without
+  refusing requests (see `shutdownDelaySeconds`).
 
 ### Bring your own ConfigMap
 
@@ -202,7 +203,7 @@ Praxis AI image; these values may advance independently.
 | `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Takes precedence over `config.inline`. Editing it does not restart the pods. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
 | `config.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when neither `config.existingConfigMap` nor `gatewayConfig.render` applies. Changing it rolls the pods. |
-| `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap. Also on when `config.existingConfigMap` is empty and the values configure grid routing (`gatewayConfig.backends`, `role: provider`, or `gridServing`). Never emits `insecure_options`. See [AI Grid Network](#ai-grid-network-agn). |
+| `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap. Also on when `config.existingConfigMap` is empty and the values configure grid routing (`gatewayConfig.backends`, `role: provider`, or `gridServing`). Never emits `insecure_options`. Changing the rendered config rolls the pods. See [AI Grid Network](#ai-grid-network-agn). |
 | `gatewayConfig.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `gatewayConfig.backends[].site` | string | `localSite` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `localSite`. Its `transport.sni` defaults to `<site>.grid.internal`. |
@@ -236,7 +237,7 @@ Praxis AI image; these values may advance independently.
 | `service.annotations` | object | `{}` | Service annotations. |
 | `service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
 | `route.enabled` | bool | `false` | Render an OpenShift Route to the Service. Needs TLS at the gateway and `route.host`. |
-| `route.tls.termination` | string | `passthrough` | `passthrough`, or `reencrypt` with `route.tls.destinationCACertificate`. A provider allows only `passthrough`. |
+| `route.tls.termination` | string | `passthrough` | `passthrough`, or `reencrypt` with `route.tls.destinationCACertificate`. That CA can be omitted when `service.annotations` has `service.beta.openshift.io/serving-cert-secret-name` naming `gatewayConfig.listenerTls.existingSecret`, since the router trusts the service CA. A provider allows only `passthrough`. |
 | `overlay.enabled` | bool | `false` | Mount an AGN routing overlay ConfigMap. |
 | `overlay.existingConfigMap` | string | `""` | Name of the overlay ConfigMap. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |

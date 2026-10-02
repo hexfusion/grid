@@ -66,7 +66,7 @@ use operator::{
     cli::Cli,
     controller::{
         agent_tool_provider,
-        grid_network::{self, OperatorCtx},
+        grid_network::{self, GridModes, OperatorCtx},
         grid_site, inference_provider,
     },
     crd::{
@@ -81,6 +81,7 @@ use operator::{
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 // ---------------------------------------------------------------------------
 // Main
@@ -94,7 +95,13 @@ use operator::{
               SWIM bootstrap, controller fan-out) reads clearer sequential than split further"
 )]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    let (filter, log_reload) =
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::from_default_env());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    operator::controller::grid_operator::set_log_reload(log_reload);
     tracing::info!("starting grid-operator");
 
     // Install the process-wide crypto provider the TLS stack requires, once,
@@ -115,6 +122,9 @@ async fn main() {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready)));
 
+    // The status object reports the enrollment wait, so it must exist before it.
+    tokio::spawn(operator::controller::grid_operator::run_publisher(client.clone()));
+
     if config.enrollment.enabled
         && let Err(error) = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)).await
     {
@@ -125,7 +135,7 @@ async fn main() {
     let GridModes {
         signal: signal_mode,
         trust,
-    } = match resolve_grid_modes(&client).await {
+    } = match resolve_grid_modes(&client, config.enrollment.enabled).await {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
@@ -156,6 +166,11 @@ async fn main() {
         tokio::spawn(watch_for_termination(trigger));
     } else {
         drop(trigger);
+    }
+
+    // Learn managementState before any controller reconciles.
+    if let Err(error) = operator::controller::grid_operator::publish(&client).await {
+        tracing::warn!(%error, "GridOperator status publish failed");
     }
 
     let result = tokio::try_join!(
@@ -287,32 +302,8 @@ async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::Swim
     }
 }
 
-/// Grid-wide modes read once from the `GridNetwork` at startup.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct GridModes {
-    /// Signal propagation.
-    signal: SignalMode,
-    /// Peer authorization on the signals path.
-    trust: operator::signals::PeerTrustMode,
-}
-
-impl GridModes {
-    /// The modes `network` declares, defaults for absent fields.
-    fn of(network: &GridNetwork) -> Self {
-        Self {
-            signal: network
-                .spec
-                .signal_transport
-                .as_ref()
-                .map(|t| t.mode)
-                .unwrap_or_default(),
-            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
-        }
-    }
-}
-
 /// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup.
-async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
+async fn resolve_grid_modes(client: &Client, enrolled: bool) -> Result<GridModes, String> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let items = networks
         .list(&kube::api::ListParams::default())
@@ -321,8 +312,9 @@ async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
         .items;
     match items.as_slice() {
         [] => {
-            tracing::info!("no GridNetwork at startup; gossip signals, pin peer trust");
-            Ok(GridModes::default())
+            let identity = if enrolled { " (enrolled identity)" } else { "" };
+            tracing::info!("no GridNetwork yet; peer trust spiffe{identity}, signal transport unset until one exists");
+            Ok(GridModes::WITHOUT_NETWORK)
         },
         [network] => {
             let modes = GridModes::of(network);
