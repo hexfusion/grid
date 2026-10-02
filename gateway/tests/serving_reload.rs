@@ -323,6 +323,13 @@ mod tests {
             serving_config(&[("west", &west)], &identity).as_bytes(),
         )]);
         gateway.eventually("west polled after it replaced east", || west.polls() > 0);
+        // A poll already in flight can land after the swap, so wait for the count to settle.
+        let last = std::cell::Cell::new(east.polls());
+        gateway.eventually("east's poller stopped", || {
+            thread::sleep(Duration::from_millis(500));
+            let now = east.polls();
+            last.replace(now) == now
+        });
         let east_polls = east.polls();
         let quiet_until = Instant::now() + Duration::from_secs(1);
         gateway.eventually("a second of east staying quiet", || Instant::now() > quiet_until);
