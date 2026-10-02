@@ -72,8 +72,18 @@ struct RunningPeer {
     /// The config the poller was built from, compared on reload.
     config: PeerServingConfig,
 
+    /// The freshness bound the poller was built with, compared on reload.
+    load_window_ms: i64,
+
     /// Stops the poller on drop.
     _handle: PollHandle,
+}
+
+impl RunningPeer {
+    /// Whether this poller already runs `peer` under `load_window_ms`.
+    fn unchanged(&self, peer: &PeerServingConfig, load_window_ms: i64) -> bool {
+        self.config == *peer && self.load_window_ms == load_window_ms
+    }
 }
 
 /// What a reload changed.
@@ -174,7 +184,7 @@ impl Control {
             );
         }
         let (next, started) = self.start_changed(config, renewed)?;
-        let outcome = self.reconcile(&next, started, renewed);
+        let outcome = self.reconcile(&next, started, renewed, config.load_window_ms);
         let ordered = Arc::new(topology.order(&self.store, now_ms()));
         {
             let _swapping = self.swap.lock().unwrap_or_else(PoisonError::into_inner);
@@ -200,11 +210,16 @@ impl Control {
             if next.insert(peer.site.as_str(), peer).is_some() {
                 return Err(format!("grid: peer site {} appears twice", peer.site).into());
             }
-            if renewed || self.peers.get(&peer.site).is_none_or(|running| running.config != *peer) {
+            let keep = self
+                .peers
+                .get(&peer.site)
+                .is_some_and(|running| running.unchanged(peer, config.load_window_ms));
+            if renewed || !keep {
                 let poller = self.poller_config(peer, config.load_window_ms);
                 let handle = (self.start)(peer, &poller, Arc::clone(&self.store), self.refresh())?;
                 started.push(RunningPeer {
                     config: peer.clone(),
+                    load_window_ms: config.load_window_ms,
                     _handle: handle,
                 });
             }
@@ -219,10 +234,15 @@ impl Control {
         next: &HashMap<&str, &PeerServingConfig>,
         started: Vec<RunningPeer>,
         renewed: bool,
+        load_window_ms: i64,
     ) -> ReloadOutcome {
         let before = self.peers.len();
-        self.peers
-            .retain(|site, running| !renewed && next.get(site.as_str()).is_some_and(|peer| running.config == **peer));
+        self.peers.retain(|site, running| {
+            !renewed
+                && next
+                    .get(site.as_str())
+                    .is_some_and(|peer| running.unchanged(peer, load_window_ms))
+        });
         let kept = self.peers.len();
         let outcome = ReloadOutcome {
             started: started.len(),
@@ -669,6 +689,29 @@ mod tests {
             grid.reload(&moved).expect("reload"),
             None,
             "an unchanged config is a no-op"
+        );
+    }
+
+    #[test]
+    fn a_new_load_window_restarts_the_pollers() {
+        let peers = Peers::default();
+        let grid = runtime(&peers, &config(&["east", "west"]));
+        let mut widened = config(&["east", "west"]);
+        widened.load_window_ms = 60_000;
+        assert_eq!(
+            grid.reload(&widened).expect("reload"),
+            Some(ReloadOutcome {
+                started: 2,
+                stopped: 2,
+                kept: 0
+            }),
+            "every poller restarts under the new freshness bound"
+        );
+        assert_eq!((peers.starts("east"), peers.starts("west")), (2, 2));
+        assert_eq!(
+            grid.reload(&widened).expect("reload"),
+            None,
+            "the same bound restarts nothing"
         );
     }
 
