@@ -178,6 +178,7 @@ async fn main() {
             .with_declared_trust(declared_trust)
             .with_rotation(rotation_running)
             .with_site_name(config.swim.site_name.clone())
+            .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
     );
 

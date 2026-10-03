@@ -81,6 +81,16 @@ pub(crate) struct ServingCandidate {
     pub(crate) cluster: String,
     /// Freshness carried from the overlay.
     pub(crate) fresh: bool,
+    /// Whether it takes new requests. Omitted when it does, so such a config
+    /// still loads on a gateway that predates the field.
+    #[serde(skip_serializing_if = "admits_new")]
+    pub(crate) admission: AdmissionState,
+}
+
+/// Whether `admission` is the default, which the gateway assumes when absent.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
+fn admits_new(admission: &AdmissionState) -> bool {
+    *admission == AdmissionState::NewAndExisting
 }
 
 /// One peer signals endpoint and the local identity material to reach it.
@@ -133,7 +143,7 @@ pub(crate) fn render<'member, Members>(
 where
     Members: IntoIterator<Item = (&'member str, &'member str)>,
 {
-    let candidates = candidates(&overlay.candidates, &overlay.local_site);
+    let candidates = candidates(overlay);
     if candidates.is_empty() {
         return None;
     }
@@ -188,48 +198,70 @@ pub(crate) fn dialable_members<'snap>(
         .collect()
 }
 
-/// Admitted inference candidates within gateway limits, deduplicated and ordered.
-fn candidates(overlay: &[RoutingCandidate], local_site: &str) -> Vec<ServingCandidate> {
-    // Local first so cold start, before any signal, prefers this site.
-    let mut unique: BTreeMap<(bool, &str, &str, &str), bool> = BTreeMap::new();
-    for candidate in overlay.iter().filter(|candidate| routable(candidate)) {
+/// A candidate's identity: remote after local, then site, name, cluster.
+type CandidateKey<'overlay> = (bool, &'overlay str, &'overlay str, &'overlay str);
+
+/// Each routable candidate once, with its freshness and admission.
+///
+/// Any stale or more restricted duplicate marks the tuple, whatever the order.
+fn dedup<'overlay>(
+    overlay: impl Iterator<Item = &'overlay RoutingCandidate>,
+    local_site: &str,
+) -> BTreeMap<CandidateKey<'overlay>, (bool, AdmissionState)> {
+    let mut unique = BTreeMap::new();
+    for candidate in overlay.filter(|candidate| routable(candidate)) {
         let key = (
             candidate.site != local_site,
             candidate.site.as_str(),
             candidate.name.as_str(),
             candidate.cluster.as_str(),
         );
-        // Any stale duplicate marks the tuple stale, whatever the order.
+        let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
         unique
             .entry(key)
-            .and_modify(|fresh| *fresh &= candidate.fresh)
-            .or_insert(candidate.fresh);
-    }
-    if unique.len() > MAX_CANDIDATES {
-        tracing::warn!(
-            candidates = unique.len(),
-            "serving config: dropping candidates past the gateway cap"
-        );
+            .and_modify(|(fresh, held): &mut (bool, AdmissionState)| {
+                *fresh &= candidate.fresh;
+                *held = (*held).max(admission);
+            })
+            .or_insert((candidate.fresh, admission));
     }
     unique
-        .into_iter()
-        .take(MAX_CANDIDATES)
-        .map(|((_, site, name, cluster), fresh)| ServingCandidate {
+}
+
+/// Inference candidates within gateway limits, deduplicated and ordered.
+///
+/// Past the cap, candidates taking new requests are kept before the rest.
+fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
+    // Local first so cold start, before any signal, prefers this site.
+    let unique = dedup(overlay.candidates.iter().chain(&overlay.excluded), &overlay.local_site);
+    let mut kept: Vec<_> = unique.into_iter().collect();
+    if kept.len() > MAX_CANDIDATES {
+        tracing::warn!(
+            candidates = kept.len(),
+            "serving config: dropping candidates past the gateway cap"
+        );
+        kept.sort_by_key(|(key, (_, admission))| (*admission != AdmissionState::NewAndExisting, *key));
+        kept.truncate(MAX_CANDIDATES);
+        kept.sort_by_key(|(key, _)| *key);
+    }
+    kept.into_iter()
+        .map(|((_, site, name, cluster), (fresh, admission))| ServingCandidate {
             kind: INFERENCE_MODEL,
             name: name.to_owned(),
             site: site.to_owned(),
             cluster: cluster.to_owned(),
             fresh,
+            admission,
         })
         .collect()
 }
 
-/// An inference candidate admitting new requests that the gateway will accept.
+/// An inference candidate the gateway will accept, whatever its admission.
+///
+/// A candidate not taking new requests stays in, so the gateway can tell a known
+/// down model, answered with 503, from an unknown one.
 fn routable(candidate: &RoutingCandidate) -> bool {
     candidate.kind == INFERENCE_MODEL
-        && candidate
-            .admission_state
-            .is_none_or(|state| state == AdmissionState::NewAndExisting)
         && [&candidate.name, &candidate.site, &candidate.cluster]
             .into_iter()
             .all(|id| valid_id(id))
@@ -403,6 +435,7 @@ mod tests {
             network: "grid".to_owned(),
             local_site: "site-a".to_owned(),
             candidates,
+            excluded: Vec::new(),
             selection_policy: None,
             generated_at: None,
         }
@@ -453,13 +486,8 @@ mod tests {
     }
 
     #[test]
-    fn candidates_the_gateway_would_reject_or_never_admit_are_dropped() {
+    fn candidates_the_gateway_would_reject_are_dropped() {
         let cases = [
-            ("excluded", cand("llama", "site-b", "pool-b", Some("none"))),
-            (
-                "existing only",
-                cand("llama", "site-b", "pool-b", Some("existing_only")),
-            ),
             ("blank cluster", cand("llama", "site-b", " ", None)),
             (
                 "oversized name",
@@ -472,6 +500,68 @@ mod tests {
         let mut mcp = cand("tool", "site-b", "pool-b", None);
         mcp.kind = "mcp_tool".to_owned();
         assert!(render(&overlay(vec![mcp]), [], &INPUTS).is_none(), "mcp_tool");
+    }
+
+    #[test]
+    fn an_excluded_candidate_reaches_the_serving_config_but_not_the_overlay_wire() {
+        let mut source = overlay(vec![cand("llama", "site-a", "pool-a", None)]);
+        source.excluded = vec![cand("llama", "site-b", "pool-b", Some("none"))];
+        let rendered = render(&source, [], &INPUTS).expect("rendered");
+        let config: serde_json::Value = serde_json::from_str(&to_text(&rendered).expect("text")).expect("json");
+        let pool_b = config["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .find(|c| c["cluster"] == "pool-b")
+            .expect("the excluded candidate is listed");
+        assert_eq!(pool_b["admission"], "none");
+        let wire = serde_json::to_string(&source).expect("overlay json");
+        assert!(!wire.contains("pool-b"), "the overlay wire is unchanged: {wire}");
+    }
+
+    #[test]
+    fn past_the_cap_candidates_taking_new_requests_are_kept_first() {
+        let excluded: Vec<_> = (0..MAX_CANDIDATES)
+            .map(|i| cand("llama", "site-a", &format!("down-{i:04}"), Some("none")))
+            .collect();
+        let mut source = overlay(vec![cand("llama", "site-z", "up", None)]);
+        source.excluded = excluded;
+        let rendered = render(&source, [], &INPUTS).expect("rendered");
+        assert_eq!(rendered.candidates.len(), MAX_CANDIDATES);
+        assert!(
+            rendered.candidates.iter().any(|c| c.cluster == "up"),
+            "the one admitted candidate survives the cap"
+        );
+    }
+
+    #[test]
+    fn a_candidate_not_taking_new_requests_stays_in_with_its_admission() {
+        let rendered = render(
+            &overlay(vec![
+                cand("llama", "site-a", "pool-a", None),
+                cand("llama", "site-b", "pool-b", Some("none")),
+                cand("llama", "site-d", "pool-d", Some("existing_only")),
+            ]),
+            [],
+            &INPUTS,
+        )
+        .expect("rendered");
+        let config: serde_json::Value = serde_json::from_str(&to_text(&rendered).expect("text")).expect("json");
+        let admission: Vec<(&str, Option<&str>)> = config["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .map(|c| (c["site"].as_str().unwrap_or(""), c["admission"].as_str()))
+            .collect();
+        assert_eq!(
+            admission,
+            [
+                ("site-a", None),
+                ("site-b", Some("none")),
+                ("site-d", Some("existing_only"))
+            ],
+            "the default is omitted, so an older gateway still loads an all-admitted config"
+        );
     }
 
     #[test]

@@ -563,6 +563,34 @@ credential projection can become available.
 
 **Phases**: Pending → Available → Degraded → Unavailable
 
+**Readiness**: `status.conditions` carries a `Ready` condition, written by the
+operator's signals loop from each scrape of the provider's metrics. Readiness is
+a condition, not a phase, so `phase` is unchanged by it.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint, or exposed no count. |
+| `False` | `NoReadyEndpoints` | Two consecutive scrapes counted zero ready endpoints. |
+| `False` | `MetricsUnreachable` | No scrape succeeded within `staleMetricsSeconds`, and the latest failed. |
+| `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds`. |
+| `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
+| `Unknown` | `MetricsNotConfigured` | No `metricsConfig`, so readiness cannot be read. |
+
+A provider whose `Ready` is `False` is excluded from routing: its site publishes
+`grid_provider_ready 0`, and its serving config entry carries `admission: none`.
+See [Polling Cross-Site Load Signals](polling-metrics.md#provider-readiness).
+
+`status.state` repeats the condition's status as one word for display, `Ready`,
+`NotReady`, or `Unknown`, so `kubectl get inferenceproviders` reads like
+`kubectl get nodes`. The STATUS column shows it. `-o wide` adds REASON, the
+condition's reason, and PHASE.
+
+```text
+NAME           PROVIDER      STATUS     AGE
+qwen3-site-a   self_hosted   Ready      3d
+qwen3-site-b   self_hosted   NotReady   3d
+```
+
 `spec.capacityWeight` is an optional positive relative provider capacity from
 `1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
 weightedRandom` and `placementPolicy.strategy: static`. If omitted, the
@@ -651,6 +679,7 @@ routing architecture for full semantics.
 | `prefixCacheHitRatio` | Prefix-cache hit ratio from `0.0` to `1.0`. |
 | `errorRate` | Error rate from `0.0` to `1.0`. |
 | `healthy` | Health gauge interpreted by the metrics parser. |
+| `readyEndpoints` | Ready endpoints in the pool, read for the `Ready` condition. Defaults to `llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, filtered by `poolName`. |
 
 #### TLS and mTLS
 

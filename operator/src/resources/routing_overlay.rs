@@ -931,6 +931,11 @@ pub struct RoutingOverlay {
     /// freshness, score, then alphabetical tiebreak.
     pub candidates: Vec<RoutingCandidate>,
 
+    /// Candidates excluded from routing, kept for the serving config so the gateway
+    /// can answer 503 for a known model. Never on the overlay's own wire.
+    #[serde(skip)]
+    pub excluded: Vec<RoutingCandidate>,
+
     /// Optional explicit local selection policy for Praxis. An absent field is
     /// intentionally backward-compatible and means deterministic selection.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1304,7 +1309,9 @@ pub fn render_routing_overlay_with_admission(
     }
 
     enrich_candidates(&mut candidates, local_site, sites, network_name, &admission_map);
-    candidates.retain(|c| c.admission_state != Some(AdmissionState::Excluded));
+    let (excluded, mut candidates): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| c.admission_state == Some(AdmissionState::Excluded));
 
     let policy = network
         .spec
@@ -1381,6 +1388,7 @@ pub fn render_routing_overlay_with_admission(
         network: network_name.to_owned(),
         local_site: local_site.to_owned(),
         candidates,
+        excluded,
         selection_policy,
         generated_at: generated_at.map(str::to_owned),
     })

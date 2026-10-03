@@ -699,6 +699,8 @@ async fn update_status(
         ModelDiscoveryConfig::OpenAiModels(openai) => openai.effective_url(&provider.spec.endpoint),
     });
     let status = InferenceProviderStatus {
+        conditions: Vec::new(),
+        state: None,
         matching_sites,
         model_discovery_error: None,
         model_discovery_url,
@@ -741,6 +743,8 @@ mod tests {
     #[test]
     fn reconciler_status_matches_only_reconciler_fields() {
         let baseline = InferenceProviderStatus {
+            conditions: Vec::new(),
+            state: None,
             matching_sites: vec!["site-a".to_owned()],
             model_discovery_error: None,
             model_discovery_url: None,
@@ -767,6 +771,23 @@ mod tests {
             ..baseline.clone()
         };
         assert!(!baseline.matches_reconciler_status(&changed_discovery_url));
+    }
+
+    #[test]
+    fn a_conditions_change_is_not_the_reconcilers_to_write() {
+        let baseline = InferenceProviderStatus::default();
+        let changed_conditions = InferenceProviderStatus {
+            conditions: vec![crate::crd::inference_provider::Condition {
+                type_: "Ready".to_owned(),
+                status: "False".to_owned(),
+                ..Default::default()
+            }],
+            ..baseline.clone()
+        };
+        assert!(
+            baseline.matches_reconciler_status(&changed_conditions),
+            "the signals loop owns conditions"
+        );
     }
 
     // -----------------------------------------------------------------------

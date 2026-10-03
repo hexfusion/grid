@@ -34,6 +34,7 @@ use crate::{
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
+    readiness,
     resources::{
         consumer_config::{self, ConsumerConfigError},
         overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
@@ -111,6 +112,12 @@ pub struct OperatorCtx {
 
     /// Served-model sets discovered from this site's providers.
     pub(crate) served_models: served_models::ServedModelStore,
+
+    /// Each provider's latest scrape, from which its readiness is resolved.
+    pub(crate) readiness: readiness::ReadinessStore,
+
+    /// How often the signals loop scrapes providers; a readiness window is at least two.
+    scrape_interval: Duration,
 
     /// Signal transport resolved once at startup: gossip or poll.
     ///
@@ -275,6 +282,8 @@ impl OperatorCtx {
             peers: signals::SignalStore::new(),
             signals: signals::SignalStore::new(),
             served_models: served_models::ServedModelStore::new(),
+            readiness: readiness::ReadinessStore::default(),
+            scrape_interval: Duration::ZERO,
             signal_mode,
             serving_writes: WriteGate::default(),
             peer_settings: PeerSettings::default(),
@@ -357,6 +366,13 @@ impl OperatorCtx {
         self.site_name.as_deref()
     }
 
+    /// Record how often the signals loop scrapes providers.
+    #[must_use]
+    pub const fn with_scrape_interval(mut self, interval: Duration) -> Self {
+        self.scrape_interval = interval;
+        self
+    }
+
     /// Name the certificate the operator issues itself after this site, not the network.
     #[must_use]
     pub fn with_site_name(mut self, site_name: Option<String>) -> Self {
@@ -419,10 +435,206 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     let providers = list_all_inference_providers(client).await?;
     ctx.signals.set_access(signal_access(&providers));
     Box::pin(register_peers(ctx, client)).await?;
-    let collected = provider_metrics::collect_provider_signals(network_name, &providers, Some(client)).await;
+    Box::pin(provider_metrics::collect_provider_signals(
+        network_name,
+        &providers,
+        Some(client),
+        &ctx.readiness,
+    ))
+    .await;
+    let collected = Box::pin(resolve_readiness(ctx, client, &providers, network_name)).await;
     publish_signals(ctx, collected);
     Ok(())
 }
+
+/// Resolve each provider's readiness, write its `Ready` condition, and return what to publish.
+async fn resolve_readiness(
+    ctx: &OperatorCtx,
+    client: &Client,
+    providers: &[InferenceProvider],
+    network_name: &str,
+) -> HashMap<String, Vec<signals::Observation>> {
+    ctx.readiness.retain(
+        &providers
+            .iter()
+            .filter_map(|p| {
+                provider_metrics::signal_scrape_plan(p)
+                    .map(|plan| readiness::key(&p.spec.grid_network_ref, plan.identity))
+            })
+            .collect(),
+    );
+    let now = Instant::now();
+    let mut collected = HashMap::new();
+    for provider in providers.iter().filter(|p| p.spec.grid_network_ref == network_name) {
+        let Some(entry) = readiness_entry(ctx, provider, now) else {
+            continue;
+        };
+        if let Err(error) = Box::pin(apply_ready_condition(client, provider, &entry.verdict)).await {
+            tracing::warn!(provider = entry.identity, %error, "provider Ready condition not written");
+        }
+        if let Some(published) = entry.published {
+            collected.insert(entry.identity.to_owned(), published);
+        }
+    }
+    collected
+}
+
+/// One provider's readiness and the signals to publish for it.
+struct ReadinessEntry<'provider> {
+    /// Routing identity.
+    identity: &'provider str,
+    /// The verdict.
+    verdict: readiness::Verdict,
+    /// Signals to publish, `None` for a provider without metrics: absent reads as ready.
+    published: Option<Vec<signals::Observation>>,
+}
+
+/// A provider's readiness entry, `None` for no identity or not yet judged.
+///
+/// A provider not scraped for readiness, with no metrics config or no usable
+/// endpoint, is `Unknown` and publishes nothing: absent reads as ready.
+fn readiness_entry<'provider>(
+    ctx: &OperatorCtx,
+    provider: &'provider InferenceProvider,
+    now: Instant,
+) -> Option<ReadinessEntry<'provider>> {
+    let identity = routing_overlay::routing_identity(provider)?;
+    if provider_metrics::signal_scrape_plan(provider).is_none() {
+        return Some(ReadinessEntry {
+            identity,
+            verdict: readiness::Verdict {
+                reason: readiness::Reason::MetricsNotConfigured,
+                message: "no metricsConfig endpoint to read readiness from".to_owned(),
+            },
+            published: None,
+        });
+    }
+    let verdict = provider_readiness(ctx, provider, now)?;
+    let ready = ready_sample(&verdict);
+    // A fresh scrape republishes with the verdict. Without one, the last published
+    // entry ages on its own, unless the verdict turned not ready.
+    let fresh = ctx
+        .readiness
+        .take_fresh(&readiness::key(&provider.spec.grid_network_ref, identity));
+    let published = match fresh {
+        Some(mut held) => {
+            held.push(ready);
+            Some(held)
+        },
+        None if verdict.reason.excludes() => Some(vec![ready]),
+        None => None,
+    };
+    Some(ReadinessEntry {
+        identity,
+        verdict,
+        published,
+    })
+}
+
+/// The `grid_provider_ready` sample for `verdict`: 1 when it serves, 0 when not.
+fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
+    signals::Observation {
+        metric: readiness::READY_SIGNAL.to_owned(),
+        labels: std::collections::BTreeMap::new(),
+        value: if verdict.reason.excludes() { 0.0 } else { 1.0 },
+        timestamp_ms: None,
+    }
+}
+
+/// How long a provider's last good scrape stands.
+///
+/// `staleMetricsSeconds`, else half the signal TTL, and never under two scrape
+/// intervals, so a provider is not judged stale between successful scrapes.
+fn readiness_stale_after(ctx: &OperatorCtx, provider: &InferenceProvider) -> Duration {
+    provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .and_then(|mc| mc.stale_metrics_seconds)
+        .filter(|secs| *secs > 0)
+        .map_or_else(|| site_signals_ttl() / 2, |secs| Duration::from_secs(secs.into()))
+        .max(ctx.scrape_interval.saturating_mul(2))
+}
+
+/// The provider's readiness verdict, `None` when it is not scraped for readiness or not yet judged.
+pub(crate) fn provider_readiness(
+    ctx: &OperatorCtx,
+    provider: &InferenceProvider,
+    now: Instant,
+) -> Option<readiness::Verdict> {
+    let plan = provider_metrics::signal_scrape_plan(provider)?;
+    let unavailable = provider
+        .status
+        .as_ref()
+        .is_some_and(|status| status.phase == crate::crd::inference_provider::ProviderPhase::Unavailable);
+    ctx.readiness.verdict(
+        &readiness::key(&provider.spec.grid_network_ref, plan.identity),
+        unavailable,
+        readiness_stale_after(ctx, provider),
+        now,
+    )
+}
+
+/// Write the provider's `Ready` condition when its status or reason changed.
+async fn apply_ready_condition(
+    client: &Client,
+    provider: &InferenceProvider,
+    verdict: &readiness::Verdict,
+) -> Result<(), OperatorError> {
+    let Some((name, patch)) = ready_condition_patch(provider, verdict) else {
+        return Ok(());
+    };
+    let api: Api<InferenceProvider> = Api::all(client.clone());
+    Box::pin(api.patch_status(
+        name,
+        &PatchParams::apply(READINESS_FIELD_MANAGER).force(),
+        &Patch::Apply(patch),
+    ))
+    .await?;
+    tracing::info!(
+        provider = name,
+        status = verdict.reason.status(),
+        reason = verdict.reason.as_str(),
+        message = %verdict.message,
+        "provider readiness changed"
+    );
+    Ok(())
+}
+
+/// The status patch carrying the provider's new `Ready` condition, `None` when unchanged.
+fn ready_condition_patch<'provider>(
+    provider: &'provider InferenceProvider,
+    verdict: &readiness::Verdict,
+) -> Option<(&'provider str, serde_json::Value)> {
+    let name = provider.metadata.name.as_deref()?;
+    let status = provider.status.as_ref();
+    let current = status.map_or(&[][..], |status| status.conditions.as_slice());
+    let shown = verdict.reason.display();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()?;
+    // Apply always carries both fields this manager owns: one it left out would be removed.
+    let condition = match readiness::ready_condition(current, verdict, &now, provider.metadata.generation) {
+        Some(condition) => condition,
+        None if status.and_then(|status| status.state.as_deref()) == Some(shown) => return None,
+        None => current
+            .iter()
+            .find(|condition| condition.type_ == readiness::READY_CONDITION)?
+            .clone(),
+    };
+    Some((
+        name,
+        serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "status": { "conditions": [condition], "state": shown }
+        }),
+    ))
+}
+
+/// Server-side apply manager for the `Ready` condition, apart from provider reconciliation.
+const READINESS_FIELD_MANAGER: &str = "grid-operator-readiness";
 
 /// Poll this site's providers once and hold the models they serve.
 ///
@@ -939,6 +1151,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
                 memory.evaluate(&memory_key, observation, admission_policy, now),
                 provider.spec.traffic_policy.as_ref().is_some_and(|p| p.drain),
             );
+            // Readiness gates admission whatever the scoring strategy, NoMetrics included.
+            let not_ready = provider_readiness(&ctx, provider, now).is_some_and(|verdict| verdict.reason.excludes());
+            let state = if not_ready {
+                crate::resources::geography::AdmissionState::Excluded
+            } else {
+                state
+            };
             admission_keys.push(memory_key);
             admission_states.insert(identity, state);
         }
@@ -3776,6 +3995,69 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 mod tests {
     use super::*;
 
+    #[expect(clippy::expect_used, reason = "test fixture")]
+    fn provider_with_status(status: &serde_json::Value) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "qwen3-site-b", "generation": 1 },
+            "spec": {
+                "gridNetworkRef": "grid",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": []
+            },
+            "status": status
+        }))
+        .expect("provider")
+    }
+
+    fn ready_condition_json(status: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "Ready", "status": status, "reason": reason, "message": "m",
+            "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
+        })
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::shadow_unrelated,
+        reason = "test assertions on a JSON patch"
+    )]
+    fn the_status_column_is_written_with_the_condition_and_backfilled_once() {
+        let down = readiness::Verdict {
+            reason: readiness::Reason::NoReadyEndpoints,
+            message: "0 ready endpoints".to_owned(),
+        };
+        // The condition already says so, but STATE was never written: backfill it.
+        let unshown = provider_with_status(&serde_json::json!({
+            "conditions": [ready_condition_json("False", "NoReadyEndpoints")]
+        }));
+        let (_, patch) = ready_condition_patch(&unshown, &down).expect("state is backfilled");
+        assert_eq!(patch["status"]["state"], "NotReady");
+        assert_eq!(
+            patch["status"]["conditions"][0]["lastTransitionTime"], "2026-10-03T00:00:00Z",
+            "the held condition rides along unchanged, so apply does not drop it"
+        );
+        // Both already current: nothing to write.
+        let shown = provider_with_status(&serde_json::json!({
+            "conditions": [ready_condition_json("False", "NoReadyEndpoints")],
+            "state": "NotReady"
+        }));
+        assert!(ready_condition_patch(&shown, &down).is_none());
+        // A transition writes both.
+        let up = readiness::Verdict {
+            reason: readiness::Reason::Ready,
+            message: "1 ready endpoints".to_owned(),
+        };
+        let (_, patch) = ready_condition_patch(&shown, &up).expect("a transition is written");
+        assert_eq!(patch["status"]["state"], "Ready");
+        assert_eq!(patch["status"]["conditions"][0]["status"], "True");
+    }
+
     fn network_with_modes(spec: &serde_json::Value) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -6610,6 +6892,7 @@ mod tests {
                     network: "net".to_owned(),
                     local_site: "site".to_owned(),
                     candidates: Vec::new(),
+                    excluded: Vec::new(),
                     selection_policy: None,
                     generated_at: Some("2026-07-29T01:00:00Z".to_owned()),
                 },

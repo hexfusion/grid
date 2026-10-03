@@ -107,41 +107,71 @@ pub(crate) struct CollectedMetrics {
 // Signals collection (poll mode)
 // ---------------------------------------------------------------------------
 
-/// Scrape each provider's endpoint and keep only its configured coarse signals.
+/// Scrape each provider's endpoint, recording its coarse signals and readiness.
 ///
 /// Sibling of [`collect_provider_metrics_with_refresh_interval`], which parses
 /// the same text into [`scoring::BackendMetrics`] for local scoring. This keeps
 /// the provider's own exposition narrowed to its declared `signalNames`, so the
 /// wire carries a coarse rollup rather than the full `/metrics` firehose. Fails
 /// closed on TLS: a provider whose TLS will not resolve is skipped, never
-/// scraped in plaintext. A failed scrape leaves the last value to expire.
+/// scraped in plaintext, and counts as a failed scrape.
 pub(crate) async fn collect_provider_signals(
     network_name: &str,
     providers: &[InferenceProvider],
     client: Option<&kube::Client>,
-) -> HashMap<String, Vec<crate::signals::Observation>> {
-    let mut out = HashMap::new();
+    readiness: &crate::readiness::ReadinessStore,
+) {
     for provider in providers {
         if provider.spec.grid_network_ref != network_name {
             continue;
         }
-        if let Some((identity, observations)) = scrape_provider_signals(provider, client).await {
-            out.insert(identity, observations);
+        let Some(plan) = signal_scrape_plan(provider) else {
+            continue;
+        };
+        let key = crate::readiness::key(network_name, plan.identity);
+        match scrape_provider_signals(provider, &plan, client).await {
+            Some(text) => record_scrape(readiness, &key, provider, &plan, &text),
+            None => readiness.record_failure(&key, Instant::now()),
         }
     }
-    out
 }
 
-/// Scrape one provider's coarse signals, or `None` to leave its last value be.
-///
-/// Every skip and failure returns `None`: a provider absent from the collection
-/// is left alone rather than erased, so a missed scrape expires on its own.
+/// Record one successful scrape: its ready-endpoint count and its declared signals.
+fn record_scrape(
+    readiness: &crate::readiness::ReadinessStore,
+    key: &str,
+    provider: &InferenceProvider,
+    plan: &SignalScrapePlan<'_>,
+    text: &str,
+) {
+    let parsed = crate::signals::parse(text);
+    let pool = provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .and_then(|mc| mc.pool_name.as_deref());
+    let ready = crate::readiness::ready_endpoints(&parsed, plan.ready_names(), pool);
+    let observations = parsed
+        .into_iter()
+        .filter(|o| plan.wanted.contains(o.metric.as_str()))
+        // A local sample's freshness is its collection time, so drop any trailing
+        // timestamp. Only relayed peer samples carry a per-sample stamp.
+        .map(|mut o| {
+            o.timestamp_ms = None;
+            o
+        })
+        .collect();
+    readiness.record_success(key, ready, observations, Instant::now());
+}
+
+/// Scrape one provider's exposition, or `None` when TLS or the scrape fails.
 async fn scrape_provider_signals(
     provider: &InferenceProvider,
+    plan: &SignalScrapePlan<'_>,
     client: Option<&kube::Client>,
-) -> Option<(String, Vec<crate::signals::Observation>)> {
+) -> Option<String> {
     let mc = provider.spec.metrics_config.as_ref()?;
-    let (identity, url, wanted) = signal_scrape_plan(provider)?;
+    let identity = plan.identity;
     let tls_config = match resolve_tls_config(mc.tls.as_ref(), client, identity).await {
         Ok(cfg) => cfg,
         Err((_reason, e)) => {
@@ -152,43 +182,54 @@ async fn scrape_provider_signals(
         },
     };
     let timeout = parse_metrics_timeout(&mc.timeout);
-    let text = scrape_metrics(&url, timeout, tls_config, mc.auth.as_ref().zip(client))
+    scrape_metrics(&plan.url, timeout, tls_config, mc.auth.as_ref().zip(client))
         .await
         .inspect_err(|e| {
-        tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
-    })
-    .ok()?;
-    let observations = crate::signals::parse(&text)
-        .into_iter()
-        .filter(|o| wanted.contains(o.metric.as_str()))
-        // A local sample's freshness is its collection time, so drop any trailing
-        // timestamp. Only relayed peer samples carry a per-sample stamp.
-        .map(|mut o| {
-            o.timestamp_ms = None;
-            o
+            tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed");
         })
-        .collect();
-    Some((identity.to_owned(), observations))
+        .ok()
 }
 
-/// The scrape target for a provider's coarse signals, if it is eligible.
+/// What to scrape for one provider and which of its series to republish.
+pub(crate) struct SignalScrapePlan<'provider> {
+    /// The provider's routing identity.
+    pub(crate) identity: &'provider str,
+    /// The metrics URL.
+    pub(crate) url: String,
+    /// Declared signal names republished as coarse signals; may be empty.
+    pub(crate) wanted: std::collections::BTreeSet<String>,
+    /// A declared ready-endpoints metric, replacing the defaults.
+    ready_override: Option<&'provider str>,
+}
+
+impl SignalScrapePlan<'_> {
+    /// The ready-endpoints names to read, preferred first.
+    fn ready_names(&self) -> &[&str] {
+        self.ready_override
+            .as_ref()
+            .map_or(&crate::readiness::DEFAULT_READY_ENDPOINTS[..], std::slice::from_ref)
+    }
+}
+
+/// The scrape plan for a provider, if it is eligible.
 ///
 /// Pure and synchronous: eligibility is decided here so the scrape path stays
 /// the I/O alone. `None` for a provider with no metrics config, no routing
-/// identity, a blank endpoint, or no declared signal names.
-fn signal_scrape_plan(provider: &InferenceProvider) -> Option<(&str, String, std::collections::BTreeSet<String>)> {
+/// identity, or a blank endpoint. A provider with no signal names is still
+/// scraped, for readiness.
+pub(crate) fn signal_scrape_plan(provider: &InferenceProvider) -> Option<SignalScrapePlan<'_>> {
     let mc = provider.spec.metrics_config.as_ref()?;
     let identity = routing_identity(provider)?;
     let endpoint = provider.spec.endpoint.trim();
     if endpoint.is_empty() || mc.metrics_endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
         return None;
     }
-    let wanted = signal_metric_names(&mc.signal_names);
-    if wanted.is_empty() {
-        return None;
-    }
-    let url = metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path);
-    Some((identity, url, wanted))
+    Some(SignalScrapePlan {
+        identity,
+        url: metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path),
+        wanted: signal_metric_names(&mc.signal_names),
+        ready_override: mc.signal_names.ready_endpoints.as_deref(),
+    })
 }
 
 /// The source metric names a provider declares for its coarse signals.
@@ -874,6 +915,7 @@ mod tests {
             prefix_cache_hit_ratio: Some("my_prefix".to_owned()),
             error_rate: Some("my_errors".to_owned()),
             healthy: Some("my_health".to_owned()),
+            ready_endpoints: None,
         };
         let names = metric_names_from_config(&cfg, None, None);
         assert_eq!(names.queue_depth.as_deref(), Some("my_queue"));

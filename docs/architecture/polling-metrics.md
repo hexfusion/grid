@@ -50,6 +50,28 @@ the store and produces a candidate list ordered least-loaded-first. The request
 path reads one ordered snapshot and takes the front admitted candidate. The
 request path does not read raw signals or compute load. It reads resolved order.
 
+## Provider Readiness
+
+Each site's operator decides whether each of its providers can serve now and
+publishes the verdict as `grid_provider_ready{grid_site,grid_provider}`: 1 when
+ready, 0 when not. A provider is not ready when its EPP reports zero ready
+endpoints for two scrapes in a row, when no scrape has succeeded within
+`staleMetricsSeconds` (half the signal TTL when unset), or when the provider is
+`Unavailable`. The same verdict is the provider's `Ready` condition.
+
+The gateway reads the latest readiness sample for each candidate when it orders
+the snapshot. A candidate whose latest sample is 0 is excluded, so a site is
+dropped within one poll of its operator deciding, and readmitted within one poll
+of it recovering. A missing series reads as ready, so a site whose operator
+predates readiness is still routed. The serving config carries the same verdict
+for this site's own providers as `admission: none`.
+
+When every candidate for a model is excluded, the gateway answers 503 with
+`Retry-After`, not 404: the model exists but cannot be served now.
+
+With the defaults of a 5 s scrape and a 5 s poll, exclusion takes at most about
+15 s and rejoin about 10 s.
+
 ## Failure Behavior
 
 | Condition | Signal produced | Routing effect |
@@ -58,6 +80,7 @@ request path does not read raw signals or compute load. It reads resolved order.
 | Readings all stale (older than the window) | Same as no reading. | The candidate sorts last until a fresh reading arrives. |
 | Peer unreachable or slow | The poll returns an error and no reading is written. | The candidate ages out of the window and then sorts last. The poll loop continues, and one unreachable peer does not wedge the others. |
 | Peer presents an untrusted or mismatched certificate | The connection is refused, so no reading is written. | The peer contributes nothing to the order. |
+| Peer reports `grid_provider_ready 0` | The candidate is excluded. | It takes no new requests until a later reading says 1. If every candidate is excluded, the model answers 503. |
 
 Loss of signal degrades to "least preferred," never to "silently treated as
 idle." A drained burst stays penalized until it ages out of the window rather
