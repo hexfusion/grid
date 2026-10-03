@@ -5,7 +5,7 @@
 apiVersion: grid.praxis.fast/v1alpha1
 kind: GridNetwork
 metadata:
-  name: {{ .network }}
+  name: {{ .network | quote }}
   labels:
     {{- include "grid-operator.labels" $ | nindent 4 }}
     grid.praxis.fast/auto-discover-sites: "true"

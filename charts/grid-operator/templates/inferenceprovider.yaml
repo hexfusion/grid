@@ -10,15 +10,15 @@
 apiVersion: grid.praxis.fast/v1alpha1
 kind: InferenceProvider
 metadata:
-  name: {{ required "grid.providers.name is required" .name }}
+  name: {{ required "grid.providers.name is required" .name | quote }}
   labels:
     {{- include "grid-operator.labels" $ | nindent 4 }}
   annotations:
     {{- include "grid-operator.afterCrds" $ | nindent 4 }}
 spec:
-  gridNetworkRef: {{ required "grid.providers.gridNetworkRef is required" .gridNetworkRef }}
-  providerKind: {{ required "grid.providers.providerKind is required" .providerKind }}
-  backendKind: {{ required "grid.providers.backendKind is required" .backendKind }}
+  gridNetworkRef: {{ required "grid.providers.gridNetworkRef is required" .gridNetworkRef | quote }}
+  providerKind: {{ required "grid.providers.providerKind is required" .providerKind | quote }}
+  backendKind: {{ required "grid.providers.backendKind is required" .backendKind | quote }}
   endpoint: {{ required "grid.providers.endpoint is required" .endpoint | quote }}
   {{- with .capacityWeight }}
   capacityWeight: {{ . }}

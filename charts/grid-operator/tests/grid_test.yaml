@@ -134,3 +134,40 @@ tests:
             models:
               - name: Qwen3-Coder-30B-A3B
                 capabilities: [text_generation]
+
+  - it: keeps YAML-ambiguous names strings
+    templates:
+      - templates/gridnetwork.yaml
+      - templates/gridsite.yaml
+      - templates/inferenceprovider.yaml
+    set:
+      site.name: "true"
+      grid.id: lab
+      grid.network: "yes"
+      grid.providers:
+        "null":
+          endpoint: http://m.llm-d.svc:80
+    asserts:
+      - isKind:
+          of: GridNetwork
+        template: templates/gridnetwork.yaml
+      - equal:
+          path: metadata.name
+          value: "yes"
+        template: templates/gridnetwork.yaml
+      - equal:
+          path: metadata.name
+          value: "true"
+        template: templates/gridsite.yaml
+      - equal:
+          path: spec.gridNetworkRef
+          value: "yes"
+        template: templates/gridsite.yaml
+      - equal:
+          path: metadata.name
+          value: "null"
+        template: templates/inferenceprovider.yaml
+      - equal:
+          path: spec.gridNetworkRef
+          value: "yes"
+        template: templates/inferenceprovider.yaml
