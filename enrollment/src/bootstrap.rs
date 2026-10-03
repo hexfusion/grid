@@ -129,13 +129,13 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
 
     ensure_credentials(&secrets, args).await?;
+    Box::pin(ensure_swim_key(&client, &secrets, args)).await?;
     if args.skip_ca {
         return Ok(());
     }
     let ca = resolve_ca(&secrets, args).await?;
     write_opaque_secret(&secrets, &args.ca_bundle_secret, "ca.crt", &ca.cert_pem).await?;
     Box::pin(ensure_site_identity(&client, &ca, args)).await?;
-    Box::pin(ensure_swim_key(&client, &secrets, args)).await?;
     if !args.skip_serving {
         ensure_serving(&secrets, &ca, args).await?;
     }
