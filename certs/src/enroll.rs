@@ -17,7 +17,7 @@ const MAX_SITE_NAME_LEN: usize = 63;
 
 /// Backdating applied to `not_before`, so a peer whose clock runs slightly slow
 /// does not reject a certificate issued moments ago.
-const CLOCK_SKEW_ALLOWANCE: Duration = Duration::minutes(5);
+pub const CLOCK_SKEW_ALLOWANCE: Duration = Duration::minutes(5);
 
 /// Default issued-certificate lifetime.
 ///

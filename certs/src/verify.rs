@@ -164,6 +164,39 @@ pub fn cert_expires_within(cert_pem: &str, window: time::Duration) -> Result<boo
     })
 }
 
+/// A certificate's `notBefore` and `notAfter`.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_validity(cert_pem: &str) -> Result<(time::OffsetDateTime, time::OffsetDateTime), VerifyError> {
+    with_cert(cert_pem, |cert| {
+        (
+            cert.validity().not_before.to_datetime(),
+            cert.validity().not_after.to_datetime(),
+        )
+    })
+}
+
+/// Lowercase hex SHA-256 over a certificate's `SubjectPublicKeyInfo`, the key digest
+/// enrollment records and [`crate::verify_csr`] returns.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_public_key_sha256(cert_pem: &str) -> Result<String, VerifyError> {
+    Ok(crate::backend::sha256(&cert_public_key(cert_pem)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// One DER certificate as PEM.
+#[must_use]
+pub fn cert_pem_from_der(der: &[u8]) -> String {
+    encode_cert(der.to_vec())
+}
+
 /// The canonical fingerprint of a certificate: lowercase hex SHA-256 over its
 /// DER form.
 ///
@@ -783,6 +816,33 @@ mod tests {
             verify_site_cert(&ca.cert_pem, &"x".repeat(MAX_CERT_PEM_BYTES + 1), "site-d"),
             Err(VerifyError::TooLarge),
             "an oversized certificate must be refused before parsing"
+        );
+    }
+
+    #[test]
+    fn a_leaf_reports_its_key_digest_and_validity() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let csr = csr_for("site-a");
+        let validity = crate::Validity::starting_now(time::Duration::days(30));
+        let issued = sign_csr(&ca, "site-a", &csr, validity).expect("sign");
+        assert_eq!(
+            cert_public_key_sha256(&issued.cert_pem),
+            Ok(issued.public_key_sha256.clone()),
+            "the digest enrollment records"
+        );
+        assert_eq!(
+            crate::verify_csr(&csr).ok(),
+            Some(issued.public_key_sha256),
+            "the CSR names the same key"
+        );
+        let (not_before, not_after) = cert_validity(&issued.cert_pem).expect("validity");
+        assert_eq!(not_before.unix_timestamp(), validity.not_before.unix_timestamp());
+        assert_eq!(not_after.unix_timestamp(), validity.not_after.unix_timestamp());
+        let der = pem::parse(&issued.cert_pem).expect("pem").into_contents();
+        assert_eq!(
+            canonical_fingerprint(&cert_pem_from_der(&der)),
+            canonical_fingerprint(&issued.cert_pem),
+            "DER round-trips to the same certificate"
         );
     }
 }

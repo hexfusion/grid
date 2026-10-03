@@ -120,6 +120,53 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /renewals:
+    post:
+      operationId: renew
+      tags: [enrollment]
+      summary: Renew a site identity with its current certificate
+      description: |
+        The site authenticates over mutual TLS with its current, unexpired grid
+        certificate and submits a signing request for a new key. Returns a new
+        certificate for the name the presented certificate carries. No token is
+        involved. A name with no enrollment record, a key that is not the site's
+        current one, or a request that reuses a held key is refused.
+      security:
+        - siteCertificateAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentRequest'
+      responses:
+        '200':
+          description: The renewed certificate and the grid CA.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Enrollment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: No client certificate, or one this grid did not issue to a site or that is outside its validity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: The enrollment record does not admit this certificate's key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: A concurrent first renewal registered the name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
 components:
   securitySchemes:
     gridAdminAuth:
@@ -130,6 +177,9 @@ components:
       type: http
       scheme: bearer
       description: A single-use site token, minted by a grid-admin.
+    siteCertificateAuth:
+      type: mutualTLS
+      description: The site's current grid certificate, presented in the TLS handshake.
 
   parameters:
     TokenId:

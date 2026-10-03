@@ -8,12 +8,14 @@
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
-use super::{Issued, NewSiteToken, Pin, StoreError};
+use super::{Held, Issued, NewSiteToken, Pin, RenewAction, Renewal, Renewed, StoreError, renewal};
 
 /// The site-token table.
 static SCHEMA_TOKENS: &str = include_str!("../../db/schema/0001_create_site_tokens.up.sql");
 /// The issued-enrollment audit table.
 static SCHEMA_ENROLLMENTS: &str = include_str!("../../db/schema/0002_create_site_enrollments.up.sql");
+/// Renewal columns on the enrollment table.
+static SCHEMA_RENEWAL: &str = include_str!("../../db/schema/0003_site_enrollment_renewal.up.sql");
 /// Advisory-lock key that serializes schema application across instances.
 const SCHEMA_LOCK_KEY: i64 = 0x671D_E401;
 
@@ -48,6 +50,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
+        sqlx::raw_sql(SCHEMA_RENEWAL).execute(&mut *tx).await.map_err(backend)?;
         tx.commit().await.map_err(backend)?;
         Ok(Self { pool })
     }
@@ -159,6 +162,86 @@ impl PgStore {
 
         tx.commit().await.map_err(backend)?;
         Ok((enrollment_id, issued))
+    }
+
+    /// Admit a renewal against the name's locked record, sign, and record the new key.
+    ///
+    /// The row lock serializes renewals of one name, so two retries cannot both rotate.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the lock, decide, sign, and write read as one transaction"
+    )]
+    pub(super) async fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
+    where
+        F: FnOnce() -> Result<Issued, StoreError> + Send,
+    {
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(backend)?;
+        let held = sqlx::query(
+            "SELECT id, public_key_sha256, previous_public_key_sha256,
+                    COALESCE(renewed_at, issued_at) AS recorded_at
+               FROM site_enrollments
+              WHERE site_name = $1
+                FOR UPDATE",
+        )
+        .bind(&renewal.site_name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .map(|row| {
+            Ok::<_, sqlx::Error>(Held {
+                id: row.try_get("id")?,
+                current_key: row.try_get("public_key_sha256")?,
+                previous_key: row.try_get("previous_public_key_sha256")?,
+                recorded_at: row.try_get("recorded_at")?,
+            })
+        })
+        .transpose()
+        .map_err(backend)?;
+        let action = renewal::decide(held.as_ref(), renewal)?;
+        let id = held.as_ref().map_or_else(Uuid::new_v4, |held| held.id);
+        let replaced_key = held.map(|held| held.current_key);
+        let issued = sign()?;
+
+        let written = match action {
+            RenewAction::Resign => Ok(()),
+            RenewAction::Register => sqlx::query(
+                "INSERT INTO site_enrollments
+                     (id, site_token_id, site_name, public_key_sha256, previous_public_key_sha256,
+                      spiffe_id, renewed_at, reserved)
+                 VALUES ($1, NULL, $2, $3, $4, $5, NOW(), TRUE)",
+            )
+            .bind(id)
+            .bind(&renewal.site_name)
+            .bind(&renewal.requested_key)
+            .bind(&renewal.presented_key)
+            .bind(&issued.spiffe_id)
+            .execute(&mut *tx)
+            .await
+            .map(|_done| ()),
+            RenewAction::Rotate | RenewAction::Supersede => sqlx::query(
+                "UPDATE site_enrollments
+                    SET public_key_sha256 = $2, previous_public_key_sha256 = $3, renewed_at = NOW()
+                  WHERE site_name = $1",
+            )
+            .bind(&renewal.site_name)
+            .bind(&renewal.requested_key)
+            .bind(&renewal.presented_key)
+            .execute(&mut *tx)
+            .await
+            .map(|_done| ()),
+        };
+        match written {
+            Ok(()) => {},
+            Err(err) if is_unique_violation(&err) => return Err(StoreError::NameTaken),
+            Err(err) => return Err(backend(err)),
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(Renewed {
+            id,
+            action,
+            replaced_key,
+            issued,
+        })
     }
 
     /// Ping the pool, for the readiness probe.
