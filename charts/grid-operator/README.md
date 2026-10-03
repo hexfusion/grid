@@ -199,6 +199,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | Secret in the release namespace holding the one-time site token. |
 | `enrollment.identitySecretName` | string | `grid-site-identity` | Secret the site identity is written to when no `GridNetwork` names one. Installing the operator alone enrolls the site; no `GridNetwork` is needed. |
 | `enrollment.caSecretName` | string | `grid-ca` | Secret the grid CA is written to when no `GridNetwork` names one. |
+| `enrollment.renewal.enabled` | bool | `true` | Renew the site identity before it expires, presenting the current one. Needs an enrollment URL: the default with `enrollment.enabled`, or `enrollment.url` set, as on a hub whose identity bootstrap issued. |
 
 ## Join a grid
 
@@ -220,6 +221,8 @@ first install, so set `grid.id` on an upgrade after it, or install the grid-site
 ## Auto-enroll
 
 With `enrollment.enabled`, the operator enrolls on startup when the site identity Secret is absent, and reports ready after it enrolls. No `GridNetwork` is needed: the token pins the grid. The operator writes to the Secrets a `GridNetwork`'s `spec.tls.siteSecretRef` and `caSecretRef` name when one exists, and otherwise to `enrollment.identitySecretName` and `enrollment.caSecretName`. Both must be in the release namespace. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
+
+With `enrollment.renewal.enabled`, the default, the operator renews the site identity when less than a third of its lifetime remains. It presents the current certificate to the enrollment service, writes the new certificate and key into the same Secret, and keeps the replaced certificate under `previous.crt` until it expires. Consumers reload the Secret without a restart. Renewal pins the enrollment service to `enrollment.caBundle` when set, and otherwise to the grid CA the site already holds. An identity that expired cannot renew: `GridNetwork` `status.identity` reports `IdentityExpired`, and the site re-enrolls.
 
 ## RBAC and namespace access
 

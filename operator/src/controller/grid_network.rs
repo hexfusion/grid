@@ -27,8 +27,8 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, TenantBudgetStatus,
-            TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus,
+            TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -490,6 +490,16 @@ pub struct OwnLeaf {
     pub fingerprint: String,
     /// The leaf's grid SPIFFE ID, when it carries one.
     pub spiffe: Option<String>,
+    /// SHA-256 of the leaf a renewal replaced, while it is still valid.
+    pub previous: Option<String>,
+}
+
+impl OwnLeaf {
+    /// Whether `fingerprint` is this site's current or still-valid previous leaf.
+    #[must_use]
+    pub fn is_own(&self, fingerprint: &str) -> bool {
+        self.fingerprint == fingerprint || self.previous.as_deref() == Some(fingerprint)
+    }
 }
 
 /// This site's own leaf, for recognising its own workloads, `None` without TLS.
@@ -504,9 +514,18 @@ pub async fn own_leaf_identity(network: &GridNetwork, client: &Client) -> Result
     let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
     let pem = std::str::from_utf8(&cert_pem).map_err(|_e| "signals TLS: certificate is not valid UTF-8".to_owned())?;
     let der = crate::resources::tls_backend::first_cert_der_from_pem(pem).map_err(str::to_owned)?;
+    // The co-located gateway may present the replaced leaf until it reloads.
+    let previous = read_signals_pem(client, site, crate::enroll::renew::PREVIOUS_CERT)
+        .await
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|replaced| certs::cert_expires_within(replaced, time::Duration::ZERO) == Ok(false))
+        .and_then(|replaced| crate::resources::tls_backend::first_cert_der_from_pem(&replaced).ok())
+        .map(|replaced| signals::leaf_fingerprint(&replaced));
     Ok(Some(OwnLeaf {
         fingerprint: signals::leaf_fingerprint(&der),
         spiffe: certs::leaf_spiffe_id(&der),
+        previous,
     }))
 }
 
@@ -860,7 +879,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     let grid_id = resolve_grid_id(&network);
-    let phase = if swim_runtime_running {
+    let identity = site_identity_status(&network, client, time::OffsetDateTime::now_utc()).await;
+    let expired = identity.as_ref().is_some_and(|status| !status.reason.is_empty());
+    let phase = if swim_runtime_running && !expired {
         determine_phase(&network, &grid_id, membership.as_ref())
     } else {
         GridNetworkPhase::Degraded
@@ -895,6 +916,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         consumer_config_statuses,
         overlay_statuses,
         budget_statuses,
+        identity,
     )
     .await?;
 
@@ -2453,6 +2475,7 @@ async fn update_status(
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
+    identity: Option<SiteIdentityStatus>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
@@ -2468,6 +2491,7 @@ async fn update_status(
         consumer_config_status: consumer_config_statuses,
         overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
+        identity,
     };
 
     if !grid_network_status_needs_update(network.status.as_ref(), &status) {
@@ -2484,6 +2508,46 @@ async fn update_status(
         .await?;
 
     Ok(())
+}
+
+/// Reason a site identity past its `notAfter` reports.
+pub const IDENTITY_EXPIRED: &str = "IdentityExpired";
+
+/// This site's identity status from its certificate, `None` without one.
+async fn site_identity_status(
+    network: &GridNetwork,
+    client: &Client,
+    now: time::OffsetDateTime,
+) -> Option<SiteIdentityStatus> {
+    let site = network.spec.tls.site_secret_ref.as_ref()?;
+    let pem = String::from_utf8(read_signals_pem(client, site, "tls.crt").await.ok()?).ok()?;
+    identity_status(&pem, now)
+}
+
+/// The identity status of `cert_pem` at `now`.
+fn identity_status(cert_pem: &str, now: time::OffsetDateTime) -> Option<SiteIdentityStatus> {
+    use time::format_description::well_known::Rfc3339;
+    let (not_before, not_after) = certs::cert_validity(cert_pem).ok()?;
+    crate::metrics::set_site_identity_expiry(not_after.unix_timestamp());
+    let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
+    let expired = now >= not_after;
+    Some(SiteIdentityStatus {
+        not_after: not_after.format(&Rfc3339).ok()?,
+        renew_after: renew_after.format(&Rfc3339).ok()?,
+        fingerprint: certs::canonical_fingerprint(cert_pem).ok()?,
+        reason: if expired {
+            IDENTITY_EXPIRED.to_owned()
+        } else {
+            String::new()
+        },
+        message: if expired {
+            "the site identity expired and cannot renew: a grid-admin deletes this site's enrollment, mints a new \
+             site token, and the site re-enrolls"
+                .to_owned()
+        } else {
+            String::new()
+        },
+    })
 }
 
 /// Return whether the status subresource differs from the desired status.
@@ -4308,6 +4372,39 @@ mod tests {
         );
     }
 
+    /// The identity status reports expiry and the renewal window, and an expired identity says how to recover.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test")]
+    fn the_identity_status_reports_expiry_and_the_renewal_window() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let csr = certs::generate_csr("east").expect("csr");
+        let start = time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
+        let validity = certs::Validity {
+            not_before: start,
+            not_after: start.saturating_add(time::Duration::days(30)),
+        };
+        let leaf = certs::sign_csr(&ca, "east", &csr.csr_pem, validity).expect("leaf");
+
+        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc()).expect("status");
+        assert!(current.reason.is_empty(), "a current identity reports no reason");
+        let (not_before, not_after) = certs::cert_validity(&leaf.cert_pem).expect("validity");
+        let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
+        assert_eq!(
+            current.renew_after,
+            renew_after
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("format")
+        );
+        assert_eq!(
+            current.fingerprint,
+            certs::canonical_fingerprint(&leaf.cert_pem).expect("fp")
+        );
+
+        let expired = identity_status(&leaf.cert_pem, not_after).expect("status");
+        assert_eq!(expired.reason, IDENTITY_EXPIRED);
+        assert!(expired.message.contains("re-enrolls"), "names the recovery");
+    }
+
     #[test]
     fn grid_network_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = GridNetworkStatus {
@@ -4319,6 +4416,7 @@ mod tests {
             consumer_config_status: Vec::new(),
             overlay_status: Vec::new(),
             budget_status: Vec::new(),
+            identity: None,
         };
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 

@@ -121,6 +121,12 @@ async fn main() {
         tracing::error!(%error, "site enrollment failed");
         std::process::exit(1);
     }
+    if config.enrollment.renew {
+        match operator::enroll::renew::Settings::from_config(&config.enrollment) {
+            Ok(settings) => drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings))),
+            Err(error) => tracing::error!(%error, "site identity renewal is off: misconfigured"),
+        }
+    }
 
     let GridModes {
         signal: signal_mode,
@@ -1676,7 +1682,7 @@ fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAdd
         return (Caller::Peer(None), None);
     };
     let fingerprint = operator::signals::leaf_fingerprint(leaf);
-    if identity.own.as_ref().is_some_and(|own| own.fingerprint == fingerprint) {
+    if identity.own.as_ref().is_some_and(|own| own.is_own(&fingerprint)) {
         return (Caller::Local, None);
     }
     let named = match identity.trust {
@@ -2366,6 +2372,37 @@ mod tests {
     /// A caller is scoped from its certificate, and nothing is trusted for
     /// presenting nothing: only this site's own certificate earns `Local`, and
     /// a missing or undeclared certificate is served nothing.
+    /// After a renewal the co-located gateway stays Local on either leaf until it reloads.
+    #[test]
+    fn the_replaced_leaf_stays_local_until_the_gateway_reloads() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let (renewed, replaced, stranger) = ([1_u8, 1], [2_u8, 2], [3_u8, 3]);
+        let identity = SignalsIdentity {
+            peers: operator::signals::PeerIdentities::new(),
+            own: Some(grid_network::OwnLeaf {
+                fingerprint: operator::signals::leaf_fingerprint(&renewed),
+                spiffe: None,
+                previous: Some(operator::signals::leaf_fingerprint(&replaced)),
+            }),
+            trust: operator::signals::PeerTrustMode::Pin,
+        };
+        assert_eq!(
+            caller_for(Some(&renewed), &identity, addr).0,
+            Caller::Local,
+            "the renewed leaf"
+        );
+        assert_eq!(
+            caller_for(Some(&replaced), &identity, addr).0,
+            Caller::Local,
+            "the replaced leaf"
+        );
+        assert_eq!(
+            caller_for(Some(&stranger), &identity, addr),
+            (Caller::Peer(None), None),
+            "anything else is not this site"
+        );
+    }
+
     #[test]
     fn signals_caller_scope_requires_a_positive_credential() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
@@ -2374,6 +2411,7 @@ mod tests {
             Some(grid_network::OwnLeaf {
                 fingerprint,
                 spiffe: None,
+                previous: None,
             })
         };
 
@@ -2429,6 +2467,7 @@ mod tests {
             own: Some(grid_network::OwnLeaf {
                 fingerprint: operator::signals::leaf_fingerprint(own),
                 spiffe: Some(certs::spiffe_id("hub")),
+                previous: None,
             }),
             trust,
         }
@@ -2580,6 +2619,7 @@ mod tests {
                 own: Some(grid_network::OwnLeaf {
                     fingerprint: operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem)),
                     spiffe: None,
+                    previous: None,
                 }),
                 trust: operator::signals::PeerTrustMode::Pin,
             }
@@ -2668,6 +2708,84 @@ mod tests {
     #[cfg(not(feature = "fips"))]
     fn ok_app() -> axum::Router {
         axum::Router::new().route(operator::signals::SIGNALS_PATH, axum::routing::get(|| async { "ok" }))
+    }
+
+    /// A renewal rebinds the listener on the new leaf: a peer's open connection keeps
+    /// polling across it, and new connections see the renewed leaf.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "serve, poll, rotate, and poll again read as one scenario"
+    )]
+    async fn a_renewal_rebinds_the_listener_without_dropping_a_peer_poll() {
+        let mesh = Mesh::new();
+        let renewed = certs::generate_site_cert(&mesh.ca, "east").expect("fixture");
+        let identity = || {
+            let peers = operator::signals::PeerIdentities::new();
+            peers.set(BTreeMap::from([(
+                "west".to_owned(),
+                operator::signals::PeerRecord {
+                    labels: gpu(),
+                    pins: Vec::new(),
+                },
+            )]));
+            SignalsIdentity {
+                peers,
+                own: None,
+                trust: operator::signals::PeerTrustMode::Spiffe,
+            }
+        };
+        let serve = |leaf: &certs::SiteCertOutput| {
+            let tls = tls_backend::build_server_config(
+                mesh.ca.cert_pem.as_bytes(),
+                leaf.cert_pem.as_bytes(),
+                leaf.key_pem.as_bytes(),
+            )
+            .expect("fixture");
+            let serving = Serving {
+                tls,
+                app: ok_app(),
+                identity: identity(),
+            };
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+                let addr = listener.local_addr().expect("fixture");
+                let (rotate, rotated) = tokio::sync::oneshot::channel::<()>();
+                let changed = async move { drop(rotated.await) };
+                let server = tokio::spawn(serve_signals_tls(listener, serving, Admission::new(8), changed));
+                (addr, rotate, server)
+            }
+        };
+        let presented = |conn: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>| {
+            conn.get_ref()
+                .1
+                .peer_certificates()
+                .and_then(<[_]>::first)
+                .map(|leaf| leaf.as_ref().to_vec())
+        };
+
+        let (before, rotate, server) = serve(&mesh.east).await;
+        let mut polling = mesh.connect(before).await;
+        assert!(get(&mut polling).await.starts_with(b"HTTP/1.1 200"), "polls before");
+        rotate.send(()).expect("rotate");
+        server
+            .await
+            .expect("server task")
+            .expect("the listener stops for the new leaf");
+        assert!(
+            get(&mut polling).await.starts_with(b"HTTP/1.1 200"),
+            "the open connection still polls across the rotation"
+        );
+
+        let (after, _rotate, _server) = serve(&renewed).await;
+        let mut fresh = mesh.connect(after).await;
+        assert_eq!(
+            presented(&fresh),
+            Some(pem_der(&renewed.cert_pem)),
+            "the rebound listener presents the renewed leaf"
+        );
+        assert!(get(&mut fresh).await.starts_with(b"HTTP/1.1 200"), "and serves");
     }
 
     /// An unnamed caller is closed after the handshake without an HTTP answer.

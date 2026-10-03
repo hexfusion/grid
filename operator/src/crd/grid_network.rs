@@ -1054,6 +1054,28 @@ pub struct GridNetworkStatus {
     /// Grid does not enforce budget limits itself (see [`BudgetPolicyConfig`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_status: Vec<TenantBudgetStatus>,
+
+    /// This site's identity certificate: when it expires and when renewal is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<SiteIdentityStatus>,
+}
+
+/// This site's identity certificate.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteIdentityStatus {
+    /// When the certificate expires, RFC 3339.
+    pub not_after: String,
+    /// When renewal is due, a third of the lifetime before `notAfter`, RFC 3339.
+    pub renew_after: String,
+    /// SHA-256 of the certificate DER, the digest peers pin.
+    pub fingerprint: String,
+    /// `IdentityExpired` once the certificate has expired.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// How to recover.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 /// Phase of an operator-generated consumer Praxis `ConfigMap` for one gateway.

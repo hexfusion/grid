@@ -77,3 +77,53 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: must not get operator Secret access
+
+  - it: an enrolled site renews its identity by default
+    template: templates/deployment.yaml
+    set:
+      swim.siteName: east
+      enrollment.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_RENEW_ENABLED, value: "true" }
+
+  - it: a hub whose identity bootstrap issued renews with only the enrollment URL
+    template: templates/deployment.yaml
+    set:
+      swim.siteName: hub
+      enrollment.url: https://grid-enrollment.grid-enrollment.svc:8443
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_RENEW_ENABLED, value: "true" }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_ENROLL_URL, value: "https://grid-enrollment.grid-enrollment.svc:8443" }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_ENROLL_IDENTITY_SECRET, value: grid-site-identity }
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_ENROLL_ENABLED, value: "true" }
+
+  - it: renewal can be turned off
+    template: templates/deployment.yaml
+    set:
+      swim.siteName: east
+      enrollment.enabled: true
+      enrollment.renewal.enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_RENEW_ENABLED, value: "true" }
+
+  - it: without an enrollment URL nothing renews
+    template: templates/deployment.yaml
+    set:
+      swim.siteName: east
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_RENEW_ENABLED, value: "true" }
+
