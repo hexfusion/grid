@@ -100,7 +100,7 @@ Validate image digest format when provided.
 
 {{/*
 Normalize values once per render, in place and idempotently. site.name and grid.seeds
-default swim.siteName and swim.seeds, grid.signals poll turns signals on, and a grid.id
+default swim.siteName and swim.seeds, and a grid.id turns signals on for grid.signals poll and
 defaults a LoadBalancer SWIM Service and the grid-gateway Service the GridNetwork names. Enrollment, the
 cross-cluster path, defaults the site name to swim.siteName (and back), the URL to the
 in-cluster grid-enrollment Service, a LoadBalancer SWIM Service, and the grid-gateway
@@ -113,8 +113,8 @@ Service. Without enrollment nothing changes.
 {{- $grid := $v.grid | default dict }}
 {{- with ($v.site | default dict).name }}{{- if not $v.swim.siteName }}{{- $_ := set $v.swim "siteName" . }}{{- end }}{{- end }}
 {{- with $grid.seeds }}{{- if not $v.swim.seeds }}{{- $_ := set $v.swim "seeds" (join "," .) }}{{- end }}{{- end }}
-{{- if eq ($grid.signals | default "") "poll" }}{{- $_ := set $v.signals "enabled" true }}{{- end }}
 {{- if $grid.id }}
+{{- if eq ($grid.signals | default "") "poll" }}{{- $_ := set $v.signals "enabled" true }}{{- end }}
 {{- if kindIs "invalid" $svc.enabled }}
 {{- $_ := set $svc "enabled" true }}
 {{- if not $svc.type }}{{- $_ := set $svc "type" "LoadBalancer" }}{{- end }}
