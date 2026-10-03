@@ -357,7 +357,10 @@ async fn ensure_site_identity(
         },
         SiteIdentity::Issue { replace } => {
             if replace && !args.force_regenerate {
-                tracing::warn!(secret = %args.site_secret, "replacing a hub identity no enrollment authority wrote");
+                tracing::warn!(
+                    secret = %args.site_secret,
+                    "replacing a hub identity no enrollment authority wrote, or whose key does not match it"
+                );
             }
             replace
         },
@@ -536,6 +539,8 @@ struct SecretView {
     ca_crt: Option<Vec<u8>>,
     /// Its `tls.crt`, if any.
     tls_crt: Option<Vec<u8>>,
+    /// Whether its `tls.key` is the key for `tls_crt`.
+    key_matches: bool,
     /// The uid and resourceVersion read, so a replace deletes only this Secret.
     read_as: kube::api::Preconditions,
 }
@@ -564,10 +569,9 @@ async fn secret_view(
         resource_version: secret.metadata.resource_version.clone(),
     };
     let mut data = secret.data.unwrap_or_default();
-    let (ca_crt, tls_crt) = (
-        data.remove("ca.crt").map(|bytes| bytes.0),
-        data.remove("tls.crt").map(|bytes| bytes.0),
-    );
+    let mut take = |key: &str| data.remove(key).map(|bytes| bytes.0);
+    let (ca_crt, tls_crt) = (take("ca.crt"), take("tls.crt"));
+    let key_matches = pair_matches(data.get("tls.key").map(|key| key.0.as_slice()), tls_crt.as_deref());
     for other in data.values_mut() {
         zeroize::Zeroize::zeroize(&mut other.0);
     }
@@ -575,8 +579,17 @@ async fn secret_view(
         authoritative,
         ca_crt,
         tls_crt,
+        key_matches,
         read_as,
     }))
+}
+
+/// Whether `key` is the private key for `cert`, both PEM.
+fn pair_matches(key: Option<&[u8]>, cert: Option<&[u8]>) -> bool {
+    let key = key.and_then(|bytes| std::str::from_utf8(bytes).ok());
+    let cert = cert.and_then(|bytes| std::str::from_utf8(bytes).ok());
+    key.zip(cert)
+        .is_some_and(|(key, cert)| certs::key_matches_cert(key, cert))
 }
 
 /// One distributed copy, `None` when absent or, for `hub`, not authoritative.
@@ -663,10 +676,11 @@ fn identity_action(view: Option<&SecretView>, ca_cert_pem: &str, site: &str, for
         .as_ref()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .unwrap_or_default();
-    if existing_identity_kept(ca_cert_pem, cert, site).is_ok() {
-        SiteIdentity::Keep
-    } else {
-        SiteIdentity::Refuse
+    match existing_identity_kept(ca_cert_pem, cert, site) {
+        // Without its key the identity cannot serve, so it is issued again.
+        Ok(()) if !view.key_matches => SiteIdentity::Issue { replace: true },
+        Ok(()) => SiteIdentity::Keep,
+        Err(_) => SiteIdentity::Refuse,
     }
 }
 
@@ -1154,6 +1168,7 @@ mod tests {
             authoritative: writer.is_some_and(|writer| CA_AUTHORITIES.contains(&writer)),
             ca_crt: Some(pem.as_bytes().to_vec()),
             tls_crt: None,
+            key_matches: false,
             read_as: kube::api::Preconditions::default(),
         }
     }
@@ -1165,6 +1180,7 @@ mod tests {
             authoritative: writer.is_some_and(|writer| CA_AUTHORITIES.contains(&writer)),
             ca_crt: None,
             tls_crt: Some(issued.cert_pem.into_bytes()),
+            key_matches: true,
             read_as: kube::api::Preconditions::default(),
         }
     }
@@ -1215,6 +1231,19 @@ mod tests {
         assert_eq!(
             identity_action(Some(&written_identity), &minted.cert_pem, "hub", false),
             SiteIdentity::Keep
+        );
+    }
+
+    #[test]
+    fn an_authoritative_identity_without_its_key_is_issued_again() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let keyless = SecretView {
+            key_matches: false,
+            ..identity(Some(MANAGED_BY), &ca)
+        };
+        assert_eq!(
+            identity_action(Some(&keyless), &ca.cert_pem, "hub", false),
+            SiteIdentity::Issue { replace: true }
         );
     }
 

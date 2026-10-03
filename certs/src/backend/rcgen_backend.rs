@@ -145,6 +145,12 @@ pub(crate) fn sign_csr(ca: &CaMaterial, spec: &CertSpec<'_>, csr_pem: &str) -> R
     })
 }
 
+/// A private key's `SubjectPublicKeyInfo` DER, `None` when it does not parse.
+pub(crate) fn key_spki_der(key_pem: &str) -> Option<Vec<u8>> {
+    use rcgen::PublicKeyData as _;
+    KeyPair::from_pem(key_pem).ok().map(|key| key.subject_public_key_info())
+}
+
 /// Verify a request's self-signature and return its `SubjectPublicKeyInfo` DER.
 pub(crate) fn csr_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
     request_spki_der(csr_pem)

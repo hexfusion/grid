@@ -269,6 +269,13 @@ pub(crate) fn sign_csr(ca: &CaMaterial, spec: &CertSpec<'_>, csr_pem: &str) -> R
     })
 }
 
+/// A private key's `SubjectPublicKeyInfo` DER, `None` when it does not parse.
+pub(crate) fn key_spki_der(key_pem: &str) -> Option<Vec<u8>> {
+    PKey::private_key_from_pem(key_pem.as_bytes())
+        .ok()
+        .and_then(|key| key.public_key_to_der().ok())
+}
+
 /// Verify a request's self-signature and return its `SubjectPublicKeyInfo` DER.
 pub(crate) fn csr_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
     let req = X509Req::from_pem(csr_pem.as_bytes()).map_err(|_bad| BackendError::ParseCsr)?;
