@@ -293,7 +293,7 @@
             "string",
             "integer"
           ],
-          "description": "Leaf lifetime in seconds. Empty keeps the service default."
+          "description": "Leaf lifetime in seconds. Empty keeps the service default, 180 days."
         },
         "gridAdminTokens": {
           "type": "object",

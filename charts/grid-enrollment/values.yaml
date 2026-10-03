@@ -107,7 +107,7 @@ route:
 enrollment:
   replicaCount: 1
   listenAddr: "0.0.0.0:8443"
-  certLifetimeSecs: ""               # empty => service default (ENROLLMENT_CERT_LIFETIME_SECS)
+  certLifetimeSecs: ""               # empty => service default, 180 days (ENROLLMENT_CERT_LIFETIME_SECS)
   renewal:
     # -- Sites renew their identity here with their current certificate over mutual
     # TLS. A reencrypt Route drops that certificate, so the render refuses reencrypt
