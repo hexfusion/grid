@@ -19,6 +19,10 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let r = Registry::new();
     r.register(Box::new(PROBE_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SITE_IDENTITY_EXPIRY.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SITE_IDENTITY_RENEWALS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROBE_DURATION.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PHASE_TRANSITIONS.clone()))
@@ -64,6 +68,24 @@ static SIGNALS_SHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
             "Signals connections shed at accept",
         ),
         &["limit"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// The site identity's `notAfter`, Unix seconds.
+static SITE_IDENTITY_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_site_identity_expiry_timestamp_seconds",
+        "When the site identity certificate expires",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Site identity renewal attempts, by result.
+static SITE_IDENTITY_RENEWALS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_site_identity_renewals_total", "Site identity renewal attempts"),
+        &["result"],
     )
     .unwrap_or_else(|_| std::process::abort())
 });
@@ -363,6 +385,16 @@ pub(crate) fn record_swim_pending_drop() {
 /// Count a signals connection shed by `limit`, `total` or `source`.
 pub fn record_signals_shed(limit: &str) {
     SIGNALS_SHED.with_label_values(&[limit]).inc();
+}
+
+/// Set when the site identity expires, Unix seconds.
+pub fn set_site_identity_expiry(not_after: i64) {
+    SITE_IDENTITY_EXPIRY.set(not_after);
+}
+
+/// Count a renewal attempt: `renewed`, `refused`, `failed`, or `expired`.
+pub fn record_site_identity_renewal(result: &str) {
+    SITE_IDENTITY_RENEWALS.with_label_values(&[result]).inc();
 }
 
 /// Gather all registered metrics for serialization.

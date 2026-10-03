@@ -92,6 +92,10 @@ pub struct Config {
     /// Secret the grid CA is written to, unless the `GridNetwork` names one.
     #[arg(long = "enroll-ca-secret", env = "GRID_ENROLL_CA_SECRET", default_value = "grid-ca")]
     pub ca_secret: String,
+
+    /// Renew the site identity through the enrollment service before it expires.
+    #[arg(long = "renew", env = "GRID_RENEW_ENABLED")]
+    pub renew: bool,
 }
 
 /// Why enrollment did not complete.
@@ -879,6 +883,8 @@ pub async fn ensure_enrolled(client: &Client, config: &Config) -> Result<(), Enr
         .await
         .map_err(|_elapsed| EnrollError::TimedOut(ENROLL_DEADLINE.as_secs()))?
 }
+
+pub mod renew;
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]

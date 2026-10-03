@@ -674,6 +674,7 @@ fn urls_must_parse_and_be_https() {
         token_secret_key: "token".to_owned(),
         identity_secret: "grid-site-identity".to_owned(),
         ca_secret: "grid-ca".to_owned(),
+        renew: false,
     };
     for (url, want) in [("http://enroll.example.com", "https"), ("not a url", "GRID_ENROLL_URL")] {
         let got = Settings::from_config(&config(url))
@@ -716,6 +717,7 @@ fn bundles_without_a_certificate_are_refused_before_anything_is_sent() {
         token_secret_key: "token".to_owned(),
         identity_secret: "grid-site-identity".to_owned(),
         ca_secret: "grid-ca".to_owned(),
+        renew: false,
     };
     assert!(Settings::from_config(&with(&ca, None)).is_ok(), "a PEM CA is accepted");
     for (config, name) in [

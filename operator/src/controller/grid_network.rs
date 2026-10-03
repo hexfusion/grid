@@ -27,8 +27,8 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, TenantBudgetStatus,
-            TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus,
+            TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -167,6 +167,12 @@ impl GridModes {
                 .unwrap_or_default(),
             trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
         }
+    }
+
+    /// Whether the site identity renews: a pinned peer would refuse the renewed leaf.
+    #[must_use]
+    pub const fn renews(self) -> bool {
+        matches!(self.trust, PeerTrustMode::Spiffe)
     }
 
     /// The modes to restart into when `network` declares other than `self`, the running modes.
@@ -501,6 +507,16 @@ pub struct OwnLeaf {
     pub fingerprint: String,
     /// The leaf's grid SPIFFE ID, when it carries one.
     pub spiffe: Option<String>,
+    /// SHA-256 of the leaf a renewal replaced, while it is still valid.
+    pub previous: Option<String>,
+}
+
+impl OwnLeaf {
+    /// Whether `fingerprint` is this site's current or still-valid previous leaf.
+    #[must_use]
+    pub fn is_own(&self, fingerprint: &str) -> bool {
+        self.fingerprint == fingerprint || self.previous.as_deref() == Some(fingerprint)
+    }
 }
 
 /// This site's own leaf, for recognising its own workloads, `None` without TLS.
@@ -515,9 +531,18 @@ pub async fn own_leaf_identity(network: &GridNetwork, client: &Client) -> Result
     let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
     let pem = std::str::from_utf8(&cert_pem).map_err(|_e| "signals TLS: certificate is not valid UTF-8".to_owned())?;
     let der = crate::resources::tls_backend::first_cert_der_from_pem(pem).map_err(str::to_owned)?;
+    // The co-located gateway may present the replaced leaf until it reloads.
+    let previous = read_signals_pem(client, site, crate::enroll::renew::PREVIOUS_CERT)
+        .await
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|replaced| certs::cert_expires_within(replaced, time::Duration::ZERO) == Ok(false))
+        .and_then(|replaced| crate::resources::tls_backend::first_cert_der_from_pem(&replaced).ok())
+        .map(|replaced| signals::leaf_fingerprint(&replaced));
     Ok(Some(OwnLeaf {
         fingerprint: signals::leaf_fingerprint(&der),
         spiffe: certs::leaf_spiffe_id(&der),
+        previous,
     }))
 }
 
@@ -871,7 +896,16 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     let grid_id = resolve_grid_id(&network);
-    let phase = if swim_runtime_running {
+    let identity = site_identity_status(
+        &network,
+        client,
+        time::OffsetDateTime::now_utc(),
+        GridModes::of(&network).renews(),
+    )
+    .await;
+    // An expired or unreadable identity degrades the network.
+    let identity_failed = identity.as_ref().is_some_and(|status| !status.reason.is_empty());
+    let phase = if swim_runtime_running && !identity_failed {
         determine_phase(&network, &grid_id, membership.as_ref())
     } else {
         GridNetworkPhase::Degraded
@@ -906,6 +940,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         consumer_config_statuses,
         overlay_statuses,
         budget_statuses,
+        identity,
     )
     .await?;
 
@@ -1258,12 +1293,37 @@ fn crd_seed_decision(resolution: &SeedResolution, previous: &[SocketAddr]) -> Cr
 // TLS Secrets
 // ---------------------------------------------------------------------------
 
-/// Ensure CA and site certificate secrets exist.
+/// What to do about the grid TLS Secrets a `GridNetwork` names.
+#[derive(Debug, PartialEq, Eq)]
+enum TlsSecrets {
+    /// Both exist.
+    Present,
+    /// Neither exists: create a self-signed CA and a site certificate from it.
+    Create,
+    /// Only one exists. A new CA would replace the grid's, so nothing is written.
+    Inconsistent,
+}
+
+/// Decide from which of the CA and site Secrets exist.
+fn tls_secrets_action(ca_exists: bool, site_exists: bool) -> TlsSecrets {
+    match (ca_exists, site_exists) {
+        (true, true) => TlsSecrets::Present,
+        (false, false) => TlsSecrets::Create,
+        _ => TlsSecrets::Inconsistent,
+    }
+}
+
+/// Create a self-signed CA and site certificate when neither Secret exists.
 ///
-/// Generates both together so the CA is available for
-/// signing the site certificate without needing to
-/// reconstruct it from PEM.
-#[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
+/// Generates both together so the CA is available for signing the site
+/// certificate. Never replaces an existing CA: one that enrollment or bootstrap
+/// wrote is the grid's, and a new one would split it.
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "decide, then create the CA and the identity it signs, as one step"
+)]
 async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
     let tls = &network.spec.tls;
     let (Some(ca_ref), Some(site_ref)) = (&tls.ca_secret_ref, &tls.site_secret_ref) else {
@@ -1276,7 +1336,19 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
     let ca_exists = ca_api.get_opt(&ca_ref.name).await?.is_some();
     let site_exists = site_api.get_opt(&site_ref.name).await?.is_some();
 
-    if ca_exists && site_exists {
+    let action = tls_secrets_action(ca_exists, site_exists);
+    if note_inconsistent(
+        ObjectRef::new(&network_site_name(network)),
+        action == TlsSecrets::Inconsistent,
+    ) {
+        tracing::warn!(
+            ca = %ca_ref.name,
+            site = %site_ref.name,
+            "only one of the grid CA and site identity Secrets exists; not replacing the CA. Re-enroll \
+             the site, or delete both to start a self-signed grid"
+        );
+    }
+    if action != TlsSecrets::Create {
         return Ok(());
     }
 
@@ -1284,45 +1356,64 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
     let ca = certs::generate_ca("grid-ca")?;
     let site_cert = certs::generate_site_cert(&ca, &site_name)?;
 
-    apply_ca_secret(&ca_api, ca_ref, &ca).await?;
-    apply_site_secret(&site_api, site_ref, &site_cert).await?;
-
-    info!("created grid TLS secrets");
-    Ok(())
-}
-
-/// Apply the CA secret via server-side apply.
-async fn apply_ca_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    ca_ref: &crate::crd::grid_network::SecretRef,
-    ca: &certs::CaCert,
-) -> Result<(), OperatorError> {
-    let data = secret::ca_secret_data(ca);
-    let s = secret::build(&ca_ref.name, &ca_ref.namespace, data);
-    api.patch(
-        &ca_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
+    // Another writer, such as enrollment, stored its CA first: it is the grid's, and a
+    // site identity from this one would not chain to it.
+    if !create_secret(
+        &ca_api,
+        secret::build(&ca_ref.name, &ca_ref.namespace, secret::ca_secret_data(&ca)),
     )
-    .await?;
-    Ok(())
-}
-
-/// Apply the site certificate secret via server-side apply.
-async fn apply_site_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    site_ref: &crate::crd::grid_network::SecretRef,
-    site_cert: &certs::SiteCertOutput,
-) -> Result<(), OperatorError> {
-    let data = secret::site_cert_secret_data(site_cert);
-    let s = secret::build(&site_ref.name, &site_ref.namespace, data);
-    api.patch(
+    .await?
+    {
+        tracing::debug!(ca = %ca_ref.name, "another writer created the grid CA; not self-signing a site identity");
+        return Ok(());
+    }
+    let site = secret::build(
         &site_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
-    )
-    .await?;
+        &site_ref.namespace,
+        secret::site_cert_secret_data(&site_cert),
+    );
+    if create_secret(&site_api, site).await? {
+        info!(ca = %ca_ref.name, site = %site_ref.name, "created a self-signed grid CA and site identity");
+    } else {
+        tracing::warn!(
+            ca = %ca_ref.name,
+            site = %site_ref.name,
+            "created a self-signed grid CA, but another writer created the site identity, which may not \
+             chain to it"
+        );
+    }
     Ok(())
+}
+
+/// Create `secret`, returning whether this call created it: a Secret another writer
+/// created first is never overwritten.
+async fn create_secret(
+    api: &Api<k8s_openapi::api::core::v1::Secret>,
+    secret: k8s_openapi::api::core::v1::Secret,
+) -> Result<bool, OperatorError> {
+    match api.create(&kube::api::PostParams::default(), &secret).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(response)) if response.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Networks whose TLS Secrets were last seen inconsistent, so the warning fires once
+/// per transition rather than every reconcile.
+static INCONSISTENT_TLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<ObjectRef<GridNetwork>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record whether `network`'s TLS Secrets are inconsistent, returning whether it just became so.
+fn note_inconsistent(network: ObjectRef<GridNetwork>, inconsistent: bool) -> bool {
+    let mut seen = INCONSISTENT_TLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if inconsistent {
+        seen.insert(network)
+    } else {
+        seen.remove(&network);
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2464,6 +2555,7 @@ async fn update_status(
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
+    identity: Option<SiteIdentityStatus>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
@@ -2479,6 +2571,7 @@ async fn update_status(
         consumer_config_status: consumer_config_statuses,
         overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
+        identity,
     };
 
     if !grid_network_status_needs_update(network.status.as_ref(), &status) {
@@ -2495,6 +2588,82 @@ async fn update_status(
         .await?;
 
     Ok(())
+}
+
+/// Reason a site identity past its `notAfter` reports.
+pub const IDENTITY_EXPIRED: &str = "IdentityExpired";
+
+/// `status.identity.reason` when the identity Secret holds no readable certificate.
+pub const IDENTITY_UNREADABLE: &str = "IdentityUnreadable";
+
+/// This site's identity status from its certificate, `None` without one.
+async fn site_identity_status(
+    network: &GridNetwork,
+    client: &Client,
+    now: time::OffsetDateTime,
+    renews: bool,
+) -> Option<SiteIdentityStatus> {
+    use crate::resources::endpoint_tls::TlsFailureReason;
+
+    let site = network.spec.tls.site_secret_ref.as_ref()?;
+    let read =
+        crate::resources::endpoint_tls::read_secret_bytes_for_tls(client, site, "tls.crt", "signals", "site identity")
+            .await;
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        // Not written yet: enrollment or the self-signed path writes it.
+        Err((TlsFailureReason::SecretMissing, _)) => return None,
+        Err((TlsFailureReason::KeyMissing, message)) => return Some(unreadable_identity(&message)),
+        // A failed read says nothing new about the certificate, so the last status stands.
+        Err(_) => return network.status.as_ref().and_then(|status| status.identity.clone()),
+    };
+    let status = String::from_utf8(bytes)
+        .ok()
+        .and_then(|pem| identity_status(&pem, now, renews));
+    Some(status.unwrap_or_else(|| unreadable_identity("tls.crt is not a certificate")))
+}
+
+/// The identity status of a Secret that holds no usable certificate.
+fn unreadable_identity(detail: &str) -> SiteIdentityStatus {
+    SiteIdentityStatus {
+        not_after: String::new(),
+        renew_after: String::new(),
+        fingerprint: String::new(),
+        reason: IDENTITY_UNREADABLE.to_owned(),
+        message: format!("the site identity cannot be read ({detail}); restore the identity Secret or re-enroll"),
+    }
+}
+
+/// The identity status of `cert_pem` at `now`; without renewal, no renewal time.
+fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> Option<SiteIdentityStatus> {
+    use time::format_description::well_known::Rfc3339;
+    let (not_before, not_after) = certs::cert_validity(cert_pem).ok()?;
+    crate::metrics::set_site_identity_expiry(not_after.unix_timestamp());
+    let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
+    let expired = now >= not_after;
+    Some(SiteIdentityStatus {
+        not_after: not_after.format(&Rfc3339).ok()?,
+        renew_after: if renews {
+            renew_after.format(&Rfc3339).ok()?
+        } else {
+            String::new()
+        },
+        fingerprint: certs::canonical_fingerprint(cert_pem).ok()?,
+        reason: if expired {
+            IDENTITY_EXPIRED.to_owned()
+        } else {
+            String::new()
+        },
+        message: if expired {
+            "the site identity expired and cannot renew: a grid-admin deletes this site's enrollment, mints a new \
+             site token, and the site re-enrolls"
+                .to_owned()
+        } else if renews {
+            String::new()
+        } else {
+            "renewal is off under pin peer trust: re-enroll and re-pin this site before notAfter".to_owned()
+        },
+    })
 }
 
 /// Return whether the status subresource differs from the desired status.
@@ -4348,6 +4517,97 @@ mod tests {
         );
     }
 
+    /// The operator self-signs only a grid with neither Secret, never over an existing CA.
+    #[test]
+    fn the_operator_never_replaces_an_existing_grid_ca() {
+        assert_eq!(tls_secrets_action(true, true), TlsSecrets::Present);
+        assert_eq!(tls_secrets_action(false, false), TlsSecrets::Create);
+        assert_eq!(
+            tls_secrets_action(true, false),
+            TlsSecrets::Inconsistent,
+            "an enrolled CA, identity gone"
+        );
+        assert_eq!(tls_secrets_action(false, true), TlsSecrets::Inconsistent);
+    }
+
+    /// The inconsistency warning fires on the transition, not on every reconcile.
+    #[test]
+    fn an_inconsistent_grid_is_warned_once() {
+        // Names no other test uses: the set is process-wide.
+        let network = || ObjectRef::new("inconsistent-tls-test-warn-once");
+        let other = || ObjectRef::new("inconsistent-tls-test-other");
+        assert!(note_inconsistent(network(), true), "the first time");
+        assert!(!note_inconsistent(network(), true), "not again");
+        assert!(!note_inconsistent(network(), false), "fixed");
+        assert!(note_inconsistent(network(), true), "and again after it recurs");
+        assert!(note_inconsistent(other(), true), "per network");
+        // Leave the process-wide set as it was.
+        assert!(!note_inconsistent(network(), false) && !note_inconsistent(other(), false));
+    }
+
+    /// The identity status reports expiry and the renewal window, and an expired identity says how to recover.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test")]
+    fn the_identity_status_reports_expiry_and_the_renewal_window() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let csr = certs::generate_csr("east").expect("csr");
+        let start = time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
+        let validity = certs::Validity {
+            not_before: start,
+            not_after: start.saturating_add(time::Duration::days(30)),
+        };
+        let leaf = certs::sign_csr(&ca, "east", &csr.csr_pem, validity).expect("leaf");
+
+        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), true).expect("status");
+        assert!(current.reason.is_empty(), "a current identity reports no reason");
+        let (not_before, not_after) = certs::cert_validity(&leaf.cert_pem).expect("validity");
+        let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
+        assert_eq!(
+            current.renew_after,
+            renew_after
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("format")
+        );
+        assert_eq!(
+            current.fingerprint,
+            certs::canonical_fingerprint(&leaf.cert_pem).expect("fp")
+        );
+
+        let expired = identity_status(&leaf.cert_pem, not_after, true).expect("status");
+        assert_eq!(expired.reason, IDENTITY_EXPIRED);
+        assert!(expired.message.contains("re-enrolls"), "names the recovery");
+
+        let pinned = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), false).expect("status");
+        assert!(pinned.renew_after.is_empty(), "pin trust schedules no renewal");
+        assert!(pinned.reason.is_empty(), "a current pinned identity is not degraded");
+        assert!(pinned.message.contains("re-pin"), "names the manual step");
+    }
+
+    #[test]
+    fn only_spiffe_trust_renews() {
+        let modes = |trust| GridModes {
+            signal: SignalMode::Gossip,
+            trust,
+        };
+        assert!(
+            !modes(PeerTrustMode::Pin).renews(),
+            "a pinned peer refuses a renewed leaf"
+        );
+        assert!(modes(PeerTrustMode::Spiffe).renews());
+        assert!(
+            GridModes::WITHOUT_NETWORK.renews(),
+            "no GridNetwork trusts by SPIFFE ID"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_identity_degrades_with_its_recovery() {
+        let status = unreadable_identity("tls.crt is not a certificate");
+        assert_eq!(status.reason, IDENTITY_UNREADABLE);
+        assert!(status.message.contains("re-enroll"), "names the recovery");
+        assert!(status.not_after.is_empty() && status.fingerprint.is_empty());
+    }
+
     #[test]
     fn grid_network_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = GridNetworkStatus {
@@ -4359,6 +4619,7 @@ mod tests {
             consumer_config_status: Vec::new(),
             overlay_status: Vec::new(),
             budget_status: Vec::new(),
+            identity: None,
         };
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 
