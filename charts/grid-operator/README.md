@@ -207,6 +207,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | Secret in the release namespace holding the one-time site token. |
 | `enrollment.identitySecretName` | string | `grid-site-identity` | Secret the site identity is written to when no `GridNetwork` names one. Installing the operator alone enrolls the site; no `GridNetwork` is needed. |
 | `enrollment.caSecretName` | string | `grid-ca` | Secret the grid CA is written to when no `GridNetwork` names one. |
+| `enrollment.renewal.enabled` | bool | `true` | Renew the site identity before it expires, presenting the current one. Off under `pin` peer trust whatever this says. Needs an enrollment URL: the default with `enrollment.enabled`, or `enrollment.url` set, as on a hub whose identity bootstrap issued. |
 
 ## Join a grid
 
@@ -231,6 +232,8 @@ wherever it comes from, and the operator never restarts when that network appear
 ## Auto-enroll
 
 With `enrollment.enabled`, the operator enrolls on startup when the site identity Secret is absent, and reports ready after it enrolls. No `GridNetwork` is needed: the token pins the grid. The operator writes to the Secrets a `GridNetwork`'s `spec.tls.siteSecretRef` and `caSecretRef` name when one exists, and otherwise to `enrollment.identitySecretName` and `enrollment.caSecretName`. Both must be in the release namespace. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
+
+With `enrollment.renewal.enabled`, the default, the operator renews the site identity when less than a third of its lifetime remains. It presents the current certificate to the enrollment service, writes the new certificate and key into the same Secret, and keeps the replaced certificate under `previous.crt` until it expires. Consumers reload the Secret without a restart. The gateway loads its upstream client certificate only at start, so after each renewal the operator rolls the gateway Deployment named by `gateway.serviceName`, setting the pod template annotation `grid.praxis.fast/site-identity-fingerprint` to the new leaf's fingerprint. Renewal pins the enrollment service to `enrollment.caBundle` when set, and otherwise to the grid CA the site already holds. An identity that expired cannot renew: `GridNetwork` `status.identity` reports `IdentityExpired`, and the site re-enrolls. The operator renews only under `spiffe` peer trust, and follows the trust its `GridNetwork` declares. Before a `GridNetwork` exists it trusts by SPIFFE ID and renews. Under `pin`, the `GridNetwork` default, it logs `renewal disabled` when it finds pin trust, leaves `status.identity.renewAfter` empty, and the site re-enrolls and is re-pinned before `status.identity.notAfter`. Setting `enrollment.renewal.enabled=false` stops this site's renewal and gateway roll and keeps its current identity until it expires. [Turn renewal off](../../docs/installation/enrollment.md#turn-renewal-off) covers turning it off for the whole grid.
 
 ## RBAC and namespace access
 
