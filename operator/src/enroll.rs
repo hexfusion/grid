@@ -536,11 +536,28 @@ enum Outcome {
     Discarded,
 }
 
+/// Refuse a target other than `defaults` when the identity already sits in `defaults`: its token is spent.
+async fn check_not_enrolled_elsewhere<S: Store + Sync>(
+    store: &S,
+    defaults: &Target,
+    target: &Target,
+) -> Result<(), EnrollError> {
+    let enrolled = &defaults.site_secret;
+    if enrolled != &target.site_secret && store.exists(enrolled).await? {
+        return Err(EnrollError::Config(format!(
+            "the site already enrolled into Secret {enrolled}, but the GridNetwork names {}; point spec.tls.siteSecretRef and caSecretRef at the enrolled Secrets",
+            target.site_secret
+        )));
+    }
+    Ok(())
+}
+
 /// Enroll unless already enrolled, then store the identity.
 async fn enroll<S: Store + Sync>(store: &S, settings: &Settings, target: &Target) -> Result<Outcome, EnrollError> {
     if store.exists(&target.site_secret).await? {
         return Ok(Outcome::AlreadyEnrolled);
     }
+    check_not_enrolled_elsewhere(store, &settings.defaults, target).await?;
     let ca_present = check_existing_ca(store, target, &settings.anchor_pem).await?;
     check_writable(store, target, ca_present, settings.backoff).await?;
     let token = site_token(store, settings).await?;

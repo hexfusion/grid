@@ -424,6 +424,24 @@ async fn an_existing_identity_skips_enrollment_without_reading_the_token() {
     assert!(store.reads.lock().expect("lock").is_empty(), "no Secret data is read");
 }
 
+#[tokio::test]
+async fn a_grid_network_naming_other_secrets_after_enrollment_is_refused() {
+    let (mock, mut settings) = serve(Reply::Sign).await;
+    settings.defaults = Target {
+        site_secret: "grid-site-identity".to_owned(),
+        ca_secret: "grid-ca".to_owned(),
+    };
+    let store = FakeStore::invited();
+    store.put("grid-site-identity", "tls.crt", "present");
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(&outcome, Err(EnrollError::Config(m)) if m.contains("grid-site-identity")),
+        "the enrolled Secret is named: {outcome:?}"
+    );
+    assert_eq!(mock.calls(), 0, "the spent token is not redeemed again");
+    assert!(store.reads.lock().expect("lock").is_empty(), "the token is not read");
+}
+
 /// Replies that must not be stored, with the reason.
 #[tokio::test]
 async fn an_unusable_certificate_is_refused_and_not_stored() {
