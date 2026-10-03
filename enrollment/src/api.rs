@@ -57,6 +57,9 @@ pub struct AppState {
 
     /// Site names issued outside enrollment, such as the hub's, that no token may claim.
     pub reserved_sites: Vec<String>,
+
+    /// Whether renewals are signed. Off stops all rotation; issued identities stay valid.
+    pub renewals_enabled: bool,
 }
 
 /// Failures the interface can report.
@@ -111,6 +114,10 @@ pub enum ApiError {
     /// The name is reserved for bootstrap.
     #[error("the site name is reserved")]
     ReservedSite,
+
+    /// Renewal is turned off for the grid.
+    #[error("renewals are disabled")]
+    RenewalsDisabled,
 
     /// The service itself failed.
     #[error("{0}")]
@@ -241,6 +248,11 @@ impl ApiError {
                 StatusCode::NOT_FOUND,
                 "not_found",
                 "no enrollment holds that site name".to_owned(),
+            ),
+            Self::RenewalsDisabled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "renewals_disabled",
+                "renewal is turned off for this grid; current identities stay valid until they expire".to_owned(),
             ),
             Self::ReservedSite => (
                 StatusCode::CONFLICT,
@@ -537,6 +549,9 @@ async fn renew(
     leaf: SiteLeaf,
     Json(input): Json<EnrollmentRequest>,
 ) -> Result<(StatusCode, Json<Enrollment>), ApiError> {
+    if !state.renewals_enabled {
+        return Err(ApiError::RenewalsDisabled);
+    }
     let renewal = Renewal {
         site_name: leaf.site_name,
         presented_key: leaf.key_sha256,

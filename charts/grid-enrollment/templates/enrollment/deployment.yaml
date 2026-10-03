@@ -94,6 +94,10 @@ spec:
             - name: ENROLLMENT_RESERVED_SEEDS_DIR
               value: /etc/grid-reserved-seeds
             {{- end }}
+            {{- if not (dig "renewal" "enabled" true .Values.enrollment) }}
+            - name: ENROLLMENT_RENEWALS_ENABLED
+              value: "false"
+            {{- end }}
             {{- if .Values.enrollment.certLifetimeSecs }}
             - name: ENROLLMENT_CERT_LIFETIME_SECS
               value: {{ .Values.enrollment.certLifetimeSecs | quote }}

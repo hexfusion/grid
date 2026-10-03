@@ -104,7 +104,8 @@ enrollment:
   renewal:
     # -- Sites renew their identity here with their current certificate over mutual
     # TLS. A reencrypt Route drops that certificate, so the render refuses reencrypt
-    # while this is on.
+    # while this is on. false refuses every renewal (503 renewals_disabled) for the
+    # whole grid; issued identities stay valid until they expire.
     enabled: true
   # kube (default): SAR via TokenReview + SubjectAccessReview, the in-cluster path
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).

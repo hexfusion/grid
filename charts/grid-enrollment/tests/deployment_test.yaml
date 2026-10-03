@@ -169,3 +169,19 @@ tests:
           content:
             name: ENROLLMENT_RESERVED_SEEDS_DIR
             value: /etc/grid-reserved-seeds
+  - it: refuses every renewal when renewal is off
+    set:
+      enrollment.renewal.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_RENEWALS_ENABLED
+            value: "false"
+  - it: leaves renewal on by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_RENEWALS_ENABLED
+            value: "false"

@@ -179,6 +179,18 @@ digest its peers pin. `GridNetwork` `status.identity.notAfter` and
 - Watch `grid_site_identity_expiry_timestamp_seconds` and
   `grid_site_identity_renewals_total` on the operator.
 
+### Turn renewal off
+
+- For the whole grid, set `enrollment.renewal.enabled=false` on the grid-enrollment
+  chart. The service refuses every renewal with 503 `renewals_disabled`, and
+  operators retry with backoff. Enrollment, deletes, and the signals and gateway
+  paths keep working.
+- For one site, set `enrollment.renewal.enabled=false` on its grid-operator chart.
+  Its operator stops renewing and stops rolling the gateway, and the chart drops
+  the gateway Deployment grant.
+- Either way, each site keeps its current identity until `status.identity.notAfter`
+  on its `GridNetwork`. Turn renewal back on before then, or the site re-enrolls.
+
 ## Troubleshooting
 
 - **Operator logs `site token rejected`**: Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and deliver the new token to the site.

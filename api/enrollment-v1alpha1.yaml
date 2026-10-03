@@ -170,7 +170,8 @@ paths:
         certificate and submits a signing request for a new key. Returns a new
         certificate for the name the presented certificate carries. No token is
         involved. A name with no enrollment record, a key that is not the site's
-        current one, or a request that reuses a held key is refused.
+        current one, or a request that reuses a held key is refused. A grid
+        with renewals turned off refuses every renewal with 503.
       security:
         - siteCertificateAuth: []
       requestBody:
@@ -196,6 +197,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '403':
           description: The enrollment record does not admit this certificate's key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Renewal is turned off for this grid (renewals_disabled). Issued certificates stay valid until they expire.
           content:
             application/json:
               schema:

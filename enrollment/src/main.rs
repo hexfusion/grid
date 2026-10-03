@@ -41,6 +41,8 @@ const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 const GRID_ADMIN_TOKENS: &str = "ENROLLMENT_GRID_ADMIN_TOKENS";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
+/// Set to `false` to refuse every renewal.
+const RENEWALS_ENABLED: &str = "ENROLLMENT_RENEWALS_ENABLED";
 /// Comma-separated site names issued outside enrollment, refused at mint and redeem.
 const RESERVED_SITES: &str = "ENROLLMENT_RESERVED_SITES";
 /// Directory of reserved-name seeds bootstrap signed with the CA key.
@@ -125,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         authorizer: Box::pin(build_authorizer()).await?,
         cert_lifetime: load_cert_lifetime(),
         reserved_sites: load_reserved_sites()?,
+        renewals_enabled: load_renewals_enabled()?,
     });
 
     // Reload the server certificate on an interval so a rotated TLS secret is
@@ -401,6 +404,19 @@ fn load_reserved_sites() -> Result<Vec<String>, Box<dyn std::error::Error>> {
         tracing::info!(?sites, "site names reserved from enrollment");
     }
     Ok(sites)
+}
+
+/// Whether renewals are signed: on unless the variable says `false`.
+fn load_renewals_enabled() -> Result<bool, String> {
+    let enabled = match std::env::var(RENEWALS_ENABLED).as_deref().map(str::trim) {
+        Err(_) | Ok("" | "true") => true,
+        Ok("false") => false,
+        Ok(other) => return Err(format!("{RENEWALS_ENABLED} must be true or false, not {other:?}")),
+    };
+    if !enabled {
+        tracing::info!("renewals disabled: every renewal is refused; issued identities stay valid until they expire");
+    }
+    Ok(enabled)
 }
 
 /// Read how long issued certificates should last.

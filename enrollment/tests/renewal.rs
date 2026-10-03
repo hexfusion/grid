@@ -46,6 +46,10 @@ impl Identity {
 }
 
 fn grid(reserved: &[&str]) -> Grid {
+    grid_with(reserved, true)
+}
+
+fn grid_with(reserved: &[&str], renewals_enabled: bool) -> Grid {
     let ca = certs::generate_ca("test-grid-ca").expect("ca");
     let copy = certs::load_ca("test-grid-ca", &ca.key_pem, &ca.cert_pem).expect("copy");
     let state = Arc::new(AppState {
@@ -54,6 +58,7 @@ fn grid(reserved: &[&str]) -> Grid {
         authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: reserved.iter().map(|site| (*site).to_owned()).collect(),
+        renewals_enabled,
     });
     Grid {
         app: router(Arc::clone(&state)),
@@ -197,6 +202,15 @@ async fn a_site_renews_with_its_current_certificate() {
 
     let again = renew(&grid, "site-a", Some(&second)).await;
     assert_eq!(again.status, StatusCode::OK, "the renewed certificate renews in turn");
+}
+
+#[tokio::test]
+async fn a_grid_with_renewals_off_refuses_every_renewal_and_keeps_enrolling() {
+    let grid = grid_with(&[], false);
+    let first = enroll(&grid, "site-a").await;
+    let renewal = renew(&grid, "site-a", Some(&first)).await;
+    assert_eq!(renewal.status, StatusCode::SERVICE_UNAVAILABLE, "{}", renewal.body);
+    assert_eq!(renewal.body["error"], "renewals_disabled");
 }
 
 #[tokio::test]
