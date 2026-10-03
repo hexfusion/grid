@@ -75,8 +75,8 @@ struct RunningPeer {
     /// The freshness bound the poller was built with, compared on reload.
     load_window_ms: i64,
 
-    /// Stops the poller on drop.
-    _handle: PollHandle,
+    /// Stops the poller on drop. Started held, committed once its reload is.
+    handle: PollHandle,
 }
 
 impl RunningPeer {
@@ -218,7 +218,7 @@ impl Control {
                 started.push(RunningPeer {
                     config: peer.clone(),
                     load_window_ms: config.load_window_ms,
-                    _handle: handle,
+                    handle,
                 });
             }
         }
@@ -247,11 +247,11 @@ impl Control {
             stopped: before.saturating_sub(kept),
             kept,
         };
-        self.peers.extend(
-            started
-                .into_iter()
-                .map(|running| (running.config.site.clone(), running)),
-        );
+        // Every start succeeded, so the reload stands: only now may the new pollers write.
+        self.peers.extend(started.into_iter().map(|running| {
+            running.handle.commit();
+            (running.config.site.clone(), running)
+        }));
         outcome
     }
 
@@ -491,7 +491,7 @@ fn report(result: &Result<Option<ReloadOutcome>, FilterError>, tally: &WatchCoun
 mod tests {
     use std::{sync::atomic::AtomicI64, time::Instant};
 
-    use grid_signals_client::{FetchError, Scrape, SignalSource, spawn_on_thread};
+    use grid_signals_client::{FetchError, Scrape, SignalSource, spawn_on_thread_held};
 
     use super::*;
     use crate::{
@@ -547,7 +547,7 @@ mod tests {
                     interval_ms: 10,
                     ..poller.clone()
                 };
-                spawn_on_thread(store, &fast, source, refresh)
+                spawn_on_thread_held(store, &fast, source, refresh)
                     .map_err(|error| -> FilterError { error.to_string().into() })
             })
         }
@@ -779,6 +779,101 @@ mod tests {
             grid.reload(&config(&["east"])).expect("reload"),
             None,
             "east is still the applied config"
+        );
+    }
+
+    /// One site reporting a fixed load, counting its fetches.
+    struct FixedSource {
+        site: String,
+        value: f64,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl SignalSource for FixedSource {
+        async fn fetch(&self) -> Result<Scrape, FetchError> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            let at = now_ms();
+            Ok(Scrape {
+                body: format!(
+                    r#"{LOAD_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#,
+                    site = self.site,
+                    value = self.value
+                ),
+                date_ms: at,
+                peer_identity: Arc::from(certs::spiffe_id(&self.site).as_str()),
+            })
+        }
+    }
+
+    /// The worst load the store holds for `site` over the last minute.
+    fn stored(store: &LoadStore, site: &str) -> Option<f64> {
+        store.window_worst(
+            &LoadStore::key(site, &format!("pool-{site}")),
+            LOAD_METRIC,
+            now_ms(),
+            60_000,
+            true,
+        )
+    }
+
+    #[test]
+    fn a_rejected_reload_leaves_the_order_and_the_store_as_they_were() {
+        const CHANGED_INTERVAL_MS: u64 = 2_001;
+        let peers = Peers::default();
+        peers.set_load("east", 0.9);
+        peers.set_load("west", 0.1);
+        let ok = peers.starter();
+        let reported = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::clone(&reported);
+        let start: StartPeer = Box::new(move |peer, poller, store, refresh| {
+            if peer.site == "north" {
+                // Fail only once the changed west has reported, as a slow later start would.
+                let deadline = Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+                while changed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Err("no route to north".into());
+            }
+            if peer.site == "west" && peer.interval_ms == CHANGED_INTERVAL_MS {
+                let source = FixedSource {
+                    site: "west".to_owned(),
+                    value: 50.0,
+                    count: Arc::clone(&changed),
+                };
+                let fast = PollerConfig {
+                    interval_ms: 10,
+                    ..poller.clone()
+                };
+                return spawn_on_thread_held(store, &fast, source, refresh)
+                    .map_err(|error| -> FilterError { error.to_string().into() });
+            }
+            ok(peer, poller, store, refresh)
+        });
+        let initial = config(&["east", "west"]);
+        let mut control = Control::new(&initial, start).expect("control");
+        control.apply(&initial).expect("apply");
+        let snapshot = control.snapshot();
+        eventually("west, the idle site, first", || {
+            front(&snapshot).as_deref() == Some("west")
+        });
+        let before = sites(&snapshot.load());
+
+        let mut next = config(&["east", "west", "north"]);
+        for peer in next.peers.iter_mut().filter(|peer| peer.site == "west") {
+            peer.interval_ms = CHANGED_INTERVAL_MS;
+        }
+        control.apply(&next).expect_err("north cannot start");
+        assert!(
+            reported.load(Ordering::SeqCst) > 0,
+            "the changed west reported before the reject"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(sites(&snapshot.load()), before, "the active order is unchanged");
+        assert_eq!(
+            stored(&control.store, "west"),
+            Some(0.1),
+            "the store holds only the running west's load"
         );
     }
 

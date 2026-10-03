@@ -15,7 +15,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use certs::spiffe_id;
-use grid_signals_client::{PeerScraper, spawn_on_thread};
+use grid_signals_client::{PeerScraper, spawn_on_thread_held};
 use praxis_filter::FilterError;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use serde::Deserialize;
@@ -182,7 +182,7 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
 pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, FilterError> {
     let start = Box::new(|peer: &PeerServingConfig, poller: &_, store, refresh| {
         let scraper = build_scraper(peer)?;
-        spawn_on_thread(store, poller, scraper, refresh)
+        spawn_on_thread_held(store, poller, scraper, refresh)
             .map_err(|error| -> FilterError { format!("grid: spawning poller for {}: {error}", peer.site).into() })
     });
     start_runtime(config, start)
