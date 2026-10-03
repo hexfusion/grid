@@ -114,8 +114,10 @@ site's trust anchor.
 
 ## Identity renewal
 
-A site renews its identity before it expires, with no new token. When less than a
-third of the lifetime remains, the operator presents the current certificate to
+A site renews its identity before it expires, with no new token. Site
+certificates last 180 days unless `enrollment.certLifetimeSecs` sets another
+lifetime, and a renewed certificate takes the service's lifetime at the time it
+is issued. When less than a third of the lifetime remains, around day 120, the operator presents the current certificate to
 the enrollment service over mutual TLS and asks for a certificate for a new key.
 It writes the new certificate and key into the same identity Secret, which the
 signals listener, the peer pollers, and the gateway reload without a restart.

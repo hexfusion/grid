@@ -259,6 +259,23 @@ async fn a_renewal_from_another_ca_is_refused() {
 }
 
 #[test]
+fn a_default_leaf_renews_at_day_120() {
+    let not_before = OffsetDateTime::UNIX_EPOCH;
+    let not_after = not_before.saturating_add(certs::DEFAULT_SITE_CERT_LIFETIME);
+    assert_eq!(
+        renew_after(not_before, not_after),
+        not_before.saturating_add(Span::days(120))
+    );
+}
+
+#[test]
+fn a_renewal_schedules_the_next_from_the_new_leaf() {
+    let (mut last, mut failures) = (None, 0);
+    let renewed = Ok(Checked::Renewed(OffsetDateTime::now_utc()));
+    assert_eq!(settle(&renewed, &mut last, &mut failures), RETRY_INITIAL);
+}
+
+#[test]
 fn retries_back_off_to_the_cap() {
     assert_eq!(retry_delay(1), RETRY_INITIAL);
     assert_eq!(retry_delay(2), RETRY_INITIAL.saturating_mul(2));

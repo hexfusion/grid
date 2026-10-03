@@ -456,7 +456,8 @@ fn settle(checked: &Result<Checked, RenewError>, last: &mut Option<String>, fail
             "waiting".to_owned(),
             until(*at, OffsetDateTime::now_utc()).min(CHECK_EVERY),
         ),
-        Ok(Checked::Renewed(_)) => ("renewed".to_owned(), CHECK_EVERY),
+        // Re-read soon, so the next renewal is scheduled from the new leaf.
+        Ok(Checked::Renewed(_)) => ("renewed".to_owned(), RETRY_INITIAL),
         Ok(Checked::Expired(_)) => ("expired".to_owned(), CHECK_EVERY),
         Err(error) => (error.to_string(), retry_delay(failures.saturating_add(1))),
     };

@@ -395,10 +395,10 @@ Known limits:
   provider gateway is down. That request fails rather than failing over.
 - The gateway matches a candidate's cluster to `gatewayConfig.backends` by name only.
   Nothing checks that the backend serves the candidate's site.
-- Site certificates last 30 days and nothing renews them. The gateway reads its
-  client certificate and the signals pollers read theirs once, at start, and a
-  `pin` digest changes on renewal. After re-enrolling, update the digests and
-  restart the gateways.
+- Site certificates last 180 days and the operator renews them around day 120.
+  The gateway reads its client certificate once, at start, so restart it within
+  about 60 days of a renewal. A `pin` digest changes on every renewal, so update
+  the peers' digests after each one.
 
 ### Routing overlay delivery
 

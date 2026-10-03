@@ -22,9 +22,8 @@ pub const CLOCK_SKEW_ALLOWANCE: Duration = Duration::minutes(5);
 /// Default issued-certificate lifetime.
 ///
 /// Finite, because expiry is the only way to remove a member (no revocation
-/// list). Longer than it should be until renewal exists, so a lapse cannot
-/// strand a site.
-pub const DEFAULT_SITE_CERT_LIFETIME: Duration = Duration::days(30);
+/// list). Renewing at a third remaining leaves a site about 60 days to reach the hub.
+pub const DEFAULT_SITE_CERT_LIFETIME: Duration = Duration::days(180);
 
 /// When a certificate is valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +219,11 @@ mod tests {
 
     use super::*;
     use crate::generate::generate_ca;
+
+    #[test]
+    fn site_certificates_last_180_days_by_default() {
+        assert_eq!(DEFAULT_SITE_CERT_LIFETIME, Duration::days(180));
+    }
 
     /// Build a request the way an enrollee would, asking for `requested_names`.
     fn csr_asking_for(requested_names: &[SanType]) -> (String, KeyPair) {
