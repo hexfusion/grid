@@ -192,6 +192,9 @@ impl Control {
             self.topology.store(topology);
             self.snapshot.store(ordered);
         }
+        // The reload stands and its topology is published: only now may the new pollers write,
+        // so their first refresh orders the new topology. Committing a kept poller is a no-op.
+        self.peers.values().for_each(|running| running.handle.commit());
         self.applied = Some(config.clone());
         self.identity = Some(identity);
         Ok(Some(outcome))
@@ -247,11 +250,11 @@ impl Control {
             stopped: before.saturating_sub(kept),
             kept,
         };
-        // Every start succeeded, so the reload stands: only now may the new pollers write.
-        self.peers.extend(started.into_iter().map(|running| {
-            running.handle.commit();
-            (running.config.site.clone(), running)
-        }));
+        self.peers.extend(
+            started
+                .into_iter()
+                .map(|running| (running.config.site.clone(), running)),
+        );
         outcome
     }
 
@@ -875,6 +878,79 @@ mod tests {
             Some(0.1),
             "the store holds only the running west's load"
         );
+    }
+
+    /// The snapshot a test publishes for a recording refresh to read.
+    type Published = Arc<Mutex<Option<Arc<ArcSwap<RouteSnapshot>>>>>;
+
+    #[test]
+    fn a_new_pollers_first_scrape_is_ordered_against_the_new_topology() {
+        let peers = Peers::default();
+        peers.set_load("east", 0.9);
+        let ok = peers.starter();
+        let published: Published = Arc::default();
+        let at_first_cycle: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
+        let (cell, seen) = (Arc::clone(&published), Arc::clone(&at_first_cycle));
+        let start: StartPeer = Box::new(move |peer, poller, store, refresh| {
+            if peer.site != "west" {
+                return ok(peer, poller, store, refresh);
+            }
+            let fetched = Arc::new(AtomicUsize::new(0));
+            let source = FixedSource {
+                site: "west".to_owned(),
+                value: 0.0,
+                count: Arc::clone(&fetched),
+            };
+            let (cell, seen) = (Arc::clone(&cell), Arc::clone(&seen));
+            let recording: Refresh = Box::new(move |scraped: &LoadStore| {
+                let mut first = seen.lock().expect("seen");
+                if first.is_none() {
+                    *first = cell
+                        .lock()
+                        .expect("cell")
+                        .as_ref()
+                        .map(|snapshot| sites(&snapshot.load()));
+                }
+                drop(first);
+                refresh(scraped);
+            });
+            // One scrape only, already fetched when the reload commits.
+            let once = PollerConfig {
+                interval_ms: 60_000,
+                ..poller.clone()
+            };
+            let handle = spawn_on_thread_held(store, &once, source, recording)
+                .map_err(|error| -> FilterError { error.to_string().into() })?;
+            eventually("west fetched while held", || fetched.load(Ordering::SeqCst) > 0);
+            Ok(handle)
+        });
+        let initial = config(&["east"]);
+        let mut control = Control::new(&initial, start).expect("control");
+        control.apply(&initial).expect("apply");
+        *published.lock().expect("cell") = Some(control.snapshot());
+
+        // Hold the publish lock so a poller committed before the publish would refresh, and record,
+        // while the old topology is still the published one.
+        let swap = Arc::clone(&control.swap);
+        let held = swap.lock().expect("swap");
+        std::thread::scope(|scope| {
+            let reload = scope.spawn(|| control.apply(&config(&["east", "west"])));
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+            reload.join().expect("reload thread").expect("reload");
+        });
+
+        eventually("west's first refresh", || {
+            at_first_cycle.lock().expect("seen").is_some()
+        });
+        let first = at_first_cycle.lock().expect("seen").clone().unwrap_or_default();
+        assert!(
+            first.contains(&"west".to_owned()),
+            "the first refresh saw the new topology: {first:?}"
+        );
+        eventually("west, idle, first", || {
+            front(&control.snapshot()).as_deref() == Some("west")
+        });
     }
 
     #[test]
