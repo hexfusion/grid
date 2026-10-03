@@ -32,10 +32,10 @@ pub use generate::{
 pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
 pub use verify::{
-    MAX_CERT_PEM_BYTES, VerifyError, anchored_ca, bundle_within, canonical_fingerprint, cert_dns_sans,
-    cert_expires_within, cert_issuer_and_expiry, cert_pem_from_der, cert_public_key, cert_public_key_sha256,
-    cert_validity, csr_public_key, has_svid_profile, leaf_only, leaf_spiffe_id, site_of_spiffe_id, verify_ca_signature,
-    verify_issued_by, verify_site_cert,
+    MAX_CERT_PEM_BYTES, VerifyError, anchored_ca, bundle_fingerprints, bundle_within, canonical_fingerprint,
+    cert_dns_sans, cert_expires_within, cert_issuer_and_expiry, cert_pem_from_der, cert_public_key,
+    cert_public_key_sha256, cert_validity, csr_public_key, has_svid_profile, leaf_only, leaf_spiffe_id,
+    site_of_spiffe_id, verify_ca_signature, verify_issued_by, verify_site_cert,
 };
 
 /// SHA-256 through the active backend: the sha2 crate by default, system openssl

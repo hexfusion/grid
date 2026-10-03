@@ -36,6 +36,8 @@ struct Leaf {
     key: String,
     not_before: OffsetDateTime,
     not_after: OffsetDateTime,
+    /// The grid CA that issued it.
+    ca: u64,
 }
 
 /// One site: what its real holder has, and what a thief has.
@@ -74,6 +76,12 @@ struct World {
     signed: Vec<SeedRecord>,
     snapshot: Option<Inner>,
     trace: Vec<String>,
+    /// The grid CA the service signs with and the TLS layer trusts.
+    ca: u64,
+    /// The CA whose key the key Secret holds, `None` once it is lost.
+    ca_key: Option<u64>,
+    /// The CA distributed in the bundle.
+    bundle: Option<u64>,
 }
 
 impl World {
@@ -87,6 +95,9 @@ impl World {
             signed: Vec::new(),
             snapshot: None,
             trace: Vec::new(),
+            ca: 1,
+            ca_key: Some(1),
+            bundle: Some(1),
         };
         world.enroll(SPOKE);
         world.reissue_hub();
@@ -116,6 +127,7 @@ impl World {
             key,
             not_before: now.saturating_sub(BACKDATE),
             not_after: now.saturating_add(LIFETIME),
+            ca: self.ca,
         }
     }
 
@@ -229,6 +241,13 @@ impl World {
         if now < leaf.not_after.saturating_sub(LIFETIME / 3) {
             return;
         }
+        if leaf.ca != self.ca {
+            let site = &self.sites[name];
+            if !site.compromised && !site.stranded {
+                self.fail(&format!("a healthy {name} was cut off by a CA change"));
+            }
+            return;
+        }
         let requested = match self.sites[name].pending.clone() {
             Some(pending) => pending,
             None => self.fresh_key(),
@@ -284,7 +303,7 @@ impl World {
         let usable: Vec<Leaf> = self.sites[name]
             .stolen
             .iter()
-            .filter(|leaf| now < leaf.not_after)
+            .filter(|leaf| now < leaf.not_after && leaf.ca == self.ca)
             .cloned()
             .collect();
         let Some(leaf) = usable
@@ -392,6 +411,66 @@ impl World {
         }
     }
 
+    /// The CA key Secret is deleted.
+    fn lose_ca_key(&mut self) {
+        self.ca_key = None;
+    }
+
+    /// The key Secret is restored from the wrong backup: another CA's key.
+    fn restore_wrong_ca_key(&mut self) {
+        self.ca_key = Some(self.ca.wrapping_add(1000));
+    }
+
+    /// What bootstrap reads: the key's CA and the distributed CA.
+    fn ca_inputs(&self) -> (Option<String>, Vec<crate::CaCopy>) {
+        let copies = self
+            .bundle
+            .map(|ca| crate::CaCopy::Holds(std::collections::BTreeSet::from([ca.to_string()])))
+            .into_iter()
+            .collect();
+        (self.ca_key.map(|ca| ca.to_string()), copies)
+    }
+
+    /// An install or upgrade runs bootstrap, which decides the CA.
+    fn sync(&mut self) {
+        let (key, distributed) = self.ca_inputs();
+        let before = self.ca;
+        match crate::ca_action(key.as_deref(), false, &distributed) {
+            crate::CaAction::Mint => {
+                self.ca = self.ca.wrapping_add(1);
+                self.bundle = Some(self.ca);
+                self.ca_key = Some(self.ca);
+            },
+            // Load signs with whatever CA the key Secret holds and rewrites the bundle.
+            crate::CaAction::Load => {
+                self.ca = self.ca_key.unwrap_or(self.ca);
+                self.bundle = Some(self.ca);
+            },
+            crate::CaAction::Refuse(_) => {},
+        }
+        if before != self.ca {
+            self.fail("the grid CA changed without ca.forceRegenerate");
+        }
+    }
+
+    /// A grid-admin starts a new grid CA on purpose: every site re-enrolls.
+    fn force_regenerate(&mut self) {
+        let (key, distributed) = self.ca_inputs();
+        if crate::ca_action(key.as_deref(), true, &distributed) != crate::CaAction::Mint {
+            self.fail("forceRegenerate did not mint");
+        }
+        self.ca = self.ca.wrapping_add(1);
+        self.bundle = Some(self.ca);
+        self.ca_key = Some(self.ca);
+        for site in self.sites.values_mut() {
+            site.stranded = true;
+        }
+        // Seeds the old CA signed no longer verify, and bootstrap re-issues the hub.
+        self.configmap = None;
+        self.signed.clear();
+        self.reissue_hub();
+    }
+
     /// Time passes. The service reapplies the mounted seed every minute.
     fn tick(&mut self, by: Duration) {
         self.store.advance(by);
@@ -400,7 +479,7 @@ impl World {
 
     fn step(&mut self) {
         let site = if self.next(2) == 0 { SPOKE } else { HUB };
-        let event = self.next(14);
+        let event = self.next(18);
         self.trace.push(format!("{event:>2} {site}"));
         match event {
             0 => self.tick(Duration::minutes(20)),
@@ -416,7 +495,11 @@ impl World {
             10 => self.apply_seed(),
             11 => self.replay_seed(),
             12 => self.snapshot = Some(self.store.snapshot()),
-            _ => self.restore(),
+            13 => self.restore(),
+            14 => self.lose_ca_key(),
+            17 => self.restore_wrong_ca_key(),
+            15 => self.sync(),
+            _ => self.force_regenerate(),
         }
         for (name, site) in &self.sites {
             // A re-issue clears a freeze once the service applies its seed.

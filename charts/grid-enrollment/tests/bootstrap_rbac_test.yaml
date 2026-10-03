@@ -287,6 +287,21 @@ tests:
           value: NAMESPACE
         documentIndex: 4
 
+  - it: lets the bootstrap delete only the hub's identity Secret, to replace a placeholder
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["grid-site-identity"]
+            verbs: ["delete"]
+        documentIndex: 3
+
   - it: lets the bootstrap write only the hub's seed Secret
     template: templates/certs/ca-bootstrap-rbac.yaml
     set:

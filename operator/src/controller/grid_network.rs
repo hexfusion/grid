@@ -1269,12 +1269,37 @@ fn crd_seed_decision(resolution: &SeedResolution, previous: &[SocketAddr]) -> Cr
 // TLS Secrets
 // ---------------------------------------------------------------------------
 
-/// Ensure CA and site certificate secrets exist.
+/// What to do about the grid TLS Secrets a `GridNetwork` names.
+#[derive(Debug, PartialEq, Eq)]
+enum TlsSecrets {
+    /// Both exist.
+    Present,
+    /// Neither exists: create a self-signed CA and a site certificate from it.
+    Create,
+    /// Only one exists. A new CA would replace the grid's, so nothing is written.
+    Inconsistent,
+}
+
+/// Decide from which of the CA and site Secrets exist.
+fn tls_secrets_action(ca_exists: bool, site_exists: bool) -> TlsSecrets {
+    match (ca_exists, site_exists) {
+        (true, true) => TlsSecrets::Present,
+        (false, false) => TlsSecrets::Create,
+        _ => TlsSecrets::Inconsistent,
+    }
+}
+
+/// Create a self-signed CA and site certificate when neither Secret exists.
 ///
-/// Generates both together so the CA is available for
-/// signing the site certificate without needing to
-/// reconstruct it from PEM.
-#[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
+/// Generates both together so the CA is available for signing the site
+/// certificate. Never replaces an existing CA: one that enrollment or bootstrap
+/// wrote is the grid's, and a new one would split it.
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "decide, then create the CA and the identity it signs, as one step"
+)]
 async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
     let tls = &network.spec.tls;
     let (Some(ca_ref), Some(site_ref)) = (&tls.ca_secret_ref, &tls.site_secret_ref) else {
@@ -1287,7 +1312,19 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
     let ca_exists = ca_api.get_opt(&ca_ref.name).await?.is_some();
     let site_exists = site_api.get_opt(&site_ref.name).await?.is_some();
 
-    if ca_exists && site_exists {
+    let action = tls_secrets_action(ca_exists, site_exists);
+    if note_inconsistent(
+        ObjectRef::new(&network_site_name(network)),
+        action == TlsSecrets::Inconsistent,
+    ) {
+        tracing::warn!(
+            ca = %ca_ref.name,
+            site = %site_ref.name,
+            "only one of the grid CA and site identity Secrets exists; not replacing the CA. Re-enroll \
+             the site, or delete both to start a self-signed grid"
+        );
+    }
+    if action != TlsSecrets::Create {
         return Ok(());
     }
 
@@ -1295,45 +1332,64 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
     let ca = certs::generate_ca("grid-ca")?;
     let site_cert = certs::generate_site_cert(&ca, &site_name)?;
 
-    apply_ca_secret(&ca_api, ca_ref, &ca).await?;
-    apply_site_secret(&site_api, site_ref, &site_cert).await?;
-
-    info!("created grid TLS secrets");
-    Ok(())
-}
-
-/// Apply the CA secret via server-side apply.
-async fn apply_ca_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    ca_ref: &crate::crd::grid_network::SecretRef,
-    ca: &certs::CaCert,
-) -> Result<(), OperatorError> {
-    let data = secret::ca_secret_data(ca);
-    let s = secret::build(&ca_ref.name, &ca_ref.namespace, data);
-    api.patch(
-        &ca_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
+    // Another writer, such as enrollment, stored its CA first: it is the grid's, and a
+    // site identity from this one would not chain to it.
+    if !create_secret(
+        &ca_api,
+        secret::build(&ca_ref.name, &ca_ref.namespace, secret::ca_secret_data(&ca)),
     )
-    .await?;
-    Ok(())
-}
-
-/// Apply the site certificate secret via server-side apply.
-async fn apply_site_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    site_ref: &crate::crd::grid_network::SecretRef,
-    site_cert: &certs::SiteCertOutput,
-) -> Result<(), OperatorError> {
-    let data = secret::site_cert_secret_data(site_cert);
-    let s = secret::build(&site_ref.name, &site_ref.namespace, data);
-    api.patch(
+    .await?
+    {
+        tracing::debug!(ca = %ca_ref.name, "another writer created the grid CA; not self-signing a site identity");
+        return Ok(());
+    }
+    let site = secret::build(
         &site_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
-    )
-    .await?;
+        &site_ref.namespace,
+        secret::site_cert_secret_data(&site_cert),
+    );
+    if create_secret(&site_api, site).await? {
+        info!(ca = %ca_ref.name, site = %site_ref.name, "created a self-signed grid CA and site identity");
+    } else {
+        tracing::warn!(
+            ca = %ca_ref.name,
+            site = %site_ref.name,
+            "created a self-signed grid CA, but another writer created the site identity, which may not \
+             chain to it"
+        );
+    }
     Ok(())
+}
+
+/// Create `secret`, returning whether this call created it: a Secret another writer
+/// created first is never overwritten.
+async fn create_secret(
+    api: &Api<k8s_openapi::api::core::v1::Secret>,
+    secret: k8s_openapi::api::core::v1::Secret,
+) -> Result<bool, OperatorError> {
+    match api.create(&kube::api::PostParams::default(), &secret).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(response)) if response.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Networks whose TLS Secrets were last seen inconsistent, so the warning fires once
+/// per transition rather than every reconcile.
+static INCONSISTENT_TLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<ObjectRef<GridNetwork>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record whether `network`'s TLS Secrets are inconsistent, returning whether it just became so.
+fn note_inconsistent(network: ObjectRef<GridNetwork>, inconsistent: bool) -> bool {
+    let mut seen = INCONSISTENT_TLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if inconsistent {
+        seen.insert(network)
+    } else {
+        seen.remove(&network);
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4370,6 +4426,30 @@ mod tests {
             "status.gridId must be returned when spec.gridId is empty, \
              preserving a previously negotiated ID across operator restarts"
         );
+    }
+
+    /// The operator self-signs only a grid with neither Secret, never over an existing CA.
+    #[test]
+    fn the_operator_never_replaces_an_existing_grid_ca() {
+        assert_eq!(tls_secrets_action(true, true), TlsSecrets::Present);
+        assert_eq!(tls_secrets_action(false, false), TlsSecrets::Create);
+        assert_eq!(
+            tls_secrets_action(true, false),
+            TlsSecrets::Inconsistent,
+            "an enrolled CA, identity gone"
+        );
+        assert_eq!(tls_secrets_action(false, true), TlsSecrets::Inconsistent);
+    }
+
+    /// The inconsistency warning fires on the transition, not on every reconcile.
+    #[test]
+    fn an_inconsistent_grid_is_warned_once() {
+        let network = || ObjectRef::new("warn-once");
+        assert!(note_inconsistent(network(), true), "the first time");
+        assert!(!note_inconsistent(network(), true), "not again");
+        assert!(!note_inconsistent(network(), false), "fixed");
+        assert!(note_inconsistent(network(), true), "and again after it recurs");
+        assert!(note_inconsistent(ObjectRef::new("other"), true), "per network");
     }
 
     /// The identity status reports expiry and the renewal window, and an expired identity says how to recover.

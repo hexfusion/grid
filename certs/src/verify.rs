@@ -236,6 +236,33 @@ pub fn canonical_fingerprint(cert_pem: &str) -> Result<String, VerifyError> {
         .collect())
 }
 
+/// The canonical fingerprint of every certificate in a bundle, which may hold the
+/// current CA and the one it replaced.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::TooLarge`] past [`MAX_CERT_PEM_BYTES`], and
+/// [`VerifyError::Malformed`] if the bundle does not parse or holds no certificate.
+pub fn bundle_fingerprints(bundle_pem: &str) -> Result<std::collections::BTreeSet<String>, VerifyError> {
+    // The same bound as bundle_within, so a bundle is never planned on and then refused.
+    if bundle_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let fingerprints: std::collections::BTreeSet<String> = cert_ders(bundle_pem)?
+        .iter()
+        .map(|der| {
+            crate::backend::sha256(der)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+        .collect();
+    if fingerprints.is_empty() {
+        return Err(VerifyError::Malformed);
+    }
+    Ok(fingerprints)
+}
+
 /// The DNS SANs on a certificate, as encoded. Case is not normalized, so the
 /// caller owns any case-insensitive comparison.
 ///
@@ -885,5 +912,17 @@ mod tests {
             Err(VerifyError::BadSignature),
             "a malformed signature"
         );
+    }
+
+    #[test]
+    fn a_bundle_fingerprints_each_certificate() {
+        let old = generate_ca("grid-ca").expect("old");
+        let current = generate_ca("grid-ca").expect("current");
+        let both = format!("{}{}", old.cert_pem, current.cert_pem);
+        let fingerprints = bundle_fingerprints(&both).expect("bundle");
+        assert_eq!(fingerprints.len(), 2);
+        assert!(fingerprints.contains(&canonical_fingerprint(&current.cert_pem).expect("fp")));
+        assert_eq!(bundle_fingerprints("not pem"), Err(VerifyError::Malformed));
+        assert_eq!(bundle_fingerprints(""), Err(VerifyError::Malformed));
     }
 }

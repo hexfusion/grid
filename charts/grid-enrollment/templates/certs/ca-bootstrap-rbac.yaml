@@ -144,6 +144,13 @@ rules:
       - {{ $.Values.hubSite.identitySecretName | quote }}
       - {{ $.Values.hubSite.caSecretName | quote }}
     verbs: ["get", "update"]
+  # Replacing an operator's placeholder identity changes its type, which only delete
+  # and create can do.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ $.Values.hubSite.identitySecretName | quote }}
+    verbs: ["delete"]
   {{- with $.Values.hubSite.swimKeySecretName }}
   - apiGroups: [""]
     resources: ["secrets"]
