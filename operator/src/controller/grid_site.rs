@@ -241,7 +241,6 @@ async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwor
     let Some(addr) = probe_addr else {
         return GatewayProbeOutcome::AddressMissing;
     };
-    // Never dial a gossiped address the guard refuses.
     if gossip_address_refused(site) {
         return GatewayProbeOutcome::AddressMissing;
     }
