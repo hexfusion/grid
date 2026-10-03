@@ -20,8 +20,9 @@ pub mod authz;
 pub mod ca;
 pub mod generated;
 pub mod store;
+pub mod tls;
 
 pub use api::{AppState, router};
 pub use auth::GridAdmins;
 pub use ca::SharedCa;
-pub use store::{Issued, NewSiteToken, Pin, Store, StoreError};
+pub use store::{Issued, NewSiteToken, Pin, Refusal, RenewAction, Renewal, Renewed, Store, StoreError};

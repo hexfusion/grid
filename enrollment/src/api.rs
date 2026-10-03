@@ -24,7 +24,7 @@ use crate::{
     auth::digest,
     authz::{Authorizer, AuthzError, Operation},
     generated::{Enrollment, EnrollmentRequest, EnrollmentToken, EnrollmentTokenRequest, Error as ErrorBody},
-    store::{Issued, NewSiteToken, Pin, Store, StoreError},
+    store::{Issued, NewSiteToken, Pin, RenewAction, Renewal, Renewed, Store, StoreError},
 };
 
 /// How long a token stays usable when the grid-admin names no expiry.
@@ -94,6 +94,16 @@ pub enum ApiError {
     #[error("not permitted")]
     Forbidden,
 
+    /// A renewal presented no usable grid site certificate.
+    #[error("a current grid site certificate is required")]
+    IdentityRequired,
+
+    /// The enrollment record does not admit the presented identity.
+    ///
+    /// One error for every reason, so a caller cannot learn which names are held.
+    #[error("this identity may not renew")]
+    IdentityRefused,
+
     /// The service itself failed.
     #[error("{0}")]
     Internal(String),
@@ -115,6 +125,7 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound => Self::NotFound,
             StoreError::NameTaken => Self::NameTaken,
             StoreError::TokenInvalid => Self::InvalidToken,
+            StoreError::Refused(_) => Self::IdentityRefused,
             StoreError::Backend(detail) => Self::Internal(detail),
         }
     }
@@ -212,6 +223,16 @@ impl ApiError {
                 "forbidden",
                 "not permitted to mint or revoke site tokens".to_owned(),
             ),
+            Self::IdentityRequired => (
+                StatusCode::UNAUTHORIZED,
+                "identity_required",
+                "renewal requires the site's current grid certificate over mutual TLS".to_owned(),
+            ),
+            Self::IdentityRefused => (
+                StatusCode::FORBIDDEN,
+                "identity_refused",
+                "this identity may not renew; re-enroll with a new site token".to_owned(),
+            ),
             Self::Internal(message) => {
                 tracing::error!(error = %message, "enrollment request could not be served");
                 (
@@ -277,6 +298,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1alpha1/enrollmenttokens", post(mint_site_token))
         .route("/v1alpha1/enrollmenttokens/{token_id}", delete_route(revoke_site_token))
         .route("/v1alpha1/enrollments", post(enroll))
+        .route("/v1alpha1/renewals", post(renew))
         .layer(DefaultBodyLimit::max(MAX_CSR_PEM_BYTES.saturating_mul(2)))
         .layer(middleware::from_fn(enforce_timeout))
         .with_state(state)
@@ -440,6 +462,101 @@ async fn enroll(
             public_key_sha256: issued.public_key_sha256,
         }),
     ))
+}
+
+/// The client certificate the TLS handshake proved, DER, set per connection.
+///
+/// `None` when the client presented none. The acceptor verified the handshake
+/// signature, so the caller holds the leaf's key.
+#[derive(Clone, Debug, Default)]
+pub struct PeerLeaf(pub Option<Arc<[u8]>>);
+
+/// Renew a site identity with its current certificate: no token, the same name.
+///
+/// The leaf is checked again here against the current CA, so a TLS layer that
+/// lags a CA rotation cannot admit a leaf from the old one.
+#[expect(
+    clippy::too_many_lines,
+    reason = "authenticate, decide, sign, and audit read as one flow"
+)]
+async fn renew(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::Extension<PeerLeaf>>,
+    Json(input): Json<EnrollmentRequest>,
+) -> Result<(StatusCode, Json<Enrollment>), ApiError> {
+    let leaf_der = peer
+        .and_then(|axum::Extension(PeerLeaf(der))| der)
+        .ok_or(ApiError::IdentityRequired)?;
+    let leaf_pem = certs::cert_pem_from_der(&leaf_der);
+    let site = certs::leaf_spiffe_id(&leaf_der)
+        .as_deref()
+        .and_then(certs::site_of_spiffe_id)
+        .map(str::to_owned)
+        .ok_or(ApiError::IdentityRequired)?;
+    let ca = state.ca.current();
+    if let Err(reason) = certs::verify_site_cert(&ca.cert_pem, &leaf_pem, &site) {
+        tracing::warn!(site, %reason, "renewal refused: the presented certificate does not verify");
+        return Err(ApiError::IdentityRequired);
+    }
+    let unusable = |_err: certs::VerifyError| ApiError::IdentityRequired;
+    let presented_key = certs::cert_public_key_sha256(&leaf_pem).map_err(unusable)?;
+    let (presented_not_before, _not_after) = certs::cert_validity(&leaf_pem).map_err(unusable)?;
+    let requested_key = verify_csr(&input.csr).map_err(signing_error)?;
+
+    let renewal = Renewal {
+        reserved: state.reserved_sites.contains(&site),
+        site_name: site,
+        presented_key,
+        requested_key,
+        presented_not_before,
+    };
+    let validity = Validity::starting_now(state.cert_lifetime);
+    let csr = input.csr;
+    let signed = Box::pin(state.store.renew_and_issue(&renewal, || {
+        sign_csr(&ca, &renewal.site_name, &csr, validity)
+            .map(|cert| Issued {
+                certificate: cert.cert_pem,
+                spiffe_id: cert.spiffe_id,
+                public_key_sha256: cert.public_key_sha256,
+            })
+            .map_err(|err| StoreError::Backend(format!("signing failed: {err}")))
+    }))
+    .await;
+    let renewed = match signed {
+        Ok(signed) => signed,
+        Err(StoreError::Refused(reason)) => {
+            tracing::warn!(site = %renewal.site_name, reason = reason.as_str(), "renewal refused");
+            return Err(ApiError::IdentityRefused);
+        },
+        Err(other) => return Err(other.into()),
+    };
+    audit(&renewed, &renewal);
+    let Renewed { id, issued, .. } = renewed;
+    Ok((
+        StatusCode::OK,
+        Json(Enrollment {
+            id,
+            certificate: issued.certificate,
+            ca_certificate: ca.cert_pem.clone(),
+            spiffe_id: issued.spiffe_id,
+            public_key_sha256: issued.public_key_sha256,
+        }),
+    ))
+}
+
+/// Record an admitted renewal by site and key digests.
+fn audit(renewed: &Renewed, renewal: &Renewal) {
+    let site = &renewal.site_name;
+    let presented_key = &renewal.presented_key;
+    let new_key = &renewal.requested_key;
+    let old_key = renewed.replaced_key.as_deref().unwrap_or("none");
+    let message = match renewed.action {
+        RenewAction::Rotate => "site identity renewed",
+        RenewAction::Resign => "site identity re-signed for a retried renewal",
+        RenewAction::Register => "reserved site registered on its first renewal",
+        RenewAction::Supersede => "reserved site record superseded by a newer bootstrap identity",
+    };
+    tracing::info!(site, old_key, presented_key, new_key, action = ?renewed.action, "{message}");
 }
 
 /// The one-time site token from `Authorization: Bearer`, or a refusal.

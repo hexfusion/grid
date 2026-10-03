@@ -313,3 +313,110 @@ async fn a_signing_failure_leaves_the_token_unspent() {
         "a signing failure rolls back, so the token stays unspent"
     );
 }
+
+/// A renewal of `site` presenting `presented` and asking for `requested`.
+fn renewal(site: &str, presented: &str, requested: &str, reserved: bool) -> enrollment::Renewal {
+    enrollment::Renewal {
+        site_name: site.to_owned(),
+        presented_key: presented.to_owned(),
+        requested_key: requested.to_owned(),
+        presented_not_before: OffsetDateTime::now_utc().saturating_sub(Duration::days(1)),
+        reserved,
+    }
+}
+
+/// A signer standing in for the CA on renewal.
+fn resign(site: &str) -> Result<Issued, StoreError> {
+    sign_for(&Pin {
+        site_name: site.to_owned(),
+    })
+}
+
+/// Rotate, refuse the replaced key, re-sign a lost response, and rotate again.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one renewal sequence")]
+async fn a_renewal_rotates_the_recorded_key() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let (site, digest) = (unique("site"), unique("digest"));
+    let (key_a, key_b, key_c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    store.mint_site_token(new_token(&site, &digest)).await.expect("mint");
+    store.redeem_and_issue(&digest, sign_for).await.expect("redeem");
+
+    let renewed = store
+        .renew_and_issue(&renewal(&site, &key_a, &key_b, false), || resign(&site))
+        .await
+        .expect("the enrolled key renews");
+    assert_eq!(renewed.action, enrollment::RenewAction::Rotate);
+    assert_eq!(renewed.replaced_key.as_deref(), Some(key_a.as_str()));
+
+    let stale = store
+        .renew_and_issue(&renewal(&site, &key_a, &key_c, false), || resign(&site))
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::Refused(enrollment::Refusal::StaleKey))),
+        "the replaced key cannot pick a new key: {stale:?}"
+    );
+    let retried = store
+        .renew_and_issue(&renewal(&site, &key_a, &key_b, false), || resign(&site))
+        .await
+        .expect("a lost response retries");
+    assert_eq!(retried.action, enrollment::RenewAction::Resign);
+    assert_eq!(retried.id, renewed.id, "the same record");
+
+    let again = store
+        .renew_and_issue(&renewal(&site, &key_b, &key_c, false), || resign(&site))
+        .await
+        .expect("the current key renews");
+    assert_eq!(again.action, enrollment::RenewAction::Rotate);
+}
+
+/// A reserved name gets a token-less record; nothing else may.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "the store path, then the schema check")]
+async fn only_a_reserved_name_records_without_a_token() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let (hub, spoke) = (unique("hub"), unique("spoke"));
+    let (x, y) = ("d".repeat(64), "e".repeat(64));
+
+    let refused = store
+        .renew_and_issue(&renewal(&spoke, &x, &y, false), || resign(&spoke))
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::Refused(enrollment::Refusal::UnknownSite))),
+        "an unrecorded spoke is refused: {refused:?}"
+    );
+    let registered = store
+        .renew_and_issue(&renewal(&hub, &x, &y, true), || resign(&hub))
+        .await
+        .expect("a reserved name registers");
+    assert_eq!(registered.action, enrollment::RenewAction::Register);
+    assert_eq!(registered.replaced_key, None);
+
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("url");
+    let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
+    let row: (Option<uuid::Uuid>, bool, String, Option<String>) = sqlx::query_as(
+        "SELECT site_token_id, reserved, public_key_sha256, previous_public_key_sha256
+           FROM site_enrollments WHERE site_name = $1",
+    )
+    .bind(&hub)
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert_eq!(row, (None, true, y, Some(x)), "token-less, reserved, keys recorded");
+
+    let forged = sqlx::query(
+        "INSERT INTO site_enrollments (id, site_token_id, site_name, public_key_sha256, spiffe_id)
+         VALUES ($1, NULL, $2, $3, $4)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(&spoke)
+    .bind("f".repeat(64))
+    .bind("spiffe://grid.internal/site/x")
+    .execute(&pool)
+    .await;
+    assert!(forged.is_err(), "the schema refuses a token-less spoke record");
+}

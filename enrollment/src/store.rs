@@ -10,8 +10,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod postgres;
+pub mod renewal;
 
 pub use postgres::PgStore;
+pub use renewal::{Held, Refusal, RenewAction, Renewal, Renewed};
 
 /// Reasons a store operation could not be carried out.
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +32,10 @@ pub enum StoreError {
     /// tell which tokens exist or have been used.
     #[error("site token is not valid")]
     TokenInvalid,
+
+    /// The enrollment record does not admit this renewal.
+    #[error("renewal refused: {0}")]
+    Refused(#[from] Refusal),
 
     /// The backend itself failed, or issuing the certificate did.
     #[error("store backend failed: {0}")]
@@ -189,6 +195,23 @@ impl Store {
             Self::Postgres(store) => store.redeem_and_issue(token_sha256, sign).await,
         }
     }
+
+    /// Admit a renewal against the name's record, sign, and record the new key, as one step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Refused`] when the record does not admit it,
+    /// [`StoreError::NameTaken`] when a concurrent first renewal registered the
+    /// name, and [`StoreError::Backend`] if signing or the backend failed.
+    pub async fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
+    where
+        F: FnOnce() -> Result<Issued, StoreError> + Send,
+    {
+        match self {
+            Self::Memory(store) => store.renew_and_issue(renewal, sign),
+            Self::Postgres(store) => store.renew_and_issue(renewal, sign).await,
+        }
+    }
 }
 
 /// Records held in this process.
@@ -209,8 +232,8 @@ struct Inner {
     /// unique constraint). Kept in step with `tokens` on mint and revoke.
     by_digest: HashMap<String, Uuid>,
 
-    /// Names already issued, to the enrollment that holds each.
-    issued_names: HashMap<String, Uuid>,
+    /// Names already issued, to the record renewal reads.
+    issued_names: HashMap<String, Held>,
 }
 
 /// One site token held in memory.
@@ -306,10 +329,35 @@ impl MemoryStore {
         if let Some(row) = inner.tokens.get_mut(&token_id) {
             row.redeemed_by = Some(enrollment_id);
         }
-        inner.issued_names.insert(pin.site_name, enrollment_id);
+        let held = Held::new(enrollment_id, issued.public_key_sha256.clone(), None);
+        inner.issued_names.insert(pin.site_name, held);
         drop(inner);
 
         Ok((enrollment_id, issued))
+    }
+
+    /// Admit a renewal, sign, and record the new key under one lock.
+    fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
+    where
+        F: FnOnce() -> Result<Issued, StoreError>,
+    {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let held = inner.issued_names.get(&renewal.site_name);
+        let action = renewal::decide(held, renewal)?;
+        let id = held.map_or_else(Uuid::new_v4, |held| held.id);
+        let replaced_key = held.map(|held| held.current_key.clone());
+        let issued = sign()?;
+        if action != RenewAction::Resign {
+            let record = Held::new(id, renewal.requested_key.clone(), Some(renewal.presented_key.clone()));
+            inner.issued_names.insert(renewal.site_name.clone(), record);
+        }
+        drop(inner);
+        Ok(Renewed {
+            id,
+            action,
+            replaced_key,
+            issued,
+        })
     }
 }
 
