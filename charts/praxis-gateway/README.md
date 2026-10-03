@@ -189,6 +189,8 @@ Praxis AI image; these values may advance independently.
 | `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider` and `gridServing` need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
+| `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
+| `log.filter` | string | `""` | Full RUST_LOG directive, such as `info,praxis_filter=debug`. When set, it replaces `log.level`. |
 | `nameOverride` | string | `""` | Override chart name. |
 | `fullnameOverride` | string | `""` | Override fully qualified app name. A grid gateway, a provider or a consumer with site backends, takes its release name. |
 | `commonLabels` | object | `{}` | Labels added to all resources. |

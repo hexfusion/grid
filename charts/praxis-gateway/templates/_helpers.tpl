@@ -461,3 +461,11 @@ A grid gateway: a provider, or a consumer with a site backend. Emits "true" or n
 {{- if kindIs "slice" $cfg.backends }}{{- range $cfg.backends }}{{- if .site }}{{- $grid = true }}{{- end }}{{- end }}{{- end }}
 {{- if $grid }}true{{- end }}
 {{- end }}
+
+{{/*
+RUST_LOG for the gateway and overlay-sync: log.filter when set, else log.level, else empty (the binary default).
+*/}}
+{{- define "praxis-gateway.rustLog" -}}
+{{- $log := .Values.log | default dict -}}
+{{- $log.filter | default $log.level -}}
+{{- end }}
