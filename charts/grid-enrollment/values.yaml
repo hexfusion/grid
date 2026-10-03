@@ -41,7 +41,9 @@ ca:
   keySecretName: grid-ca-key      # kubernetes.io/tls: tls.crt + tls.key (signing key)
   bundleSecretName: grid-ca-bundle # Opaque: ca.crt (public trust anchor)
   # Replace an existing CA in place. Off by default: regenerating the CA
-  # invalidates every certificate it has issued.
+  # invalidates every certificate it has issued. If the CA key Secret is lost while
+  # the CA bundle still exists, bootstrap refuses to mint a new CA, since that would
+  # split the grid: restore the key from backup, or set this to start a new grid.
   forceRegenerate: false
   provided:
     # Reference to a pre-created {tls.crt,tls.key} Secret. Never inline the key
@@ -213,8 +215,8 @@ db:
 #     network: grid
 
 # -- The hub's own site identity, issued by the bootstrap Job straight from the grid
-# CA, so the hub never enrolls or needs an invite. Created once and never rotated:
-# peers pin its digest. Delete the Secret, or set ca.forceRegenerate, to re-issue.
+# CA, so the hub never enrolls or needs an invite. It renews like an enrolled site.
+# Delete the Secret and upgrade to re-issue it.
 hubSite:
   # -- Hub site name. Empty disables it. Must not also be invited.
   name: ""

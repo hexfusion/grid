@@ -194,6 +194,12 @@ pub fn verify_csr(csr_pem: &str) -> Result<String, EnrollError> {
     Ok(hex(&backend::sha256(&public_key_der)))
 }
 
+/// Whether `key_pem` is the private key for `cert_pem`.
+#[must_use]
+pub fn key_matches_cert(key_pem: &str, cert_pem: &str) -> bool {
+    backend::key_spki_der(key_pem).is_some_and(|key| crate::cert_public_key(cert_pem).is_ok_and(|cert| cert == key))
+}
+
 /// Map a backend request failure onto the request-side error it stands for.
 fn map_backend_error(err: BackendError) -> EnrollError {
     match err {
@@ -220,6 +226,17 @@ mod tests {
 
     use super::*;
     use crate::generate::generate_ca;
+
+    #[test]
+    fn a_key_matches_only_its_own_certificate() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let csr = crate::generate_csr("east").expect("csr");
+        let leaf = sign_csr(&ca, "east", &csr.csr_pem, Validity::default()).expect("leaf");
+        assert!(key_matches_cert(&csr.key_pem, &leaf.cert_pem));
+        let other = crate::generate_csr("east").expect("other");
+        assert!(!key_matches_cert(&other.key_pem, &leaf.cert_pem), "another key");
+        assert!(!key_matches_cert("not a key", &leaf.cert_pem), "an unreadable key");
+    }
 
     /// Build a request the way an enrollee would, asking for `requested_names`.
     fn csr_asking_for(requested_names: &[SanType]) -> (String, KeyPair) {

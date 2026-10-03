@@ -25,7 +25,7 @@ pub mod tls;
 
 pub use api::{AppState, router};
 pub use auth::GridAdmins;
-pub use ca::SharedCa;
+pub use ca::{CaAction, CaCopy, SharedCa, ca_action};
 pub use store::{
     Issued, NewSiteToken, Pin, Refusal, RenewAction, Renewal, Renewed, SeedRecord, Seeded, Store, StoreError,
 };
