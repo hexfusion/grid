@@ -33,7 +33,7 @@ gridNetwork:
   # signalTransport:
   #   mode: poll
   # -- Grid-wide peer trust: pin (default) or spiffe. The operator applies it at
-  # startup and restarts itself when it changes.
+  # startup and, under poll, restarts itself when it changes.
   # peerTrust:
   #   mode: spiffe
 

@@ -161,7 +161,10 @@ impl GridModes {
     /// The modes to restart into when `network` declares other than `self`, the running modes.
     #[must_use]
     pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
-        network.map(Self::of).filter(|declared| *declared != self)
+        // Only the poll path reads trust, so a trust change under gossip needs no restart.
+        network.map(Self::of).filter(|declared| {
+            declared.signal != self.signal || (declared.signal == SignalMode::Poll && declared.trust != self.trust)
+        })
     }
 }
 
@@ -3227,6 +3230,29 @@ mod tests {
             GridModes::of(&poll).restart_for(Some(&poll)),
             None,
             "the restarted process runs what it declares, so it never loops"
+        );
+    }
+
+    #[test]
+    fn a_trust_change_restarts_only_under_poll() {
+        let pin = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "pin"}}));
+        assert_eq!(
+            GridModes::WITHOUT_NETWORK.restart_for(Some(&pin)),
+            None,
+            "gossip reads no trust, so a fresh install declaring pin does not restart"
+        );
+        let poll = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "spiffe"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        let poll_pin = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "pin"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            GridModes::of(&poll).restart_for(Some(&poll_pin)),
+            Some(GridModes::of(&poll_pin)),
+            "under poll a trust change restarts"
         );
     }
     use crate::swim_endpoint::EndpointResolutionFailure;
