@@ -9,6 +9,8 @@ use std::{collections::HashMap, sync::Mutex};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod lifecycle_model;
 pub mod postgres;
 pub mod renewal;
 
@@ -324,8 +326,26 @@ impl MemoryStore {
         now
     }
 
+    /// Move the clock forward.
+    #[cfg(test)]
+    fn advance(&self, by: time::Duration) {
+        self.offset
+            .fetch_add(by.whole_seconds(), std::sync::atomic::Ordering::Relaxed);
+    }
 
+    /// The whole state, for a test that restores it.
+    #[cfg(test)]
+    fn snapshot(&self) -> Inner {
+        self.inner.lock().map(|inner| inner.clone()).unwrap_or_default()
+    }
 
+    /// Put back a state [`Self::snapshot`] took.
+    #[cfg(test)]
+    fn restore(&self, state: Inner) {
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = state;
+        }
+    }
 
     /// Record a token.
     fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
