@@ -17,7 +17,7 @@ use std::{
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
-    api::{Api, ListParams, Patch, PatchParams},
+    api::{Api, DeleteParams, ListParams, Patch, PatchParams},
     runtime::{controller::Action, reflector::ObjectRef},
 };
 use tokio::{sync::Mutex, time::Duration};
@@ -2701,6 +2701,33 @@ fn warn_capped(network_name: &str, capped: usize) {
     }
 }
 
+/// Auto-discovered stub names whose SWIM member is no longer Alive.
+///
+/// These must be deleted before the cap counts them, or a peer that has churned
+/// out permanently blocks admitting a new one once [`MAX_AUTO_CREATED_SITES`] is reached.
+fn departed_stubs(existing: &BTreeSet<String>, desired: &BTreeSet<String>) -> Vec<String> {
+    existing.difference(desired).cloned().collect()
+}
+
+/// Delete the stubs of departed members and drop them from `stubs`, so the cap counts only live peers.
+async fn gc_departed_stubs(
+    api: &Api<GridSite>,
+    network_name: &str,
+    stubs: &mut BTreeSet<String>,
+    desired: &BTreeSet<String>,
+) -> Result<(), OperatorError> {
+    for name in departed_stubs(stubs, desired) {
+        match api.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {},
+            Err(kube::Error::Api(status)) if status.code == 404 => {},
+            Err(e) => return Err(e.into()),
+        }
+        stubs.remove(&name);
+        tracing::info!(name = %name, network = %network_name, "garbage-collected auto-discovered GridSite after its SWIM member left the mesh");
+    }
+    Ok(())
+}
+
 /// Whether discovery may apply `name`: an existing stub always, a new one only under [`MAX_AUTO_CREATED_SITES`].
 fn admit_stub(stubs: &mut BTreeSet<String>, name: &str) -> bool {
     if stubs.contains(name) {
@@ -2996,12 +3023,19 @@ async fn reconcile_discovered_sites(
     plaintext: bool,
 ) -> Result<(), OperatorError> {
     let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
+
+    let api: Api<GridSite> = Api::all(client.clone());
+    let mut stubs = auto_discovered_stubs(&api, network_name).await?;
+
+    // Membership has converged by here (the hold released upstream), so a stub
+    // with no Alive member is genuinely gone and the cap must not keep counting it.
+    let desired: BTreeSet<String> = sites.iter().map(|site| site.name.clone()).collect();
+    gc_departed_stubs(&api, network_name, &mut stubs, &desired).await?;
+
     if sites.is_empty() {
         return Ok(());
     }
 
-    let api: Api<GridSite> = Api::all(client.clone());
-    let mut stubs = auto_discovered_stubs(&api, network_name).await?;
     let mut capped = 0_usize;
 
     for site in &sites {
@@ -4597,6 +4631,39 @@ mod tests {
         let mut room = BTreeSet::new();
         assert!(admit_stub(&mut room, "net-a"));
         assert!(room.contains("net-a"), "an admitted stub counts against the cap");
+    }
+
+    #[test]
+    fn gc_of_departed_stubs_unwedges_a_full_cap() {
+        // Every stub is for a member that has left, so nothing is desired.
+        let mut stubs: BTreeSet<String> = (0..MAX_AUTO_CREATED_SITES).map(|i| format!("net-s{i}")).collect();
+        let desired = BTreeSet::new();
+
+        let departed = departed_stubs(&stubs, &desired);
+        assert_eq!(
+            departed.len(),
+            MAX_AUTO_CREATED_SITES,
+            "every departed stub is a GC candidate"
+        );
+        for name in &departed {
+            stubs.remove(name);
+        }
+
+        assert!(
+            admit_stub(&mut stubs, "net-new"),
+            "a new peer is admitted again once departed stubs are collected"
+        );
+    }
+
+    #[test]
+    fn gc_keeps_stubs_for_still_present_members() {
+        let stubs: BTreeSet<String> = ["net-a", "net-b", "net-c"].iter().map(|s| (*s).to_owned()).collect();
+        let desired: BTreeSet<String> = ["net-a", "net-c"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(
+            departed_stubs(&stubs, &desired),
+            vec!["net-b".to_owned()],
+            "only the absent member is collected"
+        );
     }
 
     #[test]
