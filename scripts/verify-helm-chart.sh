@@ -866,21 +866,24 @@ try_template "$GW_DIR" "absent gridServing and peerTrust maps (gw)" "${GW_REQ[@]
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
   --set gatewayConfig.listenerTls.enabled=true --namespace grid-system
 
-# listenerTls names the port https (render or BYO); probes follow the port name.
+# listenerTls names the port https (render or BYO). A rendered config probes the
+# loopback admin listener; a BYO config's probes follow the port name.
 for mode in render byo; do
-  if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); else args=(--set config.existingConfigMap=byo); fi
+  if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); want=3; else args=(--set config.existingConfigMap=byo); want=5; fi
   out=$(helm template v-port "$GW_DIR" "${args[@]}" --set gatewayConfig.listenerTls.enabled=true \
     --set gatewayConfig.listenerTls.existingSecret=l --namespace grid-system)
-  if [ "$(echo "$out" | grep -cE 'name: https|port: https|targetPort: https')" = 5 ]; then
+  if [ "$(echo "$out" | grep -cE 'name: https|port: https|targetPort: https')" = "$want" ]; then
     pass "listenerTls ($mode): port, probes, and Service target https"
   else
     fail "listenerTls ($mode): port, probes, and Service should target https"
   fi
 done
-if [ "$(helm template v-port "$GW_DIR" "${GW_RENDER[@]}" --namespace grid-system | grep -cE 'port: http$|targetPort: http$')" = 3 ]; then
-  pass "default port: probes and Service target http"
+out=$(helm template v-port "$GW_DIR" "${GW_RENDER[@]}" --namespace grid-system)
+if [ "$(echo "$out" | grep -cE 'port: http$|targetPort: http$')" = 1 ] \
+  && [ "$(echo "$out" | grep -cE -- '- http://127\.0\.0\.1:9901/(ready|healthy)$')" = 2 ]; then
+  pass "default port: Service targets http, probes ask the admin listener"
 else
-  fail "default port: probes and Service should target http"
+  fail "default port: Service should target http and probes the admin listener"
 fi
 
 # Default probes must target the container port by its name, or the pod never goes Ready.

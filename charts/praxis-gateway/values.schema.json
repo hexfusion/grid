@@ -587,6 +587,11 @@
         },
         "liveness": {
           "description": "Liveness probe settings. Null to disable."
+        },
+        "adminProbeCommand": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Command for the admin-listener probe, with the URL appended. Empty uses /bin/sh with curl or wget."
         }
       }
     },

@@ -399,16 +399,28 @@ credentials: []
 # -- Probe configuration.
 health:
   # -- Readiness probe settings. Set to null to disable.
-  # A tcpSocket without a port targets the listener port.
+  # A tcpSocket without a port becomes an HTTP probe of the loopback admin listener when
+  # the chart sees one (rendered config or config.inline). It asks /healthy when the
+  # gateway forwards to backends (rendered backends, gridServing, or config.inline
+  # clusters; /ready fails while any backend is down), else /ready, and runs /bin/sh with
+  # curl or wget, whichever the image has; see adminProbeCommand. When the chart sees no
+  # admin listener, it stays a plain TCP connect to the listener port, which checks no
+  # path. A config.inline TLS listener without a visible admin listener is refused, since
+  # a TCP probe fails its handshake every period. Give tcpSocket a port, or another
+  # handler, to keep your own probe.
   readiness:
     tcpSocket: {}
     initialDelaySeconds: 3
     periodSeconds: 5
-  # -- Liveness probe settings. Set to null to disable.
+  # -- Liveness probe settings. Set to null to disable. Chosen the same way as readiness, but always asks /healthy.
   liveness:
     tcpSocket: {}
     initialDelaySeconds: 5
     periodSeconds: 10
+  # -- Command for the admin-listener probe; the URL is appended as its last argument. Empty
+  # uses /bin/sh with curl or wget. Set it for an image with neither, for example a
+  # distroless image that ships its own HTTP check.
+  adminProbeCommand: []
 
 # -- Seconds a terminating pod keeps serving before Praxis is told to stop. Praxis
 # closes its listener as soon as it gets SIGTERM, but Service endpoints take a moment

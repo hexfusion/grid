@@ -2,12 +2,18 @@
 {{- include "praxis-gateway.validateDigest" . }}
 {{- include "praxis-gateway.validateConfig" . }}
 {{- include "praxis-gateway.validateMounts" . }}
+{{- include "praxis-gateway.validateProbes" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "praxis-gateway.fullname" . }}
   labels:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
+  {{- if (.Values.gridServing).enabled }}
+  annotations:
+    {{- /* The operator writes the serving ConfigMap only after the grid CRs (wave 1) exist. */}}
+    argocd.argoproj.io/sync-wave: "2"
+  {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -223,11 +229,14 @@ spec:
               protocol: {{ .Values.port.protocol | quote }}
           {{- with .Values.health.readiness }}
           readinessProbe:
-            {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
+            {{- /* /ready fails while any backend cluster is down. */}}
+            {{- $readyPath := "/ready" }}
+            {{- if include "praxis-gateway.servesBackends" $ }}{{ $readyPath = "/healthy" }}{{ end }}
+            {{- include "praxis-gateway.probe" (list . $ $readyPath) | nindent 12 }}
           {{- end }}
           {{- with .Values.health.liveness }}
           livenessProbe:
-            {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
+            {{- include "praxis-gateway.probe" (list . $ "/healthy") | nindent 12 }}
           {{- end }}
           {{- with .Values.shutdownDelaySeconds }}
           lifecycle:
