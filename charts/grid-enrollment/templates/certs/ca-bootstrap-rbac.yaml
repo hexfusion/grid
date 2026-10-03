@@ -59,6 +59,15 @@ rules:
       - {{ include "grid-enrollment.adminTokensSecret" . | quote }}
       {{- end }}
     verbs: ["get", "update"]
+  {{- if .Values.hubSite.name }}
+  # The CA-signed seed registering the hub's key, applied server side. Secret create is
+  # granted above; get and patch reach only this Secret.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.hubSite.seedSecretName | quote }}
+    verbs: ["get", "patch"]
+  {{- end }}
   {{- if and .Values.hubSite.name .Values.hubSite.swimKeySecretName }}
   # The SWIM key is created once and only read back, never replaced.
   - apiGroups: [""]

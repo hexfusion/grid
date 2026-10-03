@@ -180,6 +180,27 @@ pub(crate) fn verify_leaf_signature(ca_cert_pem: &str, leaf_pem: &str) -> Result
         .map_err(|_bad| BackendError::BadSignature)
 }
 
+/// Sign `message` with the CA key, the algorithm the CA certifies itself with.
+pub(crate) fn sign_message(ca: &CaMaterial, message: &[u8]) -> Result<Vec<u8>, BackendError> {
+    use rcgen::SigningKey as _;
+    ca.issuer
+        .key()
+        .sign(message)
+        .map_err(|err| BackendError::Sign(err.to_string()))
+}
+
+/// Verify a [`sign_message`] signature against the CA certificate's key.
+pub(crate) fn verify_message(ca_cert_pem: &str, message: &[u8], signature: &[u8]) -> Result<(), BackendError> {
+    let ca_der = pem::parse(ca_cert_pem).map_err(|_bad| BackendError::InvalidCaCert)?;
+    let (_rest, ca) = X509Certificate::from_der(ca_der.contents()).map_err(|_bad| BackendError::InvalidCaCert)?;
+    let signature = x509_parser::asn1_rs::BitString {
+        unused_bits: 0,
+        data: signature.into(),
+    };
+    x509_parser::verify::verify_signature(ca.public_key(), &ca.signature_algorithm, &signature, message)
+        .map_err(|_bad| BackendError::BadSignature)
+}
+
 /// SHA-256 digest (pure-Rust; the non-FIPS default path).
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest as _, Sha256};

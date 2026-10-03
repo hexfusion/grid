@@ -382,12 +382,7 @@ impl Settings {
     ///
     /// Returns a message when the URL is missing or not https, or the pin is unreadable.
     pub fn from_config(config: &super::Config) -> Result<Self, String> {
-        let url = config
-            .url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| url.starts_with("https://"))
-            .ok_or("GRID_ENROLL_URL must be an https URL to renew")?;
+        let url = renewal_url(config.url.as_deref())?;
         let pin = config
             .ca_file
             .as_deref()
@@ -403,6 +398,27 @@ impl Settings {
             },
         })
     }
+}
+
+/// The enrollment URL, https and outside the grid domain.
+fn renewal_url(url: Option<&str>) -> Result<&str, String> {
+    let url = url
+        .map(str::trim)
+        .filter(|url| url.starts_with("https://"))
+        .ok_or("GRID_ENROLL_URL must be an https URL to renew")?;
+    // Any site leaf names a host under the grid domain, so one could stand in for the service.
+    let host = reqwest::Url::parse(url)
+        .map_err(|e| format!("GRID_ENROLL_URL: {e}"))?
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+    let grid_domain = certs::SPIFFE_TRUST_DOMAIN;
+    if host == grid_domain || host.ends_with(&format!(".{grid_domain}")) {
+        return Err(format!(
+            "GRID_ENROLL_URL must not name a host under {grid_domain}, where site certificates live"
+        ));
+    }
+    Ok(url)
 }
 
 /// Keep the site identity renewed for the life of the process.

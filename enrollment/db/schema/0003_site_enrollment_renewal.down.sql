@@ -4,5 +4,8 @@ ALTER TABLE site_enrollments
     DROP CONSTRAINT IF EXISTS site_enrollments_token_or_reserved,
     DROP COLUMN IF EXISTS previous_public_key_sha256,
     DROP COLUMN IF EXISTS renewed_at,
+    DROP COLUMN IF EXISTS frozen_at,
     DROP COLUMN IF EXISTS reserved,
+    DROP COLUMN IF EXISTS seed_generation,
+    DROP COLUMN IF EXISTS epoch_at,
     ALTER COLUMN site_token_id SET NOT NULL;

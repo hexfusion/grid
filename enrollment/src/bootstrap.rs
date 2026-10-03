@@ -94,6 +94,9 @@ struct BootstrapArgs {
     /// Secret for the grid CA (`ca.crt`) beside the site identity.
     #[arg(long, default_value = "grid-ca")]
     site_ca_secret: String,
+    /// Secret, in this namespace, for the CA-signed seed that registers the site's key.
+    #[arg(long, default_value = "grid-reserved-seeds")]
+    reserved_seeds_secret: String,
     /// Secret for the grid's SWIM key (`key`, 32 bytes), created once and copied to
     /// `--site-namespace` when `--site-name` is set.
     #[arg(long)]
@@ -135,7 +138,7 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     }
     let ca = resolve_ca(&secrets, args).await?;
     write_opaque_secret(&secrets, &args.ca_bundle_secret, "ca.crt", &ca.cert_pem).await?;
-    Box::pin(ensure_site_identity(&client, &ca, args)).await?;
+    Box::pin(ensure_site_identity(&client, &ca, args, &namespace)).await?;
     if !args.skip_serving {
         ensure_serving(&secrets, &ca, args).await?;
     }
@@ -312,10 +315,20 @@ fn is_conflict(error: &(dyn Error + Send + Sync + 'static)) -> bool {
 ///
 /// Peers pin the leaf's digest, so an existing identity is kept, even an expired
 /// or unchained one, unless `--force-regenerate` is set.
-async fn ensure_site_identity(client: &kube::Client, ca: &certs::CaCert, args: &BootstrapArgs) -> Result<(), BoxError> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep or issue the identity, then seed its key, read as one step"
+)]
+async fn ensure_site_identity(
+    client: &kube::Client,
+    ca: &certs::CaCert,
+    args: &BootstrapArgs,
+    namespace: &str,
+) -> Result<(), BoxError> {
     let Some(site) = args.site_name.as_deref() else {
         return Ok(());
     };
+    let seeds = &kube::api::Api::namespaced(client.clone(), namespace);
     let secrets = &kube::api::Api::namespaced(client.clone(), &args.site_namespace);
     Box::pin(ensure_site_ca(
         secrets,
@@ -325,7 +338,10 @@ async fn ensure_site_identity(client: &kube::Client, ca: &certs::CaCert, args: &
     ))
     .await?;
     if !args.force_regenerate && Box::pin(kept_site_identity(secrets, ca, site, &args.site_secret)).await? {
-        return Ok(());
+        let kept = secret_text(secrets, &args.site_secret, "tls.crt")
+            .await?
+            .unwrap_or_default();
+        return Box::pin(ensure_seed(seeds, &args.reserved_seeds_secret, ca, site, &kept, false)).await;
     }
     let (issued, key_pem) = issue_site_identity(ca, site, crate::load_cert_lifetime())?;
     Box::pin(write_tls_secret(
@@ -337,6 +353,81 @@ async fn ensure_site_identity(client: &kube::Client, ca: &certs::CaCert, args: &
     ))
     .await?;
     log_issued(&issued, &args.site_secret);
+    Box::pin(ensure_seed(
+        seeds,
+        &args.reserved_seeds_secret,
+        ca,
+        site,
+        &issued.cert_pem,
+        true,
+    ))
+    .await
+}
+
+/// Sign a seed registering `site`'s key with the service: always for a key bootstrap
+/// just `issued`, else only when no valid seed names the site yet.
+///
+/// The generation only grows, so the service applies each re-issue once and never
+/// an older seed.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the seed's fields and where it goes, each used once"
+)]
+async fn ensure_seed(
+    seeds: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+    ca: &certs::CaCert,
+    site: &str,
+    leaf_pem: &str,
+    issued: bool,
+) -> Result<(), BoxError> {
+    use enrollment::seed::{SEED_SUFFIX, SIGNATURE_SUFFIX};
+    use kube::api::{Patch, PatchParams};
+
+    let (seed_key, signature_key) = (format!("{site}{SEED_SUFFIX}"), format!("{site}{SIGNATURE_SUFFIX}"));
+    let data = Box::pin(seeds.get_opt(name))
+        .await?
+        .and_then(|secret| secret.data)
+        .unwrap_or_default();
+    let text = |key: &str| data.get(key).and_then(|value| String::from_utf8(value.0.clone()).ok());
+    let held = text(&seed_key)
+        .zip(text(&signature_key))
+        .and_then(|(body, signature)| enrollment::seed::verified(&body, &signature, &ca.cert_pem).ok());
+    if !issued && held.as_ref().is_some_and(|seed| seed.site_name == site) {
+        return Ok(());
+    }
+    let now_ms = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0);
+    let generation = held.map_or(0, |seed| seed.generation).saturating_add(1).max(now_ms);
+    let seed = enrollment::SeedRecord {
+        site_name: site.to_owned(),
+        key_sha256: certs::cert_public_key_sha256(leaf_pem)?,
+        generation,
+        issued_at: certs::cert_validity(leaf_pem)?.0,
+    };
+    let (body, signature) = enrollment::seed::sign(&seed, ca)?;
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": name,
+            "labels": { "app.kubernetes.io/managed-by": MANAGED_BY },
+            "annotations": { "argocd.argoproj.io/sync-options": ARGO_KEEP },
+        },
+        "data": {
+            seed_key: k8s_openapi::ByteString(body.into_bytes()),
+            signature_key: k8s_openapi::ByteString(signature.into_bytes()),
+        },
+    });
+    Box::pin(seeds.patch(name, &PatchParams::apply(MANAGED_BY).force(), &Patch::Apply(&patch))).await?;
+    tracing::info!(
+        site,
+        key_sha256 = %seed.key_sha256,
+        generation,
+        secret = name,
+        "signed the reserved site seed"
+    );
     Ok(())
 }
 

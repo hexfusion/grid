@@ -120,6 +120,46 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /enrollments/{siteName}:
+    delete:
+      operationId: deleteEnrollment
+      tags: [administration]
+      summary: Delete a site's enrollment
+      description: |
+        Deletes the enrollment record that holds a site name. The site can no
+        longer renew, its current certificate stays valid until it expires, and
+        the name is released so the site can enroll again with a new token. This
+        is also how a site frozen after a renewal fork recovers. A reserved
+        name's record comes from the enrollment bootstrap and is refused here.
+      security:
+        - gridAdminAuth: []
+      parameters:
+        - name: siteName
+          in: path
+          required: true
+          description: The site name the enrollment holds.
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No enrollment holds that site name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The name is reserved for the enrollment bootstrap.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /renewals:
     post:
       operationId: renew
@@ -156,12 +196,6 @@ paths:
                 $ref: '#/components/schemas/Error'
         '403':
           description: The enrollment record does not admit this certificate's key.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '409':
-          description: A concurrent first renewal registered the name.
           content:
             application/json:
               schema:

@@ -267,3 +267,28 @@ fn retries_back_off_to_the_cap() {
     let jittered = jittered(wait);
     assert!(jittered >= wait && jittered <= wait.saturating_add(Duration::from_secs(60)));
 }
+
+#[test]
+fn renewal_refuses_an_enrollment_url_a_site_certificate_could_answer() {
+    let config = |url: &str| super::super::Config {
+        enabled: false,
+        url: Some(url.to_owned()),
+        ca_file: None,
+        grid_ca_file: None,
+        site_name: None,
+        token_secret: None,
+        token_secret_key: "token".to_owned(),
+        identity_secret: "grid-site-identity".to_owned(),
+        ca_secret: "grid-ca".to_owned(),
+        renew: true,
+    };
+    drop(Settings::from_config(&config("https://grid-enrollment.grid-enrollment.svc:8443")).expect("in-cluster URL"));
+    for url in [
+        "https://hub.grid.internal:8443",
+        "https://HUB.GRID.INTERNAL.:8443",
+        "https://grid.internal",
+        "http://grid-enrollment.svc",
+    ] {
+        assert!(Settings::from_config(&config(url)).is_err(), "{url}");
+    }
+}

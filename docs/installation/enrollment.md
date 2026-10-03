@@ -90,7 +90,7 @@ The operator retries connect failures for about five minutes and gives up after 
 ### Recovery
 
 - An expired or revoked token fails at once with `site token rejected`. Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and deliver the new token to the site.
-- Known limit: a redeemed token holds its site name, and the hub cannot release a name yet. A site that spent its token without storing an identity enrolls again only under a new site name or after the enrollment database is reset. Reinstalling the chart does not reset an external database.
+- A redeemed token holds its site name until an enrollment admin deletes the site's enrollment with `DELETE /v1alpha1/enrollments/<siteName>`. That needs `delete` on the `enrollments` resource in group `grid.praxis.fast`, which the chart's `enrollment-admin` Role grants to `enrollment.enrollmentAdmins.subjects`. After the delete, invite the site again and it re-enrolls under the same name.
 
 ## Monitoring the signing CA
 
@@ -112,6 +112,64 @@ The grid CA lasts 10 years. There is no CA rotation path yet: regenerating it
 (`ca.forceRegenerate`) re-issues every leaf and invalidates every enrolled
 site's trust anchor.
 
+## Identity renewal
+
+A site renews its identity before it expires, with no new token. When less than a
+third of the lifetime remains, the operator presents the current certificate to
+the enrollment service over mutual TLS and asks for a certificate for a new key.
+It writes the new certificate and key into the same identity Secret, which the
+signals listener, the peer pollers, and the gateway reload without a restart.
+`enrollment.renewal.enabled` in the grid-operator chart turns it on, the default
+whenever an enrollment URL is known.
+
+- The enrollment Route must use passthrough termination. A reencrypt Route drops
+  the client certificate, so the enrollment chart refuses to render one while
+  `enrollment.renewal.enabled` is on. Never put a proxy that presents a grid site
+  certificate in front of the enrollment service: every caller through it would
+  renew that site's identity.
+- The hub's identity comes from the bootstrap Job, not a token. Bootstrap signs a
+  seed with the grid CA key and writes it to the `grid-reserved-seeds` Secret,
+  and the service registers the hub's key from it. A seed the CA did not sign, or
+  one naming a site outside `hubSite.name`, is refused. A seed older than the one
+  applied is ignored and logged at warning level as a rollback or replay. Keep
+  write access to that Secret as narrow as access to `grid-ca-key`. To re-issue the hub's
+  identity, delete the Secret `hubSite.identitySecretName` in `hubSite.namespace`
+  and run `helm upgrade`. Bootstrap issues a new identity and a newer seed, which
+  replaces the hub's key and clears a freeze. Do not use `ca.forceRegenerate` for
+  this: it replaces the grid CA, and every site must re-enroll.
+- The service keeps each site's current key and the one it replaced, so a renewal
+  whose answer was lost retries safely. A site renews once per two thirds of a
+  leaf's lifetime, so it never presents any other still-valid leaf. When one
+  arrives, or the replaced key asks for a new key, two parties hold the identity:
+  the service freezes the site and logs `renewal fork` at warning level. A holder
+  of a stolen older key can cause this on purpose. It fails closed. To recover, a
+  grid-admin deletes the site's enrollment and the site re-enrolls. A frozen hub
+  clears only by deleting its identity Secret and running `helm upgrade`, which
+  re-issues it. Deleting the seed Secret alone re-signs the key it already holds,
+  which does not clear a freeze. A certificate issued more than ten
+  minutes before that recovery is refused without freezing again and logged, so
+  the recovery holds while a stolen leaf stays valid. If a re-enrolled site
+  freezes again within minutes, delete its enrollment once more. The enrollment
+  service and its database need clocks within five minutes of each other.
+- Do not restore a site's identity Secret from a backup, and do not manage it
+  with GitOps or a policy that enforces its contents. An older copy holds a key the
+  service has replaced, so the site freezes on its next renewal. Leave the Secret
+  out of disaster recovery, or plan to re-enroll the site. After the enrollment
+  database is restored from a backup, sites that renewed since the snapshot are
+  refused with `record_behind` and must re-enroll.
+- Deleting an enrollment needs `delete` on the `enrollments` resource, granted by
+  the `enrollment-admin` Role to `enrollment.enrollmentAdmins.subjects` and to no
+  one by default. With `enrollment.authz=local`, every grid-admin in the token
+  table may delete.
+- An identity that already expired cannot renew. `GridNetwork` `status.identity`
+  reports `IdentityExpired` and the phase turns `Degraded`. Delete the site's
+  enrollment, delete its identity Secret, invite it again, and restart the
+  operator so it enrolls.
+- After a grid CA change, sites hold certificates from the old CA, which the
+  service no longer accepts. They cannot renew and must re-enroll.
+- Watch `grid_site_identity_expiry_timestamp_seconds` and
+  `grid_site_identity_renewals_total` on the operator.
+
 ## Troubleshooting
 
 - **Operator logs `site token rejected`**: Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and deliver the new token to the site.
@@ -120,6 +178,8 @@ site's trust anchor.
 - **Operator logs `TLS to the enrollment service failed`**: set `enrollment.caBundle` to the CA that issued the enrollment serving certificate.
 - **Operator logs `returned CA is not the pinned grid CA`**: set `enrollment.gridCaBundle` to the grid CA. The attempt spent the token, so enroll under a new site name.
 - **Operator logs `possible interception, contact the hub`**: the certificate names another site or key. Tell the hub admin before enrolling again.
+- **Operator logs `site identity renewal failed` with `renewal refused`**: the hub does not admit this identity, or froze it after a renewal fork. A grid-admin deletes the site's enrollment, and the site enrolls again.
+- **`GridNetwork` reports `IdentityExpired`**: the identity expired before it renewed. Follow the expired-identity steps in Identity renewal.
 - **`route.host is required`**: a passthrough Route is rendering without a host. Set `route.host` to `<name>.apps.<cluster-domain>`, or set `route.enabled=false`. Under an umbrella chart, prefix both with the subchart name.
 - **CA bootstrap Job fails with `built without --features bootstrap`**: the image was built with `--no-default-features`. Use a default build, which includes `sar` and `bootstrap`.
 - **`TokenReview` or `SubjectAccessReview` calls fail**: `enrollment.authz=kube` needs the `sar` feature and `enrollment.serviceAccount.create=true`, which binds the pod to `system:auth-delegator`.

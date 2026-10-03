@@ -164,6 +164,24 @@ pub fn cert_expires_within(cert_pem: &str, window: time::Duration) -> Result<boo
     })
 }
 
+/// Check a [`crate::sign_with_ca`] signature over `message` against the CA certificate.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the CA is unparseable or the signature does not verify.
+pub fn verify_ca_signature(ca_cert_pem: &str, message: &[u8], signature: &[u8]) -> Result<(), VerifyError> {
+    if ca_cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    crate::backend::verify_message(ca_cert_pem, message, signature).map_err(|err| {
+        if err == crate::backend::BackendError::InvalidCaCert {
+            VerifyError::MalformedCa
+        } else {
+            VerifyError::BadSignature
+        }
+    })
+}
+
 /// A certificate's `notBefore` and `notAfter`.
 ///
 /// # Errors
@@ -843,6 +861,29 @@ mod tests {
             canonical_fingerprint(&cert_pem_from_der(&der)),
             canonical_fingerprint(&issued.cert_pem),
             "DER round-trips to the same certificate"
+        );
+    }
+
+    #[test]
+    fn a_ca_signature_verifies_only_for_its_message_and_ca() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let other = generate_ca("grid-ca").expect("other");
+        let signature = crate::sign_with_ca(&ca, b"seed").expect("sign");
+        assert_eq!(verify_ca_signature(&ca.cert_pem, b"seed", &signature), Ok(()));
+        assert_eq!(
+            verify_ca_signature(&ca.cert_pem, b"seeds", &signature),
+            Err(VerifyError::BadSignature),
+            "another message"
+        );
+        assert_eq!(
+            verify_ca_signature(&other.cert_pem, b"seed", &signature),
+            Err(VerifyError::BadSignature),
+            "another CA"
+        );
+        assert_eq!(
+            verify_ca_signature(&ca.cert_pem, b"seed", b"junk"),
+            Err(VerifyError::BadSignature),
+            "a malformed signature"
         );
     }
 }

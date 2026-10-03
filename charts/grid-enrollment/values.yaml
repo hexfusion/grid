@@ -99,6 +99,11 @@ enrollment:
   replicaCount: 1
   listenAddr: "0.0.0.0:8443"
   certLifetimeSecs: ""               # empty => service default (ENROLLMENT_CERT_LIFETIME_SECS)
+  renewal:
+    # -- Sites renew their identity here with their current certificate over mutual
+    # TLS. A reencrypt Route drops that certificate, so the render refuses reencrypt
+    # while this is on.
+    enabled: true
   # kube (default): SAR via TokenReview + SubjectAccessReview, the in-cluster path
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).
   # local: the standalone grid-admin-token table, for non-kube deploys.
@@ -118,6 +123,11 @@ enrollment:
       # Create a ServiceAccount to mint grid-admin tokens from, and bind it.
       create: false
       name: grid-admin
+  # Who may delete a site's enrollment, which ends its renewals and releases its name.
+  # A Role of its own, since delete and mint together re-enroll an existing site's name.
+  enrollmentAdmins:
+    # RBAC subjects, e.g. [{kind: Group, name: grid-security}].
+    subjects: []
   gridAdminTokens:
     generate: true                   # the bootstrap Job creates a grid-admin-token Secret once
     existingSecretRef: ""            # BYO Secret with key "tokens" (name:token lines)
@@ -205,3 +215,7 @@ hubSite:
   caSecretName: grid-ca
   # -- Secret for the grid's SWIM key, created once here and in hubSite.namespace. Empty skips it.
   swimKeySecretName: grid-swim-key
+  # -- Secret, in this namespace, for the seed that registers the hub's key so it can
+  # renew. Bootstrap signs it with the CA key and the service applies only what verifies.
+  # A Secret, so replaying an old seed needs the Secret access that already reads the CA key.
+  seedSecretName: grid-reserved-seeds

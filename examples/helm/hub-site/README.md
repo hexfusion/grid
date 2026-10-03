@@ -121,4 +121,4 @@ SWIM has one key and no keyring, so a rotation is a flag day. Replace `grid-swim
 
 ## Known Limits
 
-Site certificates last 30 days and nothing renews them yet. The praxis-gateway chart README lists the gateway limits.
+Site certificates last 30 days, and the operator renews them when a third of the lifetime remains (see Identity renewal in the enrollment docs). The gateway's upstream mutual TLS client certificate reloads only on a config reload or a restart, so restart the gateway within about 10 days of a renewal. The praxis-gateway chart README lists the gateway limits.

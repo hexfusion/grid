@@ -8,7 +8,9 @@
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
-use super::{Held, Issued, NewSiteToken, Pin, RenewAction, Renewal, Renewed, StoreError, renewal};
+use super::{
+    Held, Issued, NewSiteToken, Pin, Refusal, RenewAction, Renewal, Renewed, SeedRecord, Seeded, StoreError, renewal,
+};
 
 /// The site-token table.
 static SCHEMA_TOKENS: &str = include_str!("../../db/schema/0001_create_site_tokens.up.sql");
@@ -164,9 +166,43 @@ impl PgStore {
         Ok((enrollment_id, issued))
     }
 
+    /// The name's record, locked for this transaction, with whether it is reserved.
+    async fn locked(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        site_name: &str,
+    ) -> Result<Option<(Held, bool)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, public_key_sha256, previous_public_key_sha256, frozen_at IS NOT NULL AS frozen,
+                    reserved, seed_generation, epoch_at, COALESCE(renewed_at, issued_at) AS recorded_at
+               FROM site_enrollments
+              WHERE site_name = $1
+                FOR UPDATE",
+        )
+        .bind(site_name)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(backend)?;
+        row.map(|row| {
+            let generation: Option<i64> = row.try_get("seed_generation")?;
+            let held = Held {
+                id: row.try_get("id")?,
+                current_key: row.try_get("public_key_sha256")?,
+                previous_key: row.try_get("previous_public_key_sha256")?,
+                recorded_at: row.try_get("recorded_at")?,
+                epoch_at: row.try_get("epoch_at")?,
+                frozen: row.try_get("frozen")?,
+                seed_generation: generation.and_then(|value| u64::try_from(value).ok()),
+            };
+            Ok::<_, sqlx::Error>((held, row.try_get("reserved")?))
+        })
+        .transpose()
+        .map_err(backend)
+    }
+
     /// Admit a renewal against the name's locked record, sign, and record the new key.
     ///
     /// The row lock serializes renewals of one name, so two retries cannot both rotate.
+    /// A fork commits the freeze before it is refused.
     #[expect(
         clippy::too_many_lines,
         reason = "the lock, decide, sign, and write read as one transaction"
@@ -176,49 +212,27 @@ impl PgStore {
         F: FnOnce() -> Result<Issued, StoreError> + Send,
     {
         let mut tx = Box::pin(self.pool.begin()).await.map_err(backend)?;
-        let held = sqlx::query(
-            "SELECT id, public_key_sha256, previous_public_key_sha256,
-                    COALESCE(renewed_at, issued_at) AS recorded_at
-               FROM site_enrollments
-              WHERE site_name = $1
-                FOR UPDATE",
-        )
-        .bind(&renewal.site_name)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(backend)?
-        .map(|row| {
-            Ok::<_, sqlx::Error>(Held {
-                id: row.try_get("id")?,
-                current_key: row.try_get("public_key_sha256")?,
-                previous_key: row.try_get("previous_public_key_sha256")?,
-                recorded_at: row.try_get("recorded_at")?,
-            })
-        })
-        .transpose()
-        .map_err(backend)?;
-        let action = renewal::decide(held.as_ref(), renewal)?;
-        let id = held.as_ref().map_or_else(Uuid::new_v4, |held| held.id);
-        let replaced_key = held.map(|held| held.current_key);
+        let held = Box::pin(Self::locked(&mut tx, &renewal.site_name))
+            .await?
+            .map(|(held, _)| held);
+        let action = match renewal::decide(held.as_ref(), renewal) {
+            Err(Refusal::Forked) => {
+                sqlx::query("UPDATE site_enrollments SET frozen_at = NOW() WHERE site_name = $1")
+                    .bind(&renewal.site_name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
+                return Err(Refusal::Forked.into());
+            },
+            decided => decided?,
+        };
+        let Some(held) = held else {
+            return Err(Refusal::UnknownSite.into());
+        };
         let issued = sign()?;
-
-        let written = match action {
-            RenewAction::Resign => Ok(()),
-            RenewAction::Register => sqlx::query(
-                "INSERT INTO site_enrollments
-                     (id, site_token_id, site_name, public_key_sha256, previous_public_key_sha256,
-                      spiffe_id, renewed_at, reserved)
-                 VALUES ($1, NULL, $2, $3, $4, $5, NOW(), TRUE)",
-            )
-            .bind(id)
-            .bind(&renewal.site_name)
-            .bind(&renewal.requested_key)
-            .bind(&renewal.presented_key)
-            .bind(&issued.spiffe_id)
-            .execute(&mut *tx)
-            .await
-            .map(|_done| ()),
-            RenewAction::Rotate | RenewAction::Supersede => sqlx::query(
+        if action == RenewAction::Rotate {
+            sqlx::query(
                 "UPDATE site_enrollments
                     SET public_key_sha256 = $2, previous_public_key_sha256 = $3, renewed_at = NOW()
                   WHERE site_name = $1",
@@ -228,20 +242,82 @@ impl PgStore {
             .bind(&renewal.presented_key)
             .execute(&mut *tx)
             .await
-            .map(|_done| ()),
-        };
-        match written {
-            Ok(()) => {},
-            Err(err) if is_unique_violation(&err) => return Err(StoreError::NameTaken),
-            Err(err) => return Err(backend(err)),
+            .map_err(backend)?;
         }
         tx.commit().await.map_err(backend)?;
         Ok(Renewed {
-            id,
+            id: held.id,
             action,
-            replaced_key,
+            replaced_key: held.current_key,
             issued,
         })
+    }
+
+    /// Apply a verified seed to a reserved name's locked record.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the lock, decide, and write read as one transaction"
+    )]
+    pub(super) async fn seed_reserved(&self, seed: &SeedRecord) -> Result<Seeded, StoreError> {
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(backend)?;
+        let locked = Box::pin(Self::locked(&mut tx, &seed.site_name)).await?;
+        let seeded = renewal::seed_decision(locked.as_ref().map(|(held, reserved)| (held, *reserved)), seed);
+        let generation = i64::try_from(seed.generation).map_err(backend)?;
+        let written = match &seeded {
+            Seeded::Registered => sqlx::query(
+                "INSERT INTO site_enrollments
+                     (id, site_token_id, site_name, public_key_sha256, spiffe_id, renewed_at, reserved, seed_generation,
+                      epoch_at)
+                 VALUES ($1, NULL, $2, $3, $4, NOW(), TRUE, $5, $6)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(&seed.site_name)
+            .bind(&seed.key_sha256)
+            .bind(certs::spiffe_id(&seed.site_name))
+            .bind(generation)
+            .bind(seed.issued_at)
+            .execute(&mut *tx)
+            .await
+            .map(drop),
+            Seeded::Reset { .. } => sqlx::query(
+                "UPDATE site_enrollments
+                    SET public_key_sha256 = $2, previous_public_key_sha256 = NULL, frozen_at = NULL,
+                        seed_generation = $3, renewed_at = NOW(), epoch_at = $4
+                  WHERE site_name = $1",
+            )
+            .bind(&seed.site_name)
+            .bind(&seed.key_sha256)
+            .bind(generation)
+            .bind(seed.issued_at)
+            .execute(&mut *tx)
+            .await
+            .map(drop),
+            Seeded::Acknowledged => {
+                sqlx::query("UPDATE site_enrollments SET seed_generation = $2 WHERE site_name = $1")
+                    .bind(&seed.site_name)
+                    .bind(generation)
+                    .execute(&mut *tx)
+                    .await
+                    .map(drop)
+            },
+            Seeded::Unchanged | Seeded::Older | Seeded::NotReserved => Ok(()),
+        };
+        written.map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(seeded)
+    }
+
+    /// Delete a name's record.
+    pub(super) async fn delete_enrollment(&self, site_name: &str) -> Result<(), StoreError> {
+        let deleted = sqlx::query("DELETE FROM site_enrollments WHERE site_name = $1")
+            .bind(site_name)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        if deleted.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
     }
 
     /// Ping the pool, for the readiness probe.
