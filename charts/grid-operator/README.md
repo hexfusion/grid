@@ -78,6 +78,13 @@ helm upgrade grid-operator \
   --namespace grid-system
 ```
 
+The chart offers no migration guarantees at this stage. Across the API group move
+from `grid.praxis-proxy.io` to `grid.praxis.fast`, the supported path is a fresh
+install: uninstall, delete the four `grid.praxis-proxy.io` CRDs, and install
+again. An upgrade deletes the old CRDs, and every Grid resource under them,
+unless the previous release installed them with the `helm.sh/resource-policy: keep`
+annotation, which `crds.keep` set at that time.
+
 ### Grid SWIM and signals
 
 - The Deployment uses the Recreate strategy, so an upgrade stops the old pod
