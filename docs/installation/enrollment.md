@@ -124,6 +124,13 @@ signals listener, the peer pollers, and the gateway reload without a restart.
 `enrollment.renewal.enabled` in the grid-operator chart turns it on, the default
 whenever an enrollment URL is known.
 
+Renewal runs only under `spiffe` peer trust. Under `pin`, the default, peers pin the
+leaf digest and would refuse a renewed leaf, so the operator does not renew and logs
+`renewal disabled` at startup. Before a pin site's certificate expires, every 180
+days by default, re-enroll it with the expired-identity steps below and update the
+digest its peers pin. `GridNetwork` `status.identity.notAfter` and
+`grid_site_identity_expiry_timestamp_seconds` show the expiry.
+
 - The enrollment Route must use passthrough termination. A reencrypt Route drops
   the client certificate, so the enrollment chart refuses to render one while
   `enrollment.renewal.enabled` is on. Never put a proxy that presents a grid site

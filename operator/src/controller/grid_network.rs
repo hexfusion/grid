@@ -158,6 +158,12 @@ impl GridModes {
         }
     }
 
+    /// Whether the site identity renews: a pinned peer would refuse the renewed leaf.
+    #[must_use]
+    pub const fn renews(self) -> bool {
+        matches!(self.trust, PeerTrustMode::Spiffe)
+    }
+
     /// The modes to restart into when `network` declares other than `self`, the running modes.
     #[must_use]
     pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
@@ -879,7 +885,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     let grid_id = resolve_grid_id(&network);
-    let identity = site_identity_status(&network, client, time::OffsetDateTime::now_utc()).await;
+    let identity = site_identity_status(
+        &network,
+        client,
+        time::OffsetDateTime::now_utc(),
+        GridModes::of(&network).renews(),
+    )
+    .await;
     let expired = identity.as_ref().is_some_and(|status| !status.reason.is_empty());
     let phase = if swim_runtime_running && !expired {
         determine_phase(&network, &grid_id, membership.as_ref())
@@ -2574,14 +2586,15 @@ async fn site_identity_status(
     network: &GridNetwork,
     client: &Client,
     now: time::OffsetDateTime,
+    renews: bool,
 ) -> Option<SiteIdentityStatus> {
     let site = network.spec.tls.site_secret_ref.as_ref()?;
     let pem = String::from_utf8(read_signals_pem(client, site, "tls.crt").await.ok()?).ok()?;
-    identity_status(&pem, now)
+    identity_status(&pem, now, renews)
 }
 
-/// The identity status of `cert_pem` at `now`.
-fn identity_status(cert_pem: &str, now: time::OffsetDateTime) -> Option<SiteIdentityStatus> {
+/// The identity status of `cert_pem` at `now`; without renewal, no renewal time.
+fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> Option<SiteIdentityStatus> {
     use time::format_description::well_known::Rfc3339;
     let (not_before, not_after) = certs::cert_validity(cert_pem).ok()?;
     crate::metrics::set_site_identity_expiry(not_after.unix_timestamp());
@@ -2589,7 +2602,11 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime) -> Option<SiteIden
     let expired = now >= not_after;
     Some(SiteIdentityStatus {
         not_after: not_after.format(&Rfc3339).ok()?,
-        renew_after: renew_after.format(&Rfc3339).ok()?,
+        renew_after: if renews {
+            renew_after.format(&Rfc3339).ok()?
+        } else {
+            String::new()
+        },
         fingerprint: certs::canonical_fingerprint(cert_pem).ok()?,
         reason: if expired {
             IDENTITY_EXPIRED.to_owned()
@@ -2600,8 +2617,10 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime) -> Option<SiteIden
             "the site identity expired and cannot renew: a grid-admin deletes this site's enrollment, mints a new \
              site token, and the site re-enrolls"
                 .to_owned()
-        } else {
+        } else if renews {
             String::new()
+        } else {
+            "renewal is off under pin peer trust: re-enroll and re-pin this site before notAfter".to_owned()
         },
     })
 }
@@ -4465,7 +4484,7 @@ mod tests {
         };
         let leaf = certs::sign_csr(&ca, "east", &csr.csr_pem, validity).expect("leaf");
 
-        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc()).expect("status");
+        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), true).expect("status");
         assert!(current.reason.is_empty(), "a current identity reports no reason");
         let (not_before, not_after) = certs::cert_validity(&leaf.cert_pem).expect("validity");
         let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
@@ -4480,9 +4499,31 @@ mod tests {
             certs::canonical_fingerprint(&leaf.cert_pem).expect("fp")
         );
 
-        let expired = identity_status(&leaf.cert_pem, not_after).expect("status");
+        let expired = identity_status(&leaf.cert_pem, not_after, true).expect("status");
         assert_eq!(expired.reason, IDENTITY_EXPIRED);
         assert!(expired.message.contains("re-enrolls"), "names the recovery");
+
+        let pinned = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), false).expect("status");
+        assert!(pinned.renew_after.is_empty(), "pin trust schedules no renewal");
+        assert!(pinned.reason.is_empty(), "a current pinned identity is not degraded");
+        assert!(pinned.message.contains("re-pin"), "names the manual step");
+    }
+
+    #[test]
+    fn only_spiffe_trust_renews() {
+        let modes = |trust| GridModes {
+            signal: SignalMode::Gossip,
+            trust,
+        };
+        assert!(
+            !modes(PeerTrustMode::Pin).renews(),
+            "a pinned peer refuses a renewed leaf"
+        );
+        assert!(modes(PeerTrustMode::Spiffe).renews());
+        assert!(
+            GridModes::WITHOUT_NETWORK.renews(),
+            "no GridNetwork trusts by SPIFFE ID"
+        );
     }
 
     #[test]

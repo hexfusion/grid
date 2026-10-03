@@ -759,7 +759,9 @@ spec:
                       description: '`IdentityExpired` once the certificate has expired.'
                       type: string
                     renewAfter:
-                      description: When renewal is due, a third of the lifetime before `notAfter`, RFC 3339.
+                      description: |-
+                        When renewal is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
+                        under pin peer trust, which does not renew.
                       type: string
                   required:
                     - fingerprint

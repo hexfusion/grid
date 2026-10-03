@@ -1066,7 +1066,8 @@ pub struct GridNetworkStatus {
 pub struct SiteIdentityStatus {
     /// When the certificate expires, RFC 3339.
     pub not_after: String,
-    /// When renewal is due, a third of the lifetime before `notAfter`, RFC 3339.
+    /// When renewal is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
+    /// under pin peer trust, which does not renew.
     pub renew_after: String,
     /// SHA-256 of the certificate DER, the digest peers pin.
     pub fingerprint: String,

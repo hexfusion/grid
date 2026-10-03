@@ -121,13 +121,6 @@ async fn main() {
         tracing::error!(%error, "site enrollment failed");
         std::process::exit(1);
     }
-    if config.enrollment.renew {
-        match operator::enroll::renew::Settings::from_config(&config.enrollment) {
-            Ok(settings) => drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings))),
-            Err(error) => tracing::error!(%error, "site identity renewal is off: misconfigured"),
-        }
-    }
-
     let GridModes {
         signal: signal_mode,
         trust,
@@ -138,6 +131,18 @@ async fn main() {
             std::process::exit(1);
         },
     };
+    let modes = GridModes {
+        signal: signal_mode,
+        trust,
+    };
+    if config.enrollment.renew && !modes.renews() {
+        tracing::info!("renewal disabled: peerTrust pin needs re-enrollment and re-pinning at expiry");
+    } else if config.enrollment.renew {
+        match operator::enroll::renew::Settings::from_config(&config.enrollment) {
+            Ok(settings) => drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings))),
+            Err(error) => tracing::error!(%error, "site identity renewal is off: misconfigured"),
+        }
+    }
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
     let peer_settings = grid_network::PeerSettings {
         local_signals_addr: config.signals.local_addr(),
