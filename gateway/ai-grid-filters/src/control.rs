@@ -481,12 +481,10 @@ fn report(result: &Result<Option<ReloadOutcome>, FilterError>, tally: &WatchCoun
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(
+#[expect(
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::min_ident_chars,
-    clippy::panic,
     clippy::too_many_lines,
     clippy::disallowed_methods,
     reason = "tests; the pollers run on their own threads, so these sync tests wait with thread::sleep"

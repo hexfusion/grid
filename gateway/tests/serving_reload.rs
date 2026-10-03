@@ -1,13 +1,10 @@
 //! The gateway binary reloads its serving config and site identity from kubelet-style mounts.
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(
-    clippy::unwrap_used,
+#[expect(
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::min_ident_chars,
     clippy::arithmetic_side_effects,
     clippy::disallowed_methods,
     clippy::too_many_lines,
