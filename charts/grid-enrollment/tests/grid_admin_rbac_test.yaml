@@ -2,7 +2,7 @@ suite: grid-admin RBAC
 templates:
   - templates/enrollment/grid-admin-rbac.yaml
 tests:
-  - it: ships a Role limited to create and delete on enrollmenttokens
+  - it: ships a Role limited to create and delete on enrollmenttokens and get on enrollments
     documentSelector:
       path: metadata.name
       value: RELEASE-NAME-grid-enrollment-grid-admin
@@ -16,6 +16,9 @@ tests:
             - apiGroups: ["grid.praxis.fast"]
               resources: ["enrollmenttokens"]
               verbs: ["create", "delete"]
+            - apiGroups: ["grid.praxis.fast"]
+              resources: ["enrollments"]
+              verbs: ["get"]
 
   - it: binds nobody by default
     asserts:
@@ -123,7 +126,7 @@ tests:
           value:
             - apiGroups: ["grid.praxis.fast"]
               resources: ["enrollments"]
-              verbs: ["delete"]
+              verbs: ["get", "delete"]
 
   - it: binds enrollment delete only to the subjects named for it
     set:

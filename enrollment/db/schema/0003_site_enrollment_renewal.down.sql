@@ -8,4 +8,5 @@ ALTER TABLE site_enrollments
     DROP COLUMN IF EXISTS reserved,
     DROP COLUMN IF EXISTS seed_generation,
     DROP COLUMN IF EXISTS epoch_at,
+    DROP COLUMN IF EXISTS not_after,
     ALTER COLUMN site_token_id SET NOT NULL;

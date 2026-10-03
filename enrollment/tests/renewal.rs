@@ -214,6 +214,59 @@ async fn a_grid_with_renewals_off_refuses_every_renewal_and_keeps_enrolling() {
 }
 
 #[tokio::test]
+async fn a_grid_admin_reads_an_enrollment_record_without_key_material() {
+    let grid = grid(&[]);
+    let path = "/v1alpha1/enrollments/site-a";
+    let (missing, body) = send(&grid.app, ("GET", path), "", &admin(), None).await;
+    assert_eq!(
+        (missing, body["error"].clone()),
+        (StatusCode::NOT_FOUND, json!("not_found"))
+    );
+
+    let first = enroll(&grid, "site-a").await;
+    let (read, fresh) = send(&grid.app, ("GET", path), "", &admin(), None).await;
+    assert_eq!(read, StatusCode::OK, "{fresh}");
+    assert_eq!(fresh["state"], "active");
+    assert_eq!(fresh["publicKeySha256"], first.key_sha256());
+    assert!(fresh.get("renewedAt").is_none(), "never renewed: {fresh}");
+    assert!(fresh["notAfter"].is_string(), "the issued certificate's expiry");
+
+    let second = renew(&grid, "site-a", Some(&first)).await.identity();
+    let (_read, renewed) = send(&grid.app, ("GET", path), "", &admin(), None).await;
+    assert_eq!(renewed["publicKeySha256"], second.key_sha256());
+    assert_eq!(renewed["previousPublicKeySha256"], first.key_sha256());
+    assert!(renewed["renewedAt"].is_string());
+    let text = renewed.to_string();
+    assert!(!text.contains("BEGIN"), "no certificate or key material: {text}");
+
+    let (anonymous, _) = send(&grid.app, ("GET", path), "", &[], None).await;
+    assert_eq!(anonymous, StatusCode::UNAUTHORIZED, "reading needs a grid-admin");
+}
+
+#[tokio::test]
+async fn a_disabled_renewal_says_when_to_retry() {
+    let grid = grid_with(&[], false);
+    let first = enroll(&grid, "site-a").await;
+    let csr = certs::generate_csr("site-a").expect("csr");
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v1alpha1/renewals")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "csr": csr.csr_pem }).to_string()))
+        .expect("request");
+    request.extensions_mut().insert(PeerLeaf(Some(Arc::from(first.der()))));
+    let response = grid.app.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("300")
+    );
+}
+
+#[tokio::test]
 async fn a_lost_response_retries_and_the_replaced_key_cannot_pick_another() {
     let grid = grid(&[]);
     let first = enroll(&grid, "site-a").await;
@@ -231,6 +284,7 @@ async fn a_lost_response_retries_and_the_replaced_key_cannot_pick_another() {
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "a fork, the freeze it leaves, and the recovery")]
 async fn a_fork_freezes_the_site_until_a_grid_admin_deletes_its_enrollment() {
     let grid = grid(&[]);
     let first = enroll(&grid, "site-a").await;
@@ -250,6 +304,8 @@ async fn a_fork_freezes_the_site_until_a_grid_admin_deletes_its_enrollment() {
     );
 
     let path = "/v1alpha1/enrollments/site-a";
+    let (_read, record) = send(&grid.app, ("GET", path), "", &admin(), None).await;
+    assert_eq!(record["state"], "frozen", "a grid-admin sees the freeze: {record}");
     let (anonymous, _) = send(&grid.app, ("DELETE", path), "", &[], None).await;
     assert_eq!(anonymous, StatusCode::UNAUTHORIZED, "deleting needs a grid-admin");
     let (deleted, _) = send(&grid.app, ("DELETE", path), "", &admin(), None).await;

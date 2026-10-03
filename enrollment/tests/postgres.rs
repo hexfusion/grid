@@ -359,6 +359,15 @@ async fn a_renewal_rotates_the_recorded_key_and_a_fork_freezes_it() {
         .expect("a lost response retries");
     assert_eq!(retried.action, enrollment::RenewAction::Resign);
     assert_eq!(retried.id, renewed.id, "the same record");
+    let record = store.enrollment(&site).await.expect("read").expect("held");
+    assert_eq!(
+        (record.held.current_key, record.held.previous_key),
+        (key('b'), Some(key('a')))
+    );
+    assert!(
+        record.renewed_at.is_some() && !record.held.frozen,
+        "renewed, not frozen"
+    );
 
     let forked = store
         .renew_and_issue(&renewal(&site, &key('a'), &key('c')), || resign(&site))
@@ -374,8 +383,11 @@ async fn a_renewal_rotates_the_recorded_key_and_a_fork_freezes_it() {
         matches!(frozen, Err(StoreError::Refused(enrollment::Refusal::Frozen))),
         "the freeze committed: {frozen:?}"
     );
+    let frozen_record = store.enrollment(&site).await.expect("read").expect("held");
+    assert!(frozen_record.held.frozen, "a grid-admin reads the freeze");
 
     store.delete_enrollment(&site).await.expect("delete");
+    assert!(store.enrollment(&site).await.expect("read").is_none());
     assert!(matches!(
         store.delete_enrollment(&site).await,
         Err(StoreError::NotFound)

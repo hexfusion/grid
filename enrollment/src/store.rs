@@ -87,6 +87,26 @@ pub struct Issued {
     pub public_key_sha256: String,
 }
 
+impl Issued {
+    /// When the issued certificate expires.
+    fn not_after(&self) -> Option<OffsetDateTime> {
+        certs::cert_validity(&self.certificate).ok().map(|(_from, until)| until)
+    }
+}
+
+/// A name's enrollment record, as a grid-admin reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentRecord {
+    /// The record renewal decides on.
+    pub held: Held,
+    /// A name bootstrap issues.
+    pub reserved: bool,
+    /// When the record last took a new key, by renewal or a bootstrap seed.
+    pub renewed_at: Option<OffsetDateTime>,
+    /// When the latest certificate the service issued for it expires.
+    pub not_after: Option<OffsetDateTime>,
+}
+
 /// Where tokens and enrollments are kept.
 #[derive(Debug)]
 pub enum Store {
@@ -228,6 +248,18 @@ impl Store {
         }
     }
 
+    /// Read a name's enrollment record, `None` when no record holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] if the backend failed.
+    pub async fn enrollment(&self, site_name: &str) -> Result<Option<EnrollmentRecord>, StoreError> {
+        match self {
+            Self::Memory(store) => store.enrollment(site_name),
+            Self::Postgres(store) => store.enrollment(site_name).await,
+        }
+    }
+
     /// Delete a name's enrollment record, ending its renewals and releasing the name.
     ///
     /// # Errors
@@ -264,6 +296,9 @@ struct Inner {
 
     /// Names already issued, to the record renewal reads and whether the name is reserved.
     issued_names: HashMap<String, (Held, bool)>,
+
+    /// When the latest certificate issued for a name expires.
+    not_after: HashMap<String, OffsetDateTime>,
 }
 
 /// One site token held in memory.
@@ -392,6 +427,9 @@ impl MemoryStore {
             row.redeemed_by = Some(enrollment_id);
         }
         let held = Held::new(enrollment_id, issued.public_key_sha256.clone(), None, now);
+        if let Some(until) = issued.not_after() {
+            inner.not_after.insert(pin.site_name.clone(), until);
+        }
         inner.issued_names.insert(pin.site_name, (held, false));
         drop(inner);
 
@@ -421,6 +459,9 @@ impl MemoryStore {
             held.recorded_at = self.now();
         }
         let id = held.id;
+        if let Some(until) = issued.not_after() {
+            inner.not_after.insert(renewal.site_name.clone(), until);
+        }
         drop(inner);
         Ok(Renewed {
             id,
@@ -448,15 +489,31 @@ impl MemoryStore {
                 ..Held::new(id, seed.key_sha256.clone(), None, self.now())
             };
             inner.issued_names.insert(seed.site_name.clone(), (held, true));
+            inner.not_after.remove(&seed.site_name);
         }
         drop(inner);
         Ok(seeded)
+    }
+
+    /// Read a record under the lock.
+    fn enrollment(&self, site_name: &str) -> Result<Option<EnrollmentRecord>, StoreError> {
+        let inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        Ok(inner
+            .issued_names
+            .get(site_name)
+            .map(|(held, reserved)| EnrollmentRecord {
+                renewed_at: (held.recorded_at > held.epoch_at).then_some(held.recorded_at),
+                not_after: inner.not_after.get(site_name).copied(),
+                held: held.clone(),
+                reserved: *reserved,
+            }))
     }
 
     /// Delete a record under the lock.
     fn delete_enrollment(&self, site_name: &str) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
         let removed = inner.issued_names.remove(site_name);
+        inner.not_after.remove(site_name);
         drop(inner);
         removed.map(drop).ok_or(StoreError::NotFound)
     }

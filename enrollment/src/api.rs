@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, FromRequestParts, MatchedPath, Path, Request, State},
-    http::{HeaderMap, Method, StatusCode, request::Parts},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete as delete_route, get, post},
@@ -23,7 +23,10 @@ use crate::{
     SharedCa,
     auth::digest,
     authz::{Authorizer, AuthzError, Operation},
-    generated::{Enrollment, EnrollmentRequest, EnrollmentToken, EnrollmentTokenRequest, Error as ErrorBody},
+    generated::{
+        Enrollment, EnrollmentRequest, EnrollmentStatus, EnrollmentStatusState, EnrollmentToken,
+        EnrollmentTokenRequest, Error as ErrorBody, ErrorError as ErrorCode,
+    },
     store::{Issued, NewSiteToken, Pin, Refusal, RenewAction, Renewal, Renewed, Store, StoreError},
 };
 
@@ -36,6 +39,12 @@ const MAX_TOKEN_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// How long a single request may run before it is cut off. Bounds the time a slow
 /// caller holds a task, the way the body limit bounds the bytes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Seconds a client waits before retrying a 503 the API answered.
+const RETRY_AFTER_SECS: u64 = 300;
+
+/// Seconds a prober waits before asking again while the store is down.
+const READY_RETRY_AFTER_SECS: u64 = 5;
 
 /// What the handlers need.
 #[derive(Debug)]
@@ -69,7 +78,7 @@ pub enum ApiError {
     #[error("{message}")]
     BadRequest {
         /// Machine-readable code.
-        code: &'static str,
+        code: ErrorCode,
         /// What went wrong.
         message: String,
     },
@@ -181,10 +190,10 @@ impl FromRequestParts<Arc<AppState>> for GridAdmin {
 /// Minting and revoking a token act on enrollmenttokens, deleting a site's record
 /// on enrollments, so RBAC can grant each apart from any other permission.
 fn route_operation(parts: &Parts) -> Operation {
-    let verb = if parts.method == Method::DELETE {
-        "delete"
-    } else {
-        "create"
+    let verb = match parts.method {
+        Method::DELETE => "delete",
+        Method::GET => "get",
+        _ => "create",
     };
     // Keyed off the matched route so a route added later fails closed (an
     // unmapped path resolves to a resource no Role grants) instead of inheriting.
@@ -206,64 +215,64 @@ impl ApiError {
         clippy::too_many_lines,
         reason = "one arm per error variant, each with its wire message"
     )]
-    fn rendered(self) -> (StatusCode, &'static str, String) {
+    fn rendered(self) -> (StatusCode, ErrorCode, String) {
         match self {
             Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
-                "not_found",
+                ErrorCode::NotFound,
                 "no site token has that identifier".to_owned(),
             ),
             Self::NameTaken => (
                 StatusCode::CONFLICT,
-                "name_taken",
+                ErrorCode::NameTaken,
                 "another member already holds this site name".to_owned(),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                "unauthorized",
+                ErrorCode::Unauthorized,
                 "minting or revoking a token requires a grid-admin credential".to_owned(),
             ),
             Self::InvalidToken => (
                 StatusCode::UNAUTHORIZED,
-                "invalid_token",
+                ErrorCode::InvalidToken,
                 "a valid site token is required, ask a grid-admin for one".to_owned(),
             ),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
-                "forbidden",
+                ErrorCode::Forbidden,
                 "not permitted to mint or revoke site tokens".to_owned(),
             ),
             Self::IdentityRequired => (
                 StatusCode::UNAUTHORIZED,
-                "identity_required",
+                ErrorCode::IdentityRequired,
                 "renewal requires the site's current grid certificate over mutual TLS".to_owned(),
             ),
             Self::IdentityRefused => (
                 StatusCode::FORBIDDEN,
-                "identity_refused",
+                ErrorCode::IdentityRefused,
                 "this identity may not renew; re-enroll with a new site token".to_owned(),
             ),
             Self::NoEnrollment => (
                 StatusCode::NOT_FOUND,
-                "not_found",
+                ErrorCode::NotFound,
                 "no enrollment holds that site name".to_owned(),
             ),
             Self::RenewalsDisabled => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "renewals_disabled",
+                ErrorCode::RenewalsDisabled,
                 "renewal is turned off for this grid; current identities stay valid until they expire".to_owned(),
             ),
             Self::ReservedSite => (
                 StatusCode::CONFLICT,
-                "reserved_site",
+                ErrorCode::ReservedSite,
                 "a reserved site's identity is re-issued by the enrollment bootstrap, not deleted here".to_owned(),
             ),
             Self::Internal(message) => {
                 tracing::error!(error = %message, "enrollment request could not be served");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
+                    ErrorCode::Internal,
                     "the enrollment service could not complete the request".to_owned(),
                 )
             },
@@ -274,14 +283,13 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = self.rendered();
-        (
-            status,
-            Json(ErrorBody {
-                error: code.to_owned(),
-                message,
-            }),
-        )
-            .into_response()
+        let mut response = (status, Json(ErrorBody { error: code, message })).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
+        }
+        response
     }
 }
 
@@ -294,7 +302,7 @@ fn signing_error(err: EnrollError) -> ApiError {
         EnrollError::Signing(detail) => ApiError::Internal(detail),
         EnrollError::TooLarge | EnrollError::Malformed | EnrollError::BadSignature | EnrollError::InvalidSiteName => {
             ApiError::BadRequest {
-                code: "invalid_csr",
+                code: ErrorCode::InvalidCsr,
                 message: err.to_string(),
             }
         },
@@ -308,11 +316,15 @@ async fn healthz() -> StatusCode {
 
 /// Readiness: the store backend is reachable, else 503 so the pod is pulled from
 /// endpoints until the database is up.
-async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     if state.store.ready().await {
-        StatusCode::OK
+        StatusCode::OK.into_response()
     } else {
-        StatusCode::SERVICE_UNAVAILABLE
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, HeaderValue::from(READY_RETRY_AFTER_SECS))],
+        )
+            .into_response()
     }
 }
 
@@ -324,7 +336,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1alpha1/enrollmenttokens", post(mint_site_token))
         .route("/v1alpha1/enrollmenttokens/{token_id}", delete_route(revoke_site_token))
         .route("/v1alpha1/enrollments", post(enroll))
-        .route("/v1alpha1/enrollments/{site_name}", delete_route(delete_enrollment))
+        .route(
+            "/v1alpha1/enrollments/{site_name}",
+            get(get_enrollment).delete(delete_enrollment),
+        )
         .route("/v1alpha1/renewals", post(renew))
         .layer(DefaultBodyLimit::max(MAX_CSR_PEM_BYTES.saturating_mul(2)))
         .layer(middleware::from_fn(enforce_timeout))
@@ -342,7 +357,7 @@ async fn enforce_timeout(request: Request, next: Next) -> Response {
         Err(_elapsed) => (
             StatusCode::REQUEST_TIMEOUT,
             Json(ErrorBody {
-                error: "timeout".to_owned(),
+                error: ErrorCode::Timeout,
                 message: "the request exceeded the time limit".to_owned(),
             }),
         )
@@ -364,7 +379,7 @@ async fn mint_site_token(
     Json(input): Json<EnrollmentTokenRequest>,
 ) -> Result<(StatusCode, Json<EnrollmentToken>), ApiError> {
     validate_site_name(&input.site_name).map_err(|err| ApiError::BadRequest {
-        code: "invalid_site_name",
+        code: ErrorCode::InvalidSiteName,
         message: err.to_string(),
     })?;
     if state.reserved_sites.contains(&input.site_name) {
@@ -372,7 +387,7 @@ async fn mint_site_token(
     }
     if input.grid_network_ref.trim().is_empty() {
         return Err(ApiError::BadRequest {
-            code: "missing_grid_network",
+            code: ErrorCode::MissingGridNetwork,
             message: "gridNetworkRef must name the grid the site joins".to_owned(),
         });
     }
@@ -384,7 +399,7 @@ async fn mint_site_token(
         None => DEFAULT_TOKEN_TTL_SECS,
         Some(secs) if !(1..=MAX_TOKEN_TTL_SECS).contains(&secs) => {
             return Err(ApiError::BadRequest {
-                code: "invalid_token_ttl",
+                code: ErrorCode::InvalidTokenTtl,
                 message: format!("expiresInSecs must be between 1 and {MAX_TOKEN_TTL_SECS}"),
             });
         },
@@ -633,6 +648,35 @@ fn refused(renewal: &Renewal, reason: Refusal) {
     }
 }
 
+/// Read a site's enrollment record: digests and state, never key material.
+async fn get_enrollment(
+    State(state): State<Arc<AppState>>,
+    GridAdmin(_admin): GridAdmin,
+    Path(site_name): Path<String>,
+) -> Result<Json<EnrollmentStatus>, ApiError> {
+    let record = state
+        .store
+        .enrollment(&site_name)
+        .await?
+        .ok_or(ApiError::NoEnrollment)?;
+    let time = |at: OffsetDateTime| at.format(&Rfc3339).map_err(|err| ApiError::Internal(err.to_string()));
+    Ok(Json(EnrollmentStatus {
+        id: record.held.id,
+        site_name,
+        state: if record.held.frozen {
+            EnrollmentStatusState::Frozen
+        } else {
+            EnrollmentStatusState::Active
+        },
+        public_key_sha256: record.held.current_key,
+        previous_public_key_sha256: record.held.previous_key,
+        incarnation_started_at: time(record.held.epoch_at)?,
+        renewed_at: record.renewed_at.map(time).transpose()?,
+        not_after: record.not_after.map(time).transpose()?,
+        reserved: record.reserved,
+    }))
+}
+
 /// Delete a site's enrollment: its renewals end and the name is released to re-enroll.
 async fn delete_enrollment(
     State(state): State<Arc<AppState>>,
@@ -672,7 +716,7 @@ fn site_token(headers: &HeaderMap) -> Result<String, ApiError> {
 /// verbatim.
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())?;
     let (scheme, token) = value.split_once(' ')?;
     scheme
@@ -723,4 +767,78 @@ fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
 #[cfg(feature = "fips")]
 fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
     openssl::rand::rand_bytes(bytes).map_err(|_err| ApiError::Internal("system random source unavailable".to_owned()))
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests")]
+mod error_codes {
+    use axum::{http::StatusCode, response::IntoResponse as _};
+
+    use super::{ApiError, ErrorCode};
+
+    /// Every code the API answers with, and its status: the set clients rely on.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one row per wire code")]
+    fn the_wire_codes_are_the_documented_set() {
+        let bad = |code| ApiError::BadRequest {
+            code,
+            message: String::new(),
+        };
+        let answered = [
+            bad(ErrorCode::InvalidCsr),
+            bad(ErrorCode::InvalidSiteName),
+            bad(ErrorCode::InvalidTokenTtl),
+            bad(ErrorCode::MissingGridNetwork),
+            ApiError::Unauthorized,
+            ApiError::InvalidToken,
+            ApiError::IdentityRequired,
+            ApiError::Forbidden,
+            ApiError::IdentityRefused,
+            ApiError::NotFound,
+            ApiError::NoEnrollment,
+            ApiError::NameTaken,
+            ApiError::ReservedSite,
+            ApiError::Internal(String::new()),
+            ApiError::RenewalsDisabled,
+        ]
+        .map(|error| {
+            let (status, code, _message) = error.rendered();
+            (status.as_u16(), serde_json::to_value(code).expect("code"))
+        });
+        let documented: Vec<(u16, serde_json::Value)> = [
+            (400, "invalid_csr"),
+            (400, "invalid_site_name"),
+            (400, "invalid_token_ttl"),
+            (400, "missing_grid_network"),
+            (401, "unauthorized"),
+            (401, "invalid_token"),
+            (401, "identity_required"),
+            (403, "forbidden"),
+            (403, "identity_refused"),
+            (404, "not_found"),
+            (404, "not_found"),
+            (409, "name_taken"),
+            (409, "reserved_site"),
+            (500, "internal"),
+            (503, "renewals_disabled"),
+        ]
+        .into_iter()
+        .map(|(status, code)| (status, serde_json::json!(code)))
+        .collect();
+        assert_eq!(answered.to_vec(), documented);
+        assert_eq!(serde_json::to_value(ErrorCode::Timeout).expect("code"), "timeout");
+    }
+
+    #[test]
+    fn a_503_says_when_to_retry() {
+        let response = ApiError::RenewalsDisabled.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key("retry-after"));
+        assert!(
+            !ApiError::IdentityRefused
+                .into_response()
+                .headers()
+                .contains_key("retry-after")
+        );
+    }
 }

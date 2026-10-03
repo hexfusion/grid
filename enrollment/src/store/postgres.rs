@@ -146,14 +146,15 @@ impl PgStore {
         let issued = sign(&pin)?;
 
         let inserted = sqlx::query(
-            "INSERT INTO site_enrollments (id, site_token_id, site_name, public_key_sha256, spiffe_id)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO site_enrollments (id, site_token_id, site_name, public_key_sha256, spiffe_id, not_after)
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(enrollment_id)
         .bind(token_id)
         .bind(&pin.site_name)
         .bind(&issued.public_key_sha256)
         .bind(&issued.spiffe_id)
+        .bind(issued.not_after())
         .execute(&mut *tx)
         .await;
         match inserted {
@@ -182,21 +183,9 @@ impl PgStore {
         .fetch_optional(&mut **tx)
         .await
         .map_err(backend)?;
-        row.map(|row| {
-            let generation: Option<i64> = row.try_get("seed_generation")?;
-            let held = Held {
-                id: row.try_get("id")?,
-                current_key: row.try_get("public_key_sha256")?,
-                previous_key: row.try_get("previous_public_key_sha256")?,
-                recorded_at: row.try_get("recorded_at")?,
-                epoch_at: row.try_get("epoch_at")?,
-                frozen: row.try_get("frozen")?,
-                seed_generation: generation.and_then(|value| u64::try_from(value).ok()),
-            };
-            Ok::<_, sqlx::Error>((held, row.try_get("reserved")?))
-        })
-        .transpose()
-        .map_err(backend)
+        row.map(|row| Ok::<_, sqlx::Error>((held_from(&row)?, row.try_get("reserved")?)))
+            .transpose()
+            .map_err(backend)
     }
 
     /// Admit a renewal against the name's locked record, sign, and record the new key.
@@ -244,6 +233,12 @@ impl PgStore {
             .await
             .map_err(backend)?;
         }
+        sqlx::query("UPDATE site_enrollments SET not_after = $2 WHERE site_name = $1")
+            .bind(&renewal.site_name)
+            .bind(issued.not_after())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
         tx.commit().await.map_err(backend)?;
         Ok(Renewed {
             id: held.id,
@@ -282,7 +277,7 @@ impl PgStore {
             Seeded::Reset { .. } => sqlx::query(
                 "UPDATE site_enrollments
                     SET public_key_sha256 = $2, previous_public_key_sha256 = NULL, frozen_at = NULL,
-                        seed_generation = $3, renewed_at = NOW(), epoch_at = $4
+                        seed_generation = $3, renewed_at = NOW(), epoch_at = $4, not_after = NULL
                   WHERE site_name = $1",
             )
             .bind(&seed.site_name)
@@ -307,6 +302,30 @@ impl PgStore {
         Ok(seeded)
     }
 
+    /// Read a name's record without locking it.
+    pub(super) async fn enrollment(&self, site_name: &str) -> Result<Option<super::EnrollmentRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, public_key_sha256, previous_public_key_sha256, frozen_at IS NOT NULL AS frozen, reserved,
+                    seed_generation, epoch_at, COALESCE(renewed_at, issued_at) AS recorded_at, renewed_at, not_after
+               FROM site_enrollments
+              WHERE site_name = $1",
+        )
+        .bind(site_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.map(|row| {
+            Ok::<_, sqlx::Error>(super::EnrollmentRecord {
+                held: held_from(&row)?,
+                reserved: row.try_get("reserved")?,
+                renewed_at: row.try_get("renewed_at")?,
+                not_after: row.try_get("not_after")?,
+            })
+        })
+        .transpose()
+        .map_err(backend)
+    }
+
     /// Delete a name's record.
     pub(super) async fn delete_enrollment(&self, site_name: &str) -> Result<(), StoreError> {
         let deleted = sqlx::query("DELETE FROM site_enrollments WHERE site_name = $1")
@@ -324,6 +343,20 @@ impl PgStore {
     pub(super) async fn ready(&self) -> bool {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
     }
+}
+
+/// The renewal record in a `site_enrollments` row.
+fn held_from(row: &sqlx::postgres::PgRow) -> Result<Held, sqlx::Error> {
+    let generation: Option<i64> = row.try_get("seed_generation")?;
+    Ok(Held {
+        id: row.try_get("id")?,
+        current_key: row.try_get("public_key_sha256")?,
+        previous_key: row.try_get("previous_public_key_sha256")?,
+        recorded_at: row.try_get("recorded_at")?,
+        epoch_at: row.try_get("epoch_at")?,
+        frozen: row.try_get("frozen")?,
+        seed_generation: generation.and_then(|value| u64::try_from(value).ok()),
+    })
 }
 
 /// Whether an error is the unique index refusing a duplicate.

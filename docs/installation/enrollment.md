@@ -165,7 +165,12 @@ digest its peers pin. `GridNetwork` `status.identity.notAfter` and
   service has replaced, so the site freezes on its next renewal. Leave the Secret
   out of disaster recovery, or plan to re-enroll the site. After the enrollment
   database is restored from a backup, sites that renewed since the snapshot are
-  refused with `record_behind` and must re-enroll.
+  refused with `identity_refused`, logged on the hub as `record_behind`, and must
+  re-enroll.
+- To see why a site cannot renew, a grid-admin reads its record with
+  `GET /v1alpha1/enrollments/{siteName}`: `state` is `active` or `frozen`, with
+  the current and previous key digests and `notAfter`. It needs `get` on the
+  `enrollments` resource, which both the grid-admin and enrollment-admin Roles grant.
 - Deleting an enrollment needs `delete` on the `enrollments` resource, granted by
   the `enrollment-admin` Role to `enrollment.enrollmentAdmins.subjects` and to no
   one by default. With `enrollment.authz=local`, every grid-admin in the token

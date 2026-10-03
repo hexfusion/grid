@@ -11,6 +11,7 @@ ALTER TABLE site_enrollments
     ADD COLUMN IF NOT EXISTS reserved BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS seed_generation BIGINT,
     ADD COLUMN IF NOT EXISTS epoch_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS not_after TIMESTAMPTZ,
     ALTER COLUMN site_token_id DROP NOT NULL;
 
 -- When this incarnation of the record began: its insert, or a seed reset. A leaf

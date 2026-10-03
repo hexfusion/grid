@@ -26,6 +26,10 @@ rules:
   - apiGroups: ["grid.praxis.fast"]
     resources: ["enrollmenttokens"]
     verbs: ["create", "delete"]
+  # Reading a site's enrollment diagnoses a refused renewal; it shows digests only.
+  - apiGroups: ["grid.praxis.fast"]
+    resources: ["enrollments"]
+    verbs: ["get"]
 {{- if $admins.serviceAccount.create }}
 ---
 apiVersion: v1
@@ -82,7 +86,7 @@ metadata:
 rules:
   - apiGroups: ["grid.praxis.fast"]
     resources: ["enrollments"]
-    verbs: ["delete"]
+    verbs: ["get", "delete"]
 {{- with $deleters }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
