@@ -126,6 +126,110 @@ impl Renewer for Service {
     }
 }
 
+/// A gateway Deployment in memory: its identity annotation and how often it was patched.
+struct Gateway {
+    present: bool,
+    annotation: Mutex<Option<String>>,
+    patches: Mutex<u32>,
+}
+
+impl Gateway {
+    fn new(present: bool) -> Self {
+        Self {
+            present,
+            annotation: Mutex::new(None),
+            patches: Mutex::new(0),
+        }
+    }
+}
+
+impl GatewayRoller for Gateway {
+    async fn roll(&self, fingerprint: &str, renewed: bool) -> Result<GatewayRoll, RenewError> {
+        if !self.present {
+            return Ok(GatewayRoll::NoGateway);
+        }
+        let current = self.annotation.lock().expect("lock").clone();
+        if roll_patch(current.as_deref(), fingerprint, renewed).is_none() {
+            return Ok(GatewayRoll::Unchanged);
+        }
+        *self.annotation.lock().expect("lock") = Some(fingerprint.to_owned());
+        *self.patches.lock().expect("lock") += 1;
+        Ok(GatewayRoll::Rolled)
+    }
+}
+
+#[tokio::test]
+async fn a_renewal_rolls_the_gateway_onto_the_new_identity_once() {
+    let (ca, store, now) = site(Span::days(21));
+    let gateway = Gateway::new(true);
+    let checked = check(&store, &Service::new(&ca), &target(), now).await;
+    assert_eq!(rolls_after(&checked), Some(true), "{checked:?}");
+
+    let rolled = roll_gateway(&store, &gateway, &target(), true).await.expect("rolled");
+    assert_eq!(rolled, GatewayRoll::Rolled);
+    let renewed = certs::canonical_fingerprint(&store.get("tls.crt").expect("cert")).expect("fingerprint");
+    assert_eq!(
+        gateway.annotation.lock().expect("lock").as_deref(),
+        Some(renewed.as_str())
+    );
+
+    let again = roll_gateway(&store, &gateway, &target(), false).await.expect("again");
+    assert_eq!(again, GatewayRoll::Unchanged, "the same leaf rolls nothing");
+    assert_eq!(*gateway.patches.lock().expect("lock"), 1);
+}
+
+#[tokio::test]
+async fn a_site_without_a_gateway_skips_the_roll() {
+    let (_ca, store, _now) = site(Span::days(1));
+    let rolled = roll_gateway(&store, &Gateway::new(false), &target(), true)
+        .await
+        .expect("checked");
+    assert_eq!(rolled, GatewayRoll::NoGateway);
+}
+
+#[tokio::test]
+async fn a_later_check_catches_up_a_missed_roll() {
+    let (_ca, store, _now) = site(Span::days(1));
+    let gateway = Gateway::new(true);
+    let fresh = roll_gateway(&store, &gateway, &target(), false).await.expect("checked");
+    assert_eq!(
+        fresh,
+        GatewayRoll::Unchanged,
+        "a recheck leaves a gateway it never rolled"
+    );
+
+    *gateway.annotation.lock().expect("lock") = Some("older-leaf".to_owned());
+    let caught_up = roll_gateway(&store, &gateway, &target(), false).await.expect("checked");
+    assert_eq!(caught_up, GatewayRoll::Rolled, "a gateway left on an older leaf rolls");
+}
+
+#[test]
+fn a_renewal_or_a_recheck_rolls_but_not_an_expiry_or_a_failure() {
+    let now = OffsetDateTime::now_utc();
+    assert_eq!(rolls_after(&Ok(Checked::Renewed(now))), Some(true));
+    assert_eq!(rolls_after(&Ok(Checked::Waiting(now))), Some(false));
+    assert_eq!(rolls_after(&Ok(Checked::Expired(now))), None);
+    assert_eq!(rolls_after(&Err(RenewError::Transport("down".to_owned()))), None);
+}
+
+#[test]
+fn the_roll_patch_sets_the_identity_annotation_only_when_it_changes() {
+    assert!(roll_patch(Some("ab"), "ab", true).is_none());
+    assert!(
+        roll_patch(None, "ab", false).is_none(),
+        "a recheck never starts rolling"
+    );
+    let patch = roll_patch(Some("old"), "ab", false).expect("patch");
+    let set = patch
+        .pointer("/spec/template/metadata/annotations")
+        .and_then(|annotations| annotations.get(GATEWAY_IDENTITY_ANNOTATION));
+    assert_eq!(set, Some(&serde_json::json!("ab")));
+    assert!(
+        roll_patch(None, "ab", true).is_some(),
+        "a renewal rolls a gateway never rolled"
+    );
+}
+
 fn target() -> Target {
     Target {
         site_secret: "grid-site-identity".to_owned(),

@@ -2,7 +2,10 @@
 
 use std::{collections::BTreeMap, time::Duration};
 
-use k8s_openapi::{ByteString, api::core::v1::Secret};
+use k8s_openapi::{
+    ByteString,
+    api::{apps::v1::Deployment, core::v1::Secret},
+};
 use kube::{
     Api, Client,
     api::{Patch, PatchParams},
@@ -30,6 +33,9 @@ const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 const PENDING_KEY: &str = "renew.key";
 /// The CSR for [`PENDING_KEY`].
 const PENDING_CSR: &str = "renew.csr";
+
+/// Pod template annotation naming the identity the gateway pods loaded.
+pub const GATEWAY_IDENTITY_ANNOTATION: &str = "grid.praxis.fast/site-identity-fingerprint";
 
 /// The leaf the current one replaced, kept so the co-located gateway stays recognised until it reloads.
 pub const PREVIOUS_CERT: &str = "previous.crt";
@@ -136,6 +142,53 @@ pub(super) trait IdentityStore {
 pub(super) trait Renewer {
     /// Present `held`'s certificate and ask for a certificate for `csr_pem`.
     fn renew(&self, held: &Held, csr_pem: &str) -> impl Future<Output = Result<Enrollment, RenewError>> + Send;
+}
+
+/// What rolling the gateway onto a renewed identity did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GatewayRoll {
+    /// New pods are starting on the identity.
+    Rolled,
+    /// The pods already carry it.
+    Unchanged,
+    /// This site has no gateway Deployment.
+    NoGateway,
+}
+
+/// The site's gateway, which loads its upstream client certificate only at start.
+pub(super) trait GatewayRoller {
+    /// Roll the gateway onto the identity with `fingerprint`; `renewed` when it is new.
+    fn roll(&self, fingerprint: &str, renewed: bool) -> impl Future<Output = Result<GatewayRoll, RenewError>> + Send;
+}
+
+/// The patch that rolls a gateway whose pods carry `current` onto `fingerprint`, if any.
+///
+/// Outside a renewal it only catches up a gateway a missed roll left on an older leaf,
+/// never one the operator has not rolled.
+fn roll_patch(current: Option<&str>, fingerprint: &str, renewed: bool) -> Option<serde_json::Value> {
+    let behind = current.is_some_and(|current| current != fingerprint);
+    (behind || (renewed && current.is_none())).then(|| {
+        serde_json::json!({ "spec": { "template": { "metadata": { "annotations": {
+            GATEWAY_IDENTITY_ANNOTATION: fingerprint
+        } } } } })
+    })
+}
+
+/// Roll the gateway onto the identity now in `target`.
+///
+/// # Errors
+///
+/// Returns [`RenewError`] when the identity or the gateway cannot be read or patched.
+pub(super) async fn roll_gateway<S: IdentityStore + Sync, G: GatewayRoller + Sync>(
+    store: &S,
+    gateway: &G,
+    target: &Target,
+    renewed: bool,
+) -> Result<GatewayRoll, RenewError> {
+    let held = store.read(target).await?;
+    let fingerprint =
+        certs::canonical_fingerprint(&held.cert).map_err(|e| RenewError::Material(format!("certificate: {e}")))?;
+    gateway.roll(&fingerprint, renewed).await
 }
 
 /// Renew the identity in `target` if it is due at `now`.
@@ -365,6 +418,57 @@ impl Renewer for HttpsRenewer {
     }
 }
 
+/// The gateway Deployment, named like its Service.
+pub struct KubeGateway {
+    /// Deployments in the gateway's namespace.
+    api: Api<Deployment>,
+    /// The Deployment.
+    name: String,
+    /// Whether a missing Deployment was already logged.
+    missing_logged: std::sync::atomic::AtomicBool,
+}
+
+impl KubeGateway {
+    /// The gateway `name` in `namespace`.
+    #[must_use]
+    pub fn new(client: Client, namespace: &str, name: &str) -> Self {
+        Self {
+            api: Api::namespaced(client, namespace),
+            name: name.to_owned(),
+            missing_logged: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl GatewayRoller for KubeGateway {
+    #[expect(clippy::large_stack_frames, reason = "a Deployment read, once per renewal")]
+    async fn roll(&self, fingerprint: &str, renewed: bool) -> Result<GatewayRoll, RenewError> {
+        let kube = |e: kube::Error| RenewError::Kube(e.to_string());
+        let Some(deployment) = Box::pin(self.api.get_opt(&self.name))
+            .await
+            .map_err(kube)?
+            .map(Box::new)
+        else {
+            return Ok(GatewayRoll::NoGateway);
+        };
+        let current = deployment
+            .spec
+            .and_then(|spec| spec.template.metadata)
+            .and_then(|meta| meta.annotations)
+            .and_then(|mut annotations| annotations.remove(GATEWAY_IDENTITY_ANNOTATION));
+        let Some(patch) = roll_patch(current.as_deref(), fingerprint, renewed) else {
+            return Ok(GatewayRoll::Unchanged);
+        };
+        Box::pin(
+            self.api
+                .patch(&self.name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        .map_err(kube)?;
+        Ok(GatewayRoll::Rolled)
+    }
+}
+
 /// Settings for the renewal loop.
 pub struct Settings {
     /// Enrollment service base URL.
@@ -373,6 +477,8 @@ pub struct Settings {
     pin: Option<String>,
     /// Where the identity lives when no `GridNetwork` names it.
     defaults: Target,
+    /// The gateway Deployment to roll after a renewal: namespace and name.
+    gateway: Option<(String, String)>,
 }
 
 impl Settings {
@@ -396,7 +502,22 @@ impl Settings {
                 site_secret: config.identity_secret.clone(),
                 ca_secret: config.ca_secret.clone(),
             },
+            gateway: None,
         })
+    }
+
+    /// Roll the gateway Deployment `name` in `namespace` after each renewal.
+    #[must_use]
+    pub fn with_gateway(mut self, namespace: &str, name: &str) -> Self {
+        self.gateway = Some((namespace.to_owned(), name.to_owned()));
+        self
+    }
+
+    /// The gateway to roll, if one is configured.
+    fn gateway_in(&self, client: &Client) -> Option<KubeGateway> {
+        self.gateway
+            .as_ref()
+            .map(|(namespace, name)| KubeGateway::new(client.clone(), namespace, name))
     }
 }
 
@@ -430,6 +551,7 @@ pub async fn run(client: Client, settings: Settings) {
     let namespace = client.default_namespace().to_owned();
     let store = KubeIdentity(Api::namespaced(client.clone(), &namespace));
     let renewer = HttpsRenewer::new(&settings.url, settings.pin.clone());
+    let gateway = settings.gateway_in(&client);
     let mut last: Option<String> = None;
     let mut failures = 0_u32;
     loop {
@@ -440,12 +562,52 @@ pub async fn run(client: Client, settings: Settings) {
             super::STEP_BACKOFF,
         ))
         .await;
-        let checked = match target {
-            Ok(target) => check(&store, &renewer, &target, OffsetDateTime::now_utc()).await,
+        let checked = match &target {
+            Ok(target) => Box::pin(check(&store, &renewer, target, OffsetDateTime::now_utc())).await,
             Err(e) => Err(RenewError::Kube(e.to_string())),
         };
+        if let (Some(renewed), Ok(target), Some(gateway)) = (rolls_after(&checked), &target, &gateway) {
+            log_roll(
+                Box::pin(roll_gateway(&store, gateway, target, renewed)).await,
+                gateway,
+                renewed,
+            );
+        }
         let wait = settle(&checked, &mut last, &mut failures);
         tokio::time::sleep(jittered(wait)).await;
+    }
+}
+
+/// Whether `checked` rolls the gateway: after a renewal, or on a later check that
+/// catches up a missed roll. `Some(true)` after a renewal.
+const fn rolls_after(checked: &Result<Checked, RenewError>) -> Option<bool> {
+    match checked {
+        Ok(Checked::Renewed(_)) => Some(true),
+        Ok(Checked::Waiting(_)) => Some(false),
+        Ok(Checked::Expired(_)) | Err(_) => None,
+    }
+}
+
+/// Log a gateway roll; a missing gateway once.
+#[expect(clippy::cognitive_complexity, reason = "one tracing call per outcome")]
+fn log_roll(rolled: Result<GatewayRoll, RenewError>, gateway: &KubeGateway, renewed: bool) {
+    let deployment = gateway.name.as_str();
+    match rolled {
+        Ok(GatewayRoll::Rolled) => tracing::info!(deployment, "rolled the gateway onto the renewed site identity"),
+        Ok(GatewayRoll::Unchanged) => tracing::debug!(deployment, "gateway already runs the renewed site identity"),
+        Ok(GatewayRoll::NoGateway) if !gateway.missing_logged.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+            tracing::info!(
+                deployment,
+                "no gateway Deployment to roll onto the renewed site identity"
+            );
+        },
+        Ok(GatewayRoll::NoGateway) => {},
+        Err(error) if renewed => {
+            tracing::warn!(deployment, %error, "rolling the gateway onto the renewed site identity failed; retrying");
+        },
+        Err(error) => {
+            tracing::debug!(deployment, %error, "rolling the gateway onto the renewed site identity failed again");
+        },
     }
 }
 

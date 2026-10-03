@@ -123,4 +123,4 @@ SWIM has one key and no keyring, so a rotation is a flag day. Replace `grid-swim
 
 ## Known Limits
 
-Site certificates last 180 days. Under `spiffe` trust the operator renews them when a third of the lifetime remains, around day 120 (see Identity renewal in the enrollment docs). Under `pin` trust nothing renews them, so re-enroll and re-pin each site before it expires. The gateway's upstream mutual TLS client certificate reloads only on a config reload or a restart, so restart the gateway within about 60 days of a renewal. The praxis-gateway chart README lists the gateway limits.
+Site certificates last 180 days. Under `spiffe` trust the operator renews them when a third of the lifetime remains, around day 120 (see Identity renewal in the enrollment docs), and rolls the gateway Deployment, because the gateway loads its upstream mutual TLS client certificate only at start. Under `pin` trust nothing renews them, so re-enroll and re-pin each site before it expires. The praxis-gateway chart README lists the gateway limits.

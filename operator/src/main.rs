@@ -139,7 +139,10 @@ async fn main() {
         tracing::info!("renewal disabled: peerTrust pin needs re-enrollment and re-pinning at expiry");
     } else if config.enrollment.renew {
         match operator::enroll::renew::Settings::from_config(&config.enrollment) {
-            Ok(settings) => drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings))),
+            Ok(settings) => {
+                let settings = settings.with_gateway(&config.gateway.namespace, &config.gateway.service_name);
+                drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
+            },
             Err(error) => tracing::error!(%error, "site identity renewal is off: misconfigured"),
         }
     }
