@@ -315,13 +315,12 @@ async fn a_signing_failure_leaves_the_token_unspent() {
 }
 
 /// A renewal of `site` presenting `presented` and asking for `requested`.
-fn renewal(site: &str, presented: &str, requested: &str, reserved: bool) -> enrollment::Renewal {
+fn renewal(site: &str, presented: &str, requested: &str) -> enrollment::Renewal {
     enrollment::Renewal {
         site_name: site.to_owned(),
         presented_key: presented.to_owned(),
         requested_key: requested.to_owned(),
-        presented_not_before: OffsetDateTime::now_utc().saturating_sub(Duration::days(1)),
-        reserved,
+        presented_not_before: OffsetDateTime::now_utc().saturating_sub(Duration::minutes(5)),
     }
 }
 
@@ -332,89 +331,142 @@ fn resign(site: &str) -> Result<Issued, StoreError> {
     })
 }
 
-/// Rotate, refuse the replaced key, re-sign a lost response, and rotate again.
+/// A key digest from one character.
+fn key(letter: char) -> String {
+    letter.to_string().repeat(64)
+}
+
+/// Rotate, re-sign a lost response, fork, stay frozen, and release on delete.
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "one renewal sequence")]
-async fn a_renewal_rotates_the_recorded_key() {
+#[expect(clippy::too_many_lines, reason = "one record's whole lifecycle")]
+async fn a_renewal_rotates_the_recorded_key_and_a_fork_freezes_it() {
     let Some((store, _guard)) = store().await else {
         return;
     };
     let (site, digest) = (unique("site"), unique("digest"));
-    let (key_a, key_b, key_c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
     store.mint_site_token(new_token(&site, &digest)).await.expect("mint");
     store.redeem_and_issue(&digest, sign_for).await.expect("redeem");
 
     let renewed = store
-        .renew_and_issue(&renewal(&site, &key_a, &key_b, false), || resign(&site))
+        .renew_and_issue(&renewal(&site, &key('a'), &key('b')), || resign(&site))
         .await
         .expect("the enrolled key renews");
     assert_eq!(renewed.action, enrollment::RenewAction::Rotate);
-    assert_eq!(renewed.replaced_key.as_deref(), Some(key_a.as_str()));
-
-    let stale = store
-        .renew_and_issue(&renewal(&site, &key_a, &key_c, false), || resign(&site))
-        .await;
-    assert!(
-        matches!(stale, Err(StoreError::Refused(enrollment::Refusal::StaleKey))),
-        "the replaced key cannot pick a new key: {stale:?}"
-    );
+    assert_eq!(renewed.replaced_key, key('a'));
     let retried = store
-        .renew_and_issue(&renewal(&site, &key_a, &key_b, false), || resign(&site))
+        .renew_and_issue(&renewal(&site, &key('a'), &key('b')), || resign(&site))
         .await
         .expect("a lost response retries");
     assert_eq!(retried.action, enrollment::RenewAction::Resign);
     assert_eq!(retried.id, renewed.id, "the same record");
+    let record = store.enrollment(&site).await.expect("read").expect("held");
+    assert_eq!(
+        (record.held.current_key, record.held.previous_key),
+        (key('b'), Some(key('a')))
+    );
+    assert!(
+        record.renewed_at.is_some() && !record.held.frozen,
+        "renewed, not frozen"
+    );
 
-    let again = store
-        .renew_and_issue(&renewal(&site, &key_b, &key_c, false), || resign(&site))
-        .await
-        .expect("the current key renews");
-    assert_eq!(again.action, enrollment::RenewAction::Rotate);
+    let forked = store
+        .renew_and_issue(&renewal(&site, &key('a'), &key('c')), || resign(&site))
+        .await;
+    assert!(
+        matches!(forked, Err(StoreError::Refused(enrollment::Refusal::Forked))),
+        "{forked:?}"
+    );
+    let frozen = store
+        .renew_and_issue(&renewal(&site, &key('b'), &key('c')), || resign(&site))
+        .await;
+    assert!(
+        matches!(frozen, Err(StoreError::Refused(enrollment::Refusal::Frozen))),
+        "the freeze committed: {frozen:?}"
+    );
+    let frozen_record = store.enrollment(&site).await.expect("read").expect("held");
+    assert!(frozen_record.held.frozen, "a grid-admin reads the freeze");
+
+    store.delete_enrollment(&site).await.expect("delete");
+    assert!(store.enrollment(&site).await.expect("read").is_none());
+    assert!(matches!(
+        store.delete_enrollment(&site).await,
+        Err(StoreError::NotFound)
+    ));
+    let gone = store
+        .renew_and_issue(&renewal(&site, &key('b'), &key('c')), || resign(&site))
+        .await;
+    assert!(
+        matches!(gone, Err(StoreError::Refused(enrollment::Refusal::UnknownSite))),
+        "{gone:?}"
+    );
 }
 
-/// A reserved name gets a token-less record; nothing else may.
+/// A seed registers and resets a reserved record; nothing else records without a token.
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "the store path, then the schema check")]
-async fn only_a_reserved_name_records_without_a_token() {
+#[expect(clippy::too_many_lines, reason = "the seed outcomes, then the schema check")]
+async fn a_seed_registers_a_reserved_name_and_only_it_records_without_a_token() {
     let Some((store, _guard)) = store().await else {
         return;
     };
-    let (hub, spoke) = (unique("hub"), unique("spoke"));
-    let (x, y) = ("d".repeat(64), "e".repeat(64));
-
-    let refused = store
-        .renew_and_issue(&renewal(&spoke, &x, &y, false), || resign(&spoke))
-        .await;
-    assert!(
-        matches!(refused, Err(StoreError::Refused(enrollment::Refusal::UnknownSite))),
-        "an unrecorded spoke is refused: {refused:?}"
+    let hub = unique("hub");
+    let seed = |letter, generation| enrollment::SeedRecord {
+        site_name: hub.clone(),
+        key_sha256: key(letter),
+        generation,
+        issued_at: OffsetDateTime::now_utc().saturating_sub(Duration::days(1)),
+    };
+    assert_eq!(
+        store.seed_reserved(&seed('d', 10)).await.expect("seed"),
+        enrollment::Seeded::Registered
     );
-    let registered = store
-        .renew_and_issue(&renewal(&hub, &x, &y, true), || resign(&hub))
-        .await
-        .expect("a reserved name registers");
-    assert_eq!(registered.action, enrollment::RenewAction::Register);
-    assert_eq!(registered.replaced_key, None);
+    assert_eq!(
+        store.seed_reserved(&seed('d', 10)).await.expect("seed"),
+        enrollment::Seeded::Unchanged
+    );
+    assert_eq!(
+        store.seed_reserved(&seed('e', 9)).await.expect("seed"),
+        enrollment::Seeded::Older,
+        "an older generation"
+    );
+    assert_eq!(
+        store.seed_reserved(&seed('e', 11)).await.expect("seed"),
+        enrollment::Seeded::Reset { replaced_key: key('d') }
+    );
 
     let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("url");
     let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
-    let row: (Option<uuid::Uuid>, bool, String, Option<String>) = sqlx::query_as(
-        "SELECT site_token_id, reserved, public_key_sha256, previous_public_key_sha256
+    let row: (Option<uuid::Uuid>, bool, String, Option<i64>) = sqlx::query_as(
+        "SELECT site_token_id, reserved, public_key_sha256, seed_generation
            FROM site_enrollments WHERE site_name = $1",
     )
     .bind(&hub)
     .fetch_one(&pool)
     .await
     .expect("row");
-    assert_eq!(row, (None, true, y, Some(x)), "token-less, reserved, keys recorded");
+    assert_eq!(row, (None, true, key('e'), Some(11)), "token-less, reserved, seeded");
+
+    let (spoke, digest) = (unique("spoke"), unique("digest"));
+    store.mint_site_token(new_token(&spoke, &digest)).await.expect("mint");
+    store.redeem_and_issue(&digest, sign_for).await.expect("redeem");
+    let over_spoke = enrollment::SeedRecord {
+        site_name: spoke.clone(),
+        key_sha256: key('f'),
+        generation: 1,
+        issued_at: OffsetDateTime::now_utc(),
+    };
+    assert_eq!(
+        store.seed_reserved(&over_spoke).await.expect("seed"),
+        enrollment::Seeded::NotReserved,
+        "a seed never takes over a spoke's record"
+    );
 
     let forged = sqlx::query(
         "INSERT INTO site_enrollments (id, site_token_id, site_name, public_key_sha256, spiffe_id)
          VALUES ($1, NULL, $2, $3, $4)",
     )
     .bind(uuid::Uuid::new_v4())
-    .bind(&spoke)
-    .bind("f".repeat(64))
+    .bind(unique("forged"))
+    .bind(key('f'))
     .bind("spiffe://grid.internal/site/x")
     .execute(&pool)
     .await;

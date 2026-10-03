@@ -41,8 +41,12 @@ const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 const GRID_ADMIN_TOKENS: &str = "ENROLLMENT_GRID_ADMIN_TOKENS";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
+/// Set to `false` to refuse every renewal.
+const RENEWALS_ENABLED: &str = "ENROLLMENT_RENEWALS_ENABLED";
 /// Comma-separated site names issued outside enrollment, refused at mint and redeem.
 const RESERVED_SITES: &str = "ENROLLMENT_RESERVED_SITES";
+/// Directory of reserved-name seeds bootstrap signed with the CA key.
+const RESERVED_SEEDS_DIR: &str = "ENROLLMENT_RESERVED_SEEDS_DIR";
 /// Server certificate presented to callers, PEM.
 const TLS_CERT_PATH: &str = "ENROLLMENT_TLS_CERT";
 /// Private key for the server certificate, PEM.
@@ -123,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         authorizer: Box::pin(build_authorizer()).await?,
         cert_lifetime: load_cert_lifetime(),
         reserved_sites: load_reserved_sites()?,
+        renewals_enabled: load_renewals_enabled()?,
     });
 
     // Reload the server certificate on an interval so a rotated TLS secret is
@@ -131,6 +136,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reload the signing CA the same way, so a regenerated or restored CA signs
     // new site certificates without a restart.
     tokio::spawn(reload_ca(Arc::clone(&state), common_name, ca_cert_path, ca_key_path));
+    // Apply reserved-name seeds now and as bootstrap rewrites them.
+    if let Ok(dir) = std::env::var(RESERVED_SEEDS_DIR) {
+        let mut reported = std::collections::HashMap::new();
+        Box::pin(enrollment::seed::apply(
+            &state,
+            std::path::Path::new(&dir),
+            &mut reported,
+        ))
+        .await;
+        tokio::spawn(reapply_seeds(Arc::clone(&state), dir, reported));
+    }
 
     // Drain in-flight requests on SIGTERM or SIGINT rather than cutting them off,
     // so a rolling deploy does not abort an enrollment mid-issue.
@@ -243,6 +259,25 @@ async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String,
             Ok(None) => {},
             Err(err) => tracing::warn!(%err, "signing CA reload failed, keeping the current CA"),
         }
+    }
+}
+
+/// Apply reserved-name seeds on an interval, as bootstrap rewrites them.
+#[expect(
+    clippy::infinite_loop,
+    reason = "a background reloader runs for the life of the process"
+)]
+async fn reapply_seeds(state: Arc<AppState>, dir: String, mut reported: std::collections::HashMap<String, String>) {
+    let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        Box::pin(enrollment::seed::apply(
+            &state,
+            std::path::Path::new(&dir),
+            &mut reported,
+        ))
+        .await;
     }
 }
 
@@ -369,6 +404,19 @@ fn load_reserved_sites() -> Result<Vec<String>, Box<dyn std::error::Error>> {
         tracing::info!(?sites, "site names reserved from enrollment");
     }
     Ok(sites)
+}
+
+/// Whether renewals are signed: on unless the variable says `false`.
+fn load_renewals_enabled() -> Result<bool, String> {
+    let enabled = match std::env::var(RENEWALS_ENABLED).as_deref().map(str::trim) {
+        Err(_) | Ok("" | "true") => true,
+        Ok("false") => false,
+        Ok(other) => return Err(format!("{RENEWALS_ENABLED} must be true or false, not {other:?}")),
+    };
+    if !enabled {
+        tracing::info!("renewals disabled: every renewal is refused; issued identities stay valid until they expire");
+    }
+    Ok(enabled)
 }
 
 /// Read how long issued certificates should last.

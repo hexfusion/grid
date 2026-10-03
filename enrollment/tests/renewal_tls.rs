@@ -24,6 +24,7 @@ use time::{Duration, OffsetDateTime};
 struct Served {
     addr: SocketAddr,
     ca: certs::CaCert,
+    state: Arc<AppState>,
 }
 
 /// Serve a fresh grid on an ephemeral port, with `hub` reserved.
@@ -47,6 +48,7 @@ fn serve() -> Served {
         authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: vec!["hub".to_owned()],
+        renewals_enabled: true,
     });
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -54,8 +56,8 @@ fn serve() -> Served {
     let server = axum_server::from_tcp(listener)
         .expect("listener")
         .acceptor(PeerAcceptor(TlsAcceptor::new(tls)));
-    tokio::spawn(server.serve(router(state).into_make_service()));
-    Served { addr, ca: copy }
+    tokio::spawn(server.serve(router(Arc::clone(&state)).into_make_service()));
+    Served { addr, ca: copy, state }
 }
 
 /// A client trusting the grid CA, presenting `identity` when given.
@@ -79,17 +81,24 @@ async fn renew(served: &Served, client: &reqwest::Client) -> Result<(StatusCode,
     Ok((status, response.json().await.unwrap_or(Value::Null)))
 }
 
-/// A hub leaf from the grid CA, as bootstrap issues it.
-fn hub_leaf(served: &Served, validity: certs::Validity) -> (String, String) {
+/// A hub leaf from the grid CA and its seed, as bootstrap issues them.
+async fn hub_leaf(served: &Served, validity: certs::Validity) -> (String, String) {
     let csr = certs::generate_csr("hub").expect("csr");
     let cert = certs::sign_csr(&served.ca, "hub", &csr.csr_pem, validity).expect("sign");
+    let seed = enrollment::SeedRecord {
+        site_name: "hub".to_owned(),
+        key_sha256: cert.public_key_sha256.clone(),
+        generation: 1,
+        issued_at: certs::cert_validity(&cert.cert_pem).expect("validity").0,
+    };
+    served.state.store.seed_reserved(&seed).await.expect("seed");
     (cert.cert_pem, csr.key_pem.to_string())
 }
 
 #[tokio::test]
 async fn the_handshake_leaf_reaches_the_renewal_handler() {
     let served = serve();
-    let (cert, key) = hub_leaf(&served, certs::Validity::default());
+    let (cert, key) = hub_leaf(&served, certs::Validity::default()).await;
     let (status, body) = renew(&served, &client(&served, Some((&cert, &key))))
         .await
         .expect("renew");
@@ -115,7 +124,8 @@ async fn an_expired_certificate_fails_the_handshake() {
             not_before: now.saturating_sub(Duration::days(40)),
             not_after: now.saturating_sub(Duration::days(10)),
         },
-    );
+    )
+    .await;
     let refused = renew(&served, &client(&served, Some((&cert, &key)))).await;
     assert!(refused.is_err(), "an expired leaf never reaches a handler: {refused:?}");
 }

@@ -171,6 +171,10 @@ fn openssl_builder(cert: &Path, key: &Path, grid_ca_pem: &str) -> io::Result<ope
     builder.set_verify_cert_store(store.build()).map_err(io::Error::other)?;
     // PEER without FAIL_IF_NO_PEER_CERT: a certificate is optional, but one presented must verify.
     builder.set_verify(SslVerifyMode::PEER);
+    // Client verification requires a session id context, or resumption fails.
+    builder
+        .set_session_id_context(b"grid-enrollment")
+        .map_err(io::Error::other)?;
     Ok(builder)
 }
 

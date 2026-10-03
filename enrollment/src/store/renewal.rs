@@ -1,8 +1,13 @@
-//! Which renewals a site's enrollment record admits, the same for every backend.
+//! Which renewals and seeds a site's enrollment record admits, the same for every backend.
 //! The caller has already proven possession of an unexpired leaf for the name.
 
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
+
+/// Slack when comparing a leaf's `notBefore` with record times: the leaf's own backdate
+/// plus the same again for clock skew between the signer and the database. Minutes, so
+/// a stolen leaf cannot pass for one issued in another incarnation of the record.
+pub const RECORD_SKEW: Duration = Duration::minutes(10);
 
 /// An authenticated renewal request.
 #[derive(Debug, Clone)]
@@ -15,8 +20,6 @@ pub struct Renewal {
     pub requested_key: String,
     /// The presented leaf's `notBefore`.
     pub presented_not_before: OffsetDateTime,
-    /// Whether the name is reserved for bootstrap issuance.
-    pub reserved: bool,
 }
 
 /// A name's enrollment record, as renewal reads it.
@@ -30,6 +33,28 @@ pub struct Held {
     pub previous_key: Option<String>,
     /// When the record last changed.
     pub recorded_at: OffsetDateTime,
+    /// When this incarnation of the record began: its insert, or a seed reset.
+    pub epoch_at: OffsetDateTime,
+    /// Renewal refused until a grid-admin deletes the record, after a fork.
+    pub frozen: bool,
+    /// The last bootstrap seed applied, for a reserved name.
+    pub seed_generation: Option<u64>,
+}
+
+impl Held {
+    /// A record written at `now`.
+    #[must_use]
+    pub fn new(id: Uuid, current_key: String, previous_key: Option<String>, now: OffsetDateTime) -> Self {
+        Self {
+            id,
+            current_key,
+            previous_key,
+            recorded_at: now,
+            epoch_at: now,
+            frozen: false,
+            seed_generation: None,
+        }
+    }
 }
 
 /// An admitted, signed renewal.
@@ -39,23 +64,10 @@ pub struct Renewed {
     pub id: Uuid,
     /// What the renewal did to the record.
     pub action: RenewAction,
-    /// The key the record held as current before, `None` on first registration.
-    pub replaced_key: Option<String>,
+    /// The key the record held as current before.
+    pub replaced_key: String,
     /// The signed certificate.
     pub issued: super::Issued,
-}
-
-impl Held {
-    /// A record written now.
-    #[must_use]
-    pub fn new(id: Uuid, current_key: String, previous_key: Option<String>) -> Self {
-        Self {
-            id,
-            current_key,
-            previous_key,
-            recorded_at: OffsetDateTime::now_utc(),
-        }
-    }
 }
 
 /// What an admitted renewal does to the record.
@@ -65,10 +77,6 @@ pub enum RenewAction {
     Rotate,
     /// A retry after a lost response: re-sign the current key, record unchanged.
     Resign,
-    /// First renewal of a reserved name, which bootstrap issued with no record.
-    Register,
-    /// A reserved name bootstrap re-issued after the record was written.
-    Supersede,
 }
 
 /// Why a renewal was refused. Logged, never told to the caller.
@@ -77,12 +85,22 @@ pub enum Refusal {
     /// No record holds the name.
     #[error("no enrollment holds this site name")]
     UnknownSite,
-    /// The presented key is not the one the record holds.
-    #[error("the presented key is not this site's current key")]
-    StaleKey,
     /// The CSR reuses a key the record already holds.
     #[error("the certificate request reuses a held key")]
     KeyReused,
+    /// A valid leaf the record no longer holds asked for a key it does not hold: two
+    /// holders of one identity. The record is frozen.
+    #[error("a replaced key asked for a new key; the record is now frozen")]
+    Forked,
+    /// The record was frozen by an earlier fork.
+    #[error("the record is frozen until a grid-admin deletes it")]
+    Frozen,
+    /// The leaf predates this incarnation of the record, which a recovery began.
+    #[error("the presented certificate predates the site's current enrollment")]
+    Superseded,
+    /// The leaf is newer than the record, as after the database was restored.
+    #[error("the presented certificate is newer than the site's record")]
+    RecordBehind,
 }
 
 impl Refusal {
@@ -91,8 +109,11 @@ impl Refusal {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UnknownSite => "unknown_site",
-            Self::StaleKey => "stale_key",
             Self::KeyReused => "key_reused",
+            Self::Forked => "forked",
+            Self::Frozen => "frozen",
+            Self::Superseded => "superseded",
+            Self::RecordBehind => "record_behind",
         }
     }
 }
@@ -102,159 +123,286 @@ impl Refusal {
 /// # Errors
 ///
 /// Returns the [`Refusal`] when the record does not admit the presented key.
+/// [`Refusal::Forked`] obliges the caller to freeze the record.
 pub fn decide(held: Option<&Held>, renewal: &Renewal) -> Result<RenewAction, Refusal> {
-    if renewal.requested_key == renewal.presented_key {
+    let held = held.ok_or(Refusal::UnknownSite)?;
+    if held.frozen {
+        return Err(Refusal::Frozen);
+    }
+    let rolls_back =
+        renewal.presented_key == held.current_key && held.previous_key.as_ref() == Some(&renewal.requested_key);
+    if renewal.requested_key == renewal.presented_key || rolls_back {
         return Err(Refusal::KeyReused);
     }
-    let Some(held) = held else {
-        return if renewal.reserved {
-            Ok(RenewAction::Register)
-        } else {
-            Err(Refusal::UnknownSite)
-        };
-    };
     if renewal.presented_key == held.current_key {
-        return if held.previous_key.as_ref() == Some(&renewal.requested_key) {
-            Err(Refusal::KeyReused)
-        } else {
-            Ok(RenewAction::Rotate)
-        };
+        return Ok(RenewAction::Rotate);
     }
     if held.previous_key.as_ref() == Some(&renewal.presented_key) && renewal.requested_key == held.current_key {
         return Ok(RenewAction::Resign);
     }
-    // Only the CA mints a leaf newer than the record, and for a reserved name only bootstrap does.
-    let issued_at = renewal.presented_not_before.saturating_add(certs::CLOCK_SKEW_ALLOWANCE);
-    if renewal.reserved && issued_at > held.recorded_at && renewal.requested_key != held.current_key {
-        return Ok(RenewAction::Supersede);
+    // A leaf from before a recovery, or from after a restored record, is not a fork.
+    if renewal.presented_not_before.saturating_add(RECORD_SKEW) < held.epoch_at {
+        return Err(Refusal::Superseded);
     }
-    Err(Refusal::StaleKey)
+    if renewal.presented_not_before > held.recorded_at.saturating_add(RECORD_SKEW) {
+        return Err(Refusal::RecordBehind);
+    }
+    // A site renews once per two thirds of a leaf's lifetime, so it never presents a
+    // still-valid leaf older than the one it replaced: any other key is a second holder.
+    Err(Refusal::Forked)
+}
+
+/// A reserved name's identity as bootstrap last vouched for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedRecord {
+    /// The site.
+    pub site_name: String,
+    /// Key digest of the identity bootstrap issued.
+    pub key_sha256: String,
+    /// Increases with every identity bootstrap issues.
+    pub generation: u64,
+    /// The seeded leaf's `notBefore`, where the record's incarnation begins.
+    pub issued_at: OffsetDateTime,
+}
+
+/// What applying a seed did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seeded {
+    /// The reserved name had no record and now has one.
+    Registered,
+    /// A newer seed replaced the record's key, clearing any freeze.
+    Reset {
+        /// The key the record held.
+        replaced_key: String,
+    },
+    /// A newer seed for a key the record already holds, current or previous: only its
+    /// generation is recorded, so it never clears a freeze or rolls a renewal back.
+    Acknowledged,
+    /// The record already reflects this seed.
+    Unchanged,
+    /// The seed is older than the one the record applied: a rollback or a replay.
+    Older,
+    /// A record that is not reserved holds the name. Left alone.
+    NotReserved,
+}
+
+/// What a seed does to a record, `held` with whether it is reserved.
+#[must_use]
+pub fn seed_decision(held: Option<(&Held, bool)>, seed: &SeedRecord) -> Seeded {
+    match held {
+        None => Seeded::Registered,
+        Some((_, false)) => Seeded::NotReserved,
+        Some((held, true)) if held.seed_generation.is_some_and(|applied| applied > seed.generation) => Seeded::Older,
+        Some((held, true)) if held.seed_generation == Some(seed.generation) => Seeded::Unchanged,
+        // A seed resets only to a key the record never held. Re-seeding the current key
+        // must not clear a freeze, and one read before the site renewed must not roll it back.
+        Some((held, true))
+            if held.current_key == seed.key_sha256 || held.previous_key.as_ref() == Some(&seed.key_sha256) =>
+        {
+            Seeded::Acknowledged
+        },
+        Some((held, true)) => Seeded::Reset {
+            replaced_key: held.current_key.clone(),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use time::Duration;
-
     use super::*;
 
-    fn renewal(presented: &str, requested: &str, reserved: bool, not_before: OffsetDateTime) -> Renewal {
+    fn renewal(presented: &str, requested: &str) -> Renewal {
+        issued_at(
+            presented,
+            requested,
+            OffsetDateTime::now_utc().saturating_sub(Duration::minutes(5)),
+        )
+    }
+
+    fn issued_at(presented: &str, requested: &str, not_before: OffsetDateTime) -> Renewal {
         Renewal {
             site_name: "site-a".to_owned(),
             presented_key: presented.to_owned(),
             requested_key: requested.to_owned(),
             presented_not_before: not_before,
-            reserved,
         }
     }
 
-    fn held(current: &str, previous: Option<&str>, recorded_at: OffsetDateTime) -> Held {
-        Held {
-            id: Uuid::nil(),
-            current_key: current.to_owned(),
-            previous_key: previous.map(str::to_owned),
-            recorded_at,
+    /// A stray valid leaf is a fork only inside this incarnation, within the skew, at both edges.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one row per edge")]
+    fn a_stray_leaf_forks_only_within_the_record_incarnation() {
+        let epoch = OffsetDateTime::now_utc().saturating_sub(Duration::days(10));
+        let record = Held {
+            epoch_at: epoch,
+            recorded_at: epoch.saturating_add(Duration::days(1)),
+            ..held("k1", Some("k0"))
+        };
+        let second = Duration::seconds(1);
+        let floor = epoch.saturating_sub(RECORD_SKEW);
+        let ceiling = record.recorded_at.saturating_add(RECORD_SKEW);
+        let cases = [
+            (
+                "before the incarnation",
+                floor.saturating_sub(second),
+                Err(Refusal::Superseded),
+            ),
+            (
+                "just inside the floor",
+                floor.saturating_add(second),
+                Err(Refusal::Forked),
+            ),
+            (
+                "just inside the ceiling",
+                ceiling.saturating_sub(second),
+                Err(Refusal::Forked),
+            ),
+            (
+                "after the record",
+                ceiling.saturating_add(second),
+                Err(Refusal::RecordBehind),
+            ),
+        ];
+        for (name, not_before, expected) in cases {
+            assert_eq!(
+                decide(Some(&record), &issued_at("kx", "k9", not_before)),
+                expected,
+                "{name}"
+            );
         }
+        assert!(RECORD_SKEW <= Duration::minutes(10), "the window stays minutes wide");
     }
 
-    /// One decision: a name, the record, the renewal, and the outcome.
-    struct Case {
-        name: &'static str,
-        held: Option<Held>,
-        renewal: Renewal,
-        expected: Result<RenewAction, Refusal>,
+    fn held(current: &str, previous: Option<&str>) -> Held {
+        Held::new(
+            Uuid::nil(),
+            current.to_owned(),
+            previous.map(str::to_owned),
+            OffsetDateTime::now_utc(),
+        )
     }
 
-    fn case(name: &'static str, held: Option<Held>, renewal: Renewal, expected: Result<RenewAction, Refusal>) -> Case {
-        Case {
-            name,
-            held,
-            renewal,
-            expected,
-        }
-    }
+    /// A decision's name, record, renewal, and outcome.
+    type Case<'held> = (&'static str, Option<&'held Held>, Renewal, Result<RenewAction, Refusal>);
 
     #[test]
     #[expect(clippy::too_many_lines, reason = "one row per decision")]
     fn decisions() {
-        let now = OffsetDateTime::now_utc();
-        let earlier = now.saturating_sub(Duration::days(20));
-        let record = held("k1", Some("k0"), now);
-        let cases = [
-            case(
+        let record = held("k1", Some("k0"));
+        let frozen = Held {
+            frozen: true,
+            ..record.clone()
+        };
+        let cases: [Case<'_>; 9] = [
+            (
                 "the current key renews",
-                Some(record.clone()),
-                renewal("k1", "k2", false, earlier),
+                Some(&record),
+                renewal("k1", "k2"),
                 Ok(RenewAction::Rotate),
             ),
-            case(
+            (
                 "a lost response retries",
-                Some(record.clone()),
-                renewal("k0", "k1", false, earlier),
+                Some(&record),
+                renewal("k0", "k1"),
                 Ok(RenewAction::Resign),
             ),
-            case(
-                "the previous key cannot pick a new key",
-                Some(record.clone()),
-                renewal("k0", "k9", false, earlier),
-                Err(Refusal::StaleKey),
+            (
+                "the replaced key forks",
+                Some(&record),
+                renewal("k0", "k9"),
+                Err(Refusal::Forked),
             ),
-            case(
-                "an unknown key is refused",
-                Some(record.clone()),
-                renewal("kx", "k9", false, earlier),
-                Err(Refusal::StaleKey),
+            (
+                "an older valid key forks",
+                Some(&record),
+                renewal("kx", "k9"),
+                Err(Refusal::Forked),
             ),
-            case(
-                "a CSR for the presented key is refused",
-                Some(record.clone()),
-                renewal("k1", "k1", false, earlier),
+            (
+                "the presented key again",
+                Some(&record),
+                renewal("k1", "k1"),
                 Err(Refusal::KeyReused),
             ),
-            case(
-                "a CSR for the previous key is refused",
-                Some(record.clone()),
-                renewal("k1", "k0", false, earlier),
+            (
+                "the replaced key again",
+                Some(&record),
+                renewal("k1", "k0"),
                 Err(Refusal::KeyReused),
             ),
-            case(
-                "a spoke with no record is refused",
-                None,
-                renewal("k1", "k2", false, earlier),
-                Err(Refusal::UnknownSite),
+            ("no record", None, renewal("k1", "k2"), Err(Refusal::UnknownSite)),
+            (
+                "a frozen record",
+                Some(&frozen),
+                renewal("k1", "k2"),
+                Err(Refusal::Frozen),
             ),
-            case(
-                "a reserved name registers on first renewal",
-                None,
-                renewal("k1", "k2", true, earlier),
-                Ok(RenewAction::Register),
-            ),
-            case(
-                "a newer bootstrap leaf supersedes a reserved record",
-                Some(record.clone()),
-                renewal("kb", "k2", true, now),
-                Ok(RenewAction::Supersede),
-            ),
-            case(
-                "an older reserved leaf is refused",
-                Some(record.clone()),
-                renewal("kb", "k2", true, earlier),
-                Err(Refusal::StaleKey),
-            ),
-            case(
-                "a newer leaf supersedes only a reserved name",
-                Some(record),
-                renewal("kb", "k2", false, now),
-                Err(Refusal::StaleKey),
+            (
+                "a frozen record retried",
+                Some(&frozen),
+                renewal("k0", "k1"),
+                Err(Refusal::Frozen),
             ),
         ];
-        for Case {
-            name,
-            held,
-            renewal,
-            expected,
-        } in cases
-        {
-            assert_eq!(decide(held.as_ref(), &renewal), expected, "{name}");
+        for (name, held, renewal, expected) in cases {
+            assert_eq!(decide(held, &renewal), expected, "{name}");
         }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one assertion per seed outcome")]
+    fn seeds() {
+        let seed = |generation| SeedRecord {
+            site_name: "hub".to_owned(),
+            key_sha256: "kb".to_owned(),
+            generation,
+            issued_at: OffsetDateTime::now_utc(),
+        };
+        let applied = Held {
+            seed_generation: Some(5),
+            ..held("k1", None)
+        };
+        assert_eq!(seed_decision(None, &seed(1)), Seeded::Registered, "no record");
+        assert_eq!(
+            seed_decision(Some((&applied, true)), &seed(5)),
+            Seeded::Unchanged,
+            "same seed"
+        );
+        assert_eq!(
+            seed_decision(Some((&applied, true)), &seed(4)),
+            Seeded::Older,
+            "older seed"
+        );
+        assert_eq!(
+            seed_decision(Some((&applied, true)), &seed(6)),
+            Seeded::Reset {
+                replaced_key: "k1".to_owned()
+            },
+            "newer seed"
+        );
+        let holding = Held {
+            seed_generation: Some(5),
+            frozen: true,
+            ..held("kb", None)
+        };
+        assert_eq!(
+            seed_decision(Some((&holding, true)), &seed(9)),
+            Seeded::Acknowledged,
+            "re-seeding the held key leaves a freeze in place"
+        );
+        let renewed_away = Held {
+            seed_generation: Some(5),
+            ..held("k2", Some("kb"))
+        };
+        assert_eq!(
+            seed_decision(Some((&renewed_away, true)), &seed(9)),
+            Seeded::Acknowledged,
+            "a seed read before the hub renewed does not roll it back"
+        );
+        assert_eq!(
+            seed_decision(Some((&applied, false)), &seed(9)),
+            Seeded::NotReserved,
+            "a spoke's record"
+        );
     }
 }
