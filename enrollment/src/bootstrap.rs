@@ -786,8 +786,9 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
     use super::{
-        BootstrapArgs, MANAGED_BY, ServingCert, admin_tokens, argo_keep_patch, db_credentials, existing_identity_kept,
-        foreign_manager, issue_site_identity, needs_roll, roll_patch, serving_cert, serving_needs_issue,
+        BootstrapArgs, MANAGED_BY, ServingCert, admin_tokens, argo_keep_patch, db_credentials, ensure_swim_key,
+        existing_identity_kept, foreign_manager, issue_site_identity, needs_roll, roll_patch, serving_cert,
+        serving_needs_issue,
     };
 
     #[test]
@@ -1074,5 +1075,147 @@ mod tests {
         assert!(!needs_roll(Some("ab12"), "ab12"), "already serving it");
         assert!(needs_roll(Some("old"), "ab12"), "a new cert");
         assert!(needs_roll(None, "ab12"), "never stamped");
+    }
+
+    /// Secrets by namespace and name, served by [`fake_api`].
+    type Store = std::sync::Arc<std::sync::Mutex<BTreeMap<(String, String), k8s_openapi::api::core::v1::Secret>>>;
+
+    /// A Kubernetes API holding `store`: GET reads a Secret, POST creates one or answers 409.
+    fn fake_api(store: Store) -> kube::Client {
+        use http_body_util::BodyExt as _;
+
+        let service = tower::service_fn(move |req: axum::http::Request<kube::client::Body>| {
+            let store = std::sync::Arc::clone(&store);
+            async move {
+                let (parts, body) = req.into_parts();
+                let bytes = body.collect().await.expect("body").to_bytes();
+                let (code, value) = answer(&store, &parts.method, parts.uri.path(), &bytes);
+                let reply = kube::client::Body::from(serde_json::to_vec(&value).expect("json"));
+                Ok::<_, std::convert::Infallible>(
+                    axum::http::Response::builder()
+                        .status(code)
+                        .body(reply)
+                        .expect("response"),
+                )
+            }
+        });
+        kube::Client::new(service, "grid-enroll")
+    }
+
+    /// Serve one request on `/api/v1/namespaces/{namespace}/secrets[/{name}]`.
+    fn answer(store: &Store, method: &axum::http::Method, path: &str, body: &[u8]) -> (u16, serde_json::Value) {
+        let path: Vec<&str> = path.split('/').collect();
+        let namespace = path.get(4).copied().unwrap_or_default().to_owned();
+        let mut map = store.lock().expect("lock");
+        if method == axum::http::Method::POST {
+            let secret: k8s_openapi::api::core::v1::Secret = serde_json::from_slice(body).expect("secret");
+            let name = secret.metadata.name.clone().unwrap_or_default();
+            return match map.entry((namespace, name)) {
+                std::collections::btree_map::Entry::Occupied(_) => (409, failure(409, "AlreadyExists")),
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    (201, serde_json::to_value(slot.insert(secret)).expect("json"))
+                },
+            };
+        }
+        let name = path.get(6).copied().unwrap_or_default().to_owned();
+        map.get(&(namespace, name)).map_or_else(
+            || (404, failure(404, "NotFound")),
+            |secret| (200, serde_json::to_value(secret).expect("json")),
+        )
+    }
+
+    fn failure(code: u16, reason: &str) -> serde_json::Value {
+        serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": reason, "code": code})
+    }
+
+    fn put_key(store: &Store, namespace: &str, key: &[u8]) {
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some("grid-swim-key".to_owned()),
+                ..ObjectMeta::default()
+            },
+            data: Some(BTreeMap::from([(
+                "key".to_owned(),
+                k8s_openapi::ByteString(key.to_vec()),
+            )])),
+            ..k8s_openapi::api::core::v1::Secret::default()
+        };
+        store
+            .lock()
+            .expect("lock")
+            .insert((namespace.to_owned(), "grid-swim-key".to_owned()), secret);
+    }
+
+    fn key_in(store: &Store, namespace: &str) -> Option<Vec<u8>> {
+        store
+            .lock()
+            .expect("lock")
+            .get(&(namespace.to_owned(), "grid-swim-key".to_owned()))?
+            .data
+            .as_ref()?
+            .get("key")
+            .map(|bytes| bytes.0.clone())
+    }
+
+    /// Run [`ensure_swim_key`] against `store` with `flags`.
+    async fn swim_key_run(store: &Store, flags: &[&str]) -> Result<(), super::BoxError> {
+        let args = BootstrapArgs::parse_from(["bootstrap", "--swim-key-secret", "grid-swim-key"].iter().chain(flags));
+        let client = fake_api(std::sync::Arc::clone(store));
+        let secrets = kube::api::Api::namespaced(client.clone(), "grid-enroll");
+        Box::pin(ensure_swim_key(&client, &secrets, &args)).await
+    }
+
+    const HUB: [&str; 2] = ["--site-name", "hub"];
+
+    #[tokio::test]
+    async fn the_swim_key_is_created_once_and_shared_with_the_hub() {
+        let store = Store::default();
+        swim_key_run(&store, &HUB).await.expect("first run");
+        let key = key_in(&store, "grid-enroll").expect("release namespace key");
+        assert_eq!(key.len(), 32, "sized for the operator");
+        assert_eq!(key_in(&store, "grid"), Some(key.clone()), "the hub gets the same key");
+        swim_key_run(&store, &HUB).await.expect("second run");
+        assert_eq!(
+            key_in(&store, "grid-enroll"),
+            Some(key.clone()),
+            "a rerun keeps the key"
+        );
+        assert_eq!(key_in(&store, "grid"), Some(key), "a rerun keeps the hub copy");
+    }
+
+    #[tokio::test]
+    async fn without_a_site_the_swim_key_stays_in_the_release_namespace() {
+        let store = Store::default();
+        swim_key_run(&store, &[]).await.expect("run");
+        assert!(key_in(&store, "grid-enroll").is_some(), "created");
+        assert_eq!(key_in(&store, "grid"), None, "no hub copy");
+    }
+
+    #[tokio::test]
+    async fn an_existing_swim_key_is_copied_to_the_hub() {
+        let store = Store::default();
+        put_key(&store, "grid-enroll", &[7; 32]);
+        swim_key_run(&store, &HUB).await.expect("run");
+        assert_eq!(key_in(&store, "grid-enroll"), Some(vec![7; 32]), "kept");
+        assert_eq!(key_in(&store, "grid"), Some(vec![7; 32]), "copied");
+    }
+
+    #[tokio::test]
+    async fn a_different_hub_swim_key_is_refused() {
+        let store = Store::default();
+        put_key(&store, "grid-enroll", &[7; 32]);
+        put_key(&store, "grid", &[8; 32]);
+        let error = swim_key_run(&store, &HUB).await.expect_err("conflict");
+        assert!(error.to_string().contains("different SWIM key"), "{error}");
+        assert_eq!(key_in(&store, "grid"), Some(vec![8; 32]), "neither key is replaced");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_sized_swim_key_is_refused() {
+        let store = Store::default();
+        put_key(&store, "grid-enroll", &[7; 16]);
+        let error = swim_key_run(&store, &HUB).await.expect_err("short key");
+        assert!(error.to_string().contains("16 bytes"), "{error}");
+        assert_eq!(key_in(&store, "grid"), None, "a bad key is not copied");
     }
 }
