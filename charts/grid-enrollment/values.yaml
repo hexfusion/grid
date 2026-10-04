@@ -116,7 +116,8 @@ enrollment:
     enabled: true
   # kube (default): SAR via TokenReview + SubjectAccessReview, the in-cluster path
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).
-  # local: the standalone grid-admin-token table, for non-kube deploys.
+  # local: the standalone grid-admin-token table, for non-kube deploys. The table has no
+  # roles, so every token in it may mint and revoke tokens and read and delete enrollments.
   authz: kube                        # kube | local
   # Audience a grid-admin token must be bound to under authz=kube, e.g.
   # kubectl create token <sa> --audience grid-enrollment --duration 10m.

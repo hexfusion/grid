@@ -176,8 +176,8 @@ digest its peers pin. `GridNetwork` `status.identity.notAfter` and
   `enrollments` resource, which both the grid-admin and enrollment-admin Roles grant.
 - Deleting an enrollment needs `delete` on the `enrollments` resource, granted by
   the `enrollment-admin` Role to `enrollment.enrollmentAdmins.subjects` and to no
-  one by default. With `enrollment.authz=local`, every grid-admin in the token
-  table may delete.
+  one by default. With `enrollment.authz=local`, the token table has no roles, so
+  every grid-admin in it may read and delete enrollments as well as mint tokens.
 - An identity that already expired cannot rotate. `GridNetwork` `status.identity`
   reports `IdentityExpired` and the phase turns `Degraded`. Delete the site's
   enrollment, delete its identity Secret, invite it again, and restart the
