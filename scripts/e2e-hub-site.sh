@@ -658,6 +658,9 @@ watch_mtls() {
 # calls the site gateway with the hub's client certificate. Three tries, as above.
 watch_hub_path() {
   local pf="" code try out="$WORK/hubpath"
+  # stop_monitors kills this subshell; take its port-forward with it.
+  trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null; exit 0' TERM
+  trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null' EXIT
   while :; do
     for try in 1 2 3; do
       if [[ -z $pf ]] || ! kill -0 "$pf" 2>/dev/null; then
@@ -764,14 +767,28 @@ start_leaf_watch() {
 # polled <context> <port>: this operator has polled its peer successfully at least once.
 polled() { (($(ok_count "$(poll_counts "$1" "$2" | tr '\n' ' ')") > 0)); }
 
+# poll_baseline <context> <port>: poll counts from a scrape that succeeded and returned
+# lines, retried a few times, so a failed scrape is never read as zero polls.
+poll_baseline() {
+  local out
+  for _ in 1 2 3 4 5; do
+    if out=$(poll_counts "$1" "$2") && [[ -n $out ]]; then
+      tr '\n' ' ' <<<"$out"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 # start_renewal_watch: the poll baseline, once each site has polled its peer, so a peer
 # not yet serving at install is not counted against the rotations.
 start_renewal_watch() {
   renews || return 0
   eventually "hub polled its peer's signals" polled "$HUB_CTX" 19090 || true
   eventually "$SITE polled its peer's signals" polled "$SITE_CTX" 19091 || true
-  POLLS_HUB_START=$(poll_counts "$HUB_CTX" 19090 | tr '\n' ' ')
-  POLLS_SITE_START=$(poll_counts "$SITE_CTX" 19091 | tr '\n' ' ')
+  POLLS_HUB_START=$(poll_baseline "$HUB_CTX" 19090) || fail "hub poll baseline: metrics scrape failed"
+  POLLS_SITE_START=$(poll_baseline "$SITE_CTX" 19091) || fail "$SITE poll baseline: metrics scrape failed"
 }
 
 # at_least_renewed <n>: both sites have n identities beyond their first.
@@ -838,8 +855,8 @@ assert_renewal() {
     [[ $ctx == "$HUB_CTX" ]] || name=$SITE
     eventually "$name gateway Deployment rolled onto its current leaf" gateway_rolled_to "$ctx" "$name" || true
   done
-  end_hub=$(poll_counts "$HUB_CTX" 19090 | tr '\n' ' ')
-  end_site=$(poll_counts "$SITE_CTX" 19091 | tr '\n' ' ')
+  end_hub=$(poll_baseline "$HUB_CTX" 19090) || fail "hub poll counts: metrics scrape failed"
+  end_site=$(poll_baseline "$SITE_CTX" 19091) || fail "$SITE poll counts: metrics scrape failed"
   for name in hub "$SITE"; do
     if [[ $name == hub ]]; then prev=$POLLS_HUB_START cur=$end_hub; else prev=$POLLS_SITE_START cur=$end_site; fi
     if (($(ok_count "$cur") > $(ok_count "$prev") && $(fail_count "$cur") == $(fail_count "$prev"))); then
