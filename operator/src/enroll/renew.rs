@@ -129,6 +129,8 @@ pub(super) struct Held {
     pub(super) pending: Option<(String, Zeroizing<String>)>,
     /// The site Secret's resource version, a write precondition.
     pub(super) version: String,
+    /// The identity has rotated at least once: the Secret holds the leaf it replaced.
+    pub(super) rotated: bool,
 }
 
 /// Where the identity is read and written.
@@ -163,17 +165,18 @@ pub(super) enum GatewayRoll {
 
 /// The site's gateway, which loads its upstream client certificate only at start.
 pub(super) trait GatewayRoller {
-    /// Roll the gateway onto the identity with `fingerprint`; `renewed` when it is new.
-    fn roll(&self, fingerprint: &str, renewed: bool) -> impl Future<Output = Result<GatewayRoll, RenewError>> + Send;
+    /// Roll the gateway onto the identity with `fingerprint`; `owed` when a gateway
+    /// never rolled must roll too.
+    fn roll(&self, fingerprint: &str, owed: bool) -> impl Future<Output = Result<GatewayRoll, RenewError>> + Send;
 }
 
 /// The patch that rolls a gateway whose pods carry `current` onto `fingerprint`, if any.
 ///
-/// Outside a renewal it only catches up a gateway a missed roll left on an older leaf,
-/// never one the operator has not rolled.
-fn roll_patch(current: Option<&str>, fingerprint: &str, renewed: bool) -> Option<serde_json::Value> {
+/// A gateway on an older leaf always rolls. One never rolled rolls only when `owed`,
+/// so a fresh install is left running.
+fn roll_patch(current: Option<&str>, fingerprint: &str, owed: bool) -> Option<serde_json::Value> {
     let behind = current.is_some_and(|current| current != fingerprint);
-    (behind || (renewed && current.is_none())).then(|| {
+    (behind || (owed && current.is_none())).then(|| {
         serde_json::json!({ "spec": { "template": { "metadata": { "annotations": {
             GATEWAY_IDENTITY_ANNOTATION: fingerprint
         } } } } })
@@ -194,7 +197,9 @@ pub(super) async fn roll_gateway<S: IdentityStore + Sync, G: GatewayRoller + Syn
     let held = store.read(target).await?;
     let fingerprint =
         certs::canonical_fingerprint(&held.cert).map_err(|e| RenewError::Material(format!("certificate: {e}")))?;
-    gateway.roll(&fingerprint, renewed).await
+    // A rotated identity is owed a roll even on a recheck, so a first roll that failed
+    // is retried; a fresh install, never rotated, is left running.
+    gateway.roll(&fingerprint, renewed || held.rotated).await
 }
 
 /// Renew the identity in `target` if it is due at `now`.
@@ -325,6 +330,7 @@ impl IdentityStore for KubeIdentity {
             ca: ca.ok_or_else(|| missing("ca.crt"))?.to_string(),
             pending: pending.map(|(csr, key)| (csr.to_string(), key)),
             version,
+            rotated: data.contains_key(PREVIOUS_CERT),
         })
     }
 
@@ -448,7 +454,7 @@ impl KubeGateway {
 
 impl GatewayRoller for KubeGateway {
     #[expect(clippy::large_stack_frames, reason = "a Deployment read, once per renewal")]
-    async fn roll(&self, fingerprint: &str, renewed: bool) -> Result<GatewayRoll, RenewError> {
+    async fn roll(&self, fingerprint: &str, owed: bool) -> Result<GatewayRoll, RenewError> {
         let kube = |e: kube::Error| RenewError::Kube(e.to_string());
         let Some(deployment) = Box::pin(self.api.get_opt(&self.name))
             .await
@@ -462,7 +468,7 @@ impl GatewayRoller for KubeGateway {
             .and_then(|spec| spec.template.metadata)
             .and_then(|meta| meta.annotations)
             .and_then(|mut annotations| annotations.remove(GATEWAY_IDENTITY_ANNOTATION));
-        let Some(patch) = roll_patch(current.as_deref(), fingerprint, renewed) else {
+        let Some(patch) = roll_patch(current.as_deref(), fingerprint, owed) else {
             return Ok(GatewayRoll::Unchanged);
         };
         Box::pin(

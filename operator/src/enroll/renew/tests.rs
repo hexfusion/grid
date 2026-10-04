@@ -36,6 +36,7 @@ impl IdentityStore for Memory {
             ca: get("ca.crt").expect("ca"),
             pending: get(PENDING_CSR).zip(get(PENDING_KEY).map(Zeroizing::new)),
             version: version.to_string(),
+            rotated: data.contains_key(PREVIOUS_CERT),
         })
     }
 
@@ -131,6 +132,8 @@ struct Gateway {
     present: bool,
     annotation: Mutex<Option<String>>,
     patches: Mutex<u32>,
+    /// Fail the next patch, as an API error would.
+    fail_next: Mutex<bool>,
 }
 
 impl Gateway {
@@ -139,18 +142,22 @@ impl Gateway {
             present,
             annotation: Mutex::new(None),
             patches: Mutex::new(0),
+            fail_next: Mutex::new(false),
         }
     }
 }
 
 impl GatewayRoller for Gateway {
-    async fn roll(&self, fingerprint: &str, renewed: bool) -> Result<GatewayRoll, RenewError> {
+    async fn roll(&self, fingerprint: &str, owed: bool) -> Result<GatewayRoll, RenewError> {
         if !self.present {
             return Ok(GatewayRoll::NoGateway);
         }
         let current = self.annotation.lock().expect("lock").clone();
-        if roll_patch(current.as_deref(), fingerprint, renewed).is_none() {
+        if roll_patch(current.as_deref(), fingerprint, owed).is_none() {
             return Ok(GatewayRoll::Unchanged);
+        }
+        if std::mem::take(&mut *self.fail_next.lock().expect("lock")) {
+            return Err(RenewError::Kube("500 patch failed".to_owned()));
         }
         *self.annotation.lock().expect("lock") = Some(fingerprint.to_owned());
         *self.patches.lock().expect("lock") += 1;
@@ -185,6 +192,31 @@ async fn a_site_without_a_gateway_skips_the_roll() {
         .await
         .expect("checked");
     assert_eq!(rolled, GatewayRoll::NoGateway);
+}
+
+#[tokio::test]
+async fn a_failed_first_roll_after_a_rotation_is_retried_on_a_recheck() {
+    let (ca, store, now) = site(Span::days(21));
+    let gateway = Gateway::new(true);
+    let checked = check(&store, &Service::new(&ca), &target(), now).await;
+    assert_eq!(rolls_after(&checked), Some(true), "{checked:?}");
+
+    *gateway.fail_next.lock().expect("lock") = true;
+    let failed = roll_gateway(&store, &gateway, &target(), true).await;
+    assert!(failed.is_err(), "the first patch fails: {failed:?}");
+    assert!(gateway.annotation.lock().expect("lock").is_none(), "nothing patched");
+
+    let retried = roll_gateway(&store, &gateway, &target(), false).await.expect("retried");
+    assert_eq!(
+        retried,
+        GatewayRoll::Rolled,
+        "a rotated identity is owed its roll on a recheck"
+    );
+    let renewed = certs::canonical_fingerprint(&store.get("tls.crt").expect("cert")).expect("fingerprint");
+    assert_eq!(
+        gateway.annotation.lock().expect("lock").as_deref(),
+        Some(renewed.as_str())
+    );
 }
 
 #[tokio::test]
