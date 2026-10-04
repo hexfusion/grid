@@ -126,4 +126,3 @@ tests:
       - notContains:
           path: spec.template.spec.containers[0].env
           content: { name: GRID_ROTATION_ENABLED, value: "true" }
-
