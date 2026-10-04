@@ -120,8 +120,11 @@ certificates last 180 days unless `enrollment.certLifetimeSecs` sets another
 lifetime, and a rotated certificate takes the service's lifetime at the time it
 is issued. When less than a third of the lifetime remains, around day 120, the operator presents the current certificate to
 the enrollment service over mutual TLS and asks for a certificate for a new key.
-It writes the new certificate and key into the same identity Secret, which the
-signals listener, the peer pollers, and the gateway reload without a restart.
+It writes the new certificate and key into the same identity Secret. The signals
+listener and the peer pollers reload it without a restart. The gateway reads its
+client certificate only at start, so the operator rolls the gateway Deployment after
+each rotation, which needs `patch` on that Deployment. The grid-operator chart grants
+it while rotation is on.
 `enrollment.rotation.enabled` in the grid-operator chart turns it on, the default
 whenever an enrollment URL is known.
 
