@@ -215,7 +215,8 @@ async fn a_failed_first_roll_after_a_rotation_is_retried_on_a_recheck() {
     let renewed = certs::canonical_fingerprint(&store.get("tls.crt").expect("cert")).expect("fingerprint");
     assert_eq!(
         gateway.annotation.lock().expect("lock").as_deref(),
-        Some(renewed.as_str())
+        Some(renewed.as_str()),
+        "the retry annotates the gateway with the rotated identity's fingerprint"
     );
 }
 
