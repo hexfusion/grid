@@ -1067,13 +1067,14 @@ pub struct SiteIdentityStatus {
     /// When the certificate expires, RFC 3339.
     pub not_after: String,
     /// When rotation is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
-    /// under pin peer trust, which does not rotate.
+    /// under pin peer trust, or when this site's operator does not rotate.
     pub rotate_after: String,
     /// SHA-256 of the certificate DER, the digest peers pin.
     pub fingerprint: String,
     /// `IdentityExpired` once the certificate has expired, `IdentityUnreadable` when the
     /// Secret holds no usable certificate.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(regex(pattern = "^(IdentityExpired|IdentityUnreadable)$"))]
     pub reason: String,
     /// How to recover.
     #[serde(default, skip_serializing_if = "String::is_empty")]

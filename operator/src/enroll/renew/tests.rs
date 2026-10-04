@@ -204,6 +204,7 @@ async fn a_later_check_catches_up_a_missed_roll() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one assertion per declared trust")]
 fn renewal_follows_the_declared_peer_trust() {
     let network = |trust: Option<&str>| -> GridNetwork {
         let spec = trust.map_or_else(
@@ -218,19 +219,54 @@ fn renewal_follows_the_declared_peer_trust() {
         }))
         .expect("network")
     };
-    assert!(declared_renews(&[]), "no GridNetwork trusts by SPIFFE ID");
-    assert!(declared_renews(&[network(Some("spiffe"))]));
+    let spiffe = GridModes::WITHOUT_NETWORK;
+    let pin_install = GridModes::without_network(None, Some(PeerTrustMode::Pin));
     assert!(
-        !declared_renews(&[network(Some("pin"))]),
+        declared_renews(&[], spiffe),
+        "an install declaring nothing trusts by SPIFFE ID"
+    );
+    assert!(
+        !declared_renews(&[], pin_install),
+        "a pin install does not renew before its GridNetwork"
+    );
+    assert!(
+        declared_renews(&[network(Some("spiffe"))], pin_install),
+        "a declared GridNetwork outranks the install"
+    );
+    assert!(declared_renews(&[network(Some("spiffe"))], spiffe));
+    assert!(
+        !declared_renews(&[network(Some("pin"))], spiffe),
         "a pinned peer refuses a renewed leaf"
     );
-    assert!(!declared_renews(&[network(None)]), "pin is the default");
+    assert!(!declared_renews(&[network(None)], spiffe), "pin is the default");
     assert!(
-        !declared_renews(&[network(Some("spiffe")), network(Some("spiffe"))]),
+        !declared_renews(&[network(Some("spiffe")), network(Some("spiffe"))], spiffe),
         "several GridNetworks fail closed"
     );
     let (mut last, mut failures) = (None, 0);
     assert_eq!(settle(&Ok(Checked::Off), &mut last, &mut failures), CHECK_EVERY);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_declared_trust_change_wakes_the_loop_before_its_next_check() {
+    let (declared, changes) = tokio::sync::watch::channel(PeerTrustMode::Spiffe);
+    let mut changes = Some(changes);
+    let waker = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        declared.send_replace(PeerTrustMode::Pin);
+        declared
+    });
+    let started = tokio::time::Instant::now();
+    pause(CHECK_EVERY, &mut changes).await;
+    assert!(
+        started.elapsed() < CHECK_EVERY,
+        "woke on the change, not the hourly check"
+    );
+    assert!(changes.is_some(), "still listening");
+
+    drop(waker.await.expect("sender"));
+    pause(CHECK_EVERY, &mut changes).await;
+    assert!(changes.is_none(), "a closed channel leaves only the timer");
 }
 
 #[test]

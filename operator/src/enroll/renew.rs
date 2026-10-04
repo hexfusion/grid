@@ -15,7 +15,11 @@ use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 use super::{Enrollment, EnrollmentRequest, ErrorBody, Target, error_chain, pem_roots, read_capped, read_pem};
-use crate::{controller::grid_network::GridModes, crd::grid_network::GridNetwork, metrics};
+use crate::{
+    controller::grid_network::GridModes,
+    crd::grid_network::{GridNetwork, PeerTrustMode},
+    metrics,
+};
 
 /// The renewal route on the enrollment service.
 const RENEW_PATH: &str = "/v1alpha1/rotations";
@@ -481,6 +485,10 @@ pub struct Settings {
     defaults: Target,
     /// The gateway Deployment to roll after a renewal: namespace and name.
     gateway: Option<(String, String)>,
+    /// The modes the install declares, which apply until a `GridNetwork` exists.
+    install: GridModes,
+    /// The declared peer trust, sent by the `GridNetwork` reconcile when it changes.
+    trust_changes: Option<tokio::sync::watch::Receiver<PeerTrustMode>>,
 }
 
 impl Settings {
@@ -505,6 +513,8 @@ impl Settings {
                 ca_secret: config.ca_secret.clone(),
             },
             gateway: None,
+            install: GridModes::WITHOUT_NETWORK,
+            trust_changes: None,
         })
     }
 
@@ -512,6 +522,19 @@ impl Settings {
     #[must_use]
     pub fn with_gateway(mut self, namespace: &str, name: &str) -> Self {
         self.gateway = Some((namespace.to_owned(), name.to_owned()));
+        self
+    }
+
+    /// Follow the install's modes until a `GridNetwork` exists, and check again as soon
+    /// as the declared peer trust changes.
+    #[must_use]
+    pub fn with_declared_trust(
+        mut self,
+        install: GridModes,
+        trust_changes: tokio::sync::watch::Receiver<PeerTrustMode>,
+    ) -> Self {
+        self.install = install;
+        self.trust_changes = Some(trust_changes);
         self
     }
 
@@ -549,7 +572,7 @@ fn renewal_url(url: Option<&str>) -> Result<&str, String> {
     clippy::infinite_loop,
     reason = "a background renewer runs for the life of the process"
 )]
-pub async fn run(client: Client, settings: Settings) {
+pub async fn run(client: Client, mut settings: Settings) {
     let namespace = client.default_namespace().to_owned();
     let store = KubeIdentity(Api::namespaced(client.clone(), &namespace));
     let renewer = HttpsRenewer::new(&settings.url, settings.pin.clone());
@@ -565,7 +588,7 @@ pub async fn run(client: Client, settings: Settings) {
         ))
         .await;
         let checked = match &target {
-            Ok(target) => Box::pin(check_declared(&client, &store, &renewer, target)).await,
+            Ok(target) => Box::pin(check_declared(&client, &store, &renewer, target, settings.install)).await,
             Err(e) => Err(RenewError::Kube(e.to_string())),
         };
         if let (Some(renewed), Ok(target), Some(gateway)) = (rolls_after(&checked), &target, &gateway) {
@@ -576,7 +599,23 @@ pub async fn run(client: Client, settings: Settings) {
             );
         }
         let wait = settle(&checked, &mut last, &mut failures);
-        tokio::time::sleep(jittered(wait)).await;
+        pause(jittered(wait), &mut settings.trust_changes).await;
+    }
+}
+
+/// Sleep for `wait`, or until the declared peer trust changes.
+async fn pause(wait: Duration, trust_changes: &mut Option<tokio::sync::watch::Receiver<PeerTrustMode>>) {
+    let Some(changes) = trust_changes.as_mut() else {
+        return tokio::time::sleep(wait).await;
+    };
+    tokio::select! {
+        () = tokio::time::sleep(wait) => {},
+        result = changes.changed() => {
+            // A closed channel never changes again, so only the timer is left.
+            if result.is_err() {
+                *trust_changes = None;
+            }
+        },
     }
 }
 
@@ -586,22 +625,23 @@ async fn check_declared<S: IdentityStore + Sync, R: Renewer + Sync>(
     store: &S,
     renewer: &R,
     target: &Target,
+    install: GridModes,
 ) -> Result<Checked, RenewError> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let declared = Box::pin(networks.list(&ListParams::default()))
         .await
         .map_err(|e| RenewError::Kube(e.to_string()))?;
-    if !declared_renews(&declared.items) {
+    if !declared_renews(&declared.items, install) {
         return Ok(Checked::Off);
     }
     Box::pin(check(store, renewer, target, OffsetDateTime::now_utc())).await
 }
 
-/// Whether the declared grid lets this site renew. Without a `GridNetwork`, peers
-/// trust by SPIFFE ID.
-fn declared_renews(networks: &[GridNetwork]) -> bool {
+/// Whether the declared grid lets this site renew. Without a `GridNetwork`, the
+/// install's modes apply.
+fn declared_renews(networks: &[GridNetwork], install: GridModes) -> bool {
     match networks {
-        [] => true,
+        [] => install.renews(),
         [network] => GridModes::of(network).renews(),
         // One operator serves one grid: with several declared, renew under none of them.
         _ => false,

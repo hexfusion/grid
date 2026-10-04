@@ -126,6 +126,21 @@ pub struct OperatorCtx {
 
     /// Whether membership-derived writes may run, cleared while SWIM converges.
     membership_ready: std::sync::atomic::AtomicBool,
+
+    /// Where the declared peer trust goes, so site identity rotation follows it.
+    declared_trust: Option<tokio::sync::watch::Sender<PeerTrustMode>>,
+
+    /// Whether this process runs the site identity rotation loop.
+    rotation: bool,
+}
+
+/// Send `declared` to `sender`, returning whether it changed, so a repeat wakes nobody.
+fn send_declared_trust(sender: &tokio::sync::watch::Sender<PeerTrustMode>, declared: PeerTrustMode) -> bool {
+    sender.send_if_modified(|trust| {
+        let changed = *trust != declared;
+        *trust = declared;
+        changed
+    })
 }
 
 /// Grid-wide modes, fixed for the life of the process.
@@ -233,6 +248,29 @@ impl OperatorCtx {
             serving_writes: WriteGate::default(),
             peer_settings: PeerSettings::default(),
             membership_ready: std::sync::atomic::AtomicBool::new(true),
+            declared_trust: None,
+            rotation: false,
+        }
+    }
+
+    /// Report a rotation schedule only when this process runs the rotation loop.
+    #[must_use]
+    pub const fn with_rotation(mut self, rotation: bool) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// Send the declared peer trust here whenever a `GridNetwork` changes it.
+    #[must_use]
+    pub fn with_declared_trust(mut self, declared_trust: tokio::sync::watch::Sender<PeerTrustMode>) -> Self {
+        self.declared_trust = Some(declared_trust);
+        self
+    }
+
+    /// Publish the trust `network` declares, waking its watchers only on a change.
+    fn publish_declared_trust(&self, network: &GridNetwork) {
+        if let Some(sender) = &self.declared_trust {
+            send_declared_trust(sender, GridModes::of(network).trust);
         }
     }
 
@@ -713,6 +751,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         #[expect(clippy::exit, reason = "modes apply only at startup; Kubernetes restarts the pod")]
         std::process::exit(0);
     }
+    ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
     ensure_tls_secrets(&network, client).await?;
@@ -900,7 +939,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &network,
         client,
         time::OffsetDateTime::now_utc(),
-        GridModes::of(&network).renews(),
+        ctx.rotation && GridModes::of(&network).renews(),
     )
     .await;
     // An expired or unreadable identity degrades the network.
@@ -4533,6 +4572,16 @@ mod tests {
     }
 
     /// The inconsistency warning fires on the transition, not on every reconcile.
+    #[test]
+    fn a_declared_trust_wakes_watchers_only_when_it_changes() {
+        let (sender, mut changes) = tokio::sync::watch::channel(PeerTrustMode::Spiffe);
+        assert!(!send_declared_trust(&sender, PeerTrustMode::Spiffe), "unchanged");
+        assert!(!changes.has_changed().unwrap_or(true), "nobody woken");
+        assert!(send_declared_trust(&sender, PeerTrustMode::Pin), "pin declared");
+        assert!(changes.has_changed().unwrap_or(false), "the rotation loop wakes");
+        assert_eq!(*changes.borrow_and_update(), PeerTrustMode::Pin);
+    }
+
     #[test]
     fn an_inconsistent_grid_is_warned_once() {
         // Names no other test uses: the set is process-wide.

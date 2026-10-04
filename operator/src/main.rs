@@ -138,10 +138,16 @@ async fn main() {
         },
     };
     // The loop follows the declared peer trust, which may change after startup.
+    let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
+    let mut rotation_running = false;
     if config.enrollment.renew {
         match operator::enroll::renew::Settings::from_config(&config.enrollment) {
             Ok(settings) => {
-                let settings = settings.with_gateway(&config.gateway.namespace, &config.gateway.service_name);
+                rotation_running = true;
+                let install = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
+                let settings = settings
+                    .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
+                    .with_declared_trust(install, trust_changes);
                 drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
             },
             Err(error) => tracing::error!(%error, "site identity rotation is off: misconfigured"),
@@ -156,6 +162,8 @@ async fn main() {
     let ctx = Arc::new(
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)
+            .with_declared_trust(declared_trust)
+            .with_rotation(rotation_running)
             .hold_membership(),
     );
 
