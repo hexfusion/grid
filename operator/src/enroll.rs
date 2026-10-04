@@ -41,8 +41,7 @@ const MANAGED_BY: &str = "grid-operator";
 const SITE_LABEL: &str = "grid.praxis.fast/site";
 
 /// Recovery hint for a spent token.
-const SPENT: &str = "A spent token holds the site name until the hub releases it, which is not yet supported. \
-                     Reinstall the hub or enroll under a new site name.";
+const SPENT: &str = "Delete the site's enrollment on the hub, then mint a new invite.";
 
 /// Auto-enroll configuration.
 #[derive(Args, Debug, Clone)]
