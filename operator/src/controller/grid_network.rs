@@ -2627,7 +2627,7 @@ async fn site_identity_status(
 fn unreadable_identity(detail: &str) -> SiteIdentityStatus {
     SiteIdentityStatus {
         not_after: String::new(),
-        renew_after: String::new(),
+        rotate_after: String::new(),
         fingerprint: String::new(),
         reason: IDENTITY_UNREADABLE.to_owned(),
         message: format!("the site identity cannot be read ({detail}); restore the identity Secret or re-enroll"),
@@ -2643,7 +2643,7 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
     let expired = now >= not_after;
     Some(SiteIdentityStatus {
         not_after: not_after.format(&Rfc3339).ok()?,
-        renew_after: if renews {
+        rotate_after: if renews {
             renew_after.format(&Rfc3339).ok()?
         } else {
             String::new()
@@ -2661,7 +2661,7 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
         } else if renews {
             String::new()
         } else {
-            "renewal is off under pin peer trust: re-enroll and re-pin this site before notAfter".to_owned()
+            "rotation is off under pin peer trust: re-enroll and re-pin this site before notAfter".to_owned()
         },
     })
 }
@@ -4563,7 +4563,7 @@ mod tests {
         let (not_before, not_after) = certs::cert_validity(&leaf.cert_pem).expect("validity");
         let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
         assert_eq!(
-            current.renew_after,
+            current.rotate_after,
             renew_after
                 .format(&time::format_description::well_known::Rfc3339)
                 .expect("format")
@@ -4578,7 +4578,7 @@ mod tests {
         assert!(expired.message.contains("re-enrolls"), "names the recovery");
 
         let pinned = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), false).expect("status");
-        assert!(pinned.renew_after.is_empty(), "pin trust schedules no renewal");
+        assert!(pinned.rotate_after.is_empty(), "pin trust schedules no renewal");
         assert!(pinned.reason.is_empty(), "a current pinned identity is not degraded");
         assert!(pinned.message.contains("re-pin"), "names the manual step");
     }

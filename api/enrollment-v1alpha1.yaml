@@ -126,7 +126,7 @@ paths:
       tags: [administration]
       summary: Read a site's enrollment
       description: |
-        The enrollment record that holds a site name, to diagnose a renewal
+        The enrollment record that holds a site name, to diagnose a rotation
         refusal or a freeze. Key digests only, never key material.
       security:
         - gridAdminAuth: []
@@ -160,9 +160,9 @@ paths:
       summary: Delete a site's enrollment
       description: |
         Deletes the enrollment record that holds a site name. The site can no
-        longer renew, its current certificate stays valid until it expires, and
+        longer rotate, its current certificate stays valid until it expires, and
         the name is released so the site can enroll again with a new token. This
-        is also how a site frozen after a renewal fork recovers. A reserved
+        is also how a site frozen after a rotation fork recovers. A reserved
         name's record comes from the enrollment bootstrap and is refused here.
       security:
         - gridAdminAuth: []
@@ -193,18 +193,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
-  /renewals:
+  /rotations:
     post:
-      operationId: renew
+      operationId: rotate
       tags: [enrollment]
-      summary: Renew a site identity with its current certificate
+      summary: Rotate a site identity with its current certificate
       description: |
         The site authenticates over mutual TLS with its current, unexpired grid
         certificate and submits a signing request for a new key. Returns a new
         certificate for the name the presented certificate carries. No token is
         involved. A name with no enrollment record, a key that is not the site's
         current one, or a request that reuses a held key is refused. A grid
-        with renewals turned off refuses every renewal with 503.
+        with rotations turned off refuses every rotation with 503.
       security:
         - siteCertificateAuth: []
       requestBody:
@@ -215,7 +215,7 @@ paths:
               $ref: '#/components/schemas/EnrollmentRequest'
       responses:
         '200':
-          description: The renewed certificate and the grid CA.
+          description: The rotated certificate and the grid CA.
           content:
             application/json:
               schema:
@@ -235,7 +235,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          description: Renewal is turned off for this grid (renewals_disabled). Issued certificates stay valid until they expire.
+          description: Rotation is turned off for this grid (rotation_disabled). Issued certificates stay valid until they expire.
           headers:
             Retry-After:
               description: Seconds to wait before retrying.
@@ -404,28 +404,28 @@ components:
           type: string
           enum: [active, frozen]
           description: |
-            frozen after a renewal fork. A frozen site cannot renew until a
+            frozen after a rotation fork. A frozen site cannot rotate until a
             grid-admin deletes its enrollment and it enrolls again.
         publicKeySha256:
           type: string
           description: Lowercase hex SHA-256 of the key the latest issued certificate carries.
         previousPublicKeySha256:
           type: [string, 'null']
-          description: The key that one replaced, which may only retry a lost renewal.
+          description: The key that one replaced, which may only retry a lost rotation.
         incarnationStartedAt:
           type: string
           format: date-time
           description: When this record began, at enrollment or a bootstrap seed reset.
-        renewedAt:
+        rotatedAt:
           type: [string, 'null']
           format: date-time
-          description: When the record last took a new key, by renewal or a bootstrap seed. Null if it never has.
+          description: When the record last took a new key, by rotation or a bootstrap seed. Null if it never has.
         notAfter:
           type: [string, 'null']
           format: date-time
           description: |
             When the latest certificate this service issued expires. Null for a
-            reserved name's bootstrap certificate until its first renewal.
+            reserved name's bootstrap certificate until its first rotation.
         reserved:
           type: boolean
           description: A name bootstrap issues, such as the hub's.
@@ -445,7 +445,7 @@ components:
         | missing_grid_network | 400 | The token request names no grid. |
         | unauthorized | 401 | No grid-admin credential, or one not accepted. |
         | invalid_token | 401 | The site token is unknown, spent, or expired. |
-        | identity_required | 401 | Renewal needs the site's current grid certificate. |
+        | identity_required | 401 | Rotation needs the site's current grid certificate. |
         | forbidden | 403 | The grid-admin may not perform the action. |
         | identity_refused | 403 | The record does not admit this certificate, or the site is frozen. |
         | not_found | 404 | No such token or enrollment. |
@@ -453,7 +453,7 @@ components:
         | name_taken | 409 | Another enrollment holds the site name. |
         | reserved_site | 409 | The name is the enrollment bootstrap's. |
         | internal | 500 | The service could not complete the request. |
-        | renewals_disabled | 503 | Renewal is turned off for the grid. Issued certificates stay valid. |
+        | rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
       required: [error, message]
       properties:
         error:
@@ -474,7 +474,7 @@ components:
             - name_taken
             - reserved_site
             - internal
-            - renewals_disabled
+            - rotation_disabled
         message:
           type: string
           description: What went wrong, and what would fix it.

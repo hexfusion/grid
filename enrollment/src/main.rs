@@ -42,7 +42,7 @@ const GRID_ADMIN_TOKENS: &str = "ENROLLMENT_GRID_ADMIN_TOKENS";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
 /// Set to `false` to refuse every renewal.
-const RENEWALS_ENABLED: &str = "ENROLLMENT_RENEWALS_ENABLED";
+const RENEWALS_ENABLED: &str = "ENROLLMENT_ROTATION_ENABLED";
 /// Comma-separated site names issued outside enrollment, refused at mint and redeem.
 const RESERVED_SITES: &str = "ENROLLMENT_RESERVED_SITES";
 /// Directory of reserved-name seeds bootstrap signed with the CA key.
@@ -414,7 +414,7 @@ fn load_renewals_enabled() -> Result<bool, String> {
         Ok(other) => return Err(format!("{RENEWALS_ENABLED} must be true or false, not {other:?}")),
     };
     if !enabled {
-        tracing::info!("renewals disabled: every renewal is refused; issued identities stay valid until they expire");
+        tracing::info!("rotation disabled: every rotation is refused; issued identities stay valid until they expire");
     }
     Ok(enabled)
 }

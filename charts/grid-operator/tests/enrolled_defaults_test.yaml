@@ -78,7 +78,7 @@ tests:
       - failedTemplate:
           errorPattern: must not get operator Secret access
 
-  - it: an enrolled site renews its identity by default
+  - it: an enrolled site rotates its identity by default
     template: templates/deployment.yaml
     set:
       swim.siteName: east
@@ -86,9 +86,9 @@ tests:
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
-          content: { name: GRID_RENEW_ENABLED, value: "true" }
+          content: { name: GRID_ROTATION_ENABLED, value: "true" }
 
-  - it: a hub whose identity bootstrap issued renews with only the enrollment URL
+  - it: a hub whose identity bootstrap issued rotates with only the enrollment URL
     template: templates/deployment.yaml
     set:
       swim.siteName: hub
@@ -96,7 +96,7 @@ tests:
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
-          content: { name: GRID_RENEW_ENABLED, value: "true" }
+          content: { name: GRID_ROTATION_ENABLED, value: "true" }
       - contains:
           path: spec.template.spec.containers[0].env
           content: { name: GRID_ENROLL_URL, value: "https://grid-enrollment.grid-enrollment.svc:8443" }
@@ -107,23 +107,23 @@ tests:
           path: spec.template.spec.containers[0].env
           content: { name: GRID_ENROLL_ENABLED, value: "true" }
 
-  - it: renewal can be turned off
+  - it: rotation can be turned off
     template: templates/deployment.yaml
     set:
       swim.siteName: east
       enrollment.enabled: true
-      enrollment.renewal.enabled: false
+      enrollment.rotation.enabled: false
     asserts:
       - notContains:
           path: spec.template.spec.containers[0].env
-          content: { name: GRID_RENEW_ENABLED, value: "true" }
+          content: { name: GRID_ROTATION_ENABLED, value: "true" }
 
-  - it: without an enrollment URL nothing renews
+  - it: without an enrollment URL nothing rotates
     template: templates/deployment.yaml
     set:
       swim.siteName: east
     asserts:
       - notContains:
           path: spec.template.spec.containers[0].env
-          content: { name: GRID_RENEW_ENABLED, value: "true" }
+          content: { name: GRID_ROTATION_ENABLED, value: "true" }
 

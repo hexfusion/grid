@@ -743,7 +743,7 @@ spec:
                   description: The negotiated grid ID.
                   type: string
                 identity:
-                  description: 'This site''s identity certificate: when it expires and when renewal is due.'
+                  description: 'This site''s identity certificate: when it expires and when rotation is due.'
                   nullable: true
                   properties:
                     fingerprint:
@@ -760,15 +760,15 @@ spec:
                         `IdentityExpired` once the certificate has expired, `IdentityUnreadable` when the
                         Secret holds no usable certificate.
                       type: string
-                    renewAfter:
+                    rotateAfter:
                       description: |-
-                        When renewal is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
-                        under pin peer trust, which does not renew.
+                        When rotation is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
+                        under pin peer trust, which does not rotate.
                       type: string
                   required:
                     - fingerprint
                     - notAfter
-                    - renewAfter
+                    - rotateAfter
                   type: object
                 observedGeneration:
                   default: 0

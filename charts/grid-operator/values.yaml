@@ -243,11 +243,11 @@ enrollment:
   identitySecretName: grid-site-identity
   # -- Secret the grid CA is written to when no GridNetwork names one.
   caSecretName: grid-ca
-  renewal:
-    # -- Renew the site identity before it expires, presenting the current one. Needs an
+  rotation:
+    # -- Rotate the site identity before it expires, presenting the current one. Needs an
     # enrollment URL: the default with enabled, or url set, as on a hub whose identity
     # bootstrap issued. Without caBundle the grid CA in caSecretName pins the service.
-    # Off under pin peer trust whatever this says: a pinned peer refuses a renewed leaf.
+    # Off under pin peer trust whatever this says: a pinned peer refuses a rotated leaf.
     enabled: true
   # -- Secret holding the one-time site token.
   tokenSecretRef:

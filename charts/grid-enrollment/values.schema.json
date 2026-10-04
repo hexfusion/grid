@@ -279,7 +279,7 @@
         "replicaCount": {
           "type": "integer"
         },
-        "renewal": {
+        "rotation": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -555,7 +555,7 @@
           "type": "string"
         },
         "seedSecretName": {
-          "description": "Secret for the CA-signed seed that registers the hub's key so it can renew.",
+          "description": "Secret for the CA-signed seed that registers the hub's key so it can rotate.",
           "type": "string",
           "minLength": 1
         }

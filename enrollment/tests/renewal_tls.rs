@@ -73,7 +73,7 @@ fn client(served: &Served, identity: Option<(&str, &str)>) -> reqwest::Client {
 async fn renew(served: &Served, client: &reqwest::Client) -> Result<(StatusCode, Value), reqwest::Error> {
     let csr = certs::generate_csr("hub").expect("csr");
     let response = client
-        .post(format!("https://localhost:{}/v1alpha1/renewals", served.addr.port()))
+        .post(format!("https://localhost:{}/v1alpha1/rotations", served.addr.port()))
         .json(&json!({ "csr": csr.csr_pem }))
         .send()
         .await?;

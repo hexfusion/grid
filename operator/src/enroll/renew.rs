@@ -18,7 +18,7 @@ use super::{Enrollment, EnrollmentRequest, ErrorBody, Target, error_chain, pem_r
 use crate::{controller::grid_network::GridModes, crd::grid_network::GridNetwork, metrics};
 
 /// The renewal route on the enrollment service.
-const RENEW_PATH: &str = "/v1alpha1/renewals";
+const RENEW_PATH: &str = "/v1alpha1/rotations";
 
 /// Longest wait between checks, so an identity replaced out of band is still watched.
 const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -30,9 +30,9 @@ const RETRY_INITIAL: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// Secret keys holding a renewal in flight, so a restart retries with the same key.
-const PENDING_KEY: &str = "renew.key";
+const PENDING_KEY: &str = "rotate.key";
 /// The CSR for [`PENDING_KEY`].
-const PENDING_CSR: &str = "renew.csr";
+const PENDING_CSR: &str = "rotate.csr";
 
 /// Pod template annotation naming the identity the gateway pods loaded.
 pub const GATEWAY_IDENTITY_ANNOTATION: &str = "grid.praxis.fast/site-identity-fingerprint";
@@ -80,13 +80,13 @@ pub(super) enum RenewError {
     #[error("enrollment service unavailable: {0}")]
     Transport(String),
     /// The service did not accept the presented certificate.
-    #[error("renewal unauthenticated ({0}); re-enroll this site with a new site token")]
+    #[error("rotation unauthenticated ({0}); re-enroll this site with a new site token")]
     Unauthenticated(String),
     /// The service refused this identity.
-    #[error("renewal refused ({0}); re-enroll this site with a new site token")]
+    #[error("rotation refused ({0}); re-enroll this site with a new site token")]
     Refused(String),
     /// The service answered with a certificate this site cannot use.
-    #[error("renewal response invalid: {0}")]
+    #[error("rotation response invalid: {0}")]
     Invalid(String),
 }
 
@@ -366,7 +366,7 @@ impl HttpsRenewer {
 
     /// A client presenting `held` and trusting only the pin.
     fn client(&self, held: &Held) -> Result<reqwest::Client, RenewError> {
-        let roots = pem_roots(self.pin.as_deref().unwrap_or(&held.ca), "renewal trust")
+        let roots = pem_roots(self.pin.as_deref().unwrap_or(&held.ca), "rotation trust")
             .map_err(|e| RenewError::Material(e.to_string()))?;
         let identity = client_identity(&held.cert, &held.key)
             .map_err(|e| RenewError::Material(format!("client identity: {}", error_chain(&e))))?;
@@ -378,7 +378,7 @@ impl HttpsRenewer {
             .tls_certs_only(roots)
             .identity(identity)
             .build()
-            .map_err(|e| RenewError::Material(format!("renewal client: {e}")))
+            .map_err(|e| RenewError::Material(format!("rotation client: {e}")))
     }
 }
 
@@ -528,7 +528,7 @@ fn renewal_url(url: Option<&str>) -> Result<&str, String> {
     let url = url
         .map(str::trim)
         .filter(|url| url.starts_with("https://"))
-        .ok_or("GRID_ENROLL_URL must be an https URL to renew")?;
+        .ok_or("GRID_ENROLL_URL must be an https URL to rotate")?;
     // Any site leaf names a host under the grid domain, so one could stand in for the service.
     let host = reqwest::Url::parse(url)
         .map_err(|e| format!("GRID_ENROLL_URL: {e}"))?
@@ -623,23 +623,23 @@ const fn rolls_after(checked: &Result<Checked, RenewError>) -> Option<bool> {
 fn log_roll(rolled: Result<GatewayRoll, RenewError>, gateway: &KubeGateway, renewed: bool) {
     let deployment = gateway.name.as_str();
     match rolled {
-        Ok(GatewayRoll::Rolled) => tracing::info!(deployment, "rolled the gateway onto the renewed site identity"),
-        Ok(GatewayRoll::Unchanged) => tracing::debug!(deployment, "gateway already runs the renewed site identity"),
+        Ok(GatewayRoll::Rolled) => tracing::info!(deployment, "rolled the gateway onto the rotated site identity"),
+        Ok(GatewayRoll::Unchanged) => tracing::debug!(deployment, "gateway already runs the rotated site identity"),
         // Only a renewal's roll reports a missing gateway, once; a recheck has nothing to report.
         Ok(GatewayRoll::NoGateway)
             if renewed && !gateway.missing_logged.swap(true, std::sync::atomic::Ordering::Relaxed) =>
         {
             tracing::info!(
                 deployment,
-                "no gateway Deployment to roll onto the renewed site identity"
+                "no gateway Deployment to roll onto the rotated site identity"
             );
         },
         Ok(GatewayRoll::NoGateway) => tracing::debug!(deployment, "no gateway Deployment to roll"),
         Err(error) if renewed => {
-            tracing::warn!(deployment, %error, "rolling the gateway onto the renewed site identity failed; retrying");
+            tracing::warn!(deployment, %error, "rolling the gateway onto the rotated site identity failed; retrying");
         },
         Err(error) => {
-            tracing::debug!(deployment, %error, "rolling the gateway onto the renewed site identity failed again");
+            tracing::debug!(deployment, %error, "rolling the gateway onto the rotated site identity failed again");
         },
     }
 }
@@ -652,7 +652,7 @@ fn settle(checked: &Result<Checked, RenewError>, last: &mut Option<String>, fail
             until(*at, OffsetDateTime::now_utc()).min(CHECK_EVERY),
         ),
         // Re-read soon, so the next renewal is scheduled from the new leaf.
-        Ok(Checked::Renewed(_)) => ("renewed".to_owned(), RETRY_INITIAL),
+        Ok(Checked::Renewed(_)) => ("rotated".to_owned(), RETRY_INITIAL),
         Ok(Checked::Expired(_)) => ("expired".to_owned(), CHECK_EVERY),
         Ok(Checked::Off) => ("off".to_owned(), CHECK_EVERY),
         Err(error) => (error.to_string(), retry_delay(failures.saturating_add(1))),
@@ -672,27 +672,27 @@ fn settle(checked: &Result<Checked, RenewError>, last: &mut Option<String>, fail
 fn report(checked: &Result<Checked, RenewError>, changed: bool, wait: Duration) {
     match checked {
         Ok(Checked::Renewed(until)) => {
-            metrics::record_site_identity_renewal("renewed");
-            tracing::info!(not_after = %until, "site identity renewed");
+            metrics::record_site_identity_renewal("rotated");
+            tracing::info!(not_after = %until, "site identity rotated");
         },
-        Ok(Checked::Waiting(at)) if changed => tracing::info!(renew_after = %at, "site identity renewal scheduled"),
+        Ok(Checked::Waiting(at)) if changed => tracing::info!(renew_after = %at, "site identity rotation scheduled"),
         Ok(Checked::Off) if changed => {
-            tracing::info!("renewal disabled: peerTrust pin needs re-enrollment and re-pinning at expiry");
+            tracing::info!("rotation disabled: peerTrust pin needs re-enrollment and re-pinning at expiry");
         },
         Ok(Checked::Expired(at)) if changed => {
             metrics::record_site_identity_renewal("expired");
             tracing::error!(
                 not_after = %at,
-                "site identity expired and cannot renew; re-enroll this site with a new site token"
+                "site identity expired and cannot rotate; re-enroll this site with a new site token"
             );
         },
         Err(error) if changed => {
             metrics::record_site_identity_renewal(error.result());
-            tracing::warn!(%error, retry_in_s = wait.as_secs(), "site identity renewal failed");
+            tracing::warn!(%error, retry_in_s = wait.as_secs(), "site identity rotation failed");
         },
         Err(error) => {
             metrics::record_site_identity_renewal(error.result());
-            tracing::debug!(%error, retry_in_s = wait.as_secs(), "site identity renewal failed again");
+            tracing::debug!(%error, retry_in_s = wait.as_secs(), "site identity rotation failed again");
         },
         Ok(_) => {},
     }

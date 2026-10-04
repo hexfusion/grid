@@ -94,7 +94,7 @@ pub struct Config {
     pub ca_secret: String,
 
     /// Renew the site identity through the enrollment service before it expires.
-    #[arg(long = "renew", env = "GRID_RENEW_ENABLED")]
+    #[arg(long = "rotate", env = "GRID_ROTATION_ENABLED")]
     pub renew: bool,
 }
 

@@ -36,7 +36,7 @@ pub enum StoreError {
     TokenInvalid,
 
     /// The enrollment record does not admit this renewal.
-    #[error("renewal refused: {0}")]
+    #[error("rotation refused: {0}")]
     Refused(#[from] Refusal),
 
     /// The backend itself failed, or issuing the certificate did.

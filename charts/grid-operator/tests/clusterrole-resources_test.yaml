@@ -10,7 +10,7 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             verbs: ["get", "create", "patch"]
-  - it: lets renewal roll only the gateway Deployment
+  - it: lets rotation roll only the gateway Deployment
     set:
       enrollment.enabled: true
     asserts:
@@ -21,10 +21,10 @@ tests:
             resources: ["deployments"]
             resourceNames: ["grid-gateway"]
             verbs: ["get", "patch"]
-  - it: grants no Deployment access without renewal
+  - it: grants no Deployment access without rotation
     set:
       enrollment.enabled: true
-      enrollment.renewal.enabled: false
+      enrollment.rotation.enabled: false
     asserts:
       - notContains:
           path: rules

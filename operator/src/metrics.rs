@@ -81,10 +81,10 @@ static SITE_IDENTITY_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {
     .unwrap_or_else(|_| std::process::abort())
 });
 
-/// Site identity renewal attempts, by result.
+/// Site identity rotation attempts, by result.
 static SITE_IDENTITY_RENEWALS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("grid_site_identity_renewals_total", "Site identity renewal attempts"),
+        Opts::new("grid_site_identity_rotations_total", "Site identity rotation attempts"),
         &["result"],
     )
     .unwrap_or_else(|_| std::process::abort())

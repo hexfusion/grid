@@ -20,7 +20,7 @@
 #   KEEP=1              keep clusters this run created
 #   ARTIFACTS           log directory (default /tmp/grid-hub-site-e2e)
 #   TIMEOUT             seconds to wait for each converging condition (default 180)
-#   RENEWAL_LIFETIME    site certificate lifetime in seconds for the spiffe leg, which
+#   ROTATION_LIFETIME    site certificate lifetime in seconds for the spiffe leg, which
 #                       then polls signals and asserts renewal, a fork, and re-enrollment
 #   NET_PREFIX          command prefix for calls to LoadBalancer addresses, e.g. under
 #                       rootless podman: podman unshare --rootless-netns
@@ -179,14 +179,14 @@ helm_on() {
 }
 
 # renews: this leg asserts renewal, which only spiffe trust does.
-renews() { [[ $MODE == spiffe && -n ${RENEWAL_LIFETIME:-} ]]; }
+renews() { [[ $MODE == spiffe && -n ${ROTATION_LIFETIME:-} ]]; }
 
 # renewal_args <chart>: a short lifetime, signals polling, and a grid-admin for this leg.
 renewal_args() {
   RA=()
   renews || return 0
   case $1 in
-    grid-enrollment) RA=(--set "enrollment.certLifetimeSecs=$RENEWAL_LIFETIME"
+    grid-enrollment) RA=(--set "enrollment.certLifetimeSecs=$ROTATION_LIFETIME"
       --set enrollment.gridAdmins.serviceAccount.create=true
       --set "enrollment.enrollmentAdmins.subjects[0].kind=ServiceAccount"
       --set "enrollment.enrollmentAdmins.subjects[0].name=grid-admin"
@@ -596,7 +596,7 @@ assert_health() {
 }
 
 # ---------------------------------------------------------------------------
-# Identity renewal
+# Certificate rotation
 # ---------------------------------------------------------------------------
 
 # leaf_of <context> <dir>: the identity's certificate and key, and its notBefore in epoch seconds.
@@ -722,10 +722,10 @@ poll_counts() {
   return "$rc"
 }
 
-# renewals_logged <context>: INFO "site identity renewed" lines across this operator's pods.
+# renewals_logged <context>: INFO "site identity rotated" lines across this operator's pods.
 renewals_logged() {
   k "$1" logs deployment/grid-operator --all-containers 2>/dev/null | strip_ansi \
-    | grep -c ' INFO .*site identity renewed' || true
+    | grep -c ' INFO .*site identity rotated' || true
 }
 
 # enroll_api <out> <method> <path> [curl args...]: a call to the enrollment service.
@@ -742,7 +742,7 @@ renew_with() {
   local out=$1 key="$WORK/fork.key"
   openssl ecparam -name prime256v1 -genkey -noout -out "$key" 2>/dev/null
   openssl req -new -key "$key" -subj "/CN=$SITE" -out "$WORK/fork.csr" 2>/dev/null
-  jq -n --rawfile csr "$WORK/fork.csr" '{csr: $csr}' | enroll_api "$out" POST /renewals -d @- --cert "$2" --key "$3"
+  jq -n --rawfile csr "$WORK/fork.csr" '{csr: $csr}' | enroll_api "$out" POST /rotations -d @- --cert "$2" --key "$3"
 }
 
 admin_token() {
@@ -798,7 +798,7 @@ assert_renewal() {
   watch_hub_path &
   HUBPATH_PID=$!
   # A renewal is due at two thirds of the lifetime plus the 5 minute backdate; allow three.
-  deadline=$((SECONDS + 3 * (RENEWAL_LIFETIME + 300) * 2 / 3 + 120))
+  deadline=$((SECONDS + 3 * (ROTATION_LIFETIME + 300) * 2 / 3 + 120))
   until at_least_renewed 2; do
     if ((SECONDS >= deadline)); then
       fail "hub and $SITE each renewed twice (hub $(generations hub), $SITE $(generations "$SITE") generations)"
@@ -851,7 +851,7 @@ assert_renewal() {
   # A replaced leaf asking for a new key is a fork: refused, and the site freezes.
   g=$(($(generations "$SITE") - 2))
   until openssl x509 -in "$WORK/leaves/$SITE/g$g/tls.crt" -noout -checkend 30 >/dev/null; do
-    if ((SECONDS >= deadline + RENEWAL_LIFETIME)); then
+    if ((SECONDS >= deadline + ROTATION_LIFETIME)); then
       fail "no replaced $SITE leaf still valid for the fork check"
       stop_monitors
       return
@@ -898,7 +898,7 @@ assert_renewal() {
   watch_leaves &
   WATCH_PID=$!
   eventually "$SITE re-enrolled with a new invite after the delete" enrolled "$SITE_CTX" || { stop_monitors; return; }
-  deadline=$((SECONDS + (RENEWAL_LIFETIME + 300) * 2 / 3 + 180))
+  deadline=$((SECONDS + (ROTATION_LIFETIME + 300) * 2 / 3 + 180))
   until (($(generations "$SITE") > 1)); do
     if ((SECONDS >= deadline)); then
       fail "re-enrolled $SITE renewed (generations $(generations "$SITE"))"
@@ -918,15 +918,15 @@ assert_pin_no_renewal() {
   for ctx in "$HUB_CTX" "$SITE_CTX"; do
     # Captured first: grep -q exits at its match, and pipefail would report the writer's SIGPIPE.
     logs=$(k "$ctx" logs deployment/grid-operator --all-containers | strip_ansi)
-    if grep -q 'renewal disabled: peerTrust pin' <<<"$logs"; then
+    if grep -q 'rotation disabled: peerTrust pin' <<<"$logs"; then
       pass "$ctx: operator logged that pin trust disables renewal"
     else
-      fail "$ctx: no renewal disabled line under pin trust"
+      fail "$ctx: no rotation disabled line under pin trust"
     fi
-    if [[ -z $(k "$ctx" get gridnetwork grid -o jsonpath='{.status.identity.renewAfter}') ]]; then
-      pass "$ctx: status.identity.renewAfter is empty under pin trust"
+    if [[ -z $(k "$ctx" get gridnetwork grid -o jsonpath='{.status.identity.rotateAfter}') ]]; then
+      pass "$ctx: status.identity.rotateAfter is empty under pin trust"
     else
-      fail "$ctx: status.identity.renewAfter set under pin trust"
+      fail "$ctx: status.identity.rotateAfter set under pin trust"
     fi
   done
 }

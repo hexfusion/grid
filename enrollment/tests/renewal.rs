@@ -165,7 +165,7 @@ async fn renew(grid: &Grid, site: &str, peer: Option<&Identity>) -> Reply {
 
 async fn renew_with(grid: &Grid, peer: Option<&Identity>, csr_pem: &str) -> (StatusCode, Value) {
     let body = json!({ "csr": csr_pem }).to_string();
-    send(&grid.app, ("POST", "/v1alpha1/renewals"), &body, &[], peer).await
+    send(&grid.app, ("POST", "/v1alpha1/rotations"), &body, &[], peer).await
 }
 
 /// A CSR for the key in `key_pem`.
@@ -210,7 +210,7 @@ async fn a_grid_with_renewals_off_refuses_every_renewal_and_keeps_enrolling() {
     let first = enroll(&grid, "site-a").await;
     let renewal = renew(&grid, "site-a", Some(&first)).await;
     assert_eq!(renewal.status, StatusCode::SERVICE_UNAVAILABLE, "{}", renewal.body);
-    assert_eq!(renewal.body["error"], "renewals_disabled");
+    assert_eq!(renewal.body["error"], "rotation_disabled");
 }
 
 #[tokio::test]
@@ -228,14 +228,14 @@ async fn a_grid_admin_reads_an_enrollment_record_without_key_material() {
     assert_eq!(read, StatusCode::OK, "{fresh}");
     assert_eq!(fresh["state"], "active");
     assert_eq!(fresh["publicKeySha256"], first.key_sha256());
-    assert!(fresh.get("renewedAt").is_none(), "never renewed: {fresh}");
+    assert!(fresh.get("rotatedAt").is_none(), "never renewed: {fresh}");
     assert!(fresh["notAfter"].is_string(), "the issued certificate's expiry");
 
     let second = renew(&grid, "site-a", Some(&first)).await.identity();
     let (_read, renewed) = send(&grid.app, ("GET", path), "", &admin(), None).await;
     assert_eq!(renewed["publicKeySha256"], second.key_sha256());
     assert_eq!(renewed["previousPublicKeySha256"], first.key_sha256());
-    assert!(renewed["renewedAt"].is_string());
+    assert!(renewed["rotatedAt"].is_string());
     let text = renewed.to_string();
     assert!(!text.contains("BEGIN"), "no certificate or key material: {text}");
 
@@ -250,7 +250,7 @@ async fn a_disabled_renewal_says_when_to_retry() {
     let csr = certs::generate_csr("site-a").expect("csr");
     let mut request = Request::builder()
         .method("POST")
-        .uri("/v1alpha1/renewals")
+        .uri("/v1alpha1/rotations")
         .header("content-type", "application/json")
         .body(Body::from(json!({ "csr": csr.csr_pem }).to_string()))
         .expect("request");
@@ -356,7 +356,7 @@ async fn renewal_without_a_usable_certificate_is_refused() {
 #[tokio::test]
 async fn an_unauthenticated_renewal_is_refused_before_its_body_is_read() {
     let grid = grid(&[]);
-    let (status, body) = send(&grid.app, ("POST", "/v1alpha1/renewals"), "not json", &[], None).await;
+    let (status, body) = send(&grid.app, ("POST", "/v1alpha1/rotations"), "not json", &[], None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "refused, not a body error: {body}");
 }
 

@@ -52,11 +52,11 @@ pub struct EnrollmentStatus {
     #[serde(rename = "incarnationStartedAt")]
     pub incarnation_started_at: ::std::string::String,
     /**When the latest certificate this service issued expires. Null for a
-reserved name's bootstrap certificate until its first renewal.
+reserved name's bootstrap certificate until its first rotation.
 */
     #[serde(rename = "notAfter", skip_serializing_if = "::std::option::Option::is_none")]
     pub not_after: ::std::option::Option<::std::string::String>,
-    ///The key that one replaced, which may only retry a lost renewal.
+    ///The key that one replaced, which may only retry a lost rotation.
     #[serde(
         rename = "previousPublicKeySha256",
         skip_serializing_if = "::std::option::Option::is_none"
@@ -65,23 +65,23 @@ reserved name's bootstrap certificate until its first renewal.
     ///Lowercase hex SHA-256 of the key the latest issued certificate carries.
     #[serde(rename = "publicKeySha256")]
     pub public_key_sha256: ::std::string::String,
-    ///When the record last took a new key, by renewal or a bootstrap seed. Null if it never has.
-    #[serde(
-        rename = "renewedAt",
-        skip_serializing_if = "::std::option::Option::is_none"
-    )]
-    pub renewed_at: ::std::option::Option<::std::string::String>,
     ///A name bootstrap issues, such as the hub's.
     pub reserved: bool,
+    ///When the record last took a new key, by rotation or a bootstrap seed. Null if it never has.
+    #[serde(
+        rename = "rotatedAt",
+        skip_serializing_if = "::std::option::Option::is_none"
+    )]
+    pub rotated_at: ::std::option::Option<::std::string::String>,
     ///The site name the record holds.
     #[serde(rename = "siteName")]
     pub site_name: ::std::string::String,
-    /**frozen after a renewal fork. A frozen site cannot renew until a
+    /**frozen after a rotation fork. A frozen site cannot rotate until a
 grid-admin deletes its enrollment and it enrolls again.
 */
     pub state: EnrollmentStatusState,
 }
-/**frozen after a renewal fork. A frozen site cannot renew until a
+/**frozen after a rotation fork. A frozen site cannot rotate until a
 grid-admin deletes its enrollment and it enrolls again.
 */
 #[derive(
@@ -189,7 +189,7 @@ Retry-After when present, and stop on 401 and 403.
 | missing_grid_network | 400 | The token request names no grid. |
 | unauthorized | 401 | No grid-admin credential, or one not accepted. |
 | invalid_token | 401 | The site token is unknown, spent, or expired. |
-| identity_required | 401 | Renewal needs the site's current grid certificate. |
+| identity_required | 401 | Rotation needs the site's current grid certificate. |
 | forbidden | 403 | The grid-admin may not perform the action. |
 | identity_refused | 403 | The record does not admit this certificate, or the site is frozen. |
 | not_found | 404 | No such token or enrollment. |
@@ -197,7 +197,7 @@ Retry-After when present, and stop on 401 and 403.
 | name_taken | 409 | Another enrollment holds the site name. |
 | reserved_site | 409 | The name is the enrollment bootstrap's. |
 | internal | 500 | The service could not complete the request. |
-| renewals_disabled | 503 | Renewal is turned off for the grid. Issued certificates stay valid. |
+| rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct Error {
@@ -248,8 +248,8 @@ pub enum ErrorError {
     ReservedSite,
     #[serde(rename = "internal")]
     Internal,
-    #[serde(rename = "renewals_disabled")]
-    RenewalsDisabled,
+    #[serde(rename = "rotation_disabled")]
+    RotationDisabled,
 }
 impl ::std::fmt::Display for ErrorError {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -268,7 +268,7 @@ impl ::std::fmt::Display for ErrorError {
             Self::NameTaken => f.write_str("name_taken"),
             Self::ReservedSite => f.write_str("reserved_site"),
             Self::Internal => f.write_str("internal"),
-            Self::RenewalsDisabled => f.write_str("renewals_disabled"),
+            Self::RotationDisabled => f.write_str("rotation_disabled"),
         }
     }
 }
@@ -292,7 +292,7 @@ impl ::std::str::FromStr for ErrorError {
             "name_taken" => Ok(Self::NameTaken),
             "reserved_site" => Ok(Self::ReservedSite),
             "internal" => Ok(Self::Internal),
-            "renewals_disabled" => Ok(Self::RenewalsDisabled),
+            "rotation_disabled" => Ok(Self::RotationDisabled),
             _ => Err("invalid value".into()),
         }
     }

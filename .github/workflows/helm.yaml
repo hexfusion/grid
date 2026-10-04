@@ -559,8 +559,8 @@ jobs:
       - name: Run hub and site install e2e
         env:
           MODES: ${{ matrix.peer-trust-mode }}
-          # The spiffe leg renews 8 minute identities; pin trust does not renew.
-          RENEWAL_LIFETIME: "480"
+          # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
+          ROTATION_LIFETIME: "480"
           SKIP_BUILD: "1"
           IMAGE_PREFIX: ghcr.io/praxis-proxy/grid-
           IMAGE_TAG: ci

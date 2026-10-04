@@ -113,7 +113,7 @@ pub enum ApiError {
     /// The enrollment record does not admit the presented identity.
     ///
     /// One error for every reason, so a caller cannot learn which names are held.
-    #[error("this identity may not renew")]
+    #[error("this identity may not rotate")]
     IdentityRefused,
 
     /// No enrollment holds the site name.
@@ -125,8 +125,8 @@ pub enum ApiError {
     ReservedSite,
 
     /// Renewal is turned off for the grid.
-    #[error("renewals are disabled")]
-    RenewalsDisabled,
+    #[error("rotation is disabled")]
+    RotationDisabled,
 
     /// The service itself failed.
     #[error("{0}")]
@@ -246,22 +246,22 @@ impl ApiError {
             Self::IdentityRequired => (
                 StatusCode::UNAUTHORIZED,
                 ErrorCode::IdentityRequired,
-                "renewal requires the site's current grid certificate over mutual TLS".to_owned(),
+                "rotation requires the site's current grid certificate over mutual TLS".to_owned(),
             ),
             Self::IdentityRefused => (
                 StatusCode::FORBIDDEN,
                 ErrorCode::IdentityRefused,
-                "this identity may not renew; re-enroll with a new site token".to_owned(),
+                "this identity may not rotate; re-enroll with a new site token".to_owned(),
             ),
             Self::NoEnrollment => (
                 StatusCode::NOT_FOUND,
                 ErrorCode::NotFound,
                 "no enrollment holds that site name".to_owned(),
             ),
-            Self::RenewalsDisabled => (
+            Self::RotationDisabled => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::RenewalsDisabled,
-                "renewal is turned off for this grid; current identities stay valid until they expire".to_owned(),
+                ErrorCode::RotationDisabled,
+                "rotation is turned off for this grid; current identities stay valid until they expire".to_owned(),
             ),
             Self::ReservedSite => (
                 StatusCode::CONFLICT,
@@ -340,7 +340,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1alpha1/enrollments/{site_name}",
             get(get_enrollment).delete(delete_enrollment),
         )
-        .route("/v1alpha1/renewals", post(renew))
+        .route("/v1alpha1/rotations", post(renew))
         .layer(DefaultBodyLimit::max(MAX_CSR_PEM_BYTES.saturating_mul(2)))
         .layer(middleware::from_fn(enforce_timeout))
         .with_state(state)
@@ -544,7 +544,7 @@ impl FromRequestParts<Arc<AppState>> for SiteLeaf {
             .map(str::to_owned)
             .ok_or(ApiError::IdentityRequired)?;
         if let Err(reason) = certs::verify_site_cert(&state.ca.current().cert_pem, &leaf_pem, &site_name) {
-            tracing::warn!(site = %site_name, %reason, "renewal refused: the presented certificate does not verify");
+            tracing::warn!(site = %site_name, %reason, "rotation refused: the presented certificate does not verify");
             return Err(ApiError::IdentityRequired);
         }
         let key_sha256 = certs::cert_public_key_sha256(&leaf_pem).map_err(|_bad| ApiError::IdentityRequired)?;
@@ -565,7 +565,7 @@ async fn renew(
     Json(input): Json<EnrollmentRequest>,
 ) -> Result<(StatusCode, Json<Enrollment>), ApiError> {
     if !state.renewals_enabled {
-        return Err(ApiError::RenewalsDisabled);
+        return Err(ApiError::RotationDisabled);
     }
     let renewal = Renewal {
         site_name: leaf.site_name,
@@ -595,8 +595,8 @@ async fn renew(
         Err(other) => return Err(other.into()),
     };
     let message = match renewed.action {
-        RenewAction::Rotate => "site identity renewed",
-        RenewAction::Resign => "site identity re-signed for a retried renewal",
+        RenewAction::Rotate => "site identity rotated",
+        RenewAction::Resign => "site identity re-signed for a retried rotation",
     };
     tracing::info!(
         site = %renewal.site_name,
@@ -626,24 +626,24 @@ fn refused(renewal: &Renewal, reason: Refusal) {
             site,
             presented_key,
             requested_key,
-            "renewal fork: a valid certificate this site's record no longer holds asked for a new key, so two \
-             parties hold this identity. Renewal for the site is frozen until a grid-admin deletes its enrollment \
+            "rotation fork: a valid certificate this site's record no longer holds asked for a new key, so two \
+             parties hold this identity. Rotation for the site is frozen until a grid-admin deletes its enrollment \
              and it re-enrolls. A holder of a stolen older key can cause this; it fails closed."
         ),
         Refusal::RecordBehind => tracing::warn!(
             site,
             presented_key,
-            "renewal refused: the certificate is newer than the site's record, as after the enrollment database \
+            "rotation refused: the certificate is newer than the site's record, as after the enrollment database \
              was restored. The site re-enrolls."
         ),
         Refusal::Superseded => tracing::warn!(
             site,
             presented_key,
-            "renewal refused: the certificate predates the site's current enrollment. If the site was not \
+            "rotation refused: the certificate predates the site's current enrollment. If the site was not \
              recovered or re-issued, another party holds an older leaf for it; investigate."
         ),
         Refusal::UnknownSite | Refusal::KeyReused | Refusal::Frozen => {
-            tracing::warn!(site, presented_key, reason = reason.as_str(), "renewal refused");
+            tracing::warn!(site, presented_key, reason = reason.as_str(), "rotation refused");
         },
     }
 }
@@ -671,7 +671,7 @@ async fn get_enrollment(
         public_key_sha256: record.held.current_key,
         previous_public_key_sha256: record.held.previous_key,
         incarnation_started_at: time(record.held.epoch_at)?,
-        renewed_at: record.renewed_at.map(time).transpose()?,
+        rotated_at: record.renewed_at.map(time).transpose()?,
         not_after: record.not_after.map(time).transpose()?,
         reserved: record.reserved,
     }))
@@ -799,7 +799,7 @@ mod error_codes {
             ApiError::NameTaken,
             ApiError::ReservedSite,
             ApiError::Internal(String::new()),
-            ApiError::RenewalsDisabled,
+            ApiError::RotationDisabled,
         ]
         .map(|error| {
             let (status, code, _message) = error.rendered();
@@ -820,7 +820,7 @@ mod error_codes {
             (409, "name_taken"),
             (409, "reserved_site"),
             (500, "internal"),
-            (503, "renewals_disabled"),
+            (503, "rotation_disabled"),
         ]
         .into_iter()
         .map(|(status, code)| (status, serde_json::json!(code)))
@@ -831,7 +831,7 @@ mod error_codes {
 
     #[test]
     fn a_503_says_when_to_retry() {
-        let response = ApiError::RenewalsDisabled.into_response();
+        let response = ApiError::RotationDisabled.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key("retry-after"));
         assert!(

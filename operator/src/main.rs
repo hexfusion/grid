@@ -144,7 +144,7 @@ async fn main() {
                 let settings = settings.with_gateway(&config.gateway.namespace, &config.gateway.service_name);
                 drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
             },
-            Err(error) => tracing::error!(%error, "site identity renewal is off: misconfigured"),
+            Err(error) => tracing::error!(%error, "site identity rotation is off: misconfigured"),
         }
     }
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);

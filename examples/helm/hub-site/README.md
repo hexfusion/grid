@@ -101,7 +101,7 @@ Each operator routes to a peer only once a probe of its gateway, at the peer `ad
 
 `peerTrust.mode` picks how the signals listener and the provider gateway admit peers. In `pin` mode, the default, they admit the pinned digests. In `spiffe` mode, add `--set gridNetwork.peerTrust.mode=spiffe` to both grid-site commands, and on the site gateway replace the digest with `--set gatewayConfig.peerTrust.mode=spiffe --set gatewayConfig.peerTrust.spiffeId=spiffe://grid.internal/site/hub`. It needs the grid-gateway image built with the praxis `spiffe` feature, which praxis marks experimental.
 
-Only `spiffe` renews site certificates. In `pin` mode renewal is off: before a site's certificate expires, shown as `status.identity.notAfter` on its `GridNetwork`, re-enroll the site and update the digest its peers pin.
+Only `spiffe` rotates site certificates. In `pin` mode rotation is off: before a site's certificate expires, shown as `status.identity.notAfter` on its `GridNetwork`, re-enroll the site and update the digest its peers pin.
 
 ## Operations
 
@@ -123,4 +123,4 @@ SWIM has one key and no keyring, so a rotation is a flag day. Replace `grid-swim
 
 ## Known Limits
 
-Site certificates last 180 days. Under `spiffe` trust the operator renews them when a third of the lifetime remains, around day 120 (see Identity renewal in the enrollment docs), and rolls the gateway Deployment, because the gateway loads its upstream mutual TLS client certificate only at start. Under `pin` trust nothing renews them, so re-enroll and re-pin each site before it expires. The praxis-gateway chart README lists the gateway limits.
+Site certificates last 180 days. Under `spiffe` trust the operator rotates them when a third of the lifetime remains, around day 120 (see Certificate rotation in the enrollment docs), and rolls the gateway Deployment, because the gateway loads its upstream mutual TLS client certificate only at start. Under `pin` trust nothing rotates them, so re-enroll and re-pin each site before it expires. The praxis-gateway chart README lists the gateway limits.

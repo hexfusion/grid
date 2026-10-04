@@ -26,7 +26,7 @@ rules:
   - apiGroups: ["grid.praxis.fast"]
     resources: ["enrollmenttokens"]
     verbs: ["create", "delete"]
-  # Reading a site's enrollment diagnoses a refused renewal; it shows digests only.
+  # Reading a site's enrollment diagnoses a refused rotation; it shows digests only.
   - apiGroups: ["grid.praxis.fast"]
     resources: ["enrollments"]
     verbs: ["get"]
@@ -72,7 +72,7 @@ roleRef:
 {{- end }}
 {{- end }}
 {{/*
-Deleting a site's enrollment ends its renewals and releases its name. Its own Role,
+Deleting a site's enrollment ends its rotations and releases its name. Its own Role,
 bound to nobody by default: with mint it re-enrolls an existing site's name.
 */}}
 ---

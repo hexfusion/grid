@@ -112,32 +112,33 @@ The grid CA lasts 10 years. There is no CA rotation path yet: regenerating it
 (`ca.forceRegenerate`) re-issues every leaf and invalidates every enrolled
 site's trust anchor.
 
-## Identity renewal
+## Certificate rotation
 
-A site renews its identity before it expires, with no new token. Site
+A site rotates its identity certificate before it expires, with no new token.
+This covers site certificates only; the grid CA does not rotate. Site
 certificates last 180 days unless `enrollment.certLifetimeSecs` sets another
-lifetime, and a renewed certificate takes the service's lifetime at the time it
+lifetime, and a rotated certificate takes the service's lifetime at the time it
 is issued. When less than a third of the lifetime remains, around day 120, the operator presents the current certificate to
 the enrollment service over mutual TLS and asks for a certificate for a new key.
 It writes the new certificate and key into the same identity Secret, which the
 signals listener, the peer pollers, and the gateway reload without a restart.
-`enrollment.renewal.enabled` in the grid-operator chart turns it on, the default
+`enrollment.rotation.enabled` in the grid-operator chart turns it on, the default
 whenever an enrollment URL is known.
 
-Renewal runs only under `spiffe` peer trust, and follows the trust the `GridNetwork`
-declares. Before a `GridNetwork` exists the operator trusts by SPIFFE ID and renews.
+Rotation runs only under `spiffe` peer trust, and follows the trust the `GridNetwork`
+declares. Before a `GridNetwork` exists the operator trusts by SPIFFE ID and rotates.
 Under `pin`, the `GridNetwork` default, peers pin the
-leaf digest and would refuse a renewed leaf, so the operator does not renew and logs
-`renewal disabled` when it finds pin trust. Before a pin site's certificate expires, every 180
+leaf digest and would refuse a rotated leaf, so the operator does not rotate and logs
+`rotation disabled` when it finds pin trust. Before a pin site's certificate expires, every 180
 days by default, re-enroll it with the expired-identity steps below and update the
 digest its peers pin. `GridNetwork` `status.identity.notAfter` and
 `grid_site_identity_expiry_timestamp_seconds` show the expiry.
 
 - The enrollment Route must use passthrough termination. A reencrypt Route drops
   the client certificate, so the enrollment chart refuses to render one while
-  `enrollment.renewal.enabled` is on. Never put a proxy that presents a grid site
+  `enrollment.rotation.enabled` is on. Never put a proxy that presents a grid site
   certificate in front of the enrollment service: every caller through it would
-  renew that site's identity.
+  rotate that site's identity.
 - The hub's identity comes from the bootstrap Job, not a token. Bootstrap signs a
   seed with the grid CA key and writes it to the `grid-reserved-seeds` Secret,
   and the service registers the hub's key from it. A seed the CA did not sign, or
@@ -148,11 +149,11 @@ digest its peers pin. `GridNetwork` `status.identity.notAfter` and
   and run `helm upgrade`. Bootstrap issues a new identity and a newer seed, which
   replaces the hub's key and clears a freeze. Do not use `ca.forceRegenerate` for
   this: it replaces the grid CA, and every site must re-enroll.
-- The service keeps each site's current key and the one it replaced, so a renewal
-  whose answer was lost retries safely. A site renews once per two thirds of a
+- The service keeps each site's current key and the one it replaced, so a rotation
+  whose answer was lost retries safely. A site rotates once per two thirds of a
   leaf's lifetime, so it never presents any other still-valid leaf. When one
   arrives, or the replaced key asks for a new key, two parties hold the identity:
-  the service freezes the site and logs `renewal fork` at warning level. A holder
+  the service freezes the site and logs `rotation fork` at warning level. A holder
   of a stolen older key can cause this on purpose. It fails closed. To recover, a
   grid-admin deletes the site's enrollment and the site re-enrolls. A frozen hub
   clears only by deleting its identity Secret and running `helm upgrade`, which
@@ -164,12 +165,12 @@ digest its peers pin. `GridNetwork` `status.identity.notAfter` and
   service and its database need clocks within five minutes of each other.
 - Do not restore a site's identity Secret from a backup, and do not manage it
   with GitOps or a policy that enforces its contents. An older copy holds a key the
-  service has replaced, so the site freezes on its next renewal. Leave the Secret
+  service has replaced, so the site freezes on its next rotation. Leave the Secret
   out of disaster recovery, or plan to re-enroll the site. After the enrollment
-  database is restored from a backup, sites that renewed since the snapshot are
+  database is restored from a backup, sites that rotated since the snapshot are
   refused with `identity_refused`, logged on the hub as `record_behind`, and must
   re-enroll.
-- To see why a site cannot renew, a grid-admin reads its record with
+- To see why a site cannot rotate, a grid-admin reads its record with
   `GET /v1alpha1/enrollments/{siteName}`: `state` is `active` or `frozen`, with
   the current and previous key digests and `notAfter`. It needs `get` on the
   `enrollments` resource, which both the grid-admin and enrollment-admin Roles grant.
@@ -177,26 +178,26 @@ digest its peers pin. `GridNetwork` `status.identity.notAfter` and
   the `enrollment-admin` Role to `enrollment.enrollmentAdmins.subjects` and to no
   one by default. With `enrollment.authz=local`, every grid-admin in the token
   table may delete.
-- An identity that already expired cannot renew. `GridNetwork` `status.identity`
+- An identity that already expired cannot rotate. `GridNetwork` `status.identity`
   reports `IdentityExpired` and the phase turns `Degraded`. Delete the site's
   enrollment, delete its identity Secret, invite it again, and restart the
   operator so it enrolls.
 - After a grid CA change, sites hold certificates from the old CA, which the
-  service no longer accepts. They cannot renew and must re-enroll.
+  service no longer accepts. They cannot rotate and must re-enroll.
 - Watch `grid_site_identity_expiry_timestamp_seconds` and
-  `grid_site_identity_renewals_total` on the operator.
+  `grid_site_identity_rotations_total` on the operator.
 
-### Turn renewal off
+### Turn rotation off
 
-- For the whole grid, set `enrollment.renewal.enabled=false` on the grid-enrollment
-  chart. The service refuses every renewal with 503 `renewals_disabled`, and
+- For the whole grid, set `enrollment.rotation.enabled=false` on the grid-enrollment
+  chart. The service refuses every rotation with 503 `rotation_disabled`, and
   operators retry with backoff. Enrollment, deletes, and the signals and gateway
   paths keep working.
-- For one site, set `enrollment.renewal.enabled=false` on its grid-operator chart.
-  Its operator stops renewing and stops rolling the gateway, and the chart drops
+- For one site, set `enrollment.rotation.enabled=false` on its grid-operator chart.
+  Its operator stops rotating and stops rolling the gateway, and the chart drops
   the gateway Deployment grant.
 - Either way, each site keeps its current identity until `status.identity.notAfter`
-  on its `GridNetwork`. Turn renewal back on before then, or the site re-enrolls.
+  on its `GridNetwork`. Turn rotation back on before then, or the site re-enrolls.
 
 ## Troubleshooting
 
@@ -206,8 +207,8 @@ digest its peers pin. `GridNetwork` `status.identity.notAfter` and
 - **Operator logs `TLS to the enrollment service failed`**: set `enrollment.caBundle` to the CA that issued the enrollment serving certificate.
 - **Operator logs `returned CA is not the pinned grid CA`**: set `enrollment.gridCaBundle` to the grid CA. The attempt spent the token, so enroll under a new site name.
 - **Operator logs `possible interception, contact the hub`**: the certificate names another site or key. Tell the hub admin before enrolling again.
-- **Operator logs `site identity renewal failed` with `renewal refused`**: the hub does not admit this identity, or froze it after a renewal fork. A grid-admin deletes the site's enrollment, and the site enrolls again.
-- **`GridNetwork` reports `IdentityExpired`**: the identity expired before it renewed. Follow the expired-identity steps in Identity renewal.
+- **Operator logs `site identity rotation failed` with `rotation refused`**: the hub does not admit this identity, or froze it after a rotation fork. A grid-admin deletes the site's enrollment, and the site enrolls again.
+- **`GridNetwork` reports `IdentityExpired`**: the identity expired before it rotated. Follow the expired-identity steps in Certificate rotation.
 - **`route.host is required`**: a passthrough Route is rendering without a host. Set `route.host` to `<name>.apps.<cluster-domain>`, or set `route.enabled=false`. Under an umbrella chart, prefix both with the subchart name.
 - **CA bootstrap Job fails with `Restore Secret grid-ca-key from backup`**: bootstrap refused to change the grid CA, because a new or different CA would split the grid. The message names why: the key Secret is missing while the CA bundle or the hub's CA Secret still holds the grid CA, the key Secret holds a different CA than the one distributed (a wrong backup was restored), or a distributed copy does not parse. Restore the right `grid-ca-key` from backup and run `helm upgrade` again. To start a new grid on purpose, set `ca.forceRegenerate`; every site must then re-enroll.
 - **CA bootstrap Job fails with `built without --features bootstrap`**: the image was built with `--no-default-features`. Use a default build, which includes `sar` and `bootstrap`.
