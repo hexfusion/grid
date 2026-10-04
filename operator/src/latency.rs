@@ -210,8 +210,10 @@ impl Snapshot {
 
     /// Mean TTFT less mean flow-control wait, over mean uncached input tokens.
     ///
-    /// Sensitive to the workload mix: TTFT counts streaming requests only, while token
-    /// counts cover every request.
+    /// Token means are per usage report. An engine reporting usage on every chunk weights
+    /// long outputs more, but each report carries the whole prompt, so the mean stays a
+    /// prompt length. Sensitive to the workload mix: TTFT counts streaming requests only,
+    /// while token counts cover every request.
     fn prefill_seconds_per_token(&self) -> Option<f64> {
         let wait = self.queue_wait.and_then(SumCount::mean).unwrap_or(0.0);
         let cached = self.cached.map_or(0.0, |cached| cached.sum / self.input.count);

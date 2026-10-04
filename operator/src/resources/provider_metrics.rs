@@ -147,7 +147,8 @@ fn record_scrape(
     plan: &SignalScrapePlan<'_>,
     text: &str,
 ) {
-    let parsed = crate::signals::parse(text);
+    // Every sample feeds this site's own windows; only gauges are republished.
+    let (parsed, republishable): (Vec<_>, Vec<_>) = crate::signals::parse_scrape(text).into_iter().unzip();
     let pool = provider
         .spec
         .metrics_config
@@ -159,6 +160,8 @@ fn record_scrape(
     let latency = readiness.record_latency(key, &parsed, pool, Instant::now());
     let observations = parsed
         .into_iter()
+        .zip(republishable)
+        .filter_map(|(o, republishable)| republishable.then_some(o))
         .filter(|o| plan.wanted.contains(o.metric.as_str()))
         // A local sample's freshness is its collection time, so drop any trailing
         // timestamp. Only relayed peer samples carry a per-sample stamp.
@@ -843,6 +846,107 @@ mod tests {
             "spec": spec
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// A `KServe` EPP exposition for pool `qwen3-kserve`, in the label sets the lab EPP emits:
+    /// `served` streaming requests answered, about 104 usage reports each.
+    #[expect(clippy::too_many_lines, reason = "one exposition, line for line")]
+    fn kserve_epp_exposition(served: f64, ready: f64) -> String {
+        let l = r#"fairness_id="default-flow",model_name="qwen3",priority="0",target_model_name="qwen3""#;
+        let (b01, b05, b1) = (served * 0.2, served * 0.6, served * 0.9);
+        let (ttft_sum, tpot_sum) = (served * 0.4, served * 0.02);
+        let (reports, tokens) = (served * 104.0, served * 104.0 * 300.0);
+        let (requests, errors) = (served + 14.0, served / 100.0);
+        format!(
+            r#"# HELP llm_d_epp_ready_endpoints Ready endpoints.
+# TYPE llm_d_epp_ready_endpoints gauge
+llm_d_epp_ready_endpoints{{name="qwen3-kserve"}} {ready}
+# TYPE llm_d_epp_average_running_requests gauge
+llm_d_epp_average_running_requests{{name="qwen3-kserve"}} 128
+# TYPE llm_d_epp_request_ttft_seconds histogram
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="false",le="0.1"}} 14
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="false",le="+Inf"}} 14
+llm_d_epp_request_ttft_seconds_sum{{{l},streaming="false"}} 1.9
+llm_d_epp_request_ttft_seconds_count{{{l},streaming="false"}} 14
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="0.1"}} {b01}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="0.5"}} {b05}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="1"}} {b1}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="2.5"}} {served}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="+Inf"}} {served}
+llm_d_epp_request_ttft_seconds_sum{{{l},streaming="true"}} {ttft_sum}
+llm_d_epp_request_ttft_seconds_count{{{l},streaming="true"}} {served}
+# TYPE llm_d_epp_request_streaming_tpot_seconds histogram
+llm_d_epp_request_streaming_tpot_seconds_sum{{{l}}} {tpot_sum}
+llm_d_epp_request_streaming_tpot_seconds_count{{{l}}} {served}
+# TYPE llm_d_epp_request_input_tokens histogram
+llm_d_epp_request_input_tokens_sum{{{l}}} {tokens}
+llm_d_epp_request_input_tokens_count{{{l}}} {reports}
+# TYPE llm_d_epp_request_total counter
+llm_d_epp_request_total{{{l}}} {requests}
+# TYPE llm_d_epp_request_error_total counter
+llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
+"#
+        )
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "two scrapes and every published series")]
+    fn a_kserve_epp_scrape_publishes_latency_and_republishes_gauges_only() {
+        let readiness = crate::readiness::ReadinessStore::default();
+        let mut mc = mc_with_queue("llm_d_epp_average_running_requests");
+        mc.pool_name = Some("qwen3-kserve".to_owned());
+        // A counter declared as a signal is still never republished.
+        mc.signal_names.error_rate = Some("llm_d_epp_request_total".to_owned());
+        let provider = provider_fixture("qwen3-hq-east", "http://epp:9090", Some(mc));
+        let plan = signal_scrape_plan(&provider).unwrap_or_else(|| std::process::abort());
+        record_scrape(
+            &readiness,
+            "net/p",
+            &provider,
+            &plan,
+            &kserve_epp_exposition(11_000.0, 2.0),
+        );
+        assert!(readiness.take_fresh("net/p").is_some(), "first scrape recorded");
+        record_scrape(
+            &readiness,
+            "net/p",
+            &provider,
+            &plan,
+            &kserve_epp_exposition(11_581.0, 0.0),
+        );
+        let published = readiness.take_fresh("net/p").unwrap_or_default();
+        let value = |name: &str| published.iter().find(|o| o.metric == name).map(|o| o.value);
+        for name in [
+            crate::latency::TTFT_P50_SIGNAL,
+            crate::latency::TTFT_P90_SIGNAL,
+            crate::latency::TPOT_SIGNAL,
+            crate::latency::PREFILL_SIGNAL,
+            crate::latency::ERROR_RATIO_SIGNAL,
+        ] {
+            assert!(value(name).is_some(), "{name} missing from {published:?}");
+        }
+        assert!((value(crate::latency::TPOT_SIGNAL).unwrap_or_default() - 0.02).abs() < 1e-9);
+        // 581 answers at 0.4s mean TTFT over 300 prompt tokens per usage report.
+        let prefill = value(crate::latency::PREFILL_SIGNAL).unwrap_or_default();
+        assert!((prefill - 0.4 / 300.0).abs() < 1e-9, "prefill {prefill}");
+        assert!(
+            published.iter().all(|o| !o.metric.ends_with("_total")
+                && !o.metric.ends_with("_count")
+                && !o.metric.ends_with("_sum")
+                && !o.metric.ends_with("_bucket")),
+            "counters and histogram parts stay local: {published:?}"
+        );
+        assert!(
+            value("llm_d_epp_average_running_requests").is_some(),
+            "declared gauge republished"
+        );
+        let verdict = readiness
+            .verdict("net/p", false, Duration::from_secs(15), Instant::now())
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            verdict.message.contains("answered"),
+            "progress seen through the parser: {verdict:?}"
+        );
     }
 
     fn mc_with_queue(metric_name: &str) -> MetricsConfig {

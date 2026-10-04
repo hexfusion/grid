@@ -67,6 +67,18 @@ pub struct Observation {
 /// somebody else's scrape and the caller cannot repair it.
 #[must_use]
 pub fn parse(text: &str) -> Vec<Observation> {
+    parse_scrape(text)
+        .into_iter()
+        .filter_map(|(o, republishable)| republishable.then_some(o))
+        .collect()
+}
+
+/// Parse a scrape this site made itself: every finite sample, each paired with whether
+/// [`parse`] would keep it for republishing.
+///
+/// Counters and histogram parts stay, for this site's own latency and error windows.
+#[must_use]
+pub(crate) fn parse_scrape(text: &str) -> Vec<(Observation, bool)> {
     // Types first: a declaration may follow its samples, and reading in one
     // pass would admit a counter that had not been typed yet.
     let types: HashMap<&str, &str> = text
@@ -81,13 +93,14 @@ pub fn parse(text: &str) -> Vec<Observation> {
     text.lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .filter_map(parse_sample)
-        .filter(|o| {
+        .filter(|o| o.value.is_finite())
+        .map(|o| {
             // Gauges and untyped only: a relayed counter reports our restarts,
             // and an aggregate we did not observe cannot be recombined. The name
             // check catches aggregates that arrive untyped.
-            matches!(types.get(o.metric.as_str()), None | Some(&("gauge" | "untyped")))
-                && !is_aggregate_part(&o.metric)
-                && o.value.is_finite()
+            let republishable = matches!(types.get(o.metric.as_str()), None | Some(&("gauge" | "untyped")))
+                && !is_aggregate_part(&o.metric);
+            (o, republishable)
         })
         .collect()
 }
