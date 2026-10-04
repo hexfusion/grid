@@ -591,6 +591,13 @@ qwen3-site-a   self_hosted   Ready      3d
 qwen3-site-b   self_hosted   NotReady   3d
 ```
 
+`spec.maxRunning` is the most requests one endpoint runs at once, vLLM
+max-num-seqs. Its site's operator multiplies it by the EPP's fresh ready endpoints
+and publishes the product as `grid_provider_capacity_requests`, the capacity gateways weigh
+the provider's load against. When it is absent, or no endpoint is fresh, capacity is
+unknown. Before this release `maxRunning` counted the whole pool: reinstall with
+per-endpoint values.
+
 `spec.capacityWeight` is an optional positive relative provider capacity from
 `1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
 weightedRandom` and `placementPolicy.strategy: static`. If omitted, the

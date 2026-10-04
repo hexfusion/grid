@@ -23,6 +23,9 @@ spec:
   {{- with .capacityWeight }}
   capacityWeight: {{ . }}
   {{- end }}
+  {{- with .maxRunning }}
+  maxRunning: {{ . }}
+  {{- end }}
   {{- with .routingClusterRef }}
   routingClusterRef: {{ . | quote }}
   {{- end }}

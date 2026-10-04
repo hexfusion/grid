@@ -499,6 +499,8 @@ fn readiness_entry<'provider>(
     now: Instant,
 ) -> Option<ReadinessEntry<'provider>> {
     let identity = routing_overlay::routing_identity(provider)?;
+    let key = readiness::key(&provider.spec.grid_network_ref, identity);
+    let capacity = capacity_sample(provider, ctx.readiness.ready_endpoints(&key));
     if provider_metrics::signal_scrape_plan(provider).is_none() {
         return Some(ReadinessEntry {
             identity,
@@ -506,6 +508,7 @@ fn readiness_entry<'provider>(
                 reason: readiness::Reason::MetricsNotConfigured,
                 message: "no metricsConfig endpoint to read readiness from".to_owned(),
             },
+            // With no scrape there are no ready endpoints to multiply, so capacity is unknown.
             published: None,
         });
     }
@@ -513,21 +516,62 @@ fn readiness_entry<'provider>(
     let ready = ready_sample(&verdict);
     // A fresh scrape republishes with the verdict. Without one, the last published
     // entry ages on its own, unless the verdict turned not ready.
-    let fresh = ctx
-        .readiness
-        .take_fresh(&readiness::key(&provider.spec.grid_network_ref, identity));
-    let published = match fresh {
-        Some(mut held) => {
-            held.push(ready);
-            Some(held)
-        },
-        None if verdict.reason.excludes() => Some(vec![ready]),
-        None => None,
-    };
+    let fresh = ctx.readiness.take_fresh(&key);
     Some(ReadinessEntry {
         identity,
+        published: published_signals(fresh, ready, capacity, verdict.reason.excludes()),
         verdict,
-        published,
+    })
+}
+
+/// What to publish for a scraped provider: a fresh scrape with the verdict and capacity,
+/// or only those when it is not ready. Without either, the last entry ages on its own.
+fn published_signals(
+    fresh: Option<Vec<signals::Observation>>,
+    ready: signals::Observation,
+    capacity: Option<signals::Observation>,
+    excluded: bool,
+) -> Option<Vec<signals::Observation>> {
+    match fresh {
+        Some(mut held) => {
+            held.push(ready);
+            held.extend(saturation_sample(&held, capacity.as_ref()));
+            held.extend(capacity);
+            Some(held)
+        },
+        None if excluded => Some(std::iter::once(ready).chain(capacity).collect()),
+        None => None,
+    }
+}
+
+/// The `grid_provider_saturation_ratio` sample: requests held in `held` over `capacity`, `None`
+/// when either is unknown.
+fn saturation_sample(
+    held: &[signals::Observation],
+    capacity: Option<&signals::Observation>,
+) -> Option<signals::Observation> {
+    let in_flight = held.iter().find(|o| o.metric == readiness::IN_FLIGHT_SIGNAL)?.value;
+    let capacity = capacity?.value;
+    // A non-finite or negative count from a misbehaving EPP publishes no ratio, never inf.
+    (capacity > 0.0 && in_flight.is_finite() && in_flight >= 0.0).then(|| signals::Observation {
+        metric: readiness::SATURATION_SIGNAL.to_owned(),
+        labels: std::collections::BTreeMap::new(),
+        value: in_flight / capacity,
+        timestamp_ms: None,
+    })
+}
+
+/// The `grid_provider_capacity_requests` sample: the provider's per-endpoint `maxRunning` times its
+/// `ready` endpoints. `None` when it declares none or no endpoint is fresh, which leaves
+/// capacity unknown rather than zero.
+fn capacity_sample(provider: &InferenceProvider, ready: Option<f64>) -> Option<signals::Observation> {
+    let max_running = provider.spec.max_running?;
+    let ready = ready.filter(|ready| *ready > 0.0)?;
+    Some(signals::Observation {
+        metric: readiness::CAPACITY_SIGNAL.to_owned(),
+        labels: std::collections::BTreeMap::new(),
+        value: f64::from(max_running) * ready,
+        timestamp_ms: None,
     })
 }
 
@@ -3994,6 +4038,55 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturation_is_requests_held_over_capacity_when_both_are_known() {
+        let sample = |metric: &str, value: f64| signals::Observation {
+            metric: metric.to_owned(),
+            labels: std::collections::BTreeMap::new(),
+            value,
+            timestamp_ms: None,
+        };
+        let held = [sample(readiness::IN_FLIGHT_SIGNAL, 48.0)];
+        let capacity = sample(readiness::CAPACITY_SIGNAL, 64.0);
+        assert!(matches!(
+            saturation_sample(&held, Some(&capacity)),
+            Some(saturation) if saturation.metric == readiness::SATURATION_SIGNAL && (saturation.value - 0.75).abs() < f64::EPSILON
+        ));
+        assert!(saturation_sample(&held, None).is_none(), "no capacity, no ratio");
+        assert!(
+            saturation_sample(&[], Some(&capacity)).is_none(),
+            "no in-flight, no ratio"
+        );
+        for implausible in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(
+                saturation_sample(&[sample(readiness::IN_FLIGHT_SIGNAL, implausible)], Some(&capacity)).is_none(),
+                "in-flight {implausible} publishes no ratio"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_is_max_running_per_endpoint_times_ready_endpoints() {
+        let mut provider = provider_with_status(&serde_json::json!({}));
+        assert!(
+            capacity_sample(&provider, Some(3.0)).is_none(),
+            "undeclared publishes nothing"
+        );
+        provider.spec.max_running = Some(64);
+        assert!(
+            matches!(
+                capacity_sample(&provider, Some(3.0)),
+                Some(sample) if sample.metric == readiness::CAPACITY_SIGNAL && (sample.value - 192.0).abs() < f64::EPSILON
+            ),
+            "64 per endpoint x 3 endpoints"
+        );
+        assert!(
+            capacity_sample(&provider, Some(0.0)).is_none(),
+            "no fresh endpoint: unknown, not 0"
+        );
+        assert!(capacity_sample(&provider, None).is_none(), "no endpoint count: unknown");
+    }
 
     #[expect(clippy::expect_used, reason = "test fixture")]
     fn provider_with_status(status: &serde_json::Value) -> InferenceProvider {

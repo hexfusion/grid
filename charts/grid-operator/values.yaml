@@ -28,11 +28,14 @@ grid:
   swimKeySecretName: grid-swim-key
   # -- InferenceProviders this site serves, keyed by name, as in the grid-site chart.
   # model defaults to the name, providerKind to vllm, and backendKind to local_model.
+  # maxRunning is the most requests one endpoint runs at once (vLLM max-num-seqs); without
+  # it the provider's capacity, and so its saturation, is unknown.
   providers: {}
   #   qwen3:
   #     model: Qwen3-Coder-30B-A3B
   #     endpoint: http://qwen3-epp-service.llm-d.svc:80
   #     routingClusterRef: site-d
+  #     maxRunning: 64
 
 # -- Grid CRDs.
 crds:

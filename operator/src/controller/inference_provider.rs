@@ -2688,6 +2688,7 @@ mod tests {
     ) -> InferenceProviderSpec {
         InferenceProviderSpec {
             capacity_weight: None,
+            max_running: None,
             grid_network_ref: "net".to_owned(),
             access_policy: crate::crd::auth::AccessPolicy::default(),
             auth: None,

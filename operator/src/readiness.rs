@@ -22,8 +22,34 @@ pub(crate) const DEFAULT_READY_ENDPOINTS: [&str; 2] = ["llm_d_epp_ready_endpoint
 /// pool that just drained can read ready once before its first request lands.
 pub(crate) const STREAK: u32 = 2;
 
+/// The series this site publishes per provider declaring `maxRunning`: that capacity.
+pub const CAPACITY_SIGNAL: &str = "grid_provider_capacity_requests";
+
+/// The series this site publishes per provider with both counts: requests held over capacity.
+pub const SATURATION_SIGNAL: &str = "grid_provider_saturation_ratio";
+
 /// The series this site publishes per provider: 1 when ready, 0 when not.
 pub const READY_SIGNAL: &str = "grid_provider_ready";
+
+/// The resolved signal for requests a provider has running and queued.
+pub const IN_FLIGHT_SIGNAL: &str = "grid_provider_in_flight_requests";
+
+/// The EPP's per-endpoint in-flight count, from its inflight-load-producer plugin. It
+/// increments after flow control admits a request, once per scheduling profile's target, so
+/// on a P/D pool a request counts on its prefill and its decode endpoint.
+const EPP_IN_FLIGHT: &str = "llm_d_epp_inflight_requests";
+
+/// Requests the EPP's flow control holds before scheduling, labeled by `inference_pool`.
+const EPP_FLOW_CONTROL_QUEUE: &str = "llm_d_epp_flow_control_queue_size";
+
+/// Pool averages that stand in when the EPP runs no inflight-load-producer.
+const EPP_AVERAGES: [[&str; 2]; 2] = [
+    [
+        "llm_d_epp_average_running_requests",
+        "inference_pool_average_running_requests",
+    ],
+    ["llm_d_epp_average_queue_size", "inference_pool_average_queue_size"],
+];
 
 /// The `Ready` condition's status and reason for one provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +235,11 @@ impl ReadinessStore {
         self.probes().get_mut(key)?.unpublished.take()
     }
 
+    /// Ready endpoints in the provider's last successful scrape, `None` when it exposed no count.
+    pub(crate) fn ready_endpoints(&self, key: &str) -> Option<f64> {
+        self.probes().get(key)?.ready_endpoints
+    }
+
     /// Forget providers not in `keep`.
     pub(crate) fn retain(&self, keep: &std::collections::BTreeSet<String>) {
         self.probes().retain(|key, _| keep.contains(key));
@@ -307,6 +338,96 @@ pub(crate) fn ready_endpoints(observations: &[Observation], names: &[&str], pool
             .map(|o| o.value)
             .reduce(f64::max)
     })
+}
+
+/// Where a provider's in-flight count came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InFlightSource {
+    /// The EPP's inflight-load-producer, at or above the pool averages.
+    Epp,
+    /// The pool averages of running and queued times ready endpoints, above the EPP count or
+    /// in place of it.
+    EngineAverages,
+}
+
+/// Requests the provider holds: the larger of the EPP's per-endpoint count summed and its
+/// pool averages of running and queued times `ready`, plus requests flow control holds.
+///
+/// The larger of the two, so an EPP restart that zeroes its count does not read as idle. The
+/// per-endpoint count carries no pool label, so it is skipped when the EPP serves several
+/// pools. `None` when neither source is present, or the site has no fresh endpoint behind
+/// frozen averages.
+pub(crate) fn in_flight(
+    observations: &[Observation],
+    ready: Option<f64>,
+    pool: Option<&str>,
+) -> Option<(f64, InFlightSource)> {
+    let counted = (!serves_several_pools(observations))
+        .then(|| epp_count(observations))
+        .flatten();
+    // No fresh endpoint means the averages are frozen at their last value: unknown, not idle.
+    let averaged = ready.filter(|ready| *ready > 0.0).and_then(|ready| {
+        EPP_AVERAGES
+            .iter()
+            .map(|names| ready_endpoints(observations, names, pool))
+            .sum::<Option<f64>>()
+            .map(|per_endpoint| per_endpoint * ready)
+    });
+    let (held, source) = match (counted, averaged) {
+        (Some(counted), Some(averaged)) if averaged > counted => (averaged, InFlightSource::EngineAverages),
+        (Some(counted), _) => (counted, InFlightSource::Epp),
+        (None, Some(averaged)) => (averaged, InFlightSource::EngineAverages),
+        (None, None) => return None,
+    };
+    Some((held + flow_control_queued(observations, pool), source))
+}
+
+/// The EPP's in-flight count summed over endpoints, each endpoint's largest across producer
+/// instances so two producers do not double it. `None` when the EPP exports none.
+fn epp_count(observations: &[Observation]) -> Option<f64> {
+    let mut producers: std::collections::BTreeMap<&str, std::collections::BTreeMap<(&str, &str), f64>> =
+        std::collections::BTreeMap::new();
+    for observation in observations.iter().filter(|o| o.metric == EPP_IN_FLIGHT) {
+        let label = |name: &str| observation.labels.get(name).map_or("", String::as_str);
+        // Series per fairness and priority add up; producer instances repeat the same requests.
+        *producers
+            .entry(label("producer_name"))
+            .or_default()
+            .entry((label("namespace"), label("endpoint_name")))
+            .or_insert(0.0) += observation.value;
+    }
+    let mut peak: std::collections::BTreeMap<(&str, &str), f64> = std::collections::BTreeMap::new();
+    for counts in producers.values() {
+        for (endpoint, count) in counts {
+            let held = peak.entry(*endpoint).or_insert(0.0);
+            *held = held.max(*count);
+        }
+    }
+    (!peak.is_empty()).then(|| peak.values().sum())
+}
+
+/// Whether the EPP reports more than one pool or namespace, so its unlabeled per-endpoint
+/// count cannot be attributed to one pool.
+fn serves_several_pools(observations: &[Observation]) -> bool {
+    let distinct = |metrics: &[&str], label: &str| {
+        observations
+            .iter()
+            .filter(|o| metrics.contains(&o.metric.as_str()))
+            .filter_map(|o| o.labels.get(label))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    };
+    distinct(&DEFAULT_READY_ENDPOINTS, "name") > 1 || distinct(&[EPP_IN_FLIGHT], "namespace") > 1
+}
+
+/// Requests the EPP's flow control holds for `pool`, 0 when it exports none.
+fn flow_control_queued(observations: &[Observation], pool: Option<&str>) -> f64 {
+    observations
+        .iter()
+        .filter(|o| o.metric == EPP_FLOW_CONTROL_QUEUE)
+        .filter(|o| pool.is_none_or(|pool| o.labels.get("inference_pool").is_some_and(|p| p == pool)))
+        .map(|o| o.value)
+        .sum()
 }
 
 #[cfg(test)]
@@ -531,5 +652,122 @@ mod tests {
             assert_eq!(reason.status(), "False");
             assert!(reason.excludes());
         }
+    }
+
+    fn counted(endpoint: &str, namespace: &str, producer: &str, value: f64) -> Observation {
+        Observation {
+            metric: "llm_d_epp_inflight_requests".to_owned(),
+            labels: BTreeMap::from([
+                ("endpoint_name".to_owned(), endpoint.to_owned()),
+                ("namespace".to_owned(), namespace.to_owned()),
+                ("producer_name".to_owned(), producer.to_owned()),
+            ]),
+            value,
+            timestamp_ms: None,
+        }
+    }
+
+    fn queued(pool: &str, value: f64) -> Observation {
+        Observation {
+            metric: "llm_d_epp_flow_control_queue_size".to_owned(),
+            labels: BTreeMap::from([("inference_pool".to_owned(), pool.to_owned())]),
+            value,
+            timestamp_ms: None,
+        }
+    }
+
+    #[test]
+    fn in_flight_reads_the_larger_of_the_epp_count_and_the_pool_averages() {
+        let averages = [
+            sample("llm_d_epp_average_running_requests", "qwen3", 6.0),
+            sample("llm_d_epp_average_queue_size", "qwen3", 1.5),
+        ];
+        let mut observations = vec![counted("a", "ns", "p", 7.0), counted("b", "ns", "p", 5.0)];
+        assert_eq!(
+            in_flight(&observations, Some(2.0), None),
+            Some((12.0, InFlightSource::Epp)),
+            "the EPP's count alone"
+        );
+        observations.extend(averages.clone());
+        assert_eq!(
+            in_flight(&observations, Some(1.0), Some("qwen3")),
+            Some((12.0, InFlightSource::Epp)),
+            "12 counted is above (6 + 1.5) x 1"
+        );
+        let restarted = [vec![counted("a", "ns", "p", 0.0)], averages.to_vec()].concat();
+        assert_eq!(
+            in_flight(&restarted, Some(2.0), Some("qwen3")),
+            Some((15.0, InFlightSource::EngineAverages)),
+            "an EPP restart reading 0 is floored by (6 + 1.5) x 2"
+        );
+        assert_eq!(
+            in_flight(&averages, Some(2.0), Some("qwen3")),
+            Some((15.0, InFlightSource::EngineAverages)),
+            "the averages alone"
+        );
+    }
+
+    #[test]
+    fn in_flight_counts_each_endpoint_once_across_producers() {
+        let observations = [
+            counted("a", "ns", "first", 4.0),
+            counted("a", "ns", "second", 3.0),
+            counted("b", "ns", "first", 2.0),
+        ];
+        assert_eq!(
+            in_flight(&observations, None, None),
+            Some((6.0, InFlightSource::Epp)),
+            "4 + 2, not 9"
+        );
+    }
+
+    #[test]
+    fn in_flight_adds_requests_flow_control_holds_for_the_pool() {
+        let observations = [counted("a", "ns", "p", 3.0), queued("qwen3", 4.0), queued("other", 9.0)];
+        assert_eq!(
+            in_flight(&observations, None, Some("qwen3")),
+            Some((7.0, InFlightSource::Epp)),
+            "3 dispatched plus 4 held for qwen3, not other's 9"
+        );
+    }
+
+    #[test]
+    fn in_flight_uses_pool_averages_when_the_epp_serves_several_pools() {
+        let observations = [
+            counted("a", "ns", "p", 50.0),
+            sample("llm_d_epp_ready_endpoints", "qwen3", 2.0),
+            sample("llm_d_epp_ready_endpoints", "llama", 1.0),
+            sample("llm_d_epp_average_running_requests", "qwen3", 3.0),
+            sample("llm_d_epp_average_queue_size", "qwen3", 1.0),
+        ];
+        assert_eq!(
+            in_flight(&observations, Some(2.0), Some("qwen3")),
+            Some((8.0, InFlightSource::EngineAverages)),
+            "the unlabeled count covers both pools, so (3 + 1) x 2 for qwen3"
+        );
+    }
+
+    #[test]
+    fn in_flight_is_unknown_rather_than_idle() {
+        let averages = [
+            sample("llm_d_epp_average_running_requests", "qwen3", 6.0),
+            sample("llm_d_epp_average_queue_size", "qwen3", 1.5),
+        ];
+        assert_eq!(in_flight(&averages, None, None), None, "no endpoint count, no estimate");
+        assert_eq!(
+            in_flight(&averages, Some(0.0), Some("qwen3")),
+            None,
+            "no fresh endpoint behind frozen averages"
+        );
+        assert_eq!(
+            in_flight(&averages[..1], Some(2.0), None),
+            None,
+            "a missing average is not zero"
+        );
+        assert_eq!(
+            in_flight(&[queued("qwen3", 4.0)], None, Some("qwen3")),
+            None,
+            "a queue alone is no count"
+        );
     }
 }

@@ -72,6 +72,36 @@ When every candidate for a model is excluded, the gateway answers 503 with
 With the defaults of a 5 s scrape and a 5 s poll, exclusion takes at most about
 15 s and rejoin about 10 s.
 
+## Provider In-flight
+
+Each site's operator also publishes how many requests each provider holds, as
+`grid_provider_in_flight_requests{grid_site,grid_provider}`. Every input comes from the EPP's
+`/metrics`, and nothing scrapes vLLM. The value is the larger of two estimates, plus the
+requests the EPP's flow control holds for the pool (`llm_d_epp_flow_control_queue_size`):
+
+- The EPP's per-endpoint `llm_d_epp_inflight_requests`, summed, taking each endpoint's
+  largest count across producer instances. It needs the EPP's inflight-load-producer.
+- The pool's average running plus average queued requests, times ready endpoints.
+
+The larger, so an EPP restart that zeroes its count does not make the site look idle.
+The per-endpoint count carries no pool label, so when one EPP serves more than one pool the
+operator uses the pool averages alone. A site with no fresh endpoint publishes nothing,
+since its averages are frozen at their last value, and the gateway reads it as unknown.
+
+On a prefill/decode pool the EPP counts a request on its prefill and its decode
+endpoint, so the value counts endpoint occupancy, up to twice the requests. Capacity
+must therefore count the slots of every ready endpoint, prefill and decode alike.
+
+Point `metricsConfig.metricsEndpoint` at the EPP Service. A pod or headless address
+can reach a standby replica, which reports no series.
+
+Capacity is the provider's per-endpoint `spec.maxRunning` times the EPP's fresh ready
+endpoints, published as `grid_provider_capacity_requests`, so it shrinks when pods are lost.
+With no fresh endpoint it is unpublished, and the gateway reads it as unknown.
+
+With both known, the operator also publishes their ratio, requests held over
+capacity, as `grid_provider_saturation_ratio`. Gateways choose sites by it.
+
 ## Failure Behavior
 
 | Condition | Signal produced | Routing effect |

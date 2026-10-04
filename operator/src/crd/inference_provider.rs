@@ -65,6 +65,15 @@ pub struct InferenceProviderSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_weight: Option<u32>,
 
+    /// Most requests one endpoint runs at once: vLLM max-num-seqs.
+    ///
+    /// The site's operator multiplies it by the EPP's fresh ready endpoints and publishes
+    /// the product as `grid_provider_capacity_requests`, the capacity gateways weigh the
+    /// provider's load against. When absent, or no endpoint is fresh, capacity is unknown.
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_running: Option<u32>,
+
     /// Cost information.
     pub cost: Option<CostConfig>,
 

@@ -151,6 +151,7 @@ fn record_scrape(
         .as_ref()
         .and_then(|mc| mc.pool_name.as_deref());
     let ready = crate::readiness::ready_endpoints(&parsed, plan.ready_names(), pool);
+    let in_flight = in_flight_observation(&parsed, ready, pool, plan.identity);
     let observations = parsed
         .into_iter()
         .filter(|o| plan.wanted.contains(o.metric.as_str()))
@@ -160,8 +161,31 @@ fn record_scrape(
             o.timestamp_ms = None;
             o
         })
+        .chain(in_flight)
         .collect();
     readiness.record_success(key, ready, observations, Instant::now());
+}
+
+/// The resolved `grid_provider_in_flight_requests` sample, logging which source it came from.
+fn in_flight_observation(
+    parsed: &[crate::signals::Observation],
+    ready: Option<f64>,
+    pool: Option<&str>,
+    identity: &str,
+) -> Option<crate::signals::Observation> {
+    let (value, source) = crate::readiness::in_flight(parsed, ready, pool)?;
+    tracing::debug!(
+        provider = identity,
+        in_flight = value,
+        ?source,
+        "signals: provider in-flight resolved"
+    );
+    Some(crate::signals::Observation {
+        metric: crate::readiness::IN_FLIGHT_SIGNAL.to_owned(),
+        labels: std::collections::BTreeMap::new(),
+        value,
+        timestamp_ms: None,
+    })
 }
 
 /// Scrape one provider's exposition, or `None` when TLS or the scrape fails.

@@ -35,11 +35,15 @@ pub(crate) const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(30);
 /// Store retention per series, seconds.
 const WINDOW_SECS: u64 = 60;
 
-/// Freshness window the gateway orders over, milliseconds.
-const LOAD_WINDOW_MS: i64 = 30_000;
-
 /// Peer poll interval, the operator's default local scrape interval.
 const PEER_INTERVAL_MS: u64 = 5_000;
+
+/// Freshness window the gateway orders over: two polls, milliseconds.
+///
+/// The gateway orders by the worst reading in the window, so a site drained by a
+/// spike returns two polls after it clears instead of thirty seconds.
+#[expect(clippy::cast_possible_wrap, reason = "a few seconds fits i64")]
+const LOAD_WINDOW_MS: i64 = 2 * PEER_INTERVAL_MS as i64;
 
 /// Peer connect and request timeout, milliseconds.
 const PEER_TIMEOUT_MS: u64 = 2_000;
