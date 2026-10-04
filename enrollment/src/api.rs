@@ -55,7 +55,7 @@ pub struct AppState {
     /// The CA that signs enrolled certificates, reloaded when its Secret changes.
     pub ca: SharedCa,
 
-    /// How minting and revoking are authorized (grid-admin token table, or RBAC).
+    /// How grid-admin requests are authorized (grid-admin token table, or RBAC).
     pub authorizer: Authorizer,
 
     /// How long an issued certificate lasts.
@@ -231,7 +231,7 @@ impl ApiError {
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 ErrorCode::Unauthorized,
-                "minting or revoking a token requires a grid-admin credential".to_owned(),
+                "this action requires a grid-admin credential".to_owned(),
             ),
             Self::InvalidToken => (
                 StatusCode::UNAUTHORIZED,
@@ -241,7 +241,7 @@ impl ApiError {
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
                 ErrorCode::Forbidden,
-                "not permitted to mint or revoke site tokens".to_owned(),
+                "this grid-admin credential is not permitted this action".to_owned(),
             ),
             Self::IdentityRequired => (
                 StatusCode::UNAUTHORIZED,
