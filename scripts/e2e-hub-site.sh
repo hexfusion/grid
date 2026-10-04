@@ -293,7 +293,7 @@ install_hub() {
   images operator
   renewal_args grid-operator
   helm_on "$HUB_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
-    --set swim.siteName=hub --set enrollment.enabled=true \
+    --set swim.siteName=hub --set enrollment.enabled=true --set grid.peerTrust="$MODE" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$HUB_SWIM_IP" || die "install hub grid-operator"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-ca-bundle ca.crt || die "copy the hub CA bundle"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-invite-hub token hub || die "copy the hub invite"
@@ -352,6 +352,7 @@ install_site() {
   helm_on "$SITE_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
     --set "swim.siteName=$SITE" --set "swim.seeds=$HUB_SWIM_IP:7946" \
     --set enrollment.enabled=true --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
+    --set grid.peerTrust="$MODE" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" || die "install site grid-operator"
   enrollment_forward || die "enrollment forward"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" grid-ca-bundle ca.crt || die "copy the site CA bundle"
