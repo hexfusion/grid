@@ -571,7 +571,7 @@ says nothing about whether it serves now.
 | Status | Reason | When |
 |---|---|---|
 | `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint. |
-| `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints. |
+| `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints, and the EPP recorded no engine answer in the last 30s. |
 | `False` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). The message names what was missing. |
 | `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds`, and the latest timed out. |
 | `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |

@@ -22,6 +22,12 @@ pub(crate) const DEFAULT_READY_ENDPOINTS: [&str; 2] = ["llm_d_epp_ready_endpoint
 /// pool that just drained can read ready once before its first request lands.
 pub(crate) const STREAK: u32 = 2;
 
+/// How recently the engine must have answered for a zero count to read as busy, not down.
+///
+/// The EPP counts endpoints whose metrics are fresh, so a saturated engine whose /metrics
+/// answers late reads as zero while it still serves.
+pub(crate) const PROGRESS_WINDOW: Duration = Duration::from_secs(30);
+
 /// The series this site publishes per provider declaring `maxRunning`: that capacity.
 pub const CAPACITY_SIGNAL: &str = "grid_provider_capacity_requests";
 
@@ -213,6 +219,10 @@ struct Probe {
     ready_streak: u32,
     /// Whether the count marks the provider not ready, with [`STREAK`] hysteresis both ways.
     no_endpoints: bool,
+    /// When the EPP last recorded an engine answer for this provider.
+    last_progress: Option<Instant>,
+    /// Whether the latest zero count came while the engine was answering.
+    busy: bool,
     /// Recent EPP latency snapshots.
     latency: crate::latency::History,
 }
@@ -242,6 +252,7 @@ impl ReadinessStore {
     }
 
     /// Record a scrape's latency counters and return the latency series it publishes.
+    #[expect(clippy::significant_drop_tightening, reason = "the guard covers one whole update")]
     pub(crate) fn record_latency(
         &self,
         key: &str,
@@ -251,11 +262,19 @@ impl ReadinessStore {
     ) -> Vec<Observation> {
         // Built before locking, so the store is held only to append it.
         let snapshot = crate::latency::Snapshot::of(observations, pool);
-        self.probes()
-            .entry(key.to_owned())
-            .or_default()
-            .latency
-            .record(snapshot, now)
+        // The counters carry no pool label, so an EPP serving several pools proves nothing.
+        let attributable = !serves_several_pools(observations);
+        let mut probes = self.probes();
+        let probe = probes.entry(key.to_owned()).or_default();
+        if attributable
+            && probe
+                .latency
+                .latest()
+                .is_some_and(|earlier| snapshot.produced_since(earlier))
+        {
+            probe.last_progress = Some(now);
+        }
+        probe.latency.record(snapshot, now)
     }
 
     /// Record a successful scrape at `now`, with `missing` naming the series it lacked.
@@ -276,17 +295,22 @@ impl ReadinessStore {
             Some(count) if count < 1.0 => {
                 probe.zero_streak = probe.zero_streak.saturating_add(1);
                 probe.ready_streak = 0;
-                probe.no_endpoints |= probe.zero_streak >= STREAK;
+                probe.busy = probe
+                    .last_progress
+                    .is_some_and(|at| now.saturating_duration_since(at) <= PROGRESS_WINDOW);
+                probe.no_endpoints |= probe.zero_streak >= STREAK && !probe.busy;
             },
             Some(_) => {
                 probe.ready_streak = probe.ready_streak.saturating_add(1);
                 probe.zero_streak = 0;
+                probe.busy = false;
                 probe.no_endpoints &= probe.ready_streak < STREAK;
             },
             // No count to read: reachable is all that is known.
             None => {
                 probe.zero_streak = 0;
                 probe.ready_streak = 0;
+                probe.busy = false;
                 probe.no_endpoints = false;
             },
         }
@@ -407,14 +431,23 @@ fn from_ready_endpoints(probe: &Probe) -> Verdict {
                 .unwrap_or_else(|| "metrics reachable, but no ready-endpoint series".to_owned()),
         };
     };
-    let message = if count < 1.0 {
-        "0 ready endpoints in the latest scrape only".to_owned()
-    } else {
-        format!("{count} ready endpoints")
-    };
     Verdict {
         reason: Reason::Ready,
-        message,
+        message: ready_message(count, probe.busy),
+    }
+}
+
+/// The detail for a ready provider counting `count` endpoints.
+fn ready_message(count: f64, busy: bool) -> String {
+    if count >= 1.0 {
+        format!("{count} ready endpoints")
+    } else if busy {
+        format!(
+            "0 ready endpoints, but the engine answered in the last {}s",
+            PROGRESS_WINDOW.as_secs()
+        )
+    } else {
+        "0 ready endpoints in the latest scrape only".to_owned()
     }
 }
 
@@ -673,6 +706,104 @@ mod tests {
         );
         assert_eq!(scrape(1.0), Some(Reason::NoEndpointsReady));
         assert_eq!(scrape(1.0), Some(Reason::Ready));
+    }
+
+    /// One EPP scrape for pool qwen3: its ready count, a running average frozen at 128, and
+    /// `answered` usage reports so far.
+    fn saturated(ready: f64, answered: f64) -> Vec<Observation> {
+        let unlabeled = |metric: &str, value: f64| Observation {
+            metric: metric.to_owned(),
+            labels: BTreeMap::new(),
+            value,
+            timestamp_ms: None,
+        };
+        vec![
+            sample("llm_d_epp_ready_endpoints", "qwen3", ready),
+            sample("llm_d_epp_average_running_requests", "qwen3", 128.0),
+            unlabeled("llm_d_epp_request_input_tokens_count", answered),
+            unlabeled("llm_d_epp_request_input_tokens_sum", answered * 100.0),
+        ]
+    }
+
+    /// Record `observations` as the signals loop does, and return the verdict.
+    fn scrape_at(store: &ReadinessStore, observations: &[Observation], now: Instant) -> Option<Reason> {
+        let ready = ready_endpoints(observations, &DEFAULT_READY_ENDPOINTS, Some("qwen3"));
+        store.record_latency("p", observations, Some("qwen3"), now);
+        store.record_success("p", ready, None, observations.to_vec(), now);
+        reason(store, now)
+    }
+
+    const STEP: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn a_saturated_pool_that_still_answers_stays_ready_on_zero_counts() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        assert_eq!(scrape_at(&store, &saturated(2.0, 100.0), start), Some(Reason::Ready));
+        for (n, answered) in [(1_u32, 140.0), (2, 180.0), (3, 220.0)] {
+            assert_eq!(
+                scrape_at(&store, &saturated(0.0, answered), start + STEP * n),
+                Some(Reason::Ready),
+                "scrape {n}: running 128 and answering is busy, not down"
+            );
+        }
+        let verdict = store.verdict("p", false, STALE, start + STEP * 3).unwrap();
+        assert!(verdict.message.contains("answered"), "{}", verdict.message);
+    }
+
+    #[test]
+    fn a_zero_count_with_no_answers_excludes_even_with_running_requests() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        assert_eq!(scrape_at(&store, &saturated(2.0, 100.0), start), Some(Reason::Ready));
+        assert_eq!(
+            scrape_at(&store, &saturated(0.0, 100.0), start + STEP),
+            Some(Reason::Ready)
+        );
+        assert_eq!(
+            scrape_at(&store, &saturated(0.0, 100.0), start + STEP * 2),
+            Some(Reason::NoEndpointsReady),
+            "the running average freezes at zero endpoints, so it is no evidence"
+        );
+    }
+
+    #[test]
+    fn a_pool_that_stops_answering_is_excluded_once_the_window_passes() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        scrape_at(&store, &saturated(2.0, 100.0), start);
+        let answered = start + STEP;
+        scrape_at(&store, &saturated(0.0, 140.0), answered);
+        // Six more scrapes reach 30s after the last answer: still inside the window.
+        for n in 1..=6_u32 {
+            assert_eq!(
+                scrape_at(&store, &saturated(0.0, 140.0), answered + STEP * n),
+                Some(Reason::Ready),
+                "{}s after the last answer",
+                (STEP * n).as_secs()
+            );
+        }
+        assert_eq!(
+            scrape_at(&store, &saturated(0.0, 140.0), answered + STEP * 7),
+            Some(Reason::NoEndpointsReady)
+        );
+    }
+
+    #[test]
+    fn answers_from_an_epp_serving_several_pools_prove_nothing() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        let with_other_pool = |ready, answered| {
+            let mut observations = saturated(ready, answered);
+            observations.push(sample("llm_d_epp_ready_endpoints", "llama", 3.0));
+            observations
+        };
+        scrape_at(&store, &with_other_pool(2.0, 100.0), start);
+        scrape_at(&store, &with_other_pool(0.0, 140.0), start + STEP);
+        assert_eq!(
+            scrape_at(&store, &with_other_pool(0.0, 180.0), start + STEP * 2),
+            Some(Reason::NoEndpointsReady)
+        );
     }
 
     #[test]

@@ -140,6 +140,13 @@ impl Snapshot {
         }
     }
 
+    /// Whether the engine answered since `earlier`: a first token, a completion, or a usage report.
+    pub(crate) fn produced_since(&self, earlier: &Self) -> bool {
+        self.ttft.count > earlier.ttft.count
+            || self.tpot.count > earlier.tpot.count
+            || self.input.count > earlier.input.count
+    }
+
     /// `self - earlier`, `None` when any counter went backwards.
     fn since(&self, earlier: &Self) -> Option<Self> {
         let optional = |now: Option<SumCount>, then: Option<SumCount>| match (now, then) {
@@ -222,6 +229,11 @@ pub(crate) struct History {
 }
 
 impl History {
+    /// The latest recorded scrape.
+    pub(crate) fn latest(&self) -> Option<&Snapshot> {
+        self.snapshots.back().map(|(_, snapshot)| snapshot)
+    }
+
     /// Record this scrape and return the latency series to publish for it.
     pub(crate) fn record(&mut self, snapshot: Snapshot, now: Instant) -> Vec<Observation> {
         while self
