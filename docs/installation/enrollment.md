@@ -126,7 +126,8 @@ signals listener, the peer pollers, and the gateway reload without a restart.
 whenever an enrollment URL is known.
 
 Rotation runs only under `spiffe` peer trust, and follows the trust the `GridNetwork`
-declares. Before a `GridNetwork` exists the operator trusts by SPIFFE ID and rotates.
+declares. Before a `GridNetwork` exists the operator uses the install's
+`grid.peerTrust`, `spiffe` when unset, so a `pin` install does not rotate even then.
 Under `pin`, which a `GridNetwork` gets when it omits `peerTrust`, peers pin the
 leaf digest and would refuse a rotated leaf, so the operator does not rotate and logs
 `rotation disabled` when it finds pin trust. Before a pin site's certificate expires, every 180
