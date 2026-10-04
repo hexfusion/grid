@@ -1,10 +1,10 @@
 //! Renewing a site identity with its current certificate.
 
-#![allow(clippy::tests_outside_test_module, reason = "integration tests live in tests/")]
 #![expect(
+    clippy::tests_outside_test_module,
     clippy::expect_used,
     clippy::indexing_slicing,
-    reason = "tests, and serde_json::Value indexing yields Null rather than panicking"
+    reason = "integration tests live in tests/, and serde_json::Value indexing yields Null rather than panicking"
 )]
 
 use std::{collections::HashMap, sync::Arc};
