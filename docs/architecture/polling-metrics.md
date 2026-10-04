@@ -102,6 +102,26 @@ With no fresh endpoint it is unpublished, and the gateway reads it as unknown.
 With both known, the operator also publishes their ratio, requests held over
 capacity, as `grid_provider_saturation_ratio`. Gateways choose sites by it.
 
+## Provider Latency
+
+Each site's operator also publishes recent latency per provider, from the EPP's request
+histograms over the last 30s. A value is published only when at least 20 requests
+completed in that window, and it is never borrowed from another site:
+
+- `grid_provider_ttft_p50_seconds` and `grid_provider_ttft_p90_seconds`: time to first
+  token for streaming requests, from the EPP's `llm_d_epp_request_ttft_seconds`. The EPP
+  times it from receiving the request, so it includes flow-control wait and network.
+- `grid_provider_tpot_seconds`: mean time per output token for streaming requests.
+- `grid_provider_prefill_seconds_per_token`: mean TTFT less mean flow-control wait, over
+  mean uncached input tokens. It is an estimate that moves with the workload mix: TTFT
+  counts streaming requests only, while token counts cover every request.
+- `grid_provider_error_ratio`: failed requests over all requests. The latency histograms
+  record only successful requests, so a failing site can read fast. This shows it.
+
+The EPP labels these histograms by model, not pool, so an EPP serving more than one pool
+reports their combined latency. An EPP restart resets its counters, and the window starts
+over from the next scrape.
+
 ## Failure Behavior
 
 | Condition | Signal produced | Routing effect |

@@ -135,6 +135,8 @@ struct Probe {
     ready_streak: u32,
     /// Whether the count marks the provider not ready, with [`STREAK`] hysteresis both ways.
     no_endpoints: bool,
+    /// Recent EPP latency snapshots.
+    latency: crate::latency::History,
 }
 
 /// One provider's verdict and the detail behind it.
@@ -159,6 +161,23 @@ impl ReadinessStore {
     /// The probes, recovered if a panicking holder poisoned the lock: each write is whole.
     fn probes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Probe>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record a scrape's latency counters and return the latency series it publishes.
+    pub(crate) fn record_latency(
+        &self,
+        key: &str,
+        observations: &[Observation],
+        pool: Option<&str>,
+        now: Instant,
+    ) -> Vec<Observation> {
+        // Built before locking, so the store is held only to append it.
+        let snapshot = crate::latency::Snapshot::of(observations, pool);
+        self.probes()
+            .entry(key.to_owned())
+            .or_default()
+            .latency
+            .record(snapshot, now)
     }
 
     /// Record a successful scrape at `now`.

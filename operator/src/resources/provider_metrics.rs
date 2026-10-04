@@ -152,6 +152,7 @@ fn record_scrape(
         .and_then(|mc| mc.pool_name.as_deref());
     let ready = crate::readiness::ready_endpoints(&parsed, plan.ready_names(), pool);
     let in_flight = in_flight_observation(&parsed, ready, pool, plan.identity);
+    let latency = readiness.record_latency(key, &parsed, pool, Instant::now());
     let observations = parsed
         .into_iter()
         .filter(|o| plan.wanted.contains(o.metric.as_str()))
@@ -162,6 +163,7 @@ fn record_scrape(
             o
         })
         .chain(in_flight)
+        .chain(latency)
         .collect();
     readiness.record_success(key, ready, observations, Instant::now());
 }
