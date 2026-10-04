@@ -646,7 +646,6 @@ pub(crate) fn sites_matching_selector(provider: &InferenceProvider, sites: &[Gri
     names
 }
 
-
 /// The sites hosting `provider`: this site alone when its selector is empty and this site is in
 /// the provider's network, as the routing overlay attributes it, else every site the selector matches.
 fn hosting_sites(provider: &InferenceProvider, sites: &[GridSite], local_site: Option<&str>) -> Vec<String> {

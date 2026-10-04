@@ -99,6 +99,9 @@ pub struct OperatorCtx {
     /// after async DNS resolution and the SWIM channel announcement.
     pub(crate) last_seeds: std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
 
+    /// Sites each `GridNetwork`'s serving config last refused, for warning on change.
+    pub(crate) refused_sites: serving_config::RefusedSites,
+
     /// Who may read the signals endpoint, keyed by presented-cert fingerprint.
     /// Set by reconcile from each `GridSite`'s trust pins.
     pub(crate) peer_identities: signals::PeerIdentities,
@@ -278,6 +281,7 @@ impl OperatorCtx {
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
+            refused_sites: std::sync::Mutex::new(HashMap::new()),
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
             signals: signals::SignalStore::new(),
@@ -2084,6 +2088,10 @@ struct ServingSource<'src> {
     gate: &'src WriteGate,
     /// Peer addressing resolved at startup.
     settings: &'src PeerSettings,
+    /// How often this operator scrapes its providers.
+    scrape_interval: Duration,
+    /// Sites each network's serving config last refused.
+    refused: &'src serving_config::RefusedSites,
 }
 
 /// Build the serving source from membership, `None` outside poll mode.
@@ -2115,6 +2123,8 @@ fn serving_source<'src>(
         pins,
         gate: &ctx.serving_writes,
         settings: &ctx.peer_settings,
+        scrape_interval: ctx.scrape_interval,
+        refused: &ctx.refused_sites,
     })
 }
 
@@ -2134,6 +2144,7 @@ fn render_serving_text(
         tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
         pins: &source.pins,
+        scrape_interval: source.scrape_interval,
     };
     let members = source.members.iter().map(|(site, endpoint)| (*site, endpoint.as_str()));
     serving_config::render(overlay, members, &inputs)
@@ -2151,6 +2162,7 @@ async fn apply_serving_config(
     gw_ref: &GatewayRef,
     client: &Client,
 ) -> Result<Option<Duration>, OperatorError> {
+    serving_config::warn_refused_sites(overlay, network_name, source.refused);
     let Some(text) = render_serving_text(overlay, source, gw_ref)? else {
         tracing::debug!(gateway = %gw_ref.name, "serving config has no candidates; leaving any prior config");
         return Ok(None);

@@ -12,9 +12,9 @@
 //! # Phase 1 / OP-01 semantics
 //!
 //! - [`GridSite`]s are used to resolve per-provider site membership via `spec.siteSelector.matchLabels`.  An empty
-//!   selector matches all sites in the same [`GridNetwork`].
+//!   selector means this site alone, when the network lists it.
 //! - Each `(model, site)` pair becomes one `RoutingCandidate`.
-//! - `candidate.site` = the [`GridSite`] name (resolved via selector).
+//! - `candidate.site` = the [`GridSite`]'s site id (resolved via selector), as peers are keyed.
 //! - `candidate.cluster` = `spec.routingClusterRef` when set, otherwise the [`InferenceProvider`] metadata name. The
 //!   gateway uses this as the upstream cluster reference in its local routing configuration.
 //! - When no [`GridSite`]s are provided, the routing identity (`spec.routingClusterRef` or provider name) is used as
@@ -48,6 +48,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    controller::grid_network::peer_site_key,
     crd::{
         auth::{AccessPolicy, AuthStrategy},
         grid_network::GridNetwork,
@@ -1123,7 +1124,7 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// Only [`InferenceProvider`]s whose `spec.gridNetworkRef` matches
 /// `network.metadata.name` are included.  Each provider's
 /// `spec.siteSelector.matchLabels` is matched against the supplied
-/// `sites`; an empty selector matches all sites in the network.
+/// `sites`; an empty selector means `local_site` alone.
 ///
 /// The `local_site` parameter identifies this gateway's own site.
 /// Praxis uses it to score candidates running on the local site higher
@@ -1277,7 +1278,7 @@ pub fn render_routing_overlay_with_admission(
         .find(|site| site.metadata.name.as_deref() == Some(local_site) && site.spec.grid_network_ref == network_name)
         .and_then(|site| site.metadata.labels.as_ref());
 
-    let mut candidates = collect_candidates(network_name, sites, providers, consumer_site_labels)?;
+    let mut candidates = collect_candidates(network_name, sites, providers, consumer_site_labels, local_site)?;
     for provider in remote_crdt_providers {
         let access_policy = crdt_access_policy_to_operator(&provider.access_policy);
         let access_result = evaluate_access_policy(&access_policy, consumer_site_labels);
@@ -1462,6 +1463,7 @@ fn collect_candidates(
     sites: &[GridSite],
     providers: &[InferenceProvider],
     consumer_site_labels: Option<&BTreeMap<String, String>>,
+    local_site: &str,
 ) -> Result<Vec<RoutingCandidate>, String> {
     // Pre-filter sites to those in this network.
     let network_sites: Vec<&GridSite> = sites
@@ -1483,7 +1485,7 @@ fn collect_candidates(
             continue;
         }
 
-        let resolution = resolve_sites(provider, &network_sites);
+        let resolution = resolve_sites(provider, &network_sites, local_site);
         all.extend(candidates_from_provider(provider, &resolution)?);
     }
     Ok(all)
@@ -1495,12 +1497,25 @@ fn collect_candidates(
 /// which enables the Phase 1 provider-name fallback.  Returns
 /// [`SiteResolution::Known`] otherwise — with an empty `Vec` if the
 /// selector matched nothing, which suppresses candidate generation.
-fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite]) -> SiteResolution {
+///
+/// An empty selector means this site alone, when the inventory lists it, as the
+/// provider controller attributes it. Sites are keyed as peers are, so a
+/// discovered peer reads as its site id, not its object name.
+fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite], local_site: &str) -> SiteResolution {
     if network_sites.is_empty() {
         return SiteResolution::Unavailable;
     }
 
     let selector = &provider.spec.site_selector.match_labels;
+    let key = |site: &&GridSite| peer_site_key(site).map(|(key, _)| key);
+    if selector.is_empty() {
+        let listed = network_sites.iter().filter_map(key).any(|site| site == local_site);
+        return SiteResolution::Known(if listed {
+            vec![local_site.to_owned()]
+        } else {
+            Vec::new()
+        });
+    }
 
     let names: Vec<String> = network_sites
         .iter()
@@ -1510,7 +1525,7 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite]) -> S
                 .iter()
                 .all(|(k, v)| site_labels.is_some_and(|labels| labels.get(k).is_some_and(|sv| sv == v)))
         })
-        .map(|site| site.metadata.name.clone().unwrap_or_else(|| "unknown-site".to_owned()))
+        .filter_map(key)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -1990,9 +2005,19 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    /// A label every labeled test site carries, so a provider can be placed at all of them.
+    const PLACEMENT: (&str, &str) = ("test.grid/placement", "all");
+
+    /// `provider` placed at every labeled test site, as an explicit selector does.
+    fn placed_everywhere(mut provider: InferenceProvider) -> InferenceProvider {
+        provider.spec.site_selector.match_labels = BTreeMap::from([(PLACEMENT.0.to_owned(), PLACEMENT.1.to_owned())]);
+        provider
+    }
+
     fn test_site_with_labels(name: &str, network: &str, labels: &[(&str, &str)]) -> GridSite {
         let labels_map: serde_json::Map<String, serde_json::Value> = labels
             .iter()
+            .chain(std::iter::once(&PLACEMENT))
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         serde_json::from_value(serde_json::json!({
@@ -3292,30 +3317,55 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn empty_selector_matches_all_sites_in_network() {
-        let network = test_network("net");
-        let site_a = test_site("site-a", "net");
-        let site_b = test_site("site-b", "net");
-        let provider = test_provider("prov", "net", &["model"]);
+    fn an_empty_selector_places_a_provider_at_the_local_site_only() {
+        let render = |local: &str| {
+            render_routing_overlay(
+                &test_network("net"),
+                &[test_site("site-a", "net"), test_site("site-b", "net")],
+                &[test_provider("prov", "net", &["model"])],
+                &[],
+                local,
+                None,
+                None,
+                &scoring::ScoringWeights::default(),
+            )
+            .map(|overlay| overlay.candidates.into_iter().map(|c| c.site).collect::<Vec<_>>())
+        };
+        assert!(
+            matches!(render("site-a"), Ok(sites) if sites == ["site-a"]),
+            "not every site in the network"
+        );
+        assert!(
+            matches!(render("absent"), Ok(sites) if sites.is_empty()),
+            "a local site the inventory does not list hosts nothing"
+        );
+    }
+
+    #[test]
+    fn a_selector_names_a_discovered_peer_by_its_site_id() {
+        let mut peer = test_site_with_labels("grid-retail", "net", &[("hw", "gpu")]);
+        peer.metadata.labels.get_or_insert_with(BTreeMap::new).insert(
+            crate::controller::grid_network::LABEL_AUTO_DISCOVERED.to_owned(),
+            "true".to_owned(),
+        );
+        peer.metadata.annotations = Some(BTreeMap::from([(
+            crate::controller::grid_network::ANNOTATION_SITE_ID.to_owned(),
+            "retail".to_owned(),
+        )]));
+        let provider = test_provider_with_selector("prov", "net", &["model"], &[("hw", "gpu")]);
         let overlay = render_routing_overlay(
-            &network,
-            &[site_a, site_b],
+            &test_network("net"),
+            &[peer],
             &[provider],
             &[],
-            "test-site",
+            "hq",
             None,
             None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(
-            overlay.candidates.len(),
-            2,
-            "empty selector should produce one candidate per site"
-        );
         let sites: Vec<&str> = overlay.candidates.iter().map(|c| c.site.as_str()).collect();
-        assert!(sites.contains(&"site-a"), "site-a must be in candidates");
-        assert!(sites.contains(&"site-b"), "site-b must be in candidates");
+        assert_eq!(sites, ["retail"], "keyed as peers are, not by object name");
     }
 
     #[test]
@@ -3412,7 +3462,7 @@ mod tests {
             &[site],
             &[p1, p2],
             &[],
-            "test-site",
+            "site-a",
             None,
             None,
             &scoring::ScoringWeights::default(),
@@ -3438,7 +3488,7 @@ mod tests {
             &[site],
             &[provider],
             &[],
-            "test-site",
+            "site-a",
             None,
             None,
             &scoring::ScoringWeights::default(),
@@ -3708,13 +3758,17 @@ mod tests {
             &[site_a, site_b],
             &[provider],
             &[],
-            "test-site",
+            "site-a",
             None,
             None,
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(overlay.candidates.len(), 2, "one candidate per matched site");
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "an empty selector places it at the local site"
+        );
         assert!(
             overlay.candidates.iter().all(|c| !c.fresh),
             "every (model, site) candidate from a Degraded provider must have fresh=false"
@@ -6316,7 +6370,7 @@ mod tests {
         let network = test_network("net");
         let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod")]);
         let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
-        let provider = test_provider("unrestricted-prov", "net", &["model-a"]);
+        let provider = placed_everywhere(test_provider("unrestricted-prov", "net", &["model-a"]));
 
         // The provider has an empty siteSelector, so it should generate candidates
         // for ALL sites in the network when it appears in any overlay.
@@ -6369,7 +6423,12 @@ mod tests {
         let network = test_network("net");
         let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod"), ("region", "us-west")]);
         let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
-        let provider = test_provider_with_access_policy("prod-only-prov", "net", &["model-a"], &[("env", "prod")]);
+        let provider = placed_everywhere(test_provider_with_access_policy(
+            "prod-only-prov",
+            "net",
+            &["model-a"],
+            &[("env", "prod")],
+        ));
 
         // Consumer from prod site should get candidates
         // Since the provider has an empty siteSelector but restricted access policy,
@@ -6490,7 +6549,7 @@ mod tests {
         let site = test_site_with_labels("known-site", "net", &[("env", "prod")]);
         let provider_restricted =
             test_provider_with_access_policy("restricted-prov", "net", &["model-a"], &[("env", "prod")]);
-        let provider_unrestricted = test_provider("unrestricted-prov", "net", &["model-b"]);
+        let provider_unrestricted = placed_everywhere(test_provider("unrestricted-prov", "net", &["model-b"]));
 
         // Consumer site not in the sites list (unknown identity)
         let overlay = render_routing_overlay(
@@ -6525,15 +6584,19 @@ mod tests {
         let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod"), ("team", "platform")]);
         let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging"), ("team", "platform")]);
 
-        let provider_unrestricted = test_provider("unrestricted-prov", "net", &["model-general"]);
-        let provider_prod_only =
-            test_provider_with_access_policy("prod-only-prov", "net", &["model-prod"], &[("env", "prod")]);
-        let provider_platform_only = test_provider_with_access_policy(
+        let provider_unrestricted = placed_everywhere(test_provider("unrestricted-prov", "net", &["model-general"]));
+        let provider_prod_only = placed_everywhere(test_provider_with_access_policy(
+            "prod-only-prov",
+            "net",
+            &["model-prod"],
+            &[("env", "prod")],
+        ));
+        let provider_platform_only = placed_everywhere(test_provider_with_access_policy(
             "platform-only-prov",
             "net",
             &["model-platform"],
             &[("team", "platform")],
-        );
+        ));
 
         // Prod consumer should get all three providers (each provider generates candidates for both sites)
         let overlay = render_routing_overlay(
@@ -6714,7 +6777,7 @@ mod tests {
         let site = test_site_with_labels("known-site", "net", &[("env", "prod")]);
         let provider_restricted =
             test_provider_with_access_policy("local-restricted-prov", "net", &["model-a"], &[("env", "prod")]);
-        let provider_unrestricted = test_provider("local-unrestricted-prov", "net", &["model-b"]);
+        let provider_unrestricted = placed_everywhere(test_provider("local-unrestricted-prov", "net", &["model-b"]));
 
         // Consumer site not in the sites list (unknown identity)
         let overlay = render_routing_overlay(

@@ -38,15 +38,20 @@ const WINDOW_SECS: u64 = 60;
 /// Peer poll interval, the operator's default local scrape interval.
 const PEER_INTERVAL_MS: u64 = 5_000;
 
-/// Freshness window the gateway orders over: two polls, milliseconds.
-///
-/// The gateway orders by the worst reading in the window, so a site drained by a
-/// spike returns two polls after it clears instead of thirty seconds.
-#[expect(clippy::cast_possible_wrap, reason = "a few seconds fits i64")]
-const LOAD_WINDOW_MS: i64 = 2 * PEER_INTERVAL_MS as i64;
-
 /// Peer connect and request timeout, milliseconds.
 const PEER_TIMEOUT_MS: u64 = 2_000;
+
+/// The freshness window the gateway reads load over, milliseconds: the oldest a sample can
+/// be when it arrives (a scrape, a poll, and a poll timeout) plus one poll of slack, so one
+/// late poll does not turn a healthy site unknown. 17s at a 5s scrape.
+fn load_window_ms(scrape: Duration) -> i64 {
+    let scrape_ms = u64::try_from(scrape.as_millis()).unwrap_or(u64::MAX);
+    let window = PEER_INTERVAL_MS
+        .saturating_add(scrape_ms)
+        .saturating_add(PEER_TIMEOUT_MS)
+        .saturating_add(PEER_INTERVAL_MS);
+    i64::try_from(window).unwrap_or(i64::MAX)
+}
 
 /// Gateway-side cap on candidates (`validate_candidates`).
 const MAX_CANDIDATES: usize = 1024;
@@ -136,6 +141,8 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) local_signals_addr: Option<&'input str>,
     /// Declared leaf digests per remote site, empty outside pin trust.
     pub(crate) pins: &'input BTreeMap<String, Vec<String>>,
+    /// How often operators scrape their providers, taken as every site's.
+    pub(crate) scrape_interval: Duration,
 }
 
 /// Render from `(site, signals endpoint)` members, `None` when no candidate survives.
@@ -169,7 +176,7 @@ where
     Some(ServingConfig {
         local_site: overlay.local_site.clone(),
         window_secs: WINDOW_SECS,
-        load_window_ms: LOAD_WINDOW_MS,
+        load_window_ms: load_window_ms(inputs.scrape_interval),
         candidates,
         peers,
     })
@@ -263,12 +270,41 @@ fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
 /// An inference candidate the gateway will accept, whatever its admission.
 ///
 /// A candidate not taking new requests stays in, so the gateway can tell a known
-/// down model, answered with 503, from an unknown one.
+/// down model, answered with 503, from an unknown one. Its site must be a DNS-1123
+/// label, as enrolled site names are: the gateway carries it in headers and ids.
 fn routable(candidate: &RoutingCandidate) -> bool {
     candidate.kind == INFERENCE_MODEL
         && [&candidate.name, &candidate.site, &candidate.cluster]
             .into_iter()
             .all(|id| valid_id(id))
+        && certs::validate_site_name(&candidate.site).is_ok()
+}
+
+/// The candidate sites the serving config refuses for not being DNS-1123 labels.
+fn refused_sites(overlay: &RoutingOverlay) -> BTreeSet<String> {
+    overlay
+        .candidates
+        .iter()
+        .chain(&overlay.excluded)
+        .filter(|candidate| certs::validate_site_name(&candidate.site).is_err())
+        .map(|candidate| candidate.site.clone())
+        .collect()
+}
+
+/// The refused sites last seen per `GridNetwork`, keyed by network name.
+pub(crate) type RefusedSites = Mutex<HashMap<String, BTreeSet<String>>>;
+
+/// Warn when `network`'s set of refused sites changes, so an operator sees why a site never
+/// routes. Kept per network, so two networks do not flip each other's warning.
+pub(crate) fn warn_refused_sites(overlay: &RoutingOverlay, network: &str, last: &RefusedSites) {
+    let refused = refused_sites(overlay);
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if last.get(network) != Some(&refused) {
+        if !refused.is_empty() {
+            tracing::warn!(network, sites = ?refused, "serving config: refusing candidates whose site is not a DNS-1123 label");
+        }
+        last.insert(network.to_owned(), refused);
+    }
 }
 
 /// Non-blank and within the gateway's identifier bound.
@@ -422,6 +458,7 @@ mod tests {
         tls_mount: "/etc/praxis/tls",
         local_signals_addr: None,
         pins: &NO_PINS,
+        scrape_interval: Duration::from_secs(5),
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {
@@ -461,6 +498,21 @@ mod tests {
     }
 
     #[test]
+    fn the_load_window_covers_the_oldest_a_sample_can_arrive_plus_a_poll() {
+        assert_eq!(
+            load_window_ms(Duration::from_secs(5)),
+            17_000,
+            "5s poll + 5s scrape + 2s timeout + 5s"
+        );
+        assert_eq!(load_window_ms(Duration::from_secs(1)), 13_000);
+        let oldest_arrival = PEER_INTERVAL_MS + 5_000 + PEER_TIMEOUT_MS;
+        assert!(
+            i64::try_from(oldest_arrival).unwrap_or(i64::MAX) < load_window_ms(Duration::from_secs(5)),
+            "a sample at the worst-case age is still fresh"
+        );
+    }
+
+    #[test]
     fn renders_the_contract_the_gateway_parses() {
         let members = [("site-b", "203.0.113.7:9091"), ("site-a", "198.51.100.1:9091")];
         let config = render(&two_site(), members, &INPUTS).expect("routable");
@@ -490,6 +542,31 @@ mod tests {
     }
 
     #[test]
+    fn refused_sites_name_only_the_invalid_ones() {
+        let sites = refused_sites(&overlay(vec![
+            cand("llama", "site-a", "pool-a", None),
+            cand("llama", "site.b", "pool-b", None),
+        ]));
+        assert_eq!(sites, BTreeSet::from(["site.b".to_owned()]));
+    }
+
+    #[test]
+    fn refused_sites_are_kept_per_network() {
+        let last = RefusedSites::default();
+        let bad = overlay(vec![cand("llama", "site.b", "pool-b", None)]);
+        let good = overlay(vec![cand("llama", "site-a", "pool-a", None)]);
+        warn_refused_sites(&bad, "east", &last);
+        warn_refused_sites(&good, "west", &last);
+        let held = last.into_inner().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(held.get("east"), Some(&BTreeSet::from(["site.b".to_owned()])));
+        assert_eq!(
+            held.get("west"),
+            Some(&BTreeSet::new()),
+            "another network does not clear it"
+        );
+    }
+
+    #[test]
     fn candidates_the_gateway_would_reject_are_dropped() {
         let cases = [
             ("blank cluster", cand("llama", "site-b", " ", None)),
@@ -497,6 +574,10 @@ mod tests {
                 "oversized name",
                 cand(&"m".repeat(MAX_NAME_LEN + 1), "site-b", "pool-b", None),
             ),
+            ("site with a dot", cand("llama", "site.b", "pool-b", None)),
+            ("site with a slash", cand("llama", "site/b", "pool-b", None)),
+            ("site with a quote", cand("llama", "site\"b", "pool-b", None)),
+            ("uppercase site", cand("llama", "Site-B", "pool-b", None)),
         ];
         for (label, bad) in cases {
             assert!(render(&overlay(vec![bad]), [], &INPUTS).is_none(), "{label}");
@@ -594,10 +675,9 @@ mod tests {
         let other = render(&two_site(), [("site-z", "203.0.113.9:9091")], &INPUTS).expect("routable");
         assert!(other.peers.is_empty(), "a site with no candidate is not polled");
         let bad_name = overlay(vec![cand("llama", "Site_B", "pool-b", None)]);
-        let config = render(&bad_name, [("Site_B", "203.0.113.7:9091")], &INPUTS).expect("routable");
         assert!(
-            config.peers.is_empty(),
-            "a non-DNS site name would fail the gateway's SNI"
+            render(&bad_name, [("Site_B", "203.0.113.7:9091")], &INPUTS).is_none(),
+            "a non-DNS site name is neither a candidate nor a peer"
         );
     }
 
