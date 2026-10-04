@@ -21,6 +21,7 @@ one verified identity.
 | Verify | The peer's certificate is checked against the Grid CA and its SPIFFE identity, then the verified identity is compared to the site the poller intended to reach. A valid Grid peer answering for a site the poller did not dial is refused. |
 | Read | The exposition body is read under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
 | Store | Each reading is keyed on the verified peer identity, never a value the response body carries. A body label that disagrees with the verified owner is dropped. |
+| Bound | An operator keeps from a peer only the signal contract names and the EPP pool averages the gateway routes on, a `grid_provider` that is a DNS-1123 label, a finite non-negative value (at most one for `grid_provider_ready` and `grid_provider_error_ratio`), and its first 64 providers in name order. A peer's custom `signalNames` are dropped. Each refusal counts in `grid_peer_signals_refused_total{peer,reason}`. |
 
 The verified peer identity is the store key. The response body cannot choose
 where its readings land, so one peer cannot inject readings attributed to
@@ -121,6 +122,15 @@ completed in that window, and it is never borrowed from another site:
 The EPP labels these histograms by model, not pool, so an EPP serving more than one pool
 reports their combined latency. An EPP restart resets its counters, and the window starts
 over from the next scrape.
+
+## Provider Series on /metrics
+
+The operator also exports the provider series on its Prometheus `/metrics` listener,
+labeled `grid_site` and `grid_provider`: readiness, in-flight requests, capacity,
+saturation, and the latency series above. It exports its own providers and those it
+polls from peers, so a Prometheus that scrapes one hub sees every site. A peer's value
+there is what the hub last polled, up to one peer poll old, not what the peer's own
+operator holds now. A series the operator does not hold is absent, not 0.
 
 ## Failure Behavior
 

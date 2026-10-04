@@ -479,6 +479,20 @@ impl SignalStore {
         (out, oldest)
     }
 
+    /// Every sample still served, across targets.
+    #[must_use]
+    pub fn current(&self) -> Vec<Observation> {
+        let Ok(guard) = self.inner.read() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        guard
+            .values()
+            .filter(|held| held.expires_at > now)
+            .flat_map(|held| held.samples.iter().cloned())
+            .collect()
+    }
+
     /// Targets currently held and unexpired.
     #[must_use]
     pub fn targets(&self) -> Vec<String> {
@@ -1105,7 +1119,7 @@ impl PollPeers {
             .map(|(peer, url, pins)| async move {
                 let (body, date) = self.poll_one(&peer, &url, &pins).await?;
                 let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
-                let mut observations = retain_origin(parse(&body), &peer);
+                let mut observations = bound_peer(retain_origin(parse(&body), &peer), &peer);
                 reexpress_peer_ages(&mut observations, date, now_ms);
                 Some((peer, observations))
             });
@@ -1207,6 +1221,86 @@ fn with_query(url: &str, query: &str) -> Option<String> {
     http::Uri::from_parts(parts).ok().map(|uri| uri.to_string())
 }
 
+/// Names a hub keeps from a peer: the cross-site contract, plus the EPP pool averages and
+/// ready counts the gateway routes on until it routes on saturation. A peer's custom
+/// `signalNames` are dropped here.
+const PEER_SIGNAL_NAMES: [&str; 16] = [
+    crate::readiness::READY_SIGNAL,
+    crate::readiness::IN_FLIGHT_SIGNAL,
+    crate::readiness::CAPACITY_SIGNAL,
+    crate::readiness::SATURATION_SIGNAL,
+    crate::latency::TTFT_P50_SIGNAL,
+    crate::latency::TTFT_P90_SIGNAL,
+    crate::latency::TPOT_SIGNAL,
+    crate::latency::PREFILL_SIGNAL,
+    crate::latency::ERROR_RATIO_SIGNAL,
+    "inference_pool_average_queue_size",
+    "llm_d_epp_average_queue_size",
+    "inference_pool_average_running_requests",
+    "llm_d_epp_average_running_requests",
+    "inference_pool_average_kv_cache_utilization",
+    "llm_d_epp_average_kv_cache_utilization",
+    "llm_d_epp_ready_endpoints",
+];
+
+/// Most providers a hub keeps from one peer, so a peer cannot grow the hub's series without
+/// bound. The first in name order are kept.
+pub const MAX_PEER_PROVIDERS: usize = 64;
+
+/// Signals that are shares, which a peer may not report above one.
+const UNIT_SIGNALS: [&str; 2] = [crate::readiness::READY_SIGNAL, crate::latency::ERROR_RATIO_SIGNAL];
+
+/// A value a hub accepts: finite and non-negative, and at most one for a share.
+fn plausible(observation: &Observation) -> bool {
+    observation.value.is_finite()
+        && observation.value >= 0.0
+        && (observation.value <= 1.0 || !UNIT_SIGNALS.contains(&observation.metric.as_str()))
+}
+
+/// Why a hub refuses `observation` from a peer, `None` when it accepts it.
+fn refusal(observation: &Observation) -> Option<&'static str> {
+    if !PEER_SIGNAL_NAMES.contains(&observation.metric.as_str()) {
+        Some("name")
+    } else if observation
+        .labels
+        .get(PROVIDER_LABEL)
+        .is_none_or(|provider| certs::validate_site_name(provider).is_err())
+    {
+        Some("provider")
+    } else if !plausible(observation) {
+        Some("value")
+    } else {
+        None
+    }
+}
+
+/// Keep what a hub accepts from `peer`: an allowed name, a `grid_provider` that is a DNS-1123
+/// label, a plausible value, and at most [`MAX_PEER_PROVIDERS`] providers. Each refusal is
+/// counted by reason.
+fn bound_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
+    let mut kept = Vec::with_capacity(observations.len());
+    for observation in observations {
+        match refusal(&observation) {
+            Some(reason) => crate::metrics::record_peer_signal_refused(peer, reason),
+            None => kept.push(observation),
+        }
+    }
+    let providers: std::collections::BTreeSet<&str> = kept
+        .iter()
+        .filter_map(|o| o.labels.get(PROVIDER_LABEL).map(String::as_str))
+        .collect();
+    let Some(&last) = providers.iter().nth(MAX_PEER_PROVIDERS.saturating_sub(1)) else {
+        return kept;
+    };
+    let last = last.to_owned();
+    let before = kept.len();
+    kept.retain(|o| o.labels.get(PROVIDER_LABEL).is_some_and(|p| *p <= last));
+    for _ in kept.len()..before {
+        crate::metrics::record_peer_signal_refused(peer, "provider_cap");
+    }
+    kept
+}
+
 /// Keep only the observations a peer made itself.
 ///
 /// A relayed copy is dropped rather than trusted, so every site's data reaches
@@ -1258,6 +1352,88 @@ fn reexpress_peer_ages(observations: &mut [Observation], date: Option<SystemTime
 mod tests {
     use super::*;
 
+    /// A peer observation of `metric` for `provider` with `value`.
+    fn peer_sample(metric: &str, provider: &str, value: f64) -> Observation {
+        Observation {
+            metric: metric.to_owned(),
+            labels: BTreeMap::from([
+                (SITE_LABEL.to_owned(), "retail".to_owned()),
+                (PROVIDER_LABEL.to_owned(), provider.to_owned()),
+            ]),
+            value,
+            timestamp_ms: None,
+        }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one table of accepted and refused samples")]
+    fn a_hub_refuses_peer_names_providers_and_values_outside_the_contract() {
+        let cases = [
+            (
+                "contract name",
+                peer_sample(crate::readiness::SATURATION_SIGNAL, "pool", 0.5),
+                true,
+            ),
+            (
+                "gateway load name",
+                peer_sample("inference_pool_average_queue_size", "pool", 3.0),
+                true,
+            ),
+            ("custom name", peer_sample("my_custom_queue", "pool", 3.0), false),
+            (
+                "provider not a label",
+                peer_sample(crate::readiness::READY_SIGNAL, "Pool_1", 1.0),
+                false,
+            ),
+            (
+                "not finite",
+                peer_sample(crate::readiness::SATURATION_SIGNAL, "pool", f64::NAN),
+                false,
+            ),
+            (
+                "infinite",
+                peer_sample(crate::readiness::SATURATION_SIGNAL, "pool", f64::INFINITY),
+                false,
+            ),
+            (
+                "negative",
+                peer_sample(crate::readiness::IN_FLIGHT_SIGNAL, "pool", -1.0),
+                false,
+            ),
+            (
+                "share above one",
+                peer_sample(crate::latency::ERROR_RATIO_SIGNAL, "pool", 1.5),
+                false,
+            ),
+            (
+                "saturation above one",
+                peer_sample(crate::readiness::SATURATION_SIGNAL, "pool", 1.5),
+                true,
+            ),
+        ];
+        for (label, observation, kept) in cases {
+            assert_eq!(
+                bound_peer(vec![observation], "retail").len(),
+                usize::from(kept),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hub_keeps_at_most_the_first_providers_of_a_peer_in_name_order() {
+        let observations: Vec<Observation> = (0..MAX_PEER_PROVIDERS + 5)
+            .map(|i| peer_sample(crate::readiness::READY_SIGNAL, &format!("p{i:03}"), 1.0))
+            .collect();
+        let kept = bound_peer(observations, "retail");
+        assert_eq!(kept.len(), MAX_PEER_PROVIDERS);
+        assert!(
+            kept.iter()
+                .all(|o| o.labels.get(PROVIDER_LABEL).is_some_and(|p| p.as_str() < "p064")),
+            "the first {MAX_PEER_PROVIDERS} in name order are kept"
+        );
+    }
+
     #[test]
     fn peers_are_dialed_at_a_dialable_signals_endpoint() {
         let member = |site: &str, endpoint: &str, signals: Option<&str>| MemberRecord {
@@ -1302,7 +1478,7 @@ mod tests {
             let mut request = [0_u8; 1024];
             drop(stream.read(&mut request).await);
             drop(release.await);
-            let body = format!("load{{grid_site=\"{site}\"}} 1\n");
+            let body = format!("inference_pool_average_queue_size{{grid_site=\"{site}\",grid_provider=\"pool\"}} 1\n");
             let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
             drop(stream.write_all(response.as_bytes()).await);
         });

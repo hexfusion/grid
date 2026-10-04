@@ -39,6 +39,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLL_RETRIES.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(PEER_SIGNALS_REFUSED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLL_DURATION.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLL_SLOW.clone()))
@@ -121,6 +123,15 @@ static PEER_POLL_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new("grid_peer_poll_total", "Peer signal polls by outcome"),
         &["peer", "outcome"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Peer observations refused at ingest, by peer and reason.
+static PEER_SIGNALS_REFUSED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_peer_signals_refused_total", "Peer observations refused at ingest"),
+        &["peer", "reason"],
     )
     .unwrap_or_else(|_| std::process::abort())
 });
@@ -427,6 +438,11 @@ pub(crate) fn record_peer_poll(peer: &str, outcome: &str, duration: Duration, by
     }
 }
 
+/// Count a peer observation this hub refused: `name`, `provider`, `value`, or `provider_cap`.
+pub(crate) fn record_peer_signal_refused(peer: &str, reason: &str) {
+    PEER_SIGNALS_REFUSED.with_label_values(&[peer, reason]).inc();
+}
+
 /// Record an attempt that failed and will be tried again.
 pub(crate) fn record_peer_retry(peer: &str, reason: &str) {
     PEER_POLL_RETRIES.with_label_values(&[peer, reason]).inc();
@@ -474,6 +490,116 @@ pub fn set_site_identity_expiry(not_after: i64) {
 /// Count a renewal attempt: `renewed`, `refused`, `failed`, or `expired`.
 pub fn record_site_identity_renewal(result: &str) {
     SITE_IDENTITY_RENEWALS.with_label_values(&[result]).inc();
+}
+
+/// Provider series exported on `/metrics`, as each site's operator resolves them.
+const PROVIDER_SIGNALS: [(&str, &str); 9] = [
+    ("grid_provider_ready", "1 when the provider can serve, 0 when not."),
+    (
+        "grid_provider_in_flight_requests",
+        "Requests the provider holds, running, engine-queued, and held by flow control.",
+    ),
+    (
+        "grid_provider_capacity_requests",
+        "maxRunning per endpoint times fresh ready endpoints.",
+    ),
+    ("grid_provider_saturation_ratio", "Requests held over capacity."),
+    (
+        "grid_provider_ttft_p50_seconds",
+        "Median streaming time to first token over the last 30s.",
+    ),
+    (
+        "grid_provider_ttft_p90_seconds",
+        "90th percentile streaming time to first token over the last 30s.",
+    ),
+    (
+        "grid_provider_tpot_seconds",
+        "Mean streaming time per output token over the last 30s.",
+    ),
+    (
+        "grid_provider_prefill_seconds_per_token",
+        "Estimated prefill seconds per uncached input token over the last 30s. Moves with the workload mix.",
+    ),
+    (
+        "grid_provider_error_ratio",
+        "Failed requests over all requests in the last 30s.",
+    ),
+];
+
+/// Labels on each exported provider series: both bounded by the grid's sites and providers.
+const PROVIDER_LABELS: [&str; 2] = ["grid_site", "grid_provider"];
+
+/// Exports the provider series held in `stores` at each scrape, this site's own and those
+/// polled from peers. A series this site does not hold is absent, not 0.
+struct ProviderSignals {
+    /// The local and peer signal stores.
+    stores: Vec<crate::signals::SignalStore>,
+    /// One gauge per exported series, paired with its metric name so a failed constructor
+    /// drops only its own series.
+    gauges: Vec<(&'static str, prometheus::GaugeVec)>,
+    /// Serializes a scrape's reset and refill of the shared gauges.
+    collecting: std::sync::Mutex<()>,
+}
+
+impl prometheus::core::Collector for ProviderSignals {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        self.gauges.iter().flat_map(|(_, gauge)| gauge.desc()).collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let _collecting = self
+            .collecting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, gauge) in &self.gauges {
+            gauge.reset();
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for sample in self.stores.iter().flat_map(crate::signals::SignalStore::current) {
+            let (Some(site), Some(provider)) = (sample.labels.get("grid_site"), sample.labels.get("grid_provider"))
+            else {
+                continue;
+            };
+            let Some((_, gauge)) = self.gauges.iter().find(|(name, _)| *name == sample.metric) else {
+                continue;
+            };
+            // The first store holding a series wins: this site's own before a peer's.
+            if seen.insert((sample.metric.clone(), site.clone(), provider.clone())) {
+                gauge
+                    .with_label_values(&[site.as_str(), provider.as_str()])
+                    .set(sample.value);
+            }
+        }
+        self.gauges
+            .iter()
+            .flat_map(|(_, gauge)| prometheus::core::Collector::collect(gauge))
+            .collect()
+    }
+}
+
+/// Export the provider series held in `stores` on `/metrics`. Call once, with this site's
+/// store first.
+pub fn register_provider_signals(stores: Vec<crate::signals::SignalStore>) {
+    if let Err(error) = REGISTRY.register(Box::new(provider_signals(stores))) {
+        tracing::warn!(%error, "metrics: provider signals already registered");
+    }
+}
+
+/// The collector over `stores`.
+fn provider_signals(stores: Vec<crate::signals::SignalStore>) -> ProviderSignals {
+    let gauges = PROVIDER_SIGNALS
+        .iter()
+        .filter_map(|(name, help)| {
+            prometheus::GaugeVec::new(Opts::new(*name, *help), &PROVIDER_LABELS)
+                .ok()
+                .map(|gauge| (*name, gauge))
+        })
+        .collect();
+    ProviderSignals {
+        stores,
+        gauges,
+        collecting: std::sync::Mutex::new(()),
+    }
 }
 
 /// Gather all registered metrics for serialization.
@@ -643,6 +769,119 @@ mod tests {
         assert!(
             text.contains("grid_gateway_probe_duration_seconds"),
             "output should contain duration histogram"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one store across two scrapes")]
+    fn provider_signals_drop_a_series_the_store_no_longer_holds() {
+        use prometheus::core::Collector as _;
+        let ready = crate::signals::Observation {
+            metric: "grid_provider_ready".to_owned(),
+            labels: [("grid_site", "hq"), ("grid_provider", "pool")]
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            value: 1.0,
+            timestamp_ms: None,
+        };
+        let store = crate::signals::SignalStore::new();
+        let collector = provider_signals(vec![store.clone()]);
+        let count = |families: &[MetricFamily]| -> usize {
+            families
+                .iter()
+                .filter(|family| family.name() == "grid_provider_ready")
+                .map(|family| family.get_metric().len())
+                .sum()
+        };
+        store.refresh(
+            std::collections::BTreeMap::from([("pool".to_owned(), vec![ready])]),
+            Duration::from_secs(60),
+        );
+        assert_eq!(count(&collector.collect()), 1, "a held series is exported");
+        store.refresh(
+            std::collections::BTreeMap::from([("pool".to_owned(), Vec::new())]),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            count(&collector.collect()),
+            0,
+            "a dropped series is not exported from the last scrape"
+        );
+        assert_eq!(
+            collector.desc().len(),
+            PROVIDER_SIGNALS.len(),
+            "one desc per exported series"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one scenario across both stores")]
+    fn provider_signals_export_this_site_and_its_peers_and_omit_what_is_not_held() {
+        use prometheus::core::Collector as _;
+        let held = |site: &str, metric: &str, value: f64| crate::signals::Observation {
+            metric: metric.to_owned(),
+            labels: [("grid_site", site), ("grid_provider", "pool")]
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            value,
+            timestamp_ms: None,
+        };
+        let local = crate::signals::SignalStore::new();
+        local.refresh(
+            std::collections::BTreeMap::from([(
+                "pool".to_owned(),
+                vec![
+                    held("hq", "grid_provider_saturation_ratio", 0.5),
+                    held("hq", "grid_provider_ttft_p50_seconds", 0.2),
+                    held("hq", "llm_d_epp_average_queue_size", 3.0),
+                ],
+            )]),
+            Duration::from_secs(60),
+        );
+        let peers = crate::signals::SignalStore::new();
+        peers.refresh(
+            std::collections::BTreeMap::from([(
+                "retail".to_owned(),
+                vec![
+                    held("retail", "grid_provider_saturation_ratio", 0.9),
+                    held("hq", "grid_provider_saturation_ratio", 7.0),
+                ],
+            )]),
+            Duration::from_secs(60),
+        );
+        let families = provider_signals(vec![local, peers]).collect();
+        let series = |name: &str| -> Vec<(String, f64)> {
+            families
+                .iter()
+                .filter(|family| family.name() == name)
+                .flat_map(|family| family.get_metric().iter())
+                .map(|metric| {
+                    let site = metric
+                        .get_label()
+                        .iter()
+                        .find(|label| label.name() == "grid_site")
+                        .map(|label| label.value().to_owned())
+                        .unwrap_or_default();
+                    (site, metric.get_gauge().value())
+                })
+                .collect()
+        };
+        let mut saturation = series("grid_provider_saturation_ratio");
+        saturation.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            saturation,
+            [("hq".to_owned(), 0.5), ("retail".to_owned(), 0.9)],
+            "this site's value wins"
+        );
+        assert_eq!(series("grid_provider_ttft_p50_seconds"), [("hq".to_owned(), 0.2)]);
+        assert!(series("grid_provider_tpot_seconds").is_empty(), "not held, not 0");
+        assert!(
+            families
+                .iter()
+                .all(|family| family.name() != "llm_d_epp_average_queue_size"),
+            "only provider series"
         );
     }
 }

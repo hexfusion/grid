@@ -181,6 +181,8 @@ async fn main() {
             .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
     );
+    // This site's providers first, then what its peers publish, on /metrics.
+    operator::metrics::register_provider_signals(vec![ctx.signals(), ctx.peers()]);
 
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
