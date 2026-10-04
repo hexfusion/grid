@@ -72,7 +72,7 @@ static SIGNALS_SHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap_or_else(|_| std::process::abort())
 });
 
-/// The site identity's `notAfter`, Unix seconds.
+/// The site identity's `notAfter`, Unix seconds; zero when the identity cannot be read.
 static SITE_IDENTITY_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
         "grid_site_identity_expiry_timestamp_seconds",

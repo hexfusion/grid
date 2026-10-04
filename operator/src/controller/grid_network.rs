@@ -2625,6 +2625,8 @@ async fn site_identity_status(
 
 /// The identity status of a Secret that holds no usable certificate.
 fn unreadable_identity(detail: &str) -> SiteIdentityStatus {
+    // Zero, not the last good notAfter, so an expiry alert fires on broken material.
+    crate::metrics::set_site_identity_expiry(0);
     SiteIdentityStatus {
         not_after: String::new(),
         rotate_after: String::new(),
