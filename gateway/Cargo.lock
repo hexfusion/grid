@@ -36,6 +36,7 @@ dependencies = [
  "grid-signals-client",
  "http",
  "metrics",
+ "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
  "rustls",
@@ -43,6 +44,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "yaml_serde",
  "zeroize",
 ]
@@ -1381,12 +1383,18 @@ version = "0.1.4"
 dependencies = [
  "ai-grid-filters",
  "certs",
+ "httparse",
  "praxis-ai-filters",
  "praxis-proxy",
  "praxis-proxy-core",
  "praxis-proxy-filter",
+ "praxis-proxy-protocol",
+ "praxis-proxy-tls",
  "rustls",
+ "tokio",
+ "tokio-rustls",
  "tracing",
+ "yaml_serde",
 ]
 
 [[package]]

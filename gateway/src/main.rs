@@ -17,6 +17,8 @@ use std::process::ExitCode;
 use praxis_core::config::{Config, ConfigFile, DEFAULT_CONFIG};
 use tracing::info;
 
+mod metrics_listener;
+
 /// Log line emitted once tracing is up; the startup test waits for it.
 const STARTUP_MESSAGE: &str = "starting grid-gateway";
 
@@ -42,6 +44,11 @@ fn main() -> ExitCode {
     let log_output = config.runtime.logging.output;
     info!(version = env!("CARGO_PKG_VERSION"), "{STARTUP_MESSAGE}");
 
+    // Before grid routing starts, so its metrics record into the installed recorder.
+    if let Err(err) = start_metrics_listener(&config) {
+        return praxis::report_fatal(&err, log_output);
+    }
+
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
     praxis_ai_filters::register_ai_filters(&mut registry, None);
 
@@ -65,6 +72,27 @@ fn main() -> ExitCode {
     result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS)
 }
 
+/// Start the opt-in metrics listener when its env vars are set.
+///
+/// # Errors
+///
+/// Returns the settings, port, cert, or bind error.
+fn start_metrics_listener(config: &Config) -> Result<(), String> {
+    let listener = metrics_listener::MetricsListener::from_env(|name| std::env::var(name).ok())?;
+    // Praxis installs the recorder only when the admin server starts, after grid routing
+    // publishes its first snapshot, so install it now when anything will serve metrics.
+    if listener.is_some() || config.admin.address.is_some() {
+        praxis_protocol::http::pingora::metrics::install_prometheus_recorder();
+    }
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    listener.check_ports(config)?;
+    // The thread serves for the life of the process.
+    drop(listener.spawn()?);
+    Ok(())
+}
+
 /// Start the cross-site pollers and register `grid_site_route` over their snapshot.
 ///
 /// # Errors
@@ -77,7 +105,7 @@ fn start_grid_routing(
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
     let mut runtime = ai_grid_filters::spawn_grid_routing(&config)?;
-    ai_grid_filters::register_grid_filters(registry, runtime.snapshot())?;
+    ai_grid_filters::register_grid_filters(registry, runtime.snapshot(), runtime.health())?;
     // The operator rewrites the file on membership and topology changes.
     runtime
         .watch(path, SERVING_RELOAD_INTERVAL)

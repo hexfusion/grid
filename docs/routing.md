@@ -2,6 +2,8 @@
 
 AI Grid Network (AGN) routes inference traffic across provider gateways using a **multi-dimensional policy** rather than a single load-balancing algorithm. This guide starts with the routing outcome you want, then shows how policy, scoring, groups, affinity, and selection mode work together.
 
+This guide covers the routing overlay and the consumer Praxis `intelligent_route` filter. A grid gateway serving `gridServing` chooses sites with `grid_site_route` instead, from load each site publishes: see [Tuning cross-site site selection](site-selection.md).
+
 The practical model is:
 
 1. Determine which providers are eligible to receive the request.

@@ -136,6 +136,33 @@ polls from peers, so a Prometheus that scrapes one hub sees every site. A peer's
 there is what the hub last polled, up to one peer poll old, not what the peer's own
 operator holds now. A series the operator does not hold is absent, not 0.
 
+## Site Selection
+
+The gateway chooses a site by each provider's load, rho, the saturation its operator
+publishes (`grid_provider_saturation_ratio`), and draws in proportion to its published
+capacity (`grid_provider_capacity_requests`). It reads both when it orders the snapshot,
+so a request only filters and draws. A site has room when rho is below 1. Among healthy
+sites with room:
+
+- Three or more: two distinct sites are drawn in proportion to capacity, and the one
+  with the lower rho is chosen. The busiest of three is never chosen.
+- Two: one draw, each site weighted by capacity over 1 + rho, with each share kept
+  between a tenth and nine tenths, so a recovering site is still measured.
+- One: that site.
+
+With no site that has room, the gateway draws by capacity among the healthy sites tied
+on the best polled queue depth. That also covers sites that publish no in-flight count
+or capacity: a site without either has no load input, and sites without capacity are
+drawn evenly. A cluster praxis reports with no healthy endpoint is never drawn while a
+healthy one is left.
+
+A model sheds when every healthy site serving it has a fresh rho of at least 1.05. It
+routes again once one reaches 0.95. A shed request gets 429 with `Retry-After` and an
+OpenAI-style error, type `rate_limit_exceeded` and code `capacity_exhausted`, so a
+client backs off the way it does for any overload. A model with no healthy routable
+site gets 503 with code `no_healthy_site`: an outage, not load. The gateway keeps no
+count of its own requests in flight.
+
 ## Failure Behavior
 
 | Condition | Signal produced | Routing effect |

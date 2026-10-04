@@ -7,6 +7,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use praxis_core::connectivity::Upstream;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -50,7 +51,8 @@ impl CapabilityKind {
 ///
 /// Controls whether a candidate accepts new sessions, existing sessions only,
 /// or is excluded from routing entirely.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum AdmissionState {
     /// Accepts both new and existing sessions.
     #[default]
@@ -59,7 +61,8 @@ pub enum AdmissionState {
     /// Accepts only existing sessions (bound via session affinity).
     ExistingOnly,
 
-    /// Excluded from routing entirely.
+    /// Excluded from routing entirely. `none` on the wire, as the operator writes it.
+    #[serde(rename = "none")]
     Excluded,
 }
 
@@ -86,6 +89,10 @@ impl AdmissionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfig {
+    /// Whether it takes new requests, as the operator resolved it. Absent means it does.
+    #[serde(default)]
+    pub admission: AdmissionState,
+
     /// Cluster name to select when this candidate is chosen.
     pub cluster: String,
 
@@ -112,18 +119,42 @@ fn default_fresh() -> bool {
     true
 }
 
+/// A provider's recent latency, as its site's operator publishes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Latency {
+    /// Median streaming time to first token, seconds.
+    pub ttft_p50: Option<f64>,
+    /// 90th percentile streaming time to first token, seconds.
+    pub ttft_p90: Option<f64>,
+    /// Mean streaming time per output token, seconds.
+    pub tpot: Option<f64>,
+    /// Estimated prefill seconds per uncached input token.
+    pub prefill_per_token: Option<f64>,
+}
+
 /// A validated route candidate ready for runtime matching.
 ///
 /// Created by `validate_candidates` from raw config entries. All string
 /// fields are bounded and non-blank. The Grid-owned fields (`admission_state`,
 /// `rank`, `selection_tier`) are populated after validation from live signals.
 ///
-/// `Clone` is cheap: every owned field is an `Arc<str>`. The refresh step clones
+/// `Clone` is cheap: every owned field is reference counted. The refresh step clones
 /// the base set each poll cycle to re-order it by live load.
 #[derive(Clone, Debug)]
 pub struct RouteCandidate {
     /// Grid-operator admission state.
     pub admission_state: AdmissionState,
+
+    /// Requests this candidate runs at once without engine queueing, as its operator publishes
+    /// it; `None` when unpublished, which leaves its load unknown.
+    pub capacity: Option<f64>,
+
+    /// Requests held over capacity, as its operator publishes it; `None` when unpublished or
+    /// stale. Resolved when the snapshot is built, never per request.
+    pub rho: Option<f64>,
+
+    /// Recent latency its operator publishes, each `None` when unpublished or stale.
+    pub latency: Latency,
 
     /// Cluster name to select.
     pub cluster: Arc<str>,
@@ -152,6 +183,9 @@ pub struct RouteCandidate {
 
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
+
+    /// Remote site's gateway, dialed directly instead of a `load_balancer` cluster.
+    pub upstream: Option<Upstream>,
 }
 
 /// Build a deterministic stable ID from candidate identity fields.
@@ -200,7 +234,10 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
 
         let stable_id = default_stable_id(cand.kind, &cand.name, &cand.site, &cand.cluster);
         candidates.push(RouteCandidate {
-            admission_state: AdmissionState::default(),
+            admission_state: cand.admission,
+            capacity: None,
+            rho: None,
+            latency: Latency::default(),
             cluster: Arc::from(cand.cluster.as_str()),
             credential: cand.credential,
             fresh: cand.fresh,
@@ -210,6 +247,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             selection_tier: None,
             site: Arc::from(cand.site.as_str()),
             stable_id,
+            upstream: None,
         });
     }
 
@@ -294,6 +332,7 @@ mod tests {
     fn candidate(kind_str: &str, name: &str, site: &str, cluster: &str) -> CandidateConfig {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();
         CandidateConfig {
+            admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
             fresh: true,
@@ -383,5 +422,21 @@ mod tests {
     fn blank_local_site_rejected() {
         let err = validate_local_site("").expect_err("should fail");
         assert!(err.to_string().contains("local_site must be"), "{err}");
+    }
+
+    #[test]
+    fn admission_parses_as_the_operator_writes_it_and_defaults_to_admitted() {
+        let parse = |json: &str| serde_yaml::from_str::<CandidateConfig>(json).map(|c| c.admission);
+        let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
+        assert_eq!(parse(&format!("{{{base}}}")).unwrap(), AdmissionState::NewAndExisting);
+        assert_eq!(
+            parse(&format!(r#"{{{base},"admission":"none"}}"#)).unwrap(),
+            AdmissionState::Excluded
+        );
+        assert_eq!(
+            parse(&format!(r#"{{{base},"admission":"existing_only"}}"#)).unwrap(),
+            AdmissionState::ExistingOnly
+        );
+        parse(&format!(r#"{{{base},"admission":"maybe"}}"#)).expect_err("an unknown admission is refused");
     }
 }

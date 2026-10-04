@@ -188,6 +188,36 @@
         "from": { "type": "array", "items": { "type": "object" } }
       }
     },
+    "metricsListener": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "TLS listener serving only GET /metrics.",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "existingSecret": { "type": "string" },
+        "mountPath": { "type": "string" },
+        "fromNamespaces": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "annotations": { "type": "object" } }
+        },
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval": { "type": "string" },
+            "caConfigMap": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "name": { "type": "string" }, "key": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1,

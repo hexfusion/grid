@@ -6,9 +6,11 @@
 //! contribution is ordering the candidates by live load off the request path.
 
 mod control;
+mod decisions;
 mod descriptor;
 #[cfg(test)]
 mod flow;
+mod health;
 mod metadata;
 mod route;
 mod serving;
@@ -18,10 +20,12 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 pub use control::ReloadOutcome;
+pub use decisions::SiteDecisions;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
 // snapshot. The request path only reads a snapshot.
-pub use descriptor::{AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate};
+pub use descriptor::{AdmissionState, CandidateConfig, CapabilityKind, Latency, RouteCandidate};
+pub use health::ClusterHealth;
 pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use serving::{GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing};
@@ -31,7 +35,7 @@ pub use snapshot::RouteSnapshot;
 /// owns and its refresh loop swaps.
 ///
 /// Call this from the gateway after `FilterRegistry::with_builtins()`, passing
-/// the snapshot from [`spawn_grid_routing`]. The factory captures the snapshot,
+/// the snapshot and cluster health from [`spawn_grid_routing`]. The factory captures the snapshot,
 /// so every filter praxis rebuilds on a config reload clones the same `Arc` and
 /// sees the live swaps.
 ///
@@ -41,9 +45,10 @@ pub use snapshot::RouteSnapshot;
 pub fn register_grid_filters(
     registry: &mut FilterRegistry,
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
+    health: Arc<ClusterHealth>,
 ) -> Result<(), FilterError> {
     let factory = move |config: &serde_yaml::Value| -> Result<Box<dyn HttpFilter>, FilterError> {
-        route::GridSiteRouteFilter::from_config(config, Arc::clone(&snapshot))
+        route::GridSiteRouteFilter::from_config(config, Arc::clone(&snapshot), Arc::clone(&health))
     };
     registry.register("grid_site_route", FilterFactory::Http(Arc::new(factory)))
 }

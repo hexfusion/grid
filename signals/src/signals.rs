@@ -154,17 +154,26 @@ impl LoadStore {
         format!("{site}/{cluster}").into_boxed_str()
     }
 
-    /// Most recent sample of `metric` for `key`. Test-only since scoring reads
-    /// [`Self::window_worst`].
-    #[cfg(test)]
+    /// Most recent sample of `metric` for `key`.
+    #[must_use]
     pub fn latest(&self, key: &str, metric: &str) -> Option<Sample> {
         let provider = self.providers.get(key)?;
         provider.metrics.get(metric)?.samples.last().copied()
     }
 
+    /// When anything was last observed for `key`, across all its metrics.
+    #[must_use]
+    pub fn newest_at(&self, key: &str) -> Option<i64> {
+        let provider = self.providers.get(key)?;
+        provider
+            .metrics
+            .values()
+            .filter_map(|series| series.samples.last().map(|sample| sample.at_ms))
+            .max()
+    }
+
     /// Most recent sample of `metric` for `key` younger than `max_age_ms`.
-    /// Test-only since scoring reads [`Self::window_worst`].
-    #[cfg(test)]
+    #[must_use]
     pub fn fresh(&self, key: &str, metric: &str, now_ms: i64, max_age_ms: i64) -> Option<Sample> {
         // Range starts at zero: a future timestamp (publisher clock ahead) yields
         // a negative age that would otherwise read as fresh forever.

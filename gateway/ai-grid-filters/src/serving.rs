@@ -23,6 +23,7 @@ use serde::Deserialize;
 use crate::{
     control::{Control, ReloadOutcome, Watcher, watch},
     descriptor::CandidateConfig,
+    health::ClusterHealth,
     snapshot::RouteSnapshot,
 };
 
@@ -110,6 +111,10 @@ pub struct PeerServingConfig {
     /// Leaf SHA-256 digests the peer must also match, rendered under pin trust only.
     #[serde(default)]
     pub pins: Vec<String>,
+
+    /// `host:port` of the peer's gateway, routed to directly; set only while the operator verified it.
+    #[serde(default)]
+    pub gateway: Option<String>,
 }
 
 /// The running control plane: the filter's snapshot, the pollers, and the config watch.
@@ -122,6 +127,12 @@ pub struct GridRuntime {
 
     /// The config file watch, stopped on drop.
     watcher: Option<Watcher>,
+
+    /// Backend cluster health the route filter publishes and the tick reads.
+    health: Arc<ClusterHealth>,
+
+    /// Stops the health tick when the runtime drops.
+    _health_tick: std::sync::mpsc::Sender<()>,
 }
 
 impl GridRuntime {
@@ -129,6 +140,12 @@ impl GridRuntime {
     #[must_use]
     pub fn snapshot(&self) -> Arc<ArcSwap<RouteSnapshot>> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// The cluster health to register the filter over.
+    #[must_use]
+    pub fn health(&self) -> Arc<ClusterHealth> {
+        Arc::clone(&self.health)
     }
 
     /// Apply a new serving config. `None` when it is already applied.
@@ -180,6 +197,8 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
 /// peer's certificate material cannot be read or parsed, or a poller thread
 /// cannot be spawned.
 pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, FilterError> {
+    // The peer scrapers load TLS here, before the server installs the provider.
+    praxis_tls::provider::install();
     let start = Box::new(|peer: &PeerServingConfig, poller: &_, store, refresh| {
         let scraper = build_scraper(peer)?;
         spawn_on_thread_held(store, poller, scraper, refresh)
@@ -195,15 +214,42 @@ pub(crate) fn start_runtime(
 ) -> Result<GridRuntime, FilterError> {
     let mut control = Control::new(config, start)?;
     control.apply(config)?;
+    let health_tick = tick_health(control.health(), control.refresh(), control.store())
+        .map_err(|error| -> FilterError { format!("grid: spawning the health tick: {error}").into() })?;
     Ok(GridRuntime {
         snapshot: control.snapshot(),
+        health: control.health(),
         control: Arc::new(Mutex::new(control)),
         watcher: None,
+        _health_tick: health_tick,
     })
 }
 
-/// Reject peer settings that would silently stop a poller.
+/// How often the control step re-reads backend cluster health.
+const HEALTH_TICK: Duration = Duration::from_millis(100);
+
+/// Re-order the snapshot whenever the set of clusters with no healthy endpoint changes.
 ///
+/// Health moves faster than the poll cycle, so it gets its own tick; the returned
+/// sender stops the thread when dropped.
+fn tick_health(
+    health: Arc<ClusterHealth>,
+    refresh: crate::control::Refresh,
+    store: Arc<grid_signals::LoadStore>,
+) -> std::io::Result<std::sync::mpsc::Sender<()>> {
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("grid-health".to_owned())
+        .spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(HEALTH_TICK) {
+                if health.update() {
+                    refresh(&store);
+                }
+            }
+        })?;
+    Ok(stop)
+}
+
 /// A zero interval hands `Duration::ZERO` to the interval timer, which panics the
 /// detached poller thread. A zero timeout fires immediately, so the peer never
 /// scrapes. Either way that site ages to `+inf` and sorts last, a silent stale
@@ -234,6 +280,7 @@ pub(crate) fn validate_peer(peer: &PeerServingConfig) -> Result<(), FilterError>
     Ok(())
 }
 
+/// Grid mTLS to `peer`: this site's identity, verified against the grid CA and the peer's server name.
 /// Build a peer's mTLS scraper from its config, reading and parsing its
 /// certificate material.
 fn build_scraper(peer: &PeerServingConfig) -> Result<PeerScraper, FilterError> {
@@ -347,6 +394,7 @@ peers:
             client_cert_path: "/etc/grid/tls.crt".to_owned(),
             client_key_path: "/etc/grid/tls.key".to_owned(),
             pins: Vec::new(),
+            gateway: None,
         }
     }
 
@@ -411,5 +459,15 @@ peers:
         validate_peer(&zero_request).expect_err("a zero request timeout is refused");
 
         validate_peer(&valid_peer()).expect("a valid peer is accepted");
+    }
+
+    #[test]
+    fn a_peer_from_an_operator_without_gateway_support_parses_with_none() {
+        let peer: PeerServingConfig = serde_yaml::from_str(
+            "{site: east, addr: '10.0.0.1:9091', server_name: east.grid.internal, authority: east.grid.internal, \
+             grid_ca_path: /ca, client_cert_path: /crt, client_key_path: /key}",
+        )
+        .expect("an old operator's peer parses");
+        assert!(peer.gateway.is_none(), "no gateway: route through the static cluster");
     }
 }
