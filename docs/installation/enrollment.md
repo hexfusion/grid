@@ -127,7 +127,7 @@ whenever an enrollment URL is known.
 
 Rotation runs only under `spiffe` peer trust, and follows the trust the `GridNetwork`
 declares. Before a `GridNetwork` exists the operator trusts by SPIFFE ID and rotates.
-Under `pin`, the `GridNetwork` default, peers pin the
+Under `pin`, which a `GridNetwork` gets when it omits `peerTrust`, peers pin the
 leaf digest and would refuse a rotated leaf, so the operator does not rotate and logs
 `rotation disabled` when it finds pin trust. Before a pin site's certificate expires, every 180
 days by default, re-enroll it with the expired-identity steps below and update the

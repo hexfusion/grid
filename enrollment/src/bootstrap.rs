@@ -404,7 +404,7 @@ fn seed_is_current(held: Option<&enrollment::SeedRecord>, site: &str, leaf_key: 
 }
 
 /// Sign a seed registering `site`'s key with the service: always for a key bootstrap
-/// just `issued`, else only when no valid seed names the site yet.
+/// just `issued`, else only when no valid seed names the site with the identity's key.
 ///
 /// The generation only grows, so the service applies each re-issue once and never
 /// an older seed.
