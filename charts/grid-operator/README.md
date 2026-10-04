@@ -224,6 +224,9 @@ the site identity, the grid CA, and `grid.swimKeySecretName`, plus this site's G
 and `grid.signals: poll` serves signals on the SWIM Service. The CRs need the grid CRDs
 first. Argo CD applies them a sync wave after the CRDs. Plain Helm cannot map them on the
 first install, so set `grid.id` on an upgrade after it, or install the grid-site chart.
+`grid.signals` and `grid.peerTrust` also set the modes the operator starts in before any
+GridNetwork exists, with or without `grid.id`. Set them to match the grid's GridNetwork,
+wherever it comes from, and the operator never restarts when that network appears.
 
 ## Auto-enroll
 

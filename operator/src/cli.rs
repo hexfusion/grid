@@ -4,7 +4,10 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::{Args, Parser};
 
-use crate::{enroll, gateway};
+use crate::{
+    crd::grid_network::{PeerTrustMode, SignalMode},
+    enroll, gateway,
+};
 
 /// grid-operator command-line interface.
 #[derive(Parser, Debug, Clone)]
@@ -25,6 +28,23 @@ pub struct Cli {
     /// Signals serving and peer polling options.
     #[command(flatten)]
     pub signals: SignalsArgs,
+
+    /// Grid-wide modes to start in before a `GridNetwork` exists.
+    #[command(flatten)]
+    pub grid: GridArgs,
+}
+
+/// Grid-wide modes the install declares, used until its `GridNetwork` exists.
+#[derive(Args, Debug, Clone)]
+#[group(id = "grid")]
+pub struct GridArgs {
+    /// Signal transport to start in with no `GridNetwork`, the chart's grid.signals.
+    #[arg(long = "grid-signals", env = "GRID_SIGNAL_TRANSPORT", value_enum)]
+    pub signal_transport: Option<SignalMode>,
+
+    /// Peer trust to start in with no `GridNetwork`, the chart's grid.peerTrust.
+    #[arg(long = "grid-peer-trust", env = "GRID_PEER_TRUST", value_enum)]
+    pub peer_trust: Option<PeerTrustMode>,
 }
 
 /// SWIM runtime options.

@@ -144,6 +144,17 @@ impl GridModes {
         trust: PeerTrustMode::Spiffe,
     };
 
+    /// The modes to start in with no `GridNetwork` yet: the install's declared modes,
+    /// else [`Self::WITHOUT_NETWORK`]. Matching the network the install will create
+    /// means a fresh install never restarts once it appears.
+    #[must_use]
+    pub fn without_network(signal: Option<SignalMode>, trust: Option<PeerTrustMode>) -> Self {
+        Self {
+            signal: signal.unwrap_or(Self::WITHOUT_NETWORK.signal),
+            trust: trust.unwrap_or(Self::WITHOUT_NETWORK.trust),
+        }
+    }
+
     /// The modes `network` declares, defaults for absent fields.
     #[must_use]
     pub fn of(network: &GridNetwork) -> Self {
@@ -3253,6 +3264,35 @@ mod tests {
             GridModes::of(&poll).restart_for(Some(&poll_pin)),
             Some(GridModes::of(&poll_pin)),
             "under poll a trust change restarts"
+        );
+    }
+
+    #[test]
+    fn a_poll_install_starts_in_poll_before_its_grid_network_exists() {
+        let startup = GridModes::without_network(Some(SignalMode::Poll), Some(PeerTrustMode::Pin));
+        assert_eq!(startup.signal, SignalMode::Poll, "the chart's grid.signals, not gossip");
+        let poll_pin = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "pin"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            startup.restart_for(Some(&poll_pin)),
+            None,
+            "the network it declared needs no restart"
+        );
+        assert!(
+            GridModes::WITHOUT_NETWORK.restart_for(Some(&poll_pin)).is_some(),
+            "without the declared modes the same install restarts"
+        );
+        assert_eq!(
+            GridModes::without_network(Some(SignalMode::Poll), None).trust,
+            PeerTrustMode::Spiffe,
+            "undeclared trust keeps its default"
+        );
+        assert_eq!(
+            GridModes::without_network(None, None),
+            GridModes::WITHOUT_NETWORK,
+            "an install declaring nothing keeps today's defaults"
         );
     }
     use crate::swim_endpoint::EndpointResolutionFailure;

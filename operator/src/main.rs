@@ -125,7 +125,13 @@ async fn main() {
     let GridModes {
         signal: signal_mode,
         trust,
-    } = match resolve_grid_modes(&client, config.enrollment.enabled).await {
+    } = match resolve_grid_modes(
+        &client,
+        config.enrollment.enabled,
+        GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
+    )
+    .await
+    {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
@@ -287,8 +293,9 @@ async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::Swim
     }
 }
 
-/// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup.
-async fn resolve_grid_modes(client: &Client, enrolled: bool) -> Result<GridModes, String> {
+/// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup, or
+/// `without_network` when none exists yet.
+async fn resolve_grid_modes(client: &Client, enrolled: bool, without_network: GridModes) -> Result<GridModes, String> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let items = networks
         .list(&kube::api::ListParams::default())
@@ -298,8 +305,8 @@ async fn resolve_grid_modes(client: &Client, enrolled: bool) -> Result<GridModes
     match items.as_slice() {
         [] => {
             let identity = if enrolled { " (enrolled identity)" } else { "" };
-            tracing::info!("no GridNetwork yet; peer trust spiffe{identity}, signal transport unset until one exists");
-            Ok(GridModes::WITHOUT_NETWORK)
+            tracing::info!(modes = ?without_network, "no GridNetwork yet; starting in the install's modes{identity}");
+            Ok(without_network)
         },
         [network] => {
             let modes = GridModes::of(network);

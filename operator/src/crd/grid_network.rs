@@ -171,7 +171,7 @@ pub struct SelectionPolicyConfig {
 ///
 /// The mode names the dissemination path, not the transport: SWIM membership
 /// runs in both modes. Only where the load signal travels changes.
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum SignalMode {
     /// Propagate signals over the SWIM and CRDT dissemination overlay, with
@@ -197,7 +197,7 @@ pub struct SignalTransportConfig {
 }
 
 /// How a peer site proves its identity beyond chaining to the Grid CA.
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum PeerTrustMode {
     /// Its leaf digest is declared on its `GridSite`.
