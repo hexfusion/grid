@@ -19,7 +19,7 @@ seeds](../architecture/crds.md#crd-driven-swim-seeds) describes.
 
    ```bash
    helm install grid-enrollment ./charts/grid-enrollment \
-     --namespace grid --create-namespace \
+     --namespace grid-enrollment --create-namespace \
      --set route.host=enrollment.apps.example.com \
      --set db.type=external \
      --set db.external.connectionUrlSecretRef=grid-enrollment-db
@@ -224,7 +224,7 @@ Where to look:
 
 ```bash
 kubectl -n grid-system logs deploy/grid-operator | grep -i "enroll\|rotation"
-kubectl -n grid logs deploy/grid-enrollment
+kubectl -n grid-enrollment logs deploy/grid-enrollment
 kubectl get gridnetwork -o yaml   # status.identity: notAfter, rotateAfter, reason
 ```
 
