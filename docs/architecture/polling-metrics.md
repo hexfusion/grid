@@ -56,9 +56,11 @@ request path does not read raw signals or compute load. It reads resolved order.
 Each site's operator decides whether each of its providers can serve now and
 publishes the verdict as `grid_provider_ready{grid_site,grid_provider}`: 1 when
 ready, 0 when not. A provider is not ready when its EPP reports zero ready
-endpoints for two scrapes in a row, when no scrape has succeeded within
-`staleMetricsSeconds` (half the signal TTL when unset), or when the provider is
-`Unavailable`. The same verdict is the provider's `Ready` condition.
+endpoints for two scrapes in a row, when a scrape answers without the pool's
+ready-endpoint series, when no scrape has succeeded within `staleMetricsSeconds`
+(half the signal TTL when unset), or when the provider is `Unavailable`. The same
+verdict is the provider's `Ready` condition, whose reason names the cause and, for a
+failed scrape, its class. See crds.md for the reasons and the scrape metrics.
 
 The gateway reads the latest readiness sample for each candidate when it orders
 the snapshot. A candidate whose latest sample is 0 is excluded, so a site is

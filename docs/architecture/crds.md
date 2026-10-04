@@ -565,16 +565,29 @@ credential projection can become available.
 
 **Readiness**: `status.conditions` carries a `Ready` condition, written by the
 operator's signals loop from each scrape of the provider's metrics. Readiness is
-a condition, not a phase, so `phase` is unchanged by it.
+a condition, not a phase: `phase` follows the provider's configuration only, and
+says nothing about whether it serves now.
 
 | Status | Reason | When |
 |---|---|---|
-| `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint, or exposed no count. |
-| `False` | `NoReadyEndpoints` | Two consecutive scrapes counted zero ready endpoints. |
-| `False` | `MetricsUnreachable` | No scrape succeeded within `staleMetricsSeconds`, and the latest failed. |
-| `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds`. |
+| `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint. |
+| `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints. |
+| `False` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). The message names what was missing. |
+| `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds`, and the latest timed out. |
+| `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |
+| `False` | `TLSHandshakeFailed` | As above, and the latest failed TLS, including the TLS material. |
+| `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `body_cap`, `parse`, or `config`. |
+| `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds`, and none failed. |
 | `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
+| `Unknown` | `AwaitingFirstScrape` | No scrape has succeeded yet, within the grace window. |
 | `Unknown` | `MetricsNotConfigured` | No `metricsConfig`, so readiness cannot be read. |
+
+The operator logs each change of reason once: at WARN when the provider turns not
+ready, at INFO when it returns to `Ready` or waits. Each scrape counts in
+`grid_provider_scrape_total{grid_provider,result}`, where `result` is `success`,
+`no_series`, or a failure class, and
+`grid_provider_last_scrape_success_timestamp_seconds{grid_provider}` holds the time
+of the last scrape with the ready-endpoint series.
 
 A provider whose `Ready` is `False` is excluded from routing: its site publishes
 `grid_provider_ready 0`, and its serving config entry carries `admission: none`.

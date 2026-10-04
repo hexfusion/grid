@@ -130,8 +130,11 @@ pub(crate) async fn collect_provider_signals(
         };
         let key = crate::readiness::key(network_name, plan.identity);
         match scrape_provider_signals(provider, &plan, client).await {
-            Some(text) => record_scrape(readiness, &key, provider, &plan, &text),
-            None => readiness.record_failure(&key, Instant::now()),
+            Ok(text) => record_scrape(readiness, &key, provider, &plan, &text),
+            Err(class) => {
+                crate::metrics::record_provider_scrape(plan.identity, class.as_str());
+                readiness.record_failure(&key, class, Instant::now());
+            },
         }
     }
 }
@@ -151,6 +154,7 @@ fn record_scrape(
         .as_ref()
         .and_then(|mc| mc.pool_name.as_deref());
     let ready = crate::readiness::ready_endpoints(&parsed, plan.ready_names(), pool);
+    let missing = count_scrape(plan, pool, ready);
     let in_flight = in_flight_observation(&parsed, ready, pool, plan.identity);
     let latency = readiness.record_latency(key, &parsed, pool, Instant::now());
     let observations = parsed
@@ -165,7 +169,23 @@ fn record_scrape(
         .chain(in_flight)
         .chain(latency)
         .collect();
-    readiness.record_success(key, ready, observations, Instant::now());
+    readiness.record_success(key, ready, missing, observations, Instant::now());
+}
+
+/// Count a scrape that answered: `success` with the pool's ready-endpoint series, else
+/// `no_series`, returned as the message naming what was missing.
+fn count_scrape(plan: &SignalScrapePlan<'_>, pool: Option<&str>, ready: Option<f64>) -> Option<String> {
+    if ready.is_some() {
+        crate::metrics::record_provider_scrape(plan.identity, "success");
+        crate::metrics::set_provider_last_scrape_success(plan.identity, std::time::SystemTime::now());
+        return None;
+    }
+    crate::metrics::record_provider_scrape(plan.identity, "no_series");
+    let series = plan.ready_names().join(" or ");
+    Some(match pool {
+        Some(pool) => format!("metrics reachable, but no {series} series for poolName {pool}"),
+        None => format!("metrics reachable, but no {series} series"),
+    })
 }
 
 /// The resolved `grid_provider_in_flight_requests` sample, logging which source it came from.
@@ -195,25 +215,29 @@ async fn scrape_provider_signals(
     provider: &InferenceProvider,
     plan: &SignalScrapePlan<'_>,
     client: Option<&kube::Client>,
-) -> Option<String> {
-    let mc = provider.spec.metrics_config.as_ref()?;
+) -> Result<String, crate::readiness::ScrapeClass> {
+    let mc = provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .ok_or(crate::readiness::ScrapeClass::Config)?;
     let identity = plan.identity;
     let tls_config = match resolve_tls_config(mc.tls.as_ref(), client, identity).await {
         Ok(cfg) => cfg,
         Err((_reason, e)) => {
             if mc.tls.is_some() {
-                tracing::warn!(provider = identity, error = %e, "signals: provider metrics TLS unavailable; not scraping in plaintext");
+                tracing::debug!(provider = identity, error = %e, "signals: provider metrics TLS unavailable; not scraping in plaintext");
             }
-            return None;
+            return Err(crate::readiness::ScrapeClass::Tls);
         },
     };
     let timeout = parse_metrics_timeout(&mc.timeout);
     scrape_metrics(&plan.url, timeout, tls_config, mc.auth.as_ref().zip(client))
         .await
-        .inspect_err(|e| {
+        .map_err(|e| {
             tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed");
+            e.class()
         })
-        .ok()
 }
 
 /// What to scrape for one provider and which of its series to republish.
@@ -721,6 +745,7 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
         },
         metrics_scraper::MetricsScrapeError::Credential(_)
         | metrics_scraper::MetricsScrapeError::PlaintextCredential(_) => "MetricsCredentialUnavailable",
+        metrics_scraper::MetricsScrapeError::BodyTooLarge(_) => "MetricsBodyTooLarge",
         metrics_scraper::MetricsScrapeError::InvalidUrl(_)
         | metrics_scraper::MetricsScrapeError::NonOkStatus { .. }
         | metrics_scraper::MetricsScrapeError::Encoding(_) => "MetricsScrapeError",

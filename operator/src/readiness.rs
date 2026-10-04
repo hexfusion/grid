@@ -56,16 +56,26 @@ const EPP_AVERAGES: [[&str; 2]; 2] = [
 pub enum Reason {
     /// Scraped recently with at least one ready endpoint.
     Ready,
-    /// The latest scrape counted zero ready endpoints.
-    NoReadyEndpoints,
-    /// No successful scrape within the staleness window.
+    /// The latest scrapes counted zero ready endpoints.
+    NoEndpointsReady,
+    /// The scrape answered, but without the pool's ready-endpoint series.
+    NoLivenessCheck,
+    /// No successful scrape within the staleness window, and no attempt failed.
     MetricsStale,
-    /// No successful scrape within the window, and the latest attempt failed.
-    MetricsUnreachable,
+    /// No successful scrape within the window, and the latest attempt timed out.
+    ScrapeTimedOut,
+    /// No successful scrape within the window, and the latest attempt was refused (401 or 403).
+    ScrapeUnauthorized,
+    /// No successful scrape within the window, and the latest attempt failed TLS.
+    TlsHandshakeFailed,
+    /// No successful scrape within the window, and the latest attempt failed otherwise.
+    ScrapeFailed,
     /// The provider itself is `Unavailable`.
     ProviderUnavailable,
     /// The provider declares no metrics, so readiness is unknown.
     MetricsNotConfigured,
+    /// Attempted, with no scrape succeeding yet inside the grace window.
+    AwaitingFirstScrape,
 }
 
 impl Reason {
@@ -74,11 +84,16 @@ impl Reason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
-            Self::NoReadyEndpoints => "NoReadyEndpoints",
+            Self::NoEndpointsReady => "NoEndpointsReady",
+            Self::NoLivenessCheck => "NoLivenessCheck",
             Self::MetricsStale => "MetricsStale",
-            Self::MetricsUnreachable => "MetricsUnreachable",
+            Self::ScrapeTimedOut => "ScrapeTimedOut",
+            Self::ScrapeUnauthorized => "ScrapeUnauthorized",
+            Self::TlsHandshakeFailed => "TLSHandshakeFailed",
+            Self::ScrapeFailed => "ScrapeFailed",
             Self::ProviderUnavailable => "ProviderUnavailable",
             Self::MetricsNotConfigured => "MetricsNotConfigured",
+            Self::AwaitingFirstScrape => "AwaitingFirstScrape",
         }
     }
 
@@ -87,10 +102,15 @@ impl Reason {
     pub const fn status(self) -> &'static str {
         match self {
             Self::Ready => "True",
-            Self::MetricsNotConfigured => "Unknown",
-            Self::NoReadyEndpoints | Self::MetricsStale | Self::MetricsUnreachable | Self::ProviderUnavailable => {
-                "False"
-            },
+            Self::MetricsNotConfigured | Self::AwaitingFirstScrape => "Unknown",
+            Self::NoEndpointsReady
+            | Self::NoLivenessCheck
+            | Self::MetricsStale
+            | Self::ScrapeTimedOut
+            | Self::ScrapeUnauthorized
+            | Self::TlsHandshakeFailed
+            | Self::ScrapeFailed
+            | Self::ProviderUnavailable => "False",
         }
     }
 
@@ -99,20 +119,76 @@ impl Reason {
     pub const fn display(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
-            Self::MetricsNotConfigured => "Unknown",
-            Self::NoReadyEndpoints | Self::MetricsStale | Self::MetricsUnreachable | Self::ProviderUnavailable => {
-                "NotReady"
-            },
+            Self::MetricsNotConfigured | Self::AwaitingFirstScrape => "Unknown",
+            Self::NoEndpointsReady
+            | Self::NoLivenessCheck
+            | Self::MetricsStale
+            | Self::ScrapeTimedOut
+            | Self::ScrapeUnauthorized
+            | Self::TlsHandshakeFailed
+            | Self::ScrapeFailed
+            | Self::ProviderUnavailable => "NotReady",
         }
     }
 
     /// Whether the provider is known not to serve: unknown counts as ready.
     #[must_use]
     pub const fn excludes(self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Self::NoReadyEndpoints | Self::MetricsStale | Self::MetricsUnreachable | Self::ProviderUnavailable
+            Self::Ready | Self::MetricsNotConfigured | Self::AwaitingFirstScrape
         )
+    }
+}
+
+/// Why one scrape failed, bounded so it can label a metric.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrapeClass {
+    /// The request timed out.
+    Timeout,
+    /// The endpoint answered 401 or 403.
+    Unauthorized,
+    /// TLS failed: a handshake, a certificate, or the TLS material.
+    Tls,
+    /// The endpoint's name did not resolve.
+    Dns,
+    /// The connection failed.
+    Connect,
+    /// The endpoint answered with another non-2xx status.
+    Http,
+    /// The body passed the size limit.
+    BodyCap,
+    /// The body could not be read as text.
+    Parse,
+    /// The scrape could not be built: the URL, the credential, or plaintext refused.
+    Config,
+}
+
+impl ScrapeClass {
+    /// The class as a metric label and message word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Unauthorized => "unauthorized",
+            Self::Tls => "tls",
+            Self::Dns => "dns",
+            Self::Connect => "connect",
+            Self::Http => "http",
+            Self::BodyCap => "body_cap",
+            Self::Parse => "parse",
+            Self::Config => "config",
+        }
+    }
+
+    /// The `Ready` reason when this was the latest failure and nothing succeeded since.
+    const fn reason(self) -> Reason {
+        match self {
+            Self::Timeout => Reason::ScrapeTimedOut,
+            Self::Unauthorized => Reason::ScrapeUnauthorized,
+            Self::Tls => Reason::TlsHandshakeFailed,
+            Self::Dns | Self::Connect | Self::Http | Self::BodyCap | Self::Parse | Self::Config => Reason::ScrapeFailed,
+        }
     }
 }
 
@@ -127,8 +203,10 @@ struct Probe {
     ready_endpoints: Option<f64>,
     /// Signals from the latest success, until the signals loop publishes them once.
     unpublished: Option<Vec<Observation>>,
-    /// Whether the latest attempt failed.
-    failing: bool,
+    /// The latest attempt's failure, `None` when it succeeded.
+    failure: Option<ScrapeClass>,
+    /// What the latest success lacked, when it exposed no ready-endpoint count.
+    missing: Option<String>,
     /// Consecutive successful scrapes that read zero ready endpoints.
     zero_streak: u32,
     /// Consecutive successful scrapes that read some ready endpoints.
@@ -180,12 +258,14 @@ impl ReadinessStore {
             .record(snapshot, now)
     }
 
-    /// Record a successful scrape at `now`.
+    /// Record a successful scrape at `now`, with `missing` naming the series it lacked.
     #[expect(clippy::significant_drop_tightening, reason = "the guard covers one whole update")]
+    #[expect(clippy::too_many_arguments, reason = "one scrape's count, gap, signals, and time")]
     pub(crate) fn record_success(
         &self,
         key: &str,
         ready_endpoints: Option<f64>,
+        missing: Option<String>,
         observations: Vec<Observation>,
         now: Instant,
     ) {
@@ -213,33 +293,40 @@ impl ReadinessStore {
         probe.last_good = Some(now);
         probe.ready_endpoints = ready_endpoints;
         probe.unpublished = Some(observations);
-        probe.failing = false;
+        probe.failure = None;
+        probe.missing = ready_endpoints.is_none().then_some(missing).flatten();
     }
 
     /// Record a failed scrape at `now`, keeping what the last good one saw.
     #[expect(clippy::significant_drop_tightening, reason = "the guard covers one whole update")]
-    pub(crate) fn record_failure(&self, key: &str, now: Instant) {
+    pub(crate) fn record_failure(&self, key: &str, class: ScrapeClass, now: Instant) {
         let mut probes = self.probes();
         let probe = probes.entry(key.to_owned()).or_default();
         probe.first_attempt.get_or_insert(now);
-        probe.failing = true;
+        probe.failure = Some(class);
     }
 
     /// The verdict for `key` at `now`.
     ///
-    /// `None` until the provider has been attempted, and through the first
-    /// `stale_after` while no scrape has succeeded yet, so a starting operator
-    /// publishes nothing rather than a guess.
+    /// `AwaitingFirstScrape`, which is `Unknown` and publishes nothing, until the
+    /// provider has been attempted and through the first `stale_after` while no
+    /// scrape has succeeded yet, so a starting operator states that it is waiting.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "the guard covers one small evaluation"
     )]
     pub(crate) fn verdict(&self, key: &str, unavailable: bool, stale_after: Duration, now: Instant) -> Option<Verdict> {
+        let awaiting = Verdict {
+            reason: Reason::AwaitingFirstScrape,
+            message: "awaiting the first metrics scrape".to_owned(),
+        };
         let probes = self.probes();
-        let probe = probes.get(key)?;
+        let Some(probe) = probes.get(key) else {
+            return (!unavailable).then_some(awaiting);
+        };
         let within = |at: Instant| now.saturating_duration_since(at) <= stale_after;
         if probe.last_good.is_none() && !unavailable && probe.first_attempt.is_some_and(within) {
-            return None;
+            return Some(awaiting);
         }
         Some(evaluate(
             probe,
@@ -261,7 +348,13 @@ impl ReadinessStore {
 
     /// Forget providers not in `keep`.
     pub(crate) fn retain(&self, keep: &std::collections::BTreeSet<String>) {
-        self.probes().retain(|key, _| keep.contains(key));
+        self.probes().retain(|key, _| {
+            let kept = keep.contains(key);
+            if !kept && let Some((_, identity)) = key.split_once('/') {
+                crate::metrics::forget_provider_scrapes(identity);
+            }
+            kept
+        });
     }
 }
 
@@ -274,14 +367,19 @@ fn evaluate(probe: &Probe, fresh: bool, unavailable: bool, stale_after: Duration
         };
     }
     if !fresh {
-        let reason = if probe.failing {
-            Reason::MetricsUnreachable
-        } else {
-            Reason::MetricsStale
-        };
-        return Verdict {
-            reason,
-            message: format!("no successful metrics scrape in the last {}s", stale_after.as_secs()),
+        let window = stale_after.as_secs();
+        return match probe.failure {
+            Some(class) => Verdict {
+                reason: class.reason(),
+                message: format!(
+                    "no successful metrics scrape in the last {window}s; the latest failed: {}",
+                    class.as_str()
+                ),
+            },
+            None => Verdict {
+                reason: Reason::MetricsStale,
+                message: format!("no successful metrics scrape in the last {window}s"),
+            },
         };
     }
     from_ready_endpoints(probe)
@@ -296,14 +394,23 @@ fn from_ready_endpoints(probe: &Probe) -> Verdict {
             _ => format!("0 ready endpoints for {STREAK} or more scrapes"),
         };
         return Verdict {
-            reason: Reason::NoReadyEndpoints,
+            reason: Reason::NoEndpointsReady,
             message,
         };
     }
-    let message = match count {
-        Some(count) if count < 1.0 => "0 ready endpoints in the latest scrape only".to_owned(),
-        Some(count) => format!("{count} ready endpoints"),
-        None => "metrics reachable, no ready-endpoint count exposed".to_owned(),
+    let Some(count) = count else {
+        return Verdict {
+            reason: Reason::NoLivenessCheck,
+            message: probe
+                .missing
+                .clone()
+                .unwrap_or_else(|| "metrics reachable, but no ready-endpoint series".to_owned()),
+        };
+    };
+    let message = if count < 1.0 {
+        "0 ready endpoints in the latest scrape only".to_owned()
+    } else {
+        format!("{count} ready endpoints")
     };
     Verdict {
         reason: Reason::Ready,
@@ -504,31 +611,43 @@ mod tests {
     fn verdict_follows_the_latest_scrape_and_staleness() {
         let store = ReadinessStore::default();
         let start = Instant::now();
-        assert_eq!(reason(&store, start), None, "never attempted");
+        assert_eq!(
+            reason(&store, start),
+            Some(Reason::AwaitingFirstScrape),
+            "never attempted"
+        );
 
-        store.record_success("p", Some(2.0), vec![sample("q", "p", 1.0)], start);
+        store.record_success("p", Some(2.0), None, vec![sample("q", "p", 1.0)], start);
         assert_eq!(reason(&store, start), Some(Reason::Ready));
         assert_eq!(store.take_fresh("p").map(|held| held.len()), Some(1));
         assert_eq!(store.take_fresh("p"), None, "fresh signals are published once");
 
-        store.record_success("p", None, Vec::new(), start);
+        let missing = "metrics reachable, but no llm_d_epp_ready_endpoints series for poolName qwen3";
+        store.record_success("p", None, Some(missing.to_owned()), Vec::new(), start);
+        let verdict = store.verdict("p", false, STALE, start).expect("judged");
         assert_eq!(
-            reason(&store, start),
-            Some(Reason::Ready),
-            "a scrape without the count is not read as zero"
+            (verdict.reason, verdict.message.as_str()),
+            (Reason::NoLivenessCheck, missing),
+            "a 200 without the pool's series is not ready, and says which series"
         );
+        assert!(verdict.reason.excludes());
         assert_eq!(store.take_fresh("p").map(|held| held.len()), Some(0));
 
-        store.record_failure("p", start + STALE);
+        store.record_failure("p", ScrapeClass::Connect, start + STALE);
         assert_eq!(
             reason(&store, start + STALE),
-            Some(Reason::Ready),
+            Some(Reason::NoLivenessCheck),
             "a failure within the window keeps the last verdict"
         );
         assert_eq!(store.take_fresh("p"), None, "a failure publishes no held load");
-        assert_eq!(
-            reason(&store, start + STALE + Duration::from_secs(1)),
-            Some(Reason::MetricsUnreachable)
+        let stale = store
+            .verdict("p", false, STALE, start + STALE + Duration::from_secs(1))
+            .expect("judged");
+        assert_eq!(stale.reason, Reason::ScrapeFailed);
+        assert!(
+            stale.message.ends_with("the latest failed: connect"),
+            "{}",
+            stale.message
         );
     }
 
@@ -537,22 +656,22 @@ mod tests {
         let store = ReadinessStore::default();
         let now = Instant::now();
         let scrape = |count| {
-            store.record_success("p", Some(count), Vec::new(), now);
+            store.record_success("p", Some(count), None, Vec::new(), now);
             reason(&store, now)
         };
         assert_eq!(scrape(0.0), Some(Reason::Ready), "one zero reading is not enough");
-        assert_eq!(scrape(0.0), Some(Reason::NoReadyEndpoints));
+        assert_eq!(scrape(0.0), Some(Reason::NoEndpointsReady));
         assert_eq!(
             scrape(1.0),
-            Some(Reason::NoReadyEndpoints),
+            Some(Reason::NoEndpointsReady),
             "one ready reading is not enough"
         );
         assert_eq!(
             scrape(0.0),
-            Some(Reason::NoReadyEndpoints),
+            Some(Reason::NoEndpointsReady),
             "a relapse restarts the count"
         );
-        assert_eq!(scrape(1.0), Some(Reason::NoReadyEndpoints));
+        assert_eq!(scrape(1.0), Some(Reason::NoEndpointsReady));
         assert_eq!(scrape(1.0), Some(Reason::Ready));
     }
 
@@ -560,11 +679,50 @@ mod tests {
     fn a_first_scrape_that_fails_gets_the_staleness_window_before_a_verdict() {
         let store = ReadinessStore::default();
         let start = Instant::now();
-        store.record_failure("p", start);
-        assert_eq!(reason(&store, start + STALE), None, "grace, not a guess");
+        store.record_failure("p", ScrapeClass::Timeout, start);
+        assert_eq!(
+            reason(&store, start + STALE),
+            Some(Reason::AwaitingFirstScrape),
+            "grace, not a guess"
+        );
         assert_eq!(
             reason(&store, start + STALE + Duration::from_secs(1)),
-            Some(Reason::MetricsUnreachable)
+            Some(Reason::ScrapeTimedOut)
+        );
+    }
+
+    #[test]
+    fn a_failed_scrape_names_its_class() {
+        let cases = [
+            (ScrapeClass::Timeout, Reason::ScrapeTimedOut),
+            (ScrapeClass::Unauthorized, Reason::ScrapeUnauthorized),
+            (ScrapeClass::Tls, Reason::TlsHandshakeFailed),
+            (ScrapeClass::Dns, Reason::ScrapeFailed),
+            (ScrapeClass::Connect, Reason::ScrapeFailed),
+            (ScrapeClass::Http, Reason::ScrapeFailed),
+            (ScrapeClass::BodyCap, Reason::ScrapeFailed),
+            (ScrapeClass::Parse, Reason::ScrapeFailed),
+            (ScrapeClass::Config, Reason::ScrapeFailed),
+        ];
+        let start = Instant::now();
+        for (class, expected) in cases {
+            let store = ReadinessStore::default();
+            store.record_failure("p", class, start);
+            let verdict = store
+                .verdict("p", false, STALE, start + STALE + Duration::from_secs(1))
+                .expect("judged");
+            assert_eq!(verdict.reason, expected, "{class:?}");
+            assert!(
+                verdict.message.ends_with(class.as_str()),
+                "{class:?}: {}",
+                verdict.message
+            );
+            assert!(verdict.reason.excludes(), "{class:?}");
+        }
+        assert_eq!(
+            Reason::TlsHandshakeFailed.as_str(),
+            "TLSHandshakeFailed",
+            "the contract's spelling"
         );
     }
 
@@ -573,15 +731,15 @@ mod tests {
         let store = ReadinessStore::default();
         let now = Instant::now();
         for _ in 0..STREAK {
-            store.record_success(&key("east", "p"), Some(0.0), Vec::new(), now);
+            store.record_success(&key("east", "p"), Some(0.0), None, Vec::new(), now);
         }
-        store.record_success(&key("west", "p"), Some(3.0), Vec::new(), now);
+        store.record_success(&key("west", "p"), Some(3.0), None, Vec::new(), now);
         let reason_in = |network| {
             store
                 .verdict(&key(network, "p"), false, STALE, now)
                 .map(|verdict| verdict.reason)
         };
-        assert_eq!(reason_in("east"), Some(Reason::NoReadyEndpoints));
+        assert_eq!(reason_in("east"), Some(Reason::NoEndpointsReady));
         assert_eq!(reason_in("west"), Some(Reason::Ready));
     }
 
@@ -589,7 +747,7 @@ mod tests {
     fn an_unavailable_provider_is_not_ready_whatever_its_metrics_say() {
         let store = ReadinessStore::default();
         let now = Instant::now();
-        store.record_success("p", Some(3.0), Vec::new(), now);
+        store.record_success("p", Some(3.0), None, Vec::new(), now);
         let verdict = store.verdict("p", true, STALE, now).unwrap();
         assert_eq!(verdict.reason, Reason::ProviderUnavailable);
         assert!(verdict.reason.excludes());
@@ -599,10 +757,12 @@ mod tests {
     fn the_status_column_reads_like_a_node() {
         assert_eq!(Reason::Ready.display(), "Ready");
         assert_eq!(Reason::MetricsNotConfigured.display(), "Unknown");
+        assert_eq!(Reason::AwaitingFirstScrape.display(), "Unknown");
         for reason in [
-            Reason::NoReadyEndpoints,
+            Reason::NoEndpointsReady,
+            Reason::NoLivenessCheck,
             Reason::MetricsStale,
-            Reason::MetricsUnreachable,
+            Reason::ScrapeFailed,
             Reason::ProviderUnavailable,
         ] {
             assert_eq!(reason.display(), "NotReady", "{reason:?}");
@@ -637,7 +797,7 @@ mod tests {
         );
 
         let down = Verdict {
-            reason: Reason::NoReadyEndpoints,
+            reason: Reason::NoEndpointsReady,
             message: "0 ready endpoints".to_owned(),
         };
         let second = ready_condition(std::slice::from_ref(&first), &down, "t2", Some(3)).unwrap();
@@ -647,7 +807,7 @@ mod tests {
         );
 
         let unreachable = Verdict {
-            reason: Reason::MetricsUnreachable,
+            reason: Reason::ScrapeFailed,
             message: "no scrape".to_owned(),
         };
         let third = ready_condition(std::slice::from_ref(&second), &unreachable, "t3", Some(3)).unwrap();
@@ -662,10 +822,16 @@ mod tests {
         assert_eq!(Reason::Ready.status(), "True");
         assert_eq!(Reason::MetricsNotConfigured.status(), "Unknown");
         assert!(!Reason::MetricsNotConfigured.excludes(), "unknown is not down");
+        assert_eq!(Reason::AwaitingFirstScrape.status(), "Unknown");
+        assert!(!Reason::AwaitingFirstScrape.excludes(), "waiting is not down");
         for reason in [
-            Reason::NoReadyEndpoints,
+            Reason::NoEndpointsReady,
             Reason::MetricsStale,
-            Reason::MetricsUnreachable,
+            Reason::NoLivenessCheck,
+            Reason::ScrapeTimedOut,
+            Reason::ScrapeUnauthorized,
+            Reason::TlsHandshakeFailed,
+            Reason::ScrapeFailed,
             Reason::ProviderUnavailable,
         ] {
             assert_eq!(reason.status(), "False");

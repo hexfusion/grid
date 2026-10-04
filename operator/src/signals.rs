@@ -829,6 +829,7 @@ fn classify(error: &MetricsScrapeError) -> PollOutcome {
             }
         },
         MetricsScrapeError::Encoding(_) => PollOutcome::Encoding,
+        MetricsScrapeError::BodyTooLarge(_) => PollOutcome::Transport,
         MetricsScrapeError::InvalidUrl(_)
         | MetricsScrapeError::HttpWithTls(_)
         | MetricsScrapeError::TlsMaterial(_)

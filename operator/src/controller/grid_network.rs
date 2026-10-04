@@ -635,13 +635,24 @@ async fn apply_ready_condition(
         &Patch::Apply(patch),
     ))
     .await?;
-    tracing::info!(
-        provider = name,
-        status = verdict.reason.status(),
-        reason = verdict.reason.as_str(),
-        message = %verdict.message,
-        "provider readiness changed"
-    );
+    // A turn away from Ready warns; a return to Ready or a wait is informational.
+    if verdict.reason.excludes() {
+        tracing::warn!(
+            provider = name,
+            status = verdict.reason.status(),
+            reason = verdict.reason.as_str(),
+            message = %verdict.message,
+            "provider readiness changed"
+        );
+    } else {
+        tracing::info!(
+            provider = name,
+            status = verdict.reason.status(),
+            reason = verdict.reason.as_str(),
+            message = %verdict.message,
+            "provider readiness changed"
+        );
+    }
     Ok(())
 }
 
@@ -4067,6 +4078,27 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {
+        let ready = |value: f64| signals::Observation {
+            metric: readiness::READY_SIGNAL.to_owned(),
+            labels: std::collections::BTreeMap::new(),
+            value,
+            timestamp_ms: None,
+        };
+        assert!(
+            matches!(
+                published_signals(None, ready(0.0), None, true).as_deref(),
+                Some([only]) if only.metric == readiness::READY_SIGNAL && only.value == 0.0
+            ),
+            "a failed or stale provider keeps a ready=0 row, so an alert sees it"
+        );
+        assert!(
+            published_signals(None, ready(1.0), None, false).is_none(),
+            "a waiting or unconfigured provider publishes nothing"
+        );
+    }
+
+    #[test]
     fn capacity_is_max_running_per_endpoint_times_ready_endpoints() {
         let mut provider = provider_with_status(&serde_json::json!({}));
         assert!(
@@ -4122,12 +4154,12 @@ mod tests {
     )]
     fn the_status_column_is_written_with_the_condition_and_backfilled_once() {
         let down = readiness::Verdict {
-            reason: readiness::Reason::NoReadyEndpoints,
+            reason: readiness::Reason::NoEndpointsReady,
             message: "0 ready endpoints".to_owned(),
         };
         // The condition already says so, but STATE was never written: backfill it.
         let unshown = provider_with_status(&serde_json::json!({
-            "conditions": [ready_condition_json("False", "NoReadyEndpoints")]
+            "conditions": [ready_condition_json("False", "NoEndpointsReady")]
         }));
         let (_, patch) = ready_condition_patch(&unshown, &down).expect("state is backfilled");
         assert_eq!(patch["status"]["state"], "NotReady");
@@ -4137,7 +4169,7 @@ mod tests {
         );
         // Both already current: nothing to write.
         let shown = provider_with_status(&serde_json::json!({
-            "conditions": [ready_condition_json("False", "NoReadyEndpoints")],
+            "conditions": [ready_condition_json("False", "NoEndpointsReady")],
             "state": "NotReady"
         }));
         assert!(ready_condition_patch(&shown, &down).is_none());

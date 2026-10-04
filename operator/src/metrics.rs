@@ -41,6 +41,10 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_SIGNALS_REFUSED.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(PROVIDER_SCRAPES.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(PROVIDER_LAST_SCRAPE_SUCCESS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLL_DURATION.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLL_SLOW.clone()))
@@ -123,6 +127,28 @@ static PEER_POLL_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new("grid_peer_poll_total", "Peer signal polls by outcome"),
         &["peer", "outcome"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Provider metrics scrapes by provider and result: `success`, `no_series`, or a failure class
+/// (`timeout`, `unauthorized`, `tls`, `dns`, `connect`, `http`, `body_cap`, `parse`, `config`).
+static PROVIDER_SCRAPES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_provider_scrape_total", "Provider metrics scrapes by result"),
+        &["grid_provider", "result"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// When each provider's metrics last scraped with its ready-endpoint series, Unix seconds.
+static PROVIDER_LAST_SCRAPE_SUCCESS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_provider_last_scrape_success_timestamp_seconds",
+            "Unix time of the provider's last scrape with its ready-endpoint series",
+        ),
+        &["grid_provider"],
     )
     .unwrap_or_else(|_| std::process::abort())
 });
@@ -435,6 +461,39 @@ pub(crate) fn record_peer_poll(peer: &str, outcome: &str, duration: Duration, by
         PEER_RESPONSE_BYTES
             .with_label_values(&[peer])
             .inc_by(bytes.try_into().unwrap_or(u64::MAX));
+    }
+}
+
+/// Count one scrape of `provider` with `result`.
+pub(crate) fn record_provider_scrape(provider: &str, result: &str) {
+    PROVIDER_SCRAPES.with_label_values(&[provider, result]).inc();
+}
+
+/// Record that `provider` last scraped with its ready-endpoint series at `at`.
+pub(crate) fn set_provider_last_scrape_success(provider: &str, at: std::time::SystemTime) {
+    let secs = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    PROVIDER_LAST_SCRAPE_SUCCESS
+        .with_label_values(&[provider])
+        .set(secs.try_into().unwrap_or(i64::MAX));
+}
+
+/// Drop `provider`'s scrape series once it is gone, so they do not outlive it.
+pub(crate) fn forget_provider_scrapes(provider: &str) {
+    let _absent = PROVIDER_LAST_SCRAPE_SUCCESS.remove_label_values(&[provider]);
+    for result in [
+        "success",
+        "no_series",
+        "timeout",
+        "unauthorized",
+        "tls",
+        "dns",
+        "connect",
+        "http",
+        "body_cap",
+        "parse",
+        "config",
+    ] {
+        let _absent_result = PROVIDER_SCRAPES.remove_label_values(&[provider, result]);
     }
 }
 
@@ -770,6 +829,24 @@ mod tests {
             text.contains("grid_gateway_probe_duration_seconds"),
             "output should contain duration histogram"
         );
+    }
+
+    #[test]
+    fn provider_scrapes_are_counted_by_result_and_forgotten_with_the_provider() {
+        let provider = "scrape-count-test";
+        record_provider_scrape(provider, "success");
+        record_provider_scrape(provider, "no_series");
+        record_provider_scrape(provider, "no_series");
+        set_provider_last_scrape_success(provider, std::time::UNIX_EPOCH + Duration::from_secs(42));
+        assert_eq!(PROVIDER_SCRAPES.with_label_values(&[provider, "success"]).get(), 1);
+        assert_eq!(PROVIDER_SCRAPES.with_label_values(&[provider, "no_series"]).get(), 2);
+        assert_eq!(PROVIDER_LAST_SCRAPE_SUCCESS.with_label_values(&[provider]).get(), 42);
+        forget_provider_scrapes(provider);
+        assert!(
+            PROVIDER_SCRAPES.remove_label_values(&[provider, "success"]).is_err(),
+            "forgotten with the provider"
+        );
+        assert!(PROVIDER_LAST_SCRAPE_SUCCESS.remove_label_values(&[provider]).is_err());
     }
 
     #[test]
