@@ -18,6 +18,9 @@ spec:
       scheme: https
       path: /metrics
       interval: {{ .serviceMonitor.interval }}
+      {{- with .serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . | quote }}
+      {{- end }}
       tlsConfig:
         serverName: {{ printf "%s.%s.svc" $name $.Release.Namespace }}
         ca:

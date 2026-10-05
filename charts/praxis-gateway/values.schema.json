@@ -784,6 +784,9 @@
             "interval": {
               "type": "string"
             },
+            "scrapeTimeout": {
+              "type": "string"
+            },
             "caConfigMap": {
               "type": "object",
               "additionalProperties": false,
