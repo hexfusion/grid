@@ -121,6 +121,27 @@ pub fn lb_signals_endpoint(svc: &Service) -> Option<String> {
     crate::signals::SignalsEndpoint::parse(&text).map(|endpoint| endpoint.authority())
 }
 
+/// Whether this Service is a `LoadBalancer` carrying the signals port whose ingress has not
+/// arrived.
+///
+/// Both conditions bound the wait. Only a `LoadBalancer` ever reports ingress, and only a
+/// Service declaring the port has an endpoint to wait for, so without either the wait would
+/// never return.
+#[must_use]
+pub fn signals_awaiting_ingress(svc: &Service) -> bool {
+    let Some(spec) = svc.spec.as_ref() else {
+        return false;
+    };
+    if spec.type_.as_deref() != Some("LoadBalancer") {
+        return false;
+    }
+    let declares_port = spec
+        .ports
+        .as_deref()
+        .is_some_and(|ports| ports.iter().any(|p| p.name.as_deref() == Some(SIGNALS_PORT_NAME)));
+    declares_port && lb_signals_endpoint(svc).is_none()
+}
+
 /// The SWIM endpoint from one read of the Service, `None` until it has ingress.
 ///
 /// Signals live on their own Service, resolved by the caller.
@@ -320,6 +341,49 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// `svc` with an explicit Service type, for the signals wait.
+    fn typed_svc(kind: &str, ports: &[(Option<&str>, i32)], ingress_ip: Option<&str>) -> Service {
+        let mut out = svc(ports, ingress_ip);
+        if let Some(spec) = out.spec.as_mut() {
+            spec.type_ = Some(kind.to_owned());
+        }
+        out
+    }
+
+    #[test]
+    fn a_signals_load_balancer_is_awaited_only_until_its_ingress_arrives() {
+        let signals = &[(Some("signals"), 9091)];
+        let cases = [
+            ("LoadBalancer", None, true, "a pending LoadBalancer is awaited"),
+            ("LoadBalancer", Some("10.0.0.7"), false, "ingress ends the wait"),
+            (
+                "ClusterIP",
+                None,
+                false,
+                "a ClusterIP never reports ingress, so waiting would hang",
+            ),
+            ("NodePort", None, false, "nor does a NodePort"),
+        ];
+        for (kind, ingress, want, why) in cases {
+            assert_eq!(
+                signals_awaiting_ingress(&typed_svc(kind, signals, ingress)),
+                want,
+                "{kind} with ingress {ingress:?}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_load_balancer_without_the_signals_port_is_not_awaited() {
+        // Waiting would never end: the port it would wait for is not on this Service.
+        let swim_only = &[(Some("swim-udp"), 7946)];
+        assert!(!signals_awaiting_ingress(&typed_svc(
+            "LoadBalancer",
+            swim_only,
+            Some("10.0.0.7")
+        )));
     }
 
     #[test]

@@ -680,9 +680,34 @@ impl LbWatch {
         else {
             return Ok(None);
         };
+        if Box::pin(self.signals_pending()).await? {
+            return Ok(None);
+        }
         let signals = self.signals_endpoint().await?;
         let addresses = resolve_text(&text).await.map_err(swim_advertise::LookupError::Retry)?;
         Ok(addresses.first().map(|addr| (text, *addr, signals)))
+    }
+
+    /// Whether a signals `LoadBalancer` of its own is still waiting for ingress.
+    ///
+    /// The two Services are provisioned independently, so SWIM can have an address while
+    /// signals does not. Settling then gossips a site with no signals endpoint, and the
+    /// watch takes `LB_CHANGE_CONFIRMATIONS` slow polls to notice, during which peers
+    /// cannot poll this site. Only a `LoadBalancer` is awaited: nothing else ever reports
+    /// ingress, so waiting on one would never return.
+    async fn signals_pending(&self) -> Result<bool, swim_advertise::LookupError> {
+        let Some(name) = self.signals_service.as_deref() else {
+            return Ok(false);
+        };
+        let Some(svc) = self
+            .services
+            .get_opt(name)
+            .await
+            .map_err(|error| swim_advertise::LookupError::Retry(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        Ok(swim_advertise::signals_awaiting_ingress(&svc))
     }
 
     /// Every ingress endpoint the Service lists now, unresolved, or none once a tracked signals endpoint moved.
