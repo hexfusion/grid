@@ -164,11 +164,19 @@ plan_addresses() {
   # Signals have their own Service, so their own address from each pool.
   HUB_SIG_IP=$(ip_add "$hub" 3)
   SITE_SWIM_IP=$(ip_add "$site" 1)
-  SITE_SIG_IP=$(ip_add "$site" 2)
   SITE_GW_IP=$(ip_add "$site" 2)
+  SITE_SIG_IP=$(ip_add "$site" 3)
   MODEL_IP=$(kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o jsonpath='{.spec.clusterIP}')
   [[ -n $MODEL_IP ]] || die "no vcr-inference-site Service on the site"
-  log "enrollment $ENROLL_IP, hub SWIM $HUB_SWIM_IP, site SWIM $SITE_SWIM_IP, site gateway $SITE_GW_IP"
+  # Two Services asking MetalLB for one address leaves the loser pending forever,
+  # which surfaces as an unrelated deployment never going ready.
+  local planned
+  planned=$(printf '%s\n' "$ENROLL_IP" "$HUB_SWIM_IP" "$HUB_SIG_IP" \
+    "$SITE_SWIM_IP" "$SITE_SIG_IP" "$SITE_GW_IP")
+  [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 6 ]] \
+    || die "planned addresses are not distinct: $(printf '%s ' $planned)"
+  log "enrollment $ENROLL_IP, hub SWIM $HUB_SWIM_IP, hub signals $HUB_SIG_IP"
+  log "site SWIM $SITE_SWIM_IP, site signals $SITE_SIG_IP, site gateway $SITE_GW_IP"
 }
 
 # helm_on <context> <namespace> <release> <chart> [--set flags...]: the README command
