@@ -168,6 +168,16 @@ if grep -q 'value: "v-sig-grid-operator-signals.grid-system.svc:9091"' <<<"$SIG_
 else
   fail "signals: unexpected render: $(grep -E 'SIGNALS|signals|Error' <<<"$SIG_RENDER" | head -3 | tr '\n' ' ')"
 fi
+# Every Service the Deployment is told to read has to be granted. A name the operator
+# resolves but RBAC omits is a 403 it retries forever, so the pod never goes ready and
+# the symptom lands on an unrelated deployment.
+SIG_READS=$(grep -A1 'name: GRID_SIGNALS_SERVICE_NAME' <<<"$SIG_RENDER" | awk '/value:/{print $2}' | tr -d '"')
+SIG_GRANTS=$(yq 'select(.kind == "ClusterRole") | .rules[] | select(.resources[] == "services") | .resourceNames[]' <<<"$SIG_RENDER" 2>/dev/null)
+if [ -n "$SIG_READS" ] && grep -qx "$SIG_READS" <<<"$SIG_GRANTS"; then
+  pass "signals: the Service the Deployment reads is granted in the resources ClusterRole"
+else
+  fail "signals: Deployment reads '$SIG_READS', ClusterRole grants $(tr '\n' ' ' <<<"$SIG_GRANTS")"
+fi
 # Gossip must stay the SWIM Service's only port: a mixed UDP and TCP Service is refused
 # outright by some providers, which then create no load balancer at all.
 SWIM_PORTS=$(helm template v-sp "$CHART_DIR" --namespace grid-system --set signals.enabled=true \

@@ -402,7 +402,15 @@ install_grid() {
   install_hub
   install_site
   for ctx in "$HUB_CTX" "$SITE_CTX"; do
-    k "$ctx" rollout status deployment --timeout 5m >/dev/null || die "deployments on $ctx not ready"
+    # Name what is stuck and why. A bare timeout here cost two rounds of diagnosis:
+    # the pod was retrying a forbidden read and the message said only "not ready".
+    k "$ctx" rollout status deployment --timeout 5m >/dev/null && continue
+    k "$ctx" get deploy,pods -o wide >&2 || true
+    for p in $(k "$ctx" get pods -o name 2>/dev/null); do
+      k "$ctx" get "$p" -o jsonpath='{.metadata.name}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}' >&2 2>/dev/null || true
+      k "$ctx" logs "$p" --tail=20 >&2 2>/dev/null || true
+    done
+    die "deployments on $ctx not ready"
   done
   pass "hub and site installed with helm, every deployment rolled out"
 }
