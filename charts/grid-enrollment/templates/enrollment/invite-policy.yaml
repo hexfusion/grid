@@ -5,6 +5,7 @@
 {{- $ns := .Release.Namespace }}
 {{- $target := .Values.invitePolicy.namespace }}
 {{- $set := .Values.invitePolicy.clusterSet }}
+{{- $caBundle := .Values.ca.bundleSecretName | default "grid-ca-bundle" }}
 apiVersion: cluster.open-cluster-management.io/v1beta2
 kind: ManagedClusterSetBinding
 metadata:
@@ -87,10 +88,10 @@ spec:
             kind: Secret
             type: Opaque
             metadata:
-              name: grid-ca-bundle
+              name: {{ $caBundle | quote }}
               namespace: {{ $target | quote }}
             data:
-              ca.crt: '{{ printf "{{hub fromSecret %q \"grid-ca-bundle\" \"ca.crt\" hub}}" $ns }}'
+              ca.crt: '{{ printf "{{hub fromSecret %q %q \"ca.crt\" hub}}" $ns $caBundle }}'
         - complianceType: musthave
           objectDefinition:
             apiVersion: v1
