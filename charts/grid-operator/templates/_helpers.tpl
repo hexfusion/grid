@@ -192,8 +192,11 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- $port := (.Values.swim.service).port | default 7946 -}}
 {{- $seeds := list -}}
 {{- range (include "grid-operator.peerList" . | fromYamlArray) -}}
-{{- if contains ":" . -}}
+{{/* A bare IPv6 address has colons but no port, so bracket it; [addr]:port and host:port are taken as given. */}}
+{{- if or (hasPrefix "[" .) (and (contains ":" .) (not (regexMatch "^[0-9a-fA-F:]+$" .))) -}}
 {{- $seeds = append $seeds . -}}
+{{- else if contains ":" . -}}
+{{- $seeds = append $seeds (printf "[%s]:%v" . $port) -}}
 {{- else -}}
 {{- $seeds = append $seeds (printf "%s:%v" . $port) -}}
 {{- end -}}
@@ -211,6 +214,13 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- $ranges := list -}}
 {{- range (include "grid-operator.peerList" .root | fromYamlArray) -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" . -}}
+{{/* 300.0.0.1 matches the shape; an out-of-range octet would make a CIDR the API rejects,
+     taking the Service with it, so refuse to render instead. */}}
+{{- range $o := splitList "." . -}}
+{{- if gt (int $o) 255 -}}
+{{- fail (printf "peers: %q is not an IPv4 address" $o) -}}
+{{- end -}}
+{{- end -}}
 {{- $ranges = append $ranges (printf "%s/32" .) -}}
 {{- end -}}
 {{- end -}}

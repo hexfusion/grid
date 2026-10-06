@@ -121,7 +121,8 @@ spec:
             {{- end }}
             {{- if (.Values.signals).enabled }}
             - name: GRID_SIGNALS_LOCAL_ADDR
-              value: {{ printf "%s-signals.%s.svc:%v" (include "grid-operator.fullname" .) .Release.Namespace .Values.signals.port | quote }}
+              {{- /* Follows whichever Service carries the port: the signals one when rendered, else SWIM. */}}
+              value: {{ printf "%s-%s.%s.svc:%v" (include "grid-operator.fullname" .) (ternary "signals" "swim" .Values.signals.service.enabled) .Release.Namespace .Values.signals.port | quote }}
             {{- if .Values.signals.service.enabled }}
             - name: GRID_SIGNALS_SERVICE_NAME
               value: {{ printf "%s-signals" (include "grid-operator.fullname" .) | quote }}

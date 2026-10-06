@@ -17,9 +17,10 @@ aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=<vpc> \
 ```
 
 Give each cluster a distinct `machineNetwork`, or clusters sharing `10.0.0.0/16` cannot be
-peered and cross-site traffic takes the internet. Pin each to one availability zone: every
-zone costs a NAT gateway and an Elastic IP, and three clusters at the three-zone default
-ask for twelve against a regional default of sixteen.
+peered and cross-site traffic takes the internet. Pin each to one availability zone: a zone
+costs a NAT gateway and its Elastic IP, and the bootstrap machine takes one more, so three
+clusters at the three-zone default ask for twelve. Pinned, they ask for two each. Check the
+account's own Elastic IP quota (`L-0263D0A3`) rather than the published default.
 
 ## Restrict the endpoints
 
@@ -28,9 +29,14 @@ password. Close both to everything but your address and the clusters' NAT addres
 installing anything.
 
 ```bash
-aws ec2 authorize-security-group-ingress --group-id <sg> --protocol tcp --port 6443 --cidr <allowed>/32
-aws ec2 revoke-security-group-ingress    --group-id <sg> --protocol tcp --port 6443 --cidr 0.0.0.0/0
+for port in 6443 443; do
+  aws ec2 authorize-security-group-ingress --group-id <sg> --protocol tcp --port $port --cidr <allowed>/32
+  aws ec2 revoke-security-group-ingress    --group-id <sg> --protocol tcp --port $port --cidr 0.0.0.0/0
+done
 ```
+
+6443 is on the API load balancer's group and 443 on the router's, so they are different
+groups. Enrollment is a Route, so a site that cannot reach 443 never enrolls.
 
 Authorise before revoking. Match groups on `kubernetes.io/cluster/<infraID>` **or** the
 `<infraID>` name prefix, since `<infraID>-apiserver-lb` carries no cluster tag. Leave ICMP
@@ -75,13 +81,14 @@ since the operator reads them there and not from the release namespace:
 | `grid-ca-bundle` (`ca.crt`) | release namespace | every site |
 | `grid-swim-key` | release namespace | every cluster, hub included |
 
-A key that arrives after the operator has already failed on it does not retrigger the
-watch, so deliver all three first or restart the operator afterwards.
+A key that arrives late is picked up on the next reconcile, within about 30 seconds. No
+restart is needed.
 
 Then the operator on each cluster:
 
 ```bash
 helm install grid-operator charts/grid-operator -n grid-system --create-namespace \
+  --set crds.enabled=false \
   --set platform=aws \
   --set peers='<other site> <hub>' \
   --set swim.siteName=site-1 \
@@ -117,7 +124,7 @@ handshake, so a connect proves nothing.
 | A site never reaches `Available` | The hub is not accepting that site's NAT address on 6443 or 443. |
 | Signals poll but gossip never converges | The SWIM Service got a Classic load balancer, which carries no UDP. Check `platform: aws`. |
 | Peers unreachable despite correct addresses | Source ranges list VPC CIDRs rather than NAT addresses. |
-| `swimKeyRef ... did not resolve to a valid 32-byte key` | `grid-swim-key` is not in the operator's namespace. Copy it, then restart the operator: a late Secret does not retrigger the failed watch. |
+| `swimKeyRef ... did not resolve to a valid 32-byte key` | The Secret is absent from the operator's namespace, or its `key` field is missing, or the value is not exactly 32 bytes. Reconciliation retries every 30 seconds, so correcting it is enough. |
 | `no matches for kind "GridNetwork"` on a first install | The chart renders CRDs and their resources in one release. Apply the CRDs first, then install with `crds.enabled=false`. |
 | `cannot be imported into the current release: invalid ownership metadata` | CRDs applied by hand carry no Helm ownership. Install with `crds.enabled=false`. |
 | A site enrolls but the hub never starts SWIM | The hub takes `enrollment.enabled=false` and its identity from the bootstrap Job, a different path. Check the key is in its namespace and restart it. |

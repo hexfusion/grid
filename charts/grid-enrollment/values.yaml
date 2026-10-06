@@ -215,6 +215,16 @@ db:
 #   site-a:
 #     network: grid
 
+# -- ACM Policy delivering each invited site its token, the CA bundle and the gossip key.
+# The site names come from `invites`, so they are not restated here.
+invitePolicy:
+  # -- Render the policy. Needs ACM on this cluster and the sites imported.
+  enabled: false
+  # -- Namespace on each site that its operator reads the Secrets from.
+  namespace: grid
+  # -- ManagedClusterSet the sites belong to. The binding is named for it.
+  clusterSet: default
+
 # -- The hub's own site identity, issued by the bootstrap Job straight from the grid
 # CA, so the hub never enrolls or needs an invite. It rotates like an enrolled site.
 # Delete the Secret and upgrade to re-issue it.

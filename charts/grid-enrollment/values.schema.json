@@ -601,6 +601,23 @@
           "description": "Full RUST_LOG directive, such as info,enrollment=debug. When set, it replaces level."
         }
       }
+    },
+    "invitePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "clusterSet": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     }
   },
   "required": [
