@@ -1,6 +1,6 @@
 # Installing on AWS
 
-AWS needs three settings the grid does not need elsewhere:
+AWS-unique settings:
 
 - `platform: aws`, because gossip is UDP and the default load balancer carries none.
 - `peers`, the other sites' NAT addresses, which become the SWIM seeds and both Services'
