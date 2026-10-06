@@ -38,6 +38,19 @@ types 3 and 4, or path MTU discovery breaks.
 
 ## Install
 
+The grid CRDs go in before the release, because the chart renders them and the resources
+that use them together and Helm validates the whole set first:
+
+```bash
+for k in gridnetwork gridsite inferenceprovider agenttoolprovider; do
+  helm template grid-operator charts/grid-operator -n grid-system \
+    --show-only templates/crds/$k.yaml | oc apply -f -
+done
+```
+
+Then install the release with `--set crds.enabled=false`, since the CRDs are now the
+platform's rather than Helm's.
+
 Enrollment on the hub. `hubSite.namespace` must exist first:
 
 ```bash
@@ -53,8 +66,19 @@ helm install grid charts/grid-enrollment -n grid-enroll --create-namespace \
   --set invites.site-2.network=grid
 ```
 
-Copy each `grid-invite-<site>` Secret, and `ca.crt` from `grid-ca-bundle`, to that site's
-operator namespace. Then the operator on each cluster:
+Three Secrets have to reach each cluster's operator namespace before its operator starts,
+since the operator reads them there and not from the release namespace:
+
+| Secret | From | To |
+|---|---|---|
+| `grid-invite-<site>` | release namespace | that site only |
+| `grid-ca-bundle` (`ca.crt`) | release namespace | every site |
+| `grid-swim-key` | release namespace | every cluster, hub included |
+
+A key that arrives after the operator has already failed on it does not retrigger the
+watch, so deliver all three first or restart the operator afterwards.
+
+Then the operator on each cluster:
 
 ```bash
 helm install grid-operator charts/grid-operator -n grid-system --create-namespace \
@@ -93,3 +117,8 @@ handshake, so a connect proves nothing.
 | A site never reaches `Available` | The hub is not accepting that site's NAT address on 6443 or 443. |
 | Signals poll but gossip never converges | The SWIM Service got a Classic load balancer, which carries no UDP. Check `platform: aws`. |
 | Peers unreachable despite correct addresses | Source ranges list VPC CIDRs rather than NAT addresses. |
+| `swimKeyRef ... did not resolve to a valid 32-byte key` | `grid-swim-key` is not in the operator's namespace. Copy it, then restart the operator: a late Secret does not retrigger the failed watch. |
+| `no matches for kind "GridNetwork"` on a first install | The chart renders CRDs and their resources in one release. Apply the CRDs first, then install with `crds.enabled=false`. |
+| `cannot be imported into the current release: invalid ownership metadata` | CRDs applied by hand carry no Helm ownership. Install with `crds.enabled=false`. |
+| A site enrolls but the hub never starts SWIM | The hub takes `enrollment.enabled=false` and its identity from the bootstrap Job, a different path. Check the key is in its namespace and restart it. |
+| `rotation disabled: peerTrust pin needs re-enrollment` | Expected under pinned peer trust: identities do not auto-renew. Re-enroll before the certificate expires. |
