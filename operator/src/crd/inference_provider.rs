@@ -1,7 +1,7 @@
 //! [`InferenceProvider`] custom resource definition.
 //!
 //! Represents an inference backend available over the grid.
-//! Three backend categories: self-hosted clusters (llm-d),
+//! Three backend categories: self-hosted clusters,
 //! cloud-managed services (Bedrock, Vertex), and third-party
 //! APIs (OpenAI, Anthropic).
 
@@ -167,8 +167,8 @@ pub struct MetricsConfig {
     ///
     /// When set, the scrape URL is `{metrics_endpoint}{path}` instead of
     /// `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
-    /// service (such as an llm-d EPP) while the provider inference endpoint
-    /// points at the pool's request path.
+    /// service while the provider inference endpoint points at the pool's
+    /// request path.
     ///
     /// When absent, the scrape URL uses `spec.endpoint` as before.
     #[schemars(length(min = 1))]
@@ -200,8 +200,8 @@ pub struct MetricsConfig {
     ///
     /// When set, the parser only matches metric samples whose `name` label
     /// equals this value.  This is required when scraping an endpoint that
-    /// exposes metrics for multiple pools (such as an llm-d EPP), ensuring
-    /// the configured pool is selected deterministically.
+    /// exposes metrics for multiple pools, ensuring the configured pool is
+    /// selected deterministically.
     ///
     /// The parser rejects the scrape when the expected pool series is absent
     /// or when a metric sample has no `name` label and this field is set.
@@ -217,8 +217,8 @@ pub struct MetricsConfig {
     ///
     /// When set, the `queue_depth` signal value is divided by this capacity
     /// and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
-    /// average queue-size metrics (such as `llm_d_epp_average_queue_size`)
-    /// without requiring the exporter to pre-normalise.
+    /// average queue-size metrics without requiring the exporter to
+    /// pre-normalise.
     ///
     /// When absent, the `queue_depth` signal must already be normalised to
     /// 0.0–1.0 by the exporter (backward compatible).
@@ -289,7 +289,8 @@ pub enum MetricsAuthType {
     /// A short-lived token for the metrics scraper `ServiceAccount`, which may
     /// only `get` the nonResourceURL `/metrics`, sent as `Authorization: Bearer`.
     /// The operator mints it with `TokenRequest` and never sends its own token.
-    /// An llm-d EPP authorizes it with `TokenReview` and `SubjectAccessReview`.
+    /// A scrape target may authorize it with `TokenReview` and
+    /// `SubjectAccessReview`.
     ServiceAccountToken,
 }
 
@@ -505,7 +506,7 @@ pub struct ModelInfo {
 ///
 /// The probe URL is `{endpoint}{path}` when `endpoint` is set, or
 /// `{spec.endpoint}{path}` when absent.  This allows pointing health
-/// probes at a different service (e.g. an llm-d EPP health endpoint)
+/// probes at a different service, such as a scheduler's health endpoint,
 /// while `spec.endpoint` points at the inference backend.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -514,8 +515,8 @@ pub struct HealthCheckConfig {
     ///
     /// When set, the probe URL is `{endpoint}{path}` instead of
     /// `{spec.endpoint}{path}`.  This allows probing a separate service
-    /// (such as an llm-d EPP) while the provider inference endpoint
-    /// points at the pool's request path.
+    /// while the provider inference endpoint points at the pool's request
+    /// path.
     ///
     /// When absent, the probe URL uses `spec.endpoint` as before.
     #[schemars(length(min = 1))]
