@@ -121,10 +121,13 @@ pub fn lb_signals_endpoint(svc: &Service) -> Option<String> {
     crate::signals::SignalsEndpoint::parse(&text).map(|endpoint| endpoint.authority())
 }
 
-/// The SWIM endpoint and the signals endpoint from one read of the Service, `None` until it has ingress.
+/// The SWIM endpoint from one read of the Service, `None` until it has ingress.
+///
+/// Signals are a separate Service, since one Service cannot carry gossip's UDP and their
+/// TCP on every provider, so the caller resolves that endpoint on its own.
 #[must_use]
-pub fn lb_advertised(svc: &Service, bind_port: u16) -> Option<(String, Option<String>)> {
-    Some((lb_endpoint(svc, bind_port)?, lb_signals_endpoint(svc)))
+pub fn lb_advertised(svc: &Service, bind_port: u16) -> Option<String> {
+    lb_endpoint(svc, bind_port)
 }
 
 /// Every ingress as `"<lb>:<port>"` on the SWIM port, in Service order.
@@ -614,17 +617,31 @@ mod tests {
         }
     }
 
+    /// The SWIM half comes from the SWIM Service alone, so a chart that moved the signals
+    /// port off it still advertises a gossip address.
     #[test]
-    fn the_signals_endpoint_is_read_with_the_swim_one() {
-        let ports = [(Some("swim-udp"), 7946), (Some("signals"), 9091)];
+    fn the_swim_endpoint_does_not_depend_on_a_signals_port() {
+        let ports = [(Some("swim-udp"), 7946)];
         assert_eq!(lb_advertised(&svc(&ports, None), 7946), None, "waits for ingress");
         assert_eq!(
             lb_advertised(&svc(&ports, Some("10.0.0.9")), 7946),
-            Some(("10.0.0.9:7946".to_owned(), Some("10.0.0.9:9091".to_owned())))
+            Some("10.0.0.9:7946".to_owned())
         );
+    }
+
+    /// The signals endpoint is read from whichever Service carries the named port, which is
+    /// its own Service wherever one Service cannot hold gossip's UDP beside its TCP.
+    #[test]
+    fn the_signals_endpoint_comes_from_its_own_port() {
+        let own = [(Some("signals"), 9091)];
         assert_eq!(
-            lb_advertised(&svc(&ports[..1], Some("10.0.0.9")), 7946),
-            Some(("10.0.0.9:7946".to_owned(), None)),
+            lb_signals_endpoint(&svc(&own, Some("10.0.0.9"))),
+            Some("10.0.0.9:9091".to_owned())
+        );
+        assert_eq!(lb_signals_endpoint(&svc(&own, None)), None, "waits for ingress");
+        assert_eq!(
+            lb_signals_endpoint(&svc(&[(Some("swim-udp"), 7946)], Some("10.0.0.9"))),
+            None,
             "no signals port"
         );
     }

@@ -16,7 +16,9 @@
 //! `GridNetwork.status.connectedSites` and `distributedProviderCount` remain
 //! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
 //! only.
-//! `GRID_SWIM_SERVICE_NAME` advertises that Service's `LoadBalancer` address instead.
+//! `GRID_SWIM_SERVICE_NAME` advertises that Service's `LoadBalancer` address instead, and
+//! `GRID_SIGNALS_SERVICE_NAME` names the Service carrying the signals port, which is its own
+//! because one Service cannot carry gossip's UDP and signals' TCP on every provider.
 //!
 //! # SWIM encryption (environment variable)
 //!
@@ -584,7 +586,8 @@ async fn swim_advertise_addr(
             .unwrap_or(chart),
         swim_advertise::Plan::Local => return Ok((None, None)),
         swim_advertise::Plan::LoadBalancer(service) => {
-            let watch = LbWatch::discover(client, service, bind_addr.port()).await?;
+            let signals_service = std::env::var("GRID_SIGNALS_SERVICE_NAME").ok();
+            let watch = LbWatch::discover(client, service, signals_service, bind_addr.port()).await?;
             return Ok((Some(watch.addr), Some(watch)));
         },
     };
@@ -613,7 +616,10 @@ struct LbWatch {
     addr: SocketAddr,
     /// Ingress text `addr` was resolved from, watched for change.
     text: String,
-    /// Signals endpoint on the Service's `LoadBalancer` address.
+    /// Signals Service name, whose own `LoadBalancer` address carries the signals port.
+    /// `None` keeps the signals port on the SWIM Service, for a chart that still renders it there.
+    signals_service: Option<String>,
+    /// Signals endpoint on the signals Service's `LoadBalancer` address.
     signals: Option<String>,
     /// Whether `signals` is gossiped, so a change to it restarts.
     track_signals: bool,
@@ -624,10 +630,16 @@ const LEAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl LbWatch {
     /// Wait for the Service's `LoadBalancer` address, however long it takes.
-    async fn discover(client: &Client, service: String, port: u16) -> Result<Self, String> {
+    async fn discover(
+        client: &Client,
+        service: String,
+        signals_service: Option<String>,
+        port: u16,
+    ) -> Result<Self, String> {
         let watch = Self {
             services: Api::default_namespaced(client.clone()),
             service,
+            signals_service,
             port,
             addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             text: String::new(),
@@ -663,27 +675,41 @@ impl LbWatch {
 
     /// The address text, its first resolution, and the signals endpoint, retried while a hostname has no DNS.
     async fn resolved(&self) -> Result<Option<(String, SocketAddr, Option<String>)>, swim_advertise::LookupError> {
-        let Some((text, signals)) = self
+        let Some(text) = self
             .load_balancer()
             .await?
             .and_then(|svc| swim_advertise::lb_advertised(&svc, self.port))
         else {
             return Ok(None);
         };
+        let signals = self.signals_endpoint().await?;
         let addresses = resolve_text(&text).await.map_err(swim_advertise::LookupError::Retry)?;
         Ok(addresses.first().map(|addr| (text, *addr, signals)))
     }
 
     /// Every ingress endpoint the Service lists now, unresolved, or none once a tracked signals endpoint moved.
     async fn ingress(&self) -> Result<Option<Vec<String>>, swim_advertise::LookupError> {
+        let signals = self.signals_endpoint().await?;
         Ok(self.load_balancer().await?.map(|svc| {
-            let signals = swim_advertise::lb_signals_endpoint(&svc);
             if self.track_signals && signals != self.signals {
-                tracing::warn!(gossiped = ?self.signals, current = ?signals, "SWIM Service signals endpoint changed");
+                tracing::warn!(gossiped = ?self.signals, current = ?signals, "signals endpoint changed");
                 return Vec::new();
             }
             swim_advertise::lb_endpoints(&svc, self.port)
         }))
+    }
+
+    /// The signals endpoint, from the signals Service when the chart renders one and from
+    /// the SWIM Service otherwise. A Service without ingress yet gives `None` rather than
+    /// an error, so discovery keeps waiting instead of failing.
+    async fn signals_endpoint(&self) -> Result<Option<String>, swim_advertise::LookupError> {
+        let name = self.signals_service.as_deref().unwrap_or(&self.service);
+        let svc = self
+            .services
+            .get_opt(name)
+            .await
+            .map_err(|error| swim_advertise::LookupError::Retry(error.to_string()))?;
+        Ok(svc.as_ref().and_then(swim_advertise::lb_signals_endpoint))
     }
 
     /// Leave the cluster and exit once the advertised address changes.
