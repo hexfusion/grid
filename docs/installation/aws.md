@@ -49,7 +49,7 @@ that use them together and Helm validates the whole set first:
 
 ```bash
 for k in gridnetwork gridsite inferenceprovider agenttoolprovider; do
-  helm template grid-operator charts/grid-operator -n grid-system \
+  helm template grid-operator charts/grid-operator -n grid \
     --show-only templates/crds/$k.yaml | oc apply -f -
 done
 ```
@@ -73,7 +73,10 @@ helm install grid charts/grid-enrollment -n grid-enroll --create-namespace \
 ```
 
 Three Secrets have to reach each cluster's operator namespace before its operator starts,
-since the operator reads them there and not from the release namespace:
+since the operator reads them there and not from the release namespace. That namespace is
+`grid` for every cluster, the hub included: `hubSite.namespace` and `invitePolicy.namespace`
+both default to it, so installing the operator anywhere else delivers every Secret to a
+namespace it never reads.
 
 | Secret | From | To |
 |---|---|---|
@@ -87,7 +90,7 @@ restart is needed.
 Then the operator on each cluster:
 
 ```bash
-helm install grid-operator charts/grid-operator -n grid-system --create-namespace \
+helm install grid-operator charts/grid-operator -n grid --create-namespace \
   --set crds.enabled=false \
   --set platform=aws \
   --set peers='<other site> <hub>' \
@@ -108,7 +111,7 @@ The hub adds `--set enrollment.enabled=false`; its identity comes from the boots
 
 ```bash
 oc get gridsites                 # every site, on the hub
-oc get svc -n grid-system        # swim UDP and signals TCP, each with an address
+oc get svc -n grid               # swim UDP and signals TCP, each with an address
 ```
 
 Then send a datagram to 7946/UDP and open 9091/TCP between every pair. UDP has no
