@@ -123,8 +123,7 @@ pub fn lb_signals_endpoint(svc: &Service) -> Option<String> {
 
 /// The SWIM endpoint from one read of the Service, `None` until it has ingress.
 ///
-/// Signals are a separate Service, since one Service cannot carry gossip's UDP and their
-/// TCP on every provider, so the caller resolves that endpoint on its own.
+/// Signals live on their own Service, resolved by the caller.
 #[must_use]
 pub fn lb_advertised(svc: &Service, bind_port: u16) -> Option<String> {
     lb_endpoint(svc, bind_port)
@@ -617,8 +616,7 @@ mod tests {
         }
     }
 
-    /// The SWIM half comes from the SWIM Service alone, so a chart that moved the signals
-    /// port off it still advertises a gossip address.
+    /// The SWIM half must not depend on a signals port the chart may have moved.
     #[test]
     fn the_swim_endpoint_does_not_depend_on_a_signals_port() {
         let ports = [(Some("swim-udp"), 7946)];
@@ -629,8 +627,7 @@ mod tests {
         );
     }
 
-    /// The signals endpoint is read from whichever Service carries the named port, which is
-    /// its own Service wherever one Service cannot hold gossip's UDP beside its TCP.
+    /// Read from whichever Service carries the named port.
     #[test]
     fn the_signals_endpoint_comes_from_its_own_port() {
         let own = [(Some("signals"), 9091)];

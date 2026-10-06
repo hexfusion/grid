@@ -158,11 +158,7 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- $log.filter | default $log.level | default "info" -}}
 {{- end }}
 
-{{/*
-Annotations for a grid Service, the platform's own merged under the caller's.
-`platform: aws` asks for an NLB, because the default there is a Classic load balancer
-that carries no UDP, so gossip would get a listener which cannot work.
-*/}}
+{{/* Service annotations, the platform's merged under the caller's. AWS needs an NLB: the default carries no UDP. */}}
 {{- define "grid-operator.serviceAnnotations" -}}
 {{- $own := .own | default dict -}}
 {{- $platform := dict -}}
@@ -175,11 +171,7 @@ that carries no UDP, so gossip would get a listener which cannot work.
 {{- end }}
 {{- end -}}
 
-{{/*
-The grid's peers as a list, from `peers`, which takes addresses separated by spaces or
-commas so one `--set` needs neither braces nor escaping. It feeds the SWIM seeds and the
-load balancer source ranges, which are the same addresses written two ways.
-*/}}
+{{/* `peers` as a list. Spaces or commas, so one `--set` needs no braces. */}}
 {{- define "grid-operator.peerList" -}}
 {{- $raw := .Values.peers | default "" | replace "," " " -}}
 {{- $out := list -}}
@@ -192,10 +184,7 @@ load balancer source ranges, which are the same addresses written two ways.
 {{- toYaml $out -}}
 {{- end -}}
 
-{{/*
-SWIM seeds: `swim.seeds` when set, otherwise each peer at the SWIM port. A peer carrying
-its own port is taken as given.
-*/}}
+{{/* `swim.seeds` when set, else each peer at the SWIM port. A peer with a port is taken as given. */}}
 {{- define "grid-operator.swimSeeds" -}}
 {{- if .Values.swim.seeds -}}
 {{- .Values.swim.seeds -}}
@@ -213,12 +202,7 @@ its own port is taken as given.
 {{- end -}}
 {{- end -}}
 
-{{/*
-Source ranges for a grid Service: `own` when set, otherwise each peer as a host route.
-A peer that is not a bare IPv4 address contributes nothing, since a CIDR cannot be
-derived from a name, and an empty result leaves the Service open rather than silently
-unreachable.
-*/}}
+{{/* `own` when set, else each peer as a host route. A name yields none: no CIDR to derive. */}}
 {{- define "grid-operator.peerSourceRanges" -}}
 {{- $own := .own | default list -}}
 {{- if $own -}}

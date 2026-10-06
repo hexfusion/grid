@@ -17,8 +17,7 @@
 //! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
 //! only.
 //! `GRID_SWIM_SERVICE_NAME` advertises that Service's `LoadBalancer` address instead, and
-//! `GRID_SIGNALS_SERVICE_NAME` names the Service carrying the signals port, which is its own
-//! because one Service cannot carry gossip's UDP and signals' TCP on every provider.
+//! `GRID_SIGNALS_SERVICE_NAME` names the Service carrying the signals port.
 //!
 //! # SWIM encryption (environment variable)
 //!
@@ -616,10 +615,9 @@ struct LbWatch {
     addr: SocketAddr,
     /// Ingress text `addr` was resolved from, watched for change.
     text: String,
-    /// Signals Service name, whose own `LoadBalancer` address carries the signals port.
-    /// `None` keeps the signals port on the SWIM Service, for a chart that still renders it there.
+    /// Signals Service name. `None` reads the signals port off the SWIM Service.
     signals_service: Option<String>,
-    /// Signals endpoint on the signals Service's `LoadBalancer` address.
+    /// Signals endpoint on that Service's `LoadBalancer` address.
     signals: Option<String>,
     /// Whether `signals` is gossiped, so a change to it restarts.
     track_signals: bool,
@@ -699,9 +697,8 @@ impl LbWatch {
         }))
     }
 
-    /// The signals endpoint, from the signals Service when the chart renders one and from
-    /// the SWIM Service otherwise. A Service without ingress yet gives `None` rather than
-    /// an error, so discovery keeps waiting instead of failing.
+    /// The signals endpoint, from its own Service or the SWIM one. No ingress yet gives
+    /// `None`, not an error, so discovery keeps waiting.
     async fn signals_endpoint(&self) -> Result<Option<String>, swim_advertise::LookupError> {
         let name = self.signals_service.as_deref().unwrap_or(&self.service);
         let svc = self

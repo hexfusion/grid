@@ -1,8 +1,6 @@
 {{- include "grid-operator.normalize" . }}
 {{- if and (.Values.signals).enabled .Values.signals.service.enabled }}
-{{- /* Its own Service rather than a port on the SWIM one. Gossip is UDP and signals are
-       TCP, and a provider that refuses a mixed-protocol Service, AWS among them, creates
-       no load balancer at all rather than dropping one port. */}}
+{{- /* Its own Service: a mixed UDP and TCP Service is refused outright on AWS. */}}
 apiVersion: v1
 kind: Service
 metadata:
