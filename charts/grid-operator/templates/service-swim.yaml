@@ -35,12 +35,6 @@ spec:
       port: {{ .Values.swim.service.port }}
       targetPort: swim-udp
       protocol: UDP
-    {{- if (.Values.signals).enabled }}
-    - name: signals
-      port: {{ .Values.signals.port }}
-      targetPort: signals
-      protocol: TCP
-    {{- end }}
   selector:
     {{- include "grid-operator.selectorLabels" . | nindent 4 }}
 {{- end }}

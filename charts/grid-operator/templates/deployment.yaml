@@ -120,7 +120,7 @@ spec:
             {{- end }}
             {{- if (.Values.signals).enabled }}
             - name: GRID_SIGNALS_LOCAL_ADDR
-              value: {{ printf "%s-swim.%s.svc:%v" (include "grid-operator.fullname" .) .Release.Namespace .Values.signals.port | quote }}
+              value: {{ printf "%s-signals.%s.svc:%v" (include "grid-operator.fullname" .) .Release.Namespace .Values.signals.port | quote }}
             {{- with .Values.signals.advertiseAddress }}
             - name: GRID_SIGNALS_ADVERTISE_ADDR
               value: {{ . | quote }}

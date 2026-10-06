@@ -181,10 +181,21 @@ swim:
 
 # -- mTLS signals endpoint, for a GridNetwork with signalTransport poll.
 signals:
-  # -- Serve signals on the SWIM Service. Needs swim.service.enabled and, for a LoadBalancer, mixed UDP and TCP support.
+  # -- Serve this site's signals endpoint for peers to poll.
   enabled: false
-  # -- Signals TCP port on the SWIM Service, gossiped to peers with its LoadBalancer address.
+  # -- Signals TCP port, gossiped to peers with this Service's address.
   port: 9091
+  service:
+    # -- Render the signals Service.
+    enabled: true
+    # -- Service type for the signals endpoint.
+    type: LoadBalancer
+    # -- Annotations, an NLB class among them.
+    annotations: {}
+    # -- Source ranges allowed to poll signals. A peer arrives from its egress address.
+    loadBalancerSourceRanges: []
+    # -- Empty keeps Local for a LoadBalancer.
+    externalTrafficPolicy: ""
   # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
   advertiseAddress: ""
 

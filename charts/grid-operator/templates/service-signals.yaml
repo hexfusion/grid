@@ -1,0 +1,36 @@
+{{- include "grid-operator.normalize" . }}
+{{- if and (.Values.signals).enabled .Values.signals.service.enabled }}
+{{- /* Its own Service rather than a port on the SWIM one. Gossip is UDP and signals are
+       TCP, and a provider that refuses a mixed-protocol Service, AWS among them, creates
+       no load balancer at all rather than dropping one port. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "grid-operator.fullname" . }}-signals
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+  {{- with .Values.signals.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.signals.service.type | quote }}
+  {{- if eq .Values.signals.service.type "LoadBalancer" }}
+  {{- with .Values.signals.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  {{- if .Values.signals.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ .Values.signals.service.externalTrafficPolicy | quote }}
+  {{- else if eq .Values.signals.service.type "LoadBalancer" }}
+  externalTrafficPolicy: "Local"
+  {{- end }}
+  ports:
+    - name: signals
+      port: {{ .Values.signals.port }}
+      targetPort: signals
+      protocol: TCP
+  selector:
+    {{- include "grid-operator.selectorLabels" . | nindent 4 }}
+{{- end }}
