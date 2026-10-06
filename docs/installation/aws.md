@@ -18,9 +18,10 @@ aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=<vpc> \
 
 Give each cluster a distinct `machineNetwork`, or clusters sharing `10.0.0.0/16` cannot be
 peered and cross-site traffic takes the internet. Pin each to one availability zone: a zone
-costs a NAT gateway and its Elastic IP, and the bootstrap machine takes one more, so three
-clusters at the three-zone default ask for twelve. Pinned, they ask for two each. Check the
-account's own Elastic IP quota (`L-0263D0A3`) rather than the published default.
+costs a NAT gateway and its Elastic IP, and the bootstrap machine takes one Elastic IP per
+cluster, so three clusters across three zones each want nine NAT gateways and twelve Elastic
+IPs. Pinned, that is three and six. Check the account's own Elastic IP quota (`L-0263D0A3`)
+rather than the published default, since it is raised per account.
 
 ## Restrict the endpoints
 
@@ -28,15 +29,21 @@ account's own Elastic IP quota (`L-0263D0A3`) rather than the published default.
 password. Close both to everything but your address and the clusters' NAT addresses, before
 installing anything.
 
+6443 is on the API load balancer's group and 443 on the router's, so each port is a different
+group and each needs its own pair of calls. Enrollment is a Route, so a site that cannot
+reach 443 never enrolls.
+
 ```bash
-for port in 6443 443; do
-  aws ec2 authorize-security-group-ingress --group-id <sg> --protocol tcp --port $port --cidr <allowed>/32
-  aws ec2 revoke-security-group-ingress    --group-id <sg> --protocol tcp --port $port --cidr 0.0.0.0/0
-done
+lock() { # <security-group> <port>
+  aws ec2 authorize-security-group-ingress --group-id "$1" --protocol tcp --port "$2" --cidr "$ALLOWED"
+  aws ec2 revoke-security-group-ingress    --group-id "$1" --protocol tcp --port "$2" --cidr 0.0.0.0/0
+}
+lock "$API_SG" 6443
+lock "$ROUTER_SG" 443
 ```
 
-6443 is on the API load balancer's group and 443 on the router's, so they are different
-groups. Enrollment is a Route, so a site that cannot reach 443 never enrolls.
+Pointing both ports at one group leaves the other group's world-open rule in place, and the
+calls that do nothing still succeed, so nothing reports the gap.
 
 Authorise before revoking. Match groups on `kubernetes.io/cluster/<infraID>` **or** the
 `<infraID>` name prefix, since `<infraID>-apiserver-lb` carries no cluster tag. Leave ICMP
