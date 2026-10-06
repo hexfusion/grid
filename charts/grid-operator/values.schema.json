@@ -769,6 +769,16 @@
           }
         }
       }
+    },
+    "platform": {
+      "type": "string",
+      "enum": [
+        "",
+        "aws"
+      ]
+    },
+    "peers": {
+      "type": "string"
     }
   }
 }

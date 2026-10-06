@@ -163,3 +163,55 @@ tests:
           content:
             name: GRID_PEER_TRUST
           any: true
+
+  - it: takes peers as one flag, feeding the seeds and both source ranges
+    set:
+      platform: aws
+      signals.enabled: true
+      swim.service.enabled: true
+      swim.service.type: LoadBalancer
+      peers: "54.244.133.77 32.188.215.118, peer-a.example.com"
+    asserts:
+      # A name cannot become a host route, so it seeds but contributes no range.
+      - template: templates/service-swim.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["54.244.133.77/32", "32.188.215.118/32"]
+      - template: templates/service-signals.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["54.244.133.77/32", "32.188.215.118/32"]
+      - template: templates/service-signals.yaml
+        equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
+          value: nlb
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SEEDS
+            value: "54.244.133.77:7946,32.188.215.118:7946,peer-a.example.com:7946"
+
+  - it: lets explicit seeds and ranges override peers
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      swim.service.type: LoadBalancer
+      peers: "10.0.0.1 10.0.0.2"
+      swim.seeds: "seed-a:7946"
+      swim.service.loadBalancerSourceRanges: ["192.0.2.0/24"]
+    asserts:
+      - template: templates/service-swim.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["192.0.2.0/24"]
+      - template: templates/service-signals.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["192.0.2.0/24"]
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SEEDS
+            value: "seed-a:7946"

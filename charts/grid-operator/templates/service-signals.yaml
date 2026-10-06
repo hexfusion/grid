@@ -9,16 +9,19 @@ metadata:
   name: {{ include "grid-operator.fullname" . }}-signals
   labels:
     {{- include "grid-operator.labels" . | nindent 4 }}
-  {{- with .Values.signals.service.annotations }}
+  {{- $ann := include "grid-operator.serviceAnnotations" (dict "root" . "own" .Values.signals.service.annotations) }}
+  {{- if $ann }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- $ann | nindent 4 }}
   {{- end }}
 spec:
   type: {{ .Values.signals.service.type | quote }}
   {{- if eq .Values.signals.service.type "LoadBalancer" }}
-  {{- with .Values.signals.service.loadBalancerSourceRanges }}
+  {{- $own := .Values.signals.service.loadBalancerSourceRanges | default .Values.swim.service.loadBalancerSourceRanges }}
+  {{- $ranges := include "grid-operator.peerSourceRanges" (dict "root" . "own" $own) }}
+  {{- if $ranges }}
   loadBalancerSourceRanges:
-    {{- toYaml . | nindent 4 }}
+    {{- $ranges | nindent 4 }}
   {{- end }}
   {{- end }}
   {{- if .Values.signals.service.externalTrafficPolicy }}

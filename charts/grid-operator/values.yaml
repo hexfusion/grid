@@ -180,6 +180,17 @@ swim:
     loadBalancerSourceRanges: []
 
 # -- mTLS signals endpoint, for a GridNetwork with signalTransport poll.
+# -- Cloud the grid runs on, so the chart asks for the load balancer the platform needs
+# rather than making the operator write a provider annotation. `aws` asks for an NLB,
+# since the default there carries no UDP. Empty adds nothing.
+platform: ""
+
+# -- The grid's other sites, addresses separated by spaces or commas. One flag, no braces
+# and no escaping. Each becomes a SWIM seed at the SWIM port, and each bare IPv4 address
+# becomes a host route in both Services' source ranges. swim.seeds and either Service's
+# loadBalancerSourceRanges override it where they are set.
+peers: ""
+
 signals:
   # -- Serve this site's signals endpoint for peers to poll.
   enabled: false
@@ -192,7 +203,8 @@ signals:
     type: LoadBalancer
     # -- Annotations, an NLB class among them.
     annotations: {}
-    # -- Source ranges allowed to poll signals. A peer arrives from its egress address.
+    # -- Source ranges allowed to poll signals. Empty inherits swim.service's, since a
+    # peer reaches gossip and signals from the same address.
     loadBalancerSourceRanges: []
     # -- Empty keeps Local for a LoadBalancer.
     externalTrafficPolicy: ""

@@ -78,9 +78,10 @@ spec:
             - name: GRID_SWIM_SITE_NAME
               value: {{ . | quote }}
             {{- end }}
-            {{- if .Values.swim.seeds }}
+            {{- $seeds := include "grid-operator.swimSeeds" . }}
+            {{- if $seeds }}
             - name: GRID_SWIM_SEEDS
-              value: {{ .Values.swim.seeds | quote }}
+              value: {{ $seeds | quote }}
             {{- end }}
             {{- if .Values.gateway.address }}
             - name: GRID_GATEWAY_ADDRESS
