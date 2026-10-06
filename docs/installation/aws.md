@@ -1,12 +1,11 @@
 # Installing on AWS
 
-Three things differ from a network you control:
+AWS needs three settings the grid does not need elsewhere:
 
-- Gossip is UDP, so it needs a network load balancer. `platform: aws` asks for one.
-- A peer arrives from its cluster's NAT address, not a private CIDR. `peers` takes those
-  addresses and derives both the SWIM seeds and the Services' source ranges.
-- The enrollment endpoint must be a DNS name: `host` joins the serving certificate's DNS
-  names only.
+- `platform: aws`, because gossip is UDP and the default load balancer carries none.
+- `peers`, the other sites' NAT addresses, which become the SWIM seeds and both Services'
+  source ranges.
+- `host` as a DNS name, since it joins the serving certificate's DNS names only.
 
 ## Before you start
 
