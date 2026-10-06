@@ -161,7 +161,10 @@ plan_addresses() {
   [[ -n $hub && -n $site ]] || die "no MetalLB pool on the clusters; run: $0 up"
   ENROLL_IP=$(ip_add "$hub" 1)
   HUB_SWIM_IP=$(ip_add "$hub" 2)
+  # Signals have their own Service, so their own address from each pool.
+  HUB_SIG_IP=$(ip_add "$hub" 3)
   SITE_SWIM_IP=$(ip_add "$site" 1)
+  SITE_SIG_IP=$(ip_add "$site" 2)
   SITE_GW_IP=$(ip_add "$site" 2)
   MODEL_IP=$(kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o jsonpath='{.spec.clusterIP}')
   [[ -n $MODEL_IP ]] || die "no vcr-inference-site Service on the site"
@@ -294,7 +297,8 @@ install_hub() {
   renewal_args grid-operator
   helm_on "$HUB_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
     --set swim.siteName=hub --set enrollment.enabled=true --set grid.peerTrust="$MODE" \
-    "${IMG[@]}" --set swim.service.loadBalancerIP="$HUB_SWIM_IP" || die "install hub grid-operator"
+    "${IMG[@]}" --set swim.service.loadBalancerIP="$HUB_SWIM_IP" \
+    --set signals.service.loadBalancerIP="$HUB_SIG_IP" || die "install hub grid-operator"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-ca-bundle ca.crt || die "copy the hub CA bundle"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-invite-hub token hub || die "copy the hub invite"
   head -c 32 /dev/urandom | k "$HUB_CTX" create secret generic grid-swim-key --from-file=key=/dev/stdin >/dev/null \
@@ -353,7 +357,8 @@ install_site() {
     --set "swim.siteName=$SITE" --set "swim.seeds=$HUB_SWIM_IP:7946" \
     --set enrollment.enabled=true --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
     --set grid.peerTrust="$MODE" \
-    "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" || die "install site grid-operator"
+    "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" \
+    --set signals.service.loadBalancerIP="$SITE_SIG_IP" || die "install site grid-operator"
   enrollment_forward || die "enrollment forward"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" grid-ca-bundle ca.crt || die "copy the site CA bundle"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" "grid-invite-$SITE" token "$SITE" || die "copy the site invite"

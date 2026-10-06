@@ -455,13 +455,7 @@
               "type": "boolean"
             },
             "type": {
-              "type": "string",
-              "enum": [
-                "ClusterIP",
-                "LoadBalancer",
-                "NodePort"
-              ],
-              "description": "SWIM Service type."
+              "type": "string"
             },
             "annotations": {
               "type": "object",
@@ -486,6 +480,9 @@
                 "Local"
               ],
               "description": "External traffic policy for LoadBalancer or NodePort Services."
+            },
+            "loadBalancerIP": {
+              "type": "string"
             }
           }
         }

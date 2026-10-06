@@ -196,8 +196,10 @@ signals:
   service:
     # -- Render the signals Service.
     enabled: true
-    # -- Service type for the signals endpoint.
-    type: LoadBalancer
+    # -- Service type. Empty follows swim.service.type, so one knob covers both.
+    type: ""
+    # -- Address to request, where the environment assigns them.
+    loadBalancerIP: ""
     # -- Annotations, an NLB class among them.
     annotations: {}
     # -- Source ranges allowed to poll signals. Empty inherits swim.service's.
