@@ -226,16 +226,56 @@ spec:
                                     Missing transport fails closed during config rendering.
                                   nullable: true
                                   properties:
+                                    caSecretRef:
+                                      description: |-
+                                        Secret holding the CA that verifies this backend's server certificate.
+
+                                        Required under `https` and rejected otherwise. A backend's trust root is declared, never
+                                        inferred, and an absent reference fails rendering rather than falling back to the host's
+                                        trust store.
+
+                                        The operator reads each referenced Secret, concatenates them into one bundle and writes
+                                        it to a Secret of its own, which the gateway chart mounts as its upstream CA. Endpoints
+                                        may therefore carry different issuers. The rendered `ca_path` is derived, so no pod
+                                        filesystem layout appears here.
+                                      nullable: true
+                                      properties:
+                                        key:
+                                          description: |-
+                                            Key within the Secret's `data` map.
+
+                                            Required when the Secret holds multiple keys (e.g. credential references
+                                            in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+                                            Secret is consumed (e.g. TLS `ca_secret_ref`).
+                                          minLength: 1
+                                          nullable: true
+                                          type: string
+                                        name:
+                                          description: Secret name.
+                                          minLength: 1
+                                          type: string
+                                        namespace:
+                                          description: Secret namespace.
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                        - name
+                                        - namespace
+                                      type: object
                                     mode:
-                                      description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                      description: 'Transport mode: `mutual_tls`, `https` or `plaintext`.'
                                       enum:
                                         - mutual_tls
+                                        - https
                                         - plaintext
                                       type: string
                                     sni:
                                       description: |-
                                         TLS Server Name Indication (required when mode is `mutual_tls`;
                                         must not be set when mode is `plaintext`).
+
+                                        Optional under `https`, where an address that is already a hostname names itself. An
+                                        address that is an IP literal has no name to send, so `https` requires `sni` there.
                                       nullable: true
                                       type: string
                                   required:

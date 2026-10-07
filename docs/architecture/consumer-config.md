@@ -28,6 +28,14 @@ clusterEndpoints:
     transport:
       mode: mutual_tls
       sni: site-a.grid.internal
+  - cluster: model-gateway
+    address: "model-gateway.models.svc:8443"
+    transport:
+      mode: https
+      sni: model-gateway.models.svc
+      caSecretRef:
+        name: model-gateway-ca
+        namespace: grid-system
   - cluster: api-provider
     address: "mock-api.default.svc:8080"
     transport:
@@ -37,10 +45,40 @@ clusterEndpoints:
 Key differences:
 
 - `sni` moves from a top-level field to `transport.sni`.
-- `transport.mode` is the security switch (`mutual_tls` or explicit
+- `transport.mode` is the security switch (`mutual_tls`, `https`, or explicit
   insecure/dev-only `plaintext`), not `sni` presence.
 - Missing `transport` fails closed — the operator will not render the cluster entry.
 - `plaintext` must not set `sni` (rejected as likely misconfiguration).
+
+## Transport modes
+
+| mode | verifies the server | presents a client cert | CA |
+|---|---|---|---|
+| `mutual_tls` | yes | yes, the grid identity | grid CA at `tlsCertMountPath` |
+| `https` | yes | no | backend CA from `transport.caSecretRef` |
+| `plaintext` | no | no | none |
+
+Use `https` for a backend that authenticates the request rather than the caller, such as a
+model Gateway holding a bearer token. Use `mutual_tls` for a remote provider hop, where the
+peer authenticates this site's identity.
+
+`https` names its CA with `transport.caSecretRef` rather than reusing `tlsCertMountPath`, because
+a backend's trust root is not the grid's. Each endpoint may name a different issuer.
+
+The operator reads every referenced Secret, concatenates them into one PEM bundle and writes it
+to a Secret it owns. The gateway chart mounts that Secret as its upstream CA
+(`gatewayConfig.upstreamCA`), so the rendered `ca_path` is derived from a path the chart owns
+rather than declared in this API. Nothing about the pod's filesystem appears here.
+
+Rules the operator enforces, each failing the render rather than degrading it:
+
+- `https` without `caSecretRef` is rejected. There is no fallback to the host's trust roots.
+- `https` without `sni` is rejected, as `mutual_tls` is. Praxis reads SNI from the endpoint only
+  when a cluster sets `authority: { from: endpoint }`, which also changes the Host header sent
+  upstream, so the SNI is named explicitly rather than derived.
+- `caSecretRef` on `mutual_tls` or `plaintext` is rejected. Only `https` reads it.
+- `verify` is always true under `mutual_tls` and `https`. Neither TLS mode can be configured
+  without server verification. `plaintext` has no TLS at all.
 
 ## Implemented: GatewayRef.consumerConfig
 

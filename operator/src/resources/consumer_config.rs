@@ -101,6 +101,25 @@ pub enum ConsumerConfigError {
         cluster: String,
     },
 
+    /// An `https` cluster endpoint has no CA mount path.
+    #[error(
+        "https transport for cluster {cluster:?} requires caMountPath (a backend's trust root is declared, not inherited from the host)"
+    )]
+    MissingBackendCa {
+        /// Cluster name with no declared CA.
+        cluster: String,
+    },
+
+    /// A `mutual_tls` or `plaintext` cluster endpoint sets a CA mount path.
+    ///
+    /// Only `https` reads it: mutual TLS verifies with the grid CA from `tlsCertMountPath`, and
+    /// plaintext has no TLS at all. Setting it elsewhere is a likely misconfiguration.
+    #[error("caMountPath is only valid for https transport, set on cluster {cluster:?}")]
+    UnexpectedBackendCa {
+        /// Cluster name with the conflicting configuration.
+        cluster: String,
+    },
+
     /// Telemetry configuration failed validation.
     #[error("invalid telemetry configuration: {0}")]
     InvalidTelemetry(String),
@@ -544,6 +563,13 @@ fn render_load_balancer(
     ))
 }
 
+/// Where the gateway chart mounts the operator-assembled upstream CA bundle.
+///
+/// Matches `gatewayConfig.upstreamCA.mountPath` and its `ca.crt` key in the praxis-gateway
+/// chart. The operator derives `ca_path` from this rather than taking a path in the API, so pod
+/// filesystem layout stays with the chart that owns it.
+const UPSTREAM_CA_PATH: &str = "/etc/praxis/upstream-ca/ca.crt";
+
 /// Render a full cluster entry with endpoint address and explicit transport.
 ///
 /// Validates that `transport` is present and, for `mutual_tls`, that `sni`
@@ -567,6 +593,12 @@ fn render_cluster_entry(
             cluster: ep.cluster.clone(),
         })?;
 
+    if transport.mode != TransportMode::Https && transport.ca_secret_ref.is_some() {
+        return Err(ConsumerConfigError::UnexpectedBackendCa {
+            cluster: ep.cluster.clone(),
+        });
+    }
+
     match transport.mode {
         TransportMode::MutualTls => {
             let raw_sni = transport
@@ -586,6 +618,35 @@ fn render_cluster_entry(
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    client_cert:\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      cert_path: {tls_cert_mount_path}/tls.crt\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      key_path: {tls_cert_mount_path}/tls.key\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
+            ))
+        },
+        TransportMode::Https => {
+            if transport.ca_secret_ref.is_none() {
+                return Err(ConsumerConfigError::MissingBackendCa {
+                    cluster: ep.cluster.clone(),
+                });
+            }
+            // Praxis reads SNI from the endpoint only when the cluster sets
+            // `authority: { from: endpoint }`, which also changes the Host header sent upstream.
+            // Requiring sni keeps this to TLS and matches mutual_tls.
+            let raw_sni = transport
+                .sni
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| ConsumerConfigError::MissingSni {
+                    cluster: ep.cluster.clone(),
+                })?;
+            let quoted_sni = yaml_scalar(raw_sni.trim()).unwrap_or_else(|_| "\"\"".to_owned());
+            let quoted_ca = yaml_scalar(UPSTREAM_CA_PATH).unwrap_or_else(|_| "\"\"".to_owned());
+            Ok(format!(
+                "          - name: {quoted_name}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  tls:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    ca:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      ca_path: {quoted_ca}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
@@ -668,7 +729,7 @@ fn dns_safe(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        crd::grid_network::EndpointTransport,
+        crd::grid_network::{EndpointTransport, SecretRef},
         resources::{
             geography::{AdmissionState, LocalityTier},
             routing_overlay::{ProjectedCredential, ProjectedCredentialRef},
@@ -761,6 +822,7 @@ mod tests {
                 transport: Some(EndpointTransport {
                     mode: TransportMode::Plaintext,
                     sni: None,
+                    ca_secret_ref: None,
                 }),
             })
             .collect()
@@ -1698,7 +1760,129 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: Some(sni.to_owned()),
+                ca_secret_ref: None,
             }),
+        }
+    }
+
+    fn backend_ca(name: &str) -> SecretRef {
+        SecretRef {
+            name: name.to_owned(),
+            namespace: "grid-system".to_owned(),
+            key: None,
+        }
+    }
+
+    fn https_ep(cluster: &str, address: &str, sni: Option<&str>, ca: Option<SecretRef>) -> ClusterEndpointConfig {
+        ClusterEndpointConfig {
+            cluster: cluster.to_owned(),
+            address: address.to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Https,
+                sni: sni.map(str::to_owned),
+                ca_secret_ref: ca,
+            }),
+        }
+    }
+
+    /// Praxis rejects a verifying cluster with no SNI, so `https` requires one as `mutual_tls` does.
+    #[test]
+    fn https_requires_an_sni() {
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "c", true)]);
+        for sni in [None, Some("   ")] {
+            let endpoints = [https_ep("c", "model.models.svc:8443", sni, Some(backend_ca("c-ca")))];
+            let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+                .expect_err("https without sni must fail");
+            assert!(
+                matches!(err, ConsumerConfigError::MissingSni { cluster } if cluster == "c"),
+                "must name the cluster with no sni"
+            );
+        }
+    }
+
+    /// The rendered cluster must parse, with every TLS key a sibling under `tls`.
+    ///
+    /// Asserting on substrings let a wrongly indented `sni` pass as rendered-and-fine while
+    /// producing YAML Praxis cannot load, so this parses the document and reads the keys.
+    /// The parsed `tls` block of `cluster` in a rendered consumer config.
+    fn tls_block_of(yaml: &str, cluster: &str) -> serde_yaml::Value {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).expect("rendered config must parse");
+        parsed["filter_chains"][0]["filters"]
+            .as_sequence()
+            .and_then(|filters| {
+                filters
+                    .iter()
+                    .find_map(|f| f.get("clusters").and_then(|c| c.as_sequence()))
+            })
+            .and_then(|clusters| clusters.iter().find(|c| c["name"].as_str() == Some(cluster)))
+            .expect("the cluster must be present")["tls"]
+            .clone()
+    }
+
+    #[test]
+    fn https_renders_a_loadable_tls_block() {
+        let endpoints = [https_ep(
+            "model-gw",
+            "model.models.svc:8443",
+            Some("model.models.svc"),
+            Some(backend_ca("model-ca")),
+        )];
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "model-gw", true)]);
+        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .expect("https must render");
+        let tls = tls_block_of(&yaml, "model-gw");
+        assert_eq!(
+            tls["sni"].as_str(),
+            Some("model.models.svc"),
+            "sni must be a sibling of ca, not nested"
+        );
+        assert_eq!(tls["verify"].as_bool(), Some(true), "https must verify the server");
+        assert_eq!(
+            tls["ca"]["ca_path"].as_str(),
+            Some(UPSTREAM_CA_PATH),
+            "ca_path comes from the chart mount"
+        );
+        assert!(
+            tls.get("client_cert").is_none(),
+            "https must present no client certificate"
+        );
+    }
+
+    /// Without a declared CA the render fails rather than falling back to the host's roots.
+    #[test]
+    fn https_without_a_ca_mount_path_fails_closed() {
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "no-ca", true)]);
+        {
+            let endpoints = [https_ep("no-ca", "model.models.svc:8443", None, None)];
+            let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+                .expect_err("https with no declared CA must fail");
+            assert!(
+                matches!(err, ConsumerConfigError::MissingBackendCa { cluster } if cluster == "no-ca"),
+                "must name the cluster with no declared CA"
+            );
+        }
+    }
+
+    /// Only https reads caMountPath, so setting it elsewhere is a misconfiguration.
+    #[test]
+    fn a_ca_mount_path_on_another_transport_is_rejected() {
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "c", true)]);
+        for mode in [TransportMode::MutualTls, TransportMode::Plaintext] {
+            let endpoints = [ClusterEndpointConfig {
+                cluster: "c".to_owned(),
+                address: "host:8443".to_owned(),
+                transport: Some(EndpointTransport {
+                    mode: mode.clone(),
+                    sni: matches!(mode, TransportMode::MutualTls).then(|| "host".to_owned()),
+                    ca_secret_ref: Some(backend_ca("stray-ca")),
+                }),
+            }];
+            let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+                .expect_err("caSecretRef outside https must fail");
+            assert!(
+                matches!(err, ConsumerConfigError::UnexpectedBackendCa { cluster } if cluster == "c"),
+                "must reject caSecretRef on {mode:?}"
+            );
         }
     }
 
@@ -1709,6 +1893,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: None,
+                ca_secret_ref: None,
             }),
         }
     }
@@ -1811,6 +1996,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: None,
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "mtls-no-sni", true)]);
@@ -1833,6 +2019,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: Some("  ".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate(
@@ -1861,6 +2048,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: Some("unexpected.grid.internal".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate(
@@ -1889,6 +2077,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: Some("  ".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate(
@@ -1913,6 +2102,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: Some("  site-a.grid.internal  ".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "trim-test", true)]);

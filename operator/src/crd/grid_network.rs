@@ -998,6 +998,12 @@ impl Default for ConsumerConfig {
 pub enum TransportMode {
     /// Mutual TLS with CA verification and client certificate.
     MutualTls,
+    /// TLS with server verification and no client certificate: ordinary HTTPS.
+    ///
+    /// For a backend that authenticates the request rather than the caller, such as a model
+    /// Gateway holding a bearer token. The CA comes from `caMountPath`, not the grid identity,
+    /// because the backend's trust root is not the grid's.
+    Https,
     /// Plain HTTP — no TLS.  Explicit insecure/dev-only mode.
     Plaintext,
 }
@@ -1013,13 +1019,29 @@ pub enum TransportMode {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointTransport {
-    /// Transport mode: `mutual_tls` or `plaintext`.
+    /// Transport mode: `mutual_tls`, `https` or `plaintext`.
     pub mode: TransportMode,
 
     /// TLS Server Name Indication (required when mode is `mutual_tls`;
     /// must not be set when mode is `plaintext`).
+    ///
+    /// Optional under `https`, where an address that is already a hostname names itself. An
+    /// address that is an IP literal has no name to send, so `https` requires `sni` there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
+
+    /// Secret holding the CA that verifies this backend's server certificate.
+    ///
+    /// Required under `https` and rejected otherwise. A backend's trust root is declared, never
+    /// inferred, and an absent reference fails rendering rather than falling back to the host's
+    /// trust store.
+    ///
+    /// The operator reads each referenced Secret, concatenates them into one bundle and writes
+    /// it to a Secret of its own, which the gateway chart mounts as its upstream CA. Endpoints
+    /// may therefore carry different issuers. The rendered `ca_path` is derived, so no pod
+    /// filesystem layout appears here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_secret_ref: Option<SecretRef>,
 }
 
 /// Endpoint configuration for one consumer `load_balancer` cluster.
@@ -1112,7 +1134,7 @@ pub struct TlsConfig {
 }
 
 /// Reference to a Kubernetes Secret.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct SecretRef {
     /// Secret name.
     #[schemars(length(min = 1))]
@@ -1991,10 +2013,15 @@ mod tests {
             mode_values.contains(&"plaintext"),
             "transport.mode enum must include plaintext: {mode_values:?}"
         );
+        assert!(
+            mode_values.contains(&"https"),
+            "transport.mode enum must include https: {mode_values:?}"
+        );
+        // Pinned: a new mode is a new security posture, so widening this is a deliberate change.
         assert_eq!(
             mode_values.len(),
-            2,
-            "transport.mode enum must have exactly 2 values: {mode_values:?}"
+            3,
+            "transport.mode enum must have exactly 3 values: {mode_values:?}"
         );
     }
 
