@@ -101,6 +101,7 @@ helm upgrade --install grid-operator $CHARTS/grid-operator --version $VERSION \
   --set swim.siteName=hub --set enrollment.enabled=true \
   --set grid.peerTrust=spiffe --set grid.signals=poll --set signals.enabled=true \
   --set swim.service.loadBalancerIP=$HUB_SWIM_IP --set signals.service.loadBalancerIP=$HUB_SIG_IP
+
 helm upgrade --install grid-site $CHARTS/grid-site --version $VERSION \
   --kube-context kind-hub -n grid \
   --set gridNetwork.gridId=grid-1 --set gridSite.name=hub \
@@ -109,6 +110,7 @@ helm upgrade --install grid-site $CHARTS/grid-site --version $VERSION \
   --set "gridNetwork.gatewayRefs[0].name=grid-gateway" \
   --set "gridNetwork.gatewayRefs[0].namespace=grid" \
   --set "gridNetwork.gatewayRefs[0].localSiteName=hub"
+
 helm upgrade --install grid-gateway $CHARTS/praxis-gateway --version $VERSION \
   --kube-context kind-hub -n grid \
   --set image.repository=ghcr.io/praxis-proxy/grid-gateway --set image.tag=v$VERSION \
@@ -194,12 +196,14 @@ helm upgrade --install grid-operator $CHARTS/grid-operator --version $VERSION \
   --set enrollment.url=https://grid-enrollment.grid-enrollment.svc:8443 \
   --set grid.peerTrust=spiffe --set grid.signals=poll --set signals.enabled=true \
   --set swim.service.loadBalancerIP=$SITE_SWIM_IP --set signals.service.loadBalancerIP=$SITE_SIG_IP
+
 helm upgrade --install grid-site $CHARTS/grid-site --version $VERSION \
   --kube-context kind-site -n grid \
   --set gridNetwork.gridId=grid-1 --set gridSite.name=site-a \
   --set gridNetwork.peerTrust.mode=spiffe --set gridNetwork.signalTransport.mode=poll \
   --set inferenceProviders.model.endpoint=http://$MODEL_IP:8000 \
   --set inferenceProviders.model.model=$MODEL
+
 helm upgrade --install grid-gateway $CHARTS/praxis-gateway --version $VERSION \
   --kube-context kind-site -n grid \
   --set image.repository=ghcr.io/praxis-proxy/grid-gateway --set image.tag=v$VERSION \
