@@ -1147,7 +1147,7 @@ impl PollPeers {
             .map(|(peer, url, pins)| async move {
                 let (body, date) = self.poll_one(&peer, &url, &pins).await?;
                 let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
-                let mut observations = bound_peer(retain_origin(parse(&body), &peer), &peer);
+                let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
                 reexpress_peer_ages(&mut observations, date, now_ms);
                 Some((peer, observations))
             });
@@ -1345,17 +1345,29 @@ fn bound_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
     kept
 }
 
-/// Keep only the observations a peer made itself.
+/// Attribute every observation to the peer this site dialed, refusing one that
+/// names a different site.
 ///
-/// A relayed copy is dropped rather than trusted, so every site's data reaches
-/// this one from the site that observed it. The publisher already scopes what it
-/// offers; checking the label on receipt means a reader does not depend on every
-/// peer having done so.
-fn retain_origin(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
-    observations
-        .into_iter()
-        .filter(|o| o.labels.get(SITE_LABEL).is_some_and(|s| s == peer))
-        .collect()
+/// Ownership comes from the verified identity on the connection, never from the
+/// body, so a peer cannot name another site and a peer need not label its own
+/// output at all. A row that does name a different site is a peer serving data
+/// on someone else's behalf, which the grid does not allow: it is refused and
+/// counted rather than silently re-attributed, so a misconfigured peer shows up
+/// as a refusal instead of as inflated numbers of its own.
+fn stamp_origin(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
+    let mut kept = Vec::with_capacity(observations.len());
+    for mut observation in observations {
+        match observation.labels.get(SITE_LABEL) {
+            Some(site) if site != peer => {
+                crate::metrics::record_peer_signal_refused(peer, "relayed_site");
+            },
+            _ => {
+                observation.labels.insert(SITE_LABEL.to_owned(), peer.to_owned());
+                kept.push(observation);
+            },
+        }
+    }
+    kept
 }
 
 /// The largest relayed-sample age treated as plausible, one day.
@@ -1430,6 +1442,78 @@ mod tests {
             value,
             timestamp_ms: None,
         }
+    }
+
+    #[test]
+    fn a_row_naming_another_site_is_refused_not_re_attributed() {
+        // A peer serving data on another site's behalf is the chaining the grid
+        // does not allow. Re-attributing it to the dialed peer would turn a
+        // misconfigured peer into plausible numbers of its own, so it is
+        // refused and counted instead.
+        let mut claims_elsewhere = peer_sample(crate::readiness::READY_SIGNAL, "pool", 1.0);
+        claims_elsewhere
+            .labels
+            .insert(SITE_LABEL.to_owned(), "factory".to_owned());
+
+        let kept = stamp_origin(vec![claims_elsewhere], "retail");
+
+        assert!(
+            kept.is_empty(),
+            "a row naming another site must not reach this site's view"
+        );
+    }
+
+    #[test]
+    fn a_row_this_peer_labelled_correctly_is_kept() {
+        let own = peer_sample(crate::readiness::READY_SIGNAL, "pool", 1.0);
+
+        let kept = stamp_origin(vec![own], "retail");
+
+        assert_eq!(
+            kept.first().and_then(|o| o.labels.get(SITE_LABEL)).map(String::as_str),
+            Some("retail"),
+            "a correctly labelled row survives and keeps its site"
+        );
+    }
+
+    #[test]
+    fn a_sample_with_no_site_is_attributed_to_the_peer() {
+        // Previously such a sample was dropped, because attribution read the
+        // body. Attribution now comes from the connection, so the peer does not
+        // have to label its own output for this site to use it.
+        let mut unlabelled = peer_sample(crate::readiness::READY_SIGNAL, "pool", 1.0);
+        unlabelled.labels.remove(SITE_LABEL);
+
+        let stamped = stamp_origin(vec![unlabelled], "retail");
+
+        assert_eq!(
+            stamped
+                .first()
+                .and_then(|o| o.labels.get(SITE_LABEL))
+                .map(String::as_str),
+            Some("retail"),
+            "an unlabelled sample should be attributed, not dropped"
+        );
+    }
+
+    #[test]
+    fn stamping_keeps_every_sample_and_leaves_other_labels_alone() {
+        let samples = vec![
+            peer_sample(crate::readiness::READY_SIGNAL, "pool-a", 1.0),
+            peer_sample(crate::readiness::READY_SIGNAL, "pool-b", 2.0),
+        ];
+
+        let stamped = stamp_origin(samples, "retail");
+
+        assert_eq!(stamped.len(), 2, "rows the peer owns are all kept");
+        assert_eq!(
+            stamped
+                .iter()
+                .filter_map(|o| o.labels.get(PROVIDER_LABEL).map(String::as_str))
+                .collect::<Vec<_>>(),
+            ["pool-a", "pool-b"],
+            "only the site label is rewritten"
+        );
     }
 
     #[test]
@@ -1939,6 +2023,41 @@ mod tests {
     #[test]
     fn comments_and_types_are_not_samples() {
         assert_eq!(scraped().len(), 1, "one sample, no comment lines");
+    }
+
+    #[test]
+    fn a_peer_need_not_label_its_own_output() {
+        // Through the real parse path: exposition text with no grid_site, which
+        // today is dropped outright, so this is the contract statement that the
+        // connection and not the body decides ownership.
+        let observations = parse(&format!(r#"{QUEUE}{{name="pool-a"}} 3"#));
+
+        let out = stamp_origin(observations, "east");
+
+        let o = out.first().expect("the sample should survive without a site label");
+        assert_eq!(
+            o.labels.get(SITE_LABEL).map(String::as_str),
+            Some("east"),
+            "the dialed peer owns it"
+        );
+        assert_eq!(
+            o.labels.get("name").map(String::as_str),
+            Some("pool-a"),
+            "unrelated labels survive"
+        );
+    }
+
+    #[test]
+    fn a_peer_serving_another_sites_row_is_refused() {
+        // A peer relaying a third site is importing measurements it did not
+        // make. Unlike a provider mislabelling its own output, there is nothing
+        // here this site may attribute, so the row is refused rather than
+        // re-attributed to the peer that served it.
+        let observations = parse(&format!(r#"{QUEUE}{{grid_site="west",name="pool-a"}} 3"#));
+
+        let out = stamp_origin(observations, "east");
+
+        assert!(out.is_empty(), "a third site's row must not enter this site's view");
     }
 
     #[test]
