@@ -8,18 +8,23 @@
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    path::Path,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::{
+    apps::v1::Deployment,
+    core::v1::{ConfigMap, Secret},
+};
 use kube::{
     Client,
     api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions},
     runtime::{controller::Action, reflector::ObjectRef},
 };
+use serde_json::{Value, json};
 use tokio::{
     sync::Mutex,
     time::{Duration, timeout},
@@ -31,8 +36,8 @@ use crate::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus,
-            TenantBudgetStatus, TransportMode,
+            GridNetworkStatus, MountReconciliation, MountReconciliationPhase, MountReconciliationStatus, OverlayPhase,
+            OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -41,7 +46,7 @@ use crate::{
     readiness,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -592,7 +597,7 @@ fn readiness_entry<'provider>(
     let ready = ready_sample(&verdict);
     let endpoints = ctx.readiness.ready_endpoints(&key).map(|count| signals::Observation {
         metric: readiness::READY_ENDPOINTS_SIGNAL.to_owned(),
-        labels: std::collections::BTreeMap::new(),
+        labels: BTreeMap::new(),
         value: count,
         timestamp_ms: None,
     });
@@ -630,7 +635,7 @@ fn published_signals(
 fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
     signals::Observation {
         metric: readiness::READY_SIGNAL.to_owned(),
-        labels: std::collections::BTreeMap::new(),
+        labels: BTreeMap::new(),
         value: if verdict.reason.excludes() { 0.0 } else { 1.0 },
         timestamp_ms: None,
     }
@@ -711,7 +716,7 @@ async fn apply_ready_condition(
 fn ready_condition_patch<'provider>(
     provider: &'provider InferenceProvider,
     verdict: &readiness::Verdict,
-) -> Option<(&'provider str, serde_json::Value)> {
+) -> Option<(&'provider str, Value)> {
     let name = provider.metadata.name.as_deref()?;
     let status = provider.status.as_ref();
     let current = status.map_or(&[][..], |status| status.conditions.as_slice());
@@ -766,12 +771,9 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
 /// object outranks a discovered stub. `status` is deliberately not read: it is
 /// populated from gossip, and a member could advertise its own certificate under
 /// another site's name. The labels are the local object's for the same reason.
-fn peer_identities(
-    sites: &[GridSite],
-    trust: PeerTrustMode,
-) -> std::collections::BTreeMap<String, signals::PeerRecord> {
+fn peer_identities(sites: &[GridSite], trust: PeerTrustMode) -> BTreeMap<String, signals::PeerRecord> {
     let pinned = trust == PeerTrustMode::Pin;
-    let mut ranked = std::collections::BTreeMap::<String, ((bool, bool), signals::PeerRecord)>::new();
+    let mut ranked = BTreeMap::<String, ((bool, bool), signals::PeerRecord)>::new();
     for site in sites {
         let Some((key, enrolled)) = peer_site_key(site) else {
             continue;
@@ -976,11 +978,17 @@ const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 /// reconcile loop.
 const TLS_REQUEUE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Requeue while delegated gateway mounts may need rollout or Secret rotation detection.
+const MOUNT_RECONCILIATION_REQUEUE: Duration = Duration::from_secs(60);
+
 /// Field manager name for server-side apply.
 const FIELD_MANAGER: &str = "grid-operator";
 
 /// Finalizer that keeps a `GridNetwork` present until its SWIM scope withdraws.
 const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
+
+/// Bound retries when another reconcile updates a `GridNetwork` finalizer at the same time.
+const FINALIZER_PATCH_ATTEMPTS: usize = 4;
 
 /// Retry interval while a deleting network awaits local SWIM withdrawal.
 const WITHDRAWAL_RETRY_REQUEUE: Duration = Duration::from_secs(5);
@@ -1107,33 +1115,81 @@ fn persisted_grid_id(network: &GridNetwork) -> Option<&str> {
 }
 
 /// Add or remove the SWIM-withdrawal finalizer without changing other finalizers.
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded conflict retry must keep its rebase invariants together"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async Kubernetes API calls carry large request and response values"
+)]
 async fn patch_withdrawal_finalizer(
     network: &GridNetwork,
     client: &Client,
     present: bool,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    let mut resource_version = network.metadata.resource_version.clone();
     let mut finalizers = network.metadata.finalizers.clone().unwrap_or_default();
-    if present {
-        if finalizers
-            .iter()
-            .any(|finalizer| finalizer == GRID_NETWORK_WITHDRAWAL_FINALIZER)
-        {
+
+    for attempt in 0..FINALIZER_PATCH_ATTEMPTS {
+        if !set_withdrawal_finalizer(&mut finalizers, present) {
             return Ok(());
         }
-        finalizers.push(GRID_NETWORK_WITHDRAWAL_FINALIZER.to_owned());
-    } else {
-        finalizers.retain(|finalizer| finalizer != GRID_NETWORK_WITHDRAWAL_FINALIZER);
-    }
-    let patch = serde_json::json!({
-        "metadata": {
-            "resourceVersion": network.metadata.resource_version,
-            "finalizers": finalizers,
+
+        let patch = serde_json::json!({
+            "metadata": {
+                "resourceVersion": resource_version,
+                "finalizers": finalizers,
+            }
+        });
+        match api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)).await {
+            Ok(_) => return Ok(()),
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                if attempt + 1 == FINALIZER_PATCH_ATTEMPTS {
+                    return Err(kube::Error::Api(error).into());
+                }
+
+                // A normal reconcile can update status while this finalizer patch is in flight.
+                // Rebase the narrow metadata change onto the latest finalizer list so we neither
+                // surface a transient conflict as an operator error nor overwrite another finalizer.
+                let Some(latest) = api.get_opt(name).await? else {
+                    return Ok(());
+                };
+                resource_version.clone_from(&latest.metadata.resource_version);
+                finalizers = latest.metadata.finalizers.unwrap_or_default();
+                let already_present = finalizers
+                    .iter()
+                    .any(|finalizer| finalizer == GRID_NETWORK_WITHDRAWAL_FINALIZER);
+                if already_present == present {
+                    return Ok(());
+                }
+            },
+            Err(error) => return Err(error.into()),
         }
-    });
-    let api: Api<GridNetwork> = Api::all(client.clone());
-    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)).await?;
+    }
+
     Ok(())
+}
+
+/// Finalizer patches replace the list, so retain entries owned by other controllers
+/// to avoid bypassing their cleanup during a conflicting reconcile.
+fn set_withdrawal_finalizer(finalizers: &mut Vec<String>, present: bool) -> bool {
+    let had_finalizer = finalizers
+        .iter()
+        .any(|finalizer| finalizer == GRID_NETWORK_WITHDRAWAL_FINALIZER);
+    match (present, had_finalizer) {
+        (true, false) => {
+            finalizers.push(GRID_NETWORK_WITHDRAWAL_FINALIZER.to_owned());
+            true
+        },
+        (false, true) => {
+            finalizers.retain(|finalizer| finalizer != GRID_NETWORK_WITHDRAWAL_FINALIZER);
+            true
+        },
+        _ => false,
+    }
 }
 
 /// Complete a deleting network's local SWIM withdrawal before Kubernetes removes it.
@@ -1307,7 +1363,18 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
-    let requeue_interval = requeue_interval_for_network(&network, &providers)?;
+    let mut requeue_interval = requeue_interval_for_network(&network, &providers)?;
+    if network.spec.gateway_refs.iter().any(|gateway| {
+        gateway.consumer_config.as_ref().is_some_and(|config| {
+            config.enabled
+                && config
+                    .mount_reconciliation
+                    .as_ref()
+                    .is_some_and(|mounts| mounts.enabled)
+        })
+    }) {
+        requeue_interval = requeue_interval.min(MOUNT_RECONCILIATION_REQUEUE);
+    }
     // In poll mode, load travels the signals path:
     // the operator neither scrapes providers for scoring nor lets a metric
     // sample reach gossip or the overlay. An empty collection makes the overlay
@@ -1441,9 +1508,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     let OverlayOutcome {
         consumer_statuses: consumer_config_statuses,
+        mount_statuses: mount_reconciliation_statuses,
         overlay_statuses,
         serving_retry,
-    } = reconcile_routing_overlay_inner(
+    } = Box::pin(reconcile_routing_overlay_inner(
         &network,
         client,
         &providers,
@@ -1454,7 +1522,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &admission_states,
         serving.as_ref(),
         ctx.site_name(),
-    )
+    ))
     .await?;
 
     let grid_id = resolve_grid_id(&network);
@@ -1501,6 +1569,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         membership.as_ref(),
         distributed_provider_count,
         consumer_config_statuses,
+        mount_reconciliation_statuses,
         overlay_statuses,
         budget_statuses,
         identity,
@@ -1901,8 +1970,8 @@ async fn ensure_tls_secrets(
         return Ok(());
     };
 
-    let ca_api: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(client.clone(), &ca_ref.namespace);
-    let site_api: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(client.clone(), &site_ref.namespace);
+    let ca_api: Api<Secret> = Api::namespaced(client.clone(), &ca_ref.namespace);
+    let site_api: Api<Secret> = Api::namespaced(client.clone(), &site_ref.namespace);
 
     let ca_exists = ca_api.get_opt(&ca_ref.name).await?.is_some();
     let site_exists = site_api.get_opt(&site_ref.name).await?.is_some();
@@ -1967,10 +2036,7 @@ async fn ensure_tls_secrets(
 
 /// Create `secret`, returning whether this call created it: a Secret another writer
 /// created first is never overwritten.
-async fn create_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    secret: k8s_openapi::api::core::v1::Secret,
-) -> Result<bool, OperatorError> {
+async fn create_secret(api: &Api<Secret>, secret: Secret) -> Result<bool, OperatorError> {
     match api.create(&kube::api::PostParams::default(), &secret).await {
         Ok(_) => Ok(true),
         Err(kube::Error::Api(response)) if response.code == 409 => Ok(false),
@@ -2086,6 +2152,7 @@ async fn reconcile_routing_overlay_inner(
 
     let observed_generation = network.metadata.generation.unwrap_or(0);
     let mut consumer_statuses: Vec<ConsumerConfigStatus> = Vec::new();
+    let mut mount_statuses: Vec<MountReconciliationStatus> = Vec::new();
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
 
@@ -2167,13 +2234,77 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        if overlay.candidates.is_empty() {
+        let no_candidates = overlay.candidates.is_empty();
+        if no_candidates {
             tracing::warn!(
                 network = network_name,
                 gateway = %gw_ref.name,
                 "routing overlay has no candidates; distributing authoritative no-route state"
             );
         }
+        // For delegated gateways, make the generated config and all of its
+        // Secret mounts available before publishing candidates that can use
+        // them. A pending or failed mount/config rollout retains the previous
+        // routing overlay. An empty overlay is published first so a mount or
+        // config failure cannot retain a previously serving route.
+        let mut delegated_mount_reconciled = false;
+        if !no_candidates
+            && let Some(cc) = gw_ref
+                .consumer_config
+                .as_ref()
+                .filter(|cc| cc.enabled && cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled))
+        {
+            match Box::pin(apply_consumer_config_for_gateway(
+                &overlay,
+                network_name,
+                gw_ref,
+                cc,
+                &network.spec.tls,
+                observed_generation,
+                client,
+            ))
+            .await
+            {
+                Ok(outcome) => {
+                    if outcome.config_applied {
+                        consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+                    }
+                    if let Some(status) = outcome.mount_status {
+                        delegated_mount_reconciled = !status.applied_revision.is_empty();
+                        mount_statuses.push(status);
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        network = network_name,
+                        gateway = %gw_ref.name,
+                        namespace = %gw_ref.namespace,
+                        error = %error,
+                        "delegated gateway mounts are not ready; retaining the previously distributed routing overlay"
+                    );
+                    consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &error, observed_generation));
+                    let delegation = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled);
+                    mount_statuses.push(mount_reconciliation_status_error(
+                        gw_ref,
+                        delegation,
+                        &error,
+                        observed_generation,
+                    ));
+                },
+            }
+            if !delegated_mount_reconciled {
+                overlay_statuses.push(retained_overlay_status(
+                    network,
+                    gw_ref,
+                    observed_generation,
+                    Some(&render),
+                    "GatewayMountsNotReady",
+                    "routing overlay publication is waiting for mounted Secrets and a ready gateway rollout",
+                ));
+                continue;
+            }
+        }
+
         let resource_version = match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await
         {
             Ok(rv) => rv,
@@ -2228,10 +2359,25 @@ async fn reconcile_routing_overlay_inner(
         // abort the reconcile loop — other gateways continue to be processed.
         // Gateways with consumerConfig.enabled=false get a Disabled entry.
         // Gateways without a consumerConfig block are omitted from status.
-        if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
-            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await {
-                Ok(()) => {
-                    consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+        if !delegated_mount_reconciled && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
+            match Box::pin(apply_consumer_config_for_gateway(
+                &overlay,
+                network_name,
+                gw_ref,
+                cc,
+                &network.spec.tls,
+                observed_generation,
+                client,
+            ))
+            .await
+            {
+                Ok(outcome) => {
+                    if outcome.config_applied {
+                        consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+                    }
+                    if let Some(status) = outcome.mount_status {
+                        mount_statuses.push(status);
+                    }
                 },
                 Err(e) => {
                     tracing::warn!(
@@ -2242,6 +2388,13 @@ async fn reconcile_routing_overlay_inner(
                         "consumer Praxis config render/apply failed; recorded in status"
                     );
                     consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &e, observed_generation));
+                    let delegation = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled);
+                    mount_statuses.push(mount_reconciliation_status_error(
+                        gw_ref,
+                        delegation,
+                        &e,
+                        observed_generation,
+                    ));
                 },
             }
         } else if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| !cc.enabled) {
@@ -2250,6 +2403,7 @@ async fn reconcile_routing_overlay_inner(
     }
     Ok(OverlayOutcome {
         consumer_statuses,
+        mount_statuses,
         overlay_statuses,
         serving_retry,
     })
@@ -2263,6 +2417,8 @@ const EMPTY_CANDIDATES: &str = "EmptyCandidates";
 struct OverlayOutcome {
     /// Consumer config render and apply results.
     consumer_statuses: Vec<ConsumerConfigStatus>,
+    /// Delegated gateway Secret mount outcomes.
+    mount_statuses: Vec<MountReconciliationStatus>,
     /// Overlay distribution results.
     overlay_statuses: Vec<OverlayRevisionStatus>,
     /// Soonest a deferred serving config write can land.
@@ -2274,7 +2430,7 @@ struct ServingSource<'src> {
     /// Dialable `(site, signals endpoint)` members.
     members: Vec<(&'src str, String)>,
     /// Declared leaf digests per member, empty outside pin trust.
-    pins: std::collections::BTreeMap<String, Vec<String>>,
+    pins: BTreeMap<String, Vec<String>>,
     /// Write coalescing state.
     gate: &'src WriteGate,
     /// Peer addressing resolved at startup.
@@ -2301,7 +2457,7 @@ fn serving_source<'src>(
             serving_config::dialable_members(snapshot, &identities, settings.trust, encrypted, settings.peer_port)
         })
         .unwrap_or_default();
-    let mut pins = std::collections::BTreeMap::new();
+    let mut pins = BTreeMap::new();
     let mut members = Vec::with_capacity(dialable.len());
     for (site, endpoint, declared) in dialable {
         if !declared.is_empty() {
@@ -2404,6 +2560,87 @@ fn keep_rendered_at(
             entry
         })
         .collect()
+}
+
+/// Keep last applied consumer status for gateways whose empty candidate set
+/// deliberately retained their previous working config.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preserving last-good per-gateway status is one compact selection pass"
+)]
+fn keep_consumer_config_status_at(
+    network: &GridNetwork,
+    desired: &[ConsumerConfigStatus],
+) -> Vec<ConsumerConfigStatus> {
+    let prior = network
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.consumer_config_status.as_slice());
+    let mut kept = Vec::new();
+    for gw_ref in &network.spec.gateway_refs {
+        let Some(cc) = gw_ref.consumer_config.as_ref() else {
+            continue;
+        };
+        if !cc.enabled {
+            kept.push(consumer_config_status_disabled(
+                gw_ref,
+                cc,
+                network.metadata.generation.unwrap_or(0),
+            ));
+            continue;
+        }
+        if let Some(status) = desired
+            .iter()
+            .find(|status| status.gateway_name == gw_ref.name && status.namespace == gw_ref.namespace)
+            .or_else(|| {
+                prior.iter().find(|status| {
+                    status.gateway_name == gw_ref.name
+                        && status.namespace == gw_ref.namespace
+                        && status.phase != ConsumerConfigPhase::Disabled
+                })
+            })
+        {
+            kept.push(status.clone());
+        }
+    }
+    kept
+}
+
+/// Keep the last requirements/readiness evidence while an empty overlay
+/// intentionally retains the corresponding last working consumer config.
+fn keep_mount_reconciliation_status_at(
+    network: &GridNetwork,
+    desired: &[MountReconciliationStatus],
+) -> Vec<MountReconciliationStatus> {
+    let prior = network
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.mount_reconciliation_status.as_slice());
+    let mut kept = Vec::new();
+    for gw_ref in &network.spec.gateway_refs {
+        let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) else {
+            continue;
+        };
+        let expected_deployment = cc
+            .mount_reconciliation
+            .as_ref()
+            .filter(|mounts| mounts.enabled)
+            .and_then(|mounts| mounts.deployment_name.as_deref());
+        if let Some(status) = desired
+            .iter()
+            .find(|status| status.gateway_name == gw_ref.name && status.namespace == gw_ref.namespace)
+            .or_else(|| {
+                prior.iter().find(|status| {
+                    status.gateway_name == gw_ref.name
+                        && status.namespace == gw_ref.namespace
+                        && status.deployment_name.as_deref() == expected_deployment
+                })
+            })
+        {
+            kept.push(status.clone());
+        }
+    }
+    kept
 }
 
 /// Whether two entries differ at most in `rendered_at` and `observed_generation`.
@@ -2513,75 +2750,441 @@ async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorE
     Ok(list.items)
 }
 
-/// Server-side apply the operator-generated consumer Praxis config `ConfigMap`.
-///
-/// Only called when `gw_ref.consumer_config.enabled` is `true`.  Renders the
-/// consumer Praxis YAML from the routing overlay and applies it to the gateway
-/// namespace.  The generated config never contains credential token bytes.
+/// Outcome of rendering and optionally reconciling a consumer gateway.
+struct ConsumerApplyOutcome {
+    /// Whether the generated Praxis `ConfigMap` was applied in this pass.
+    config_applied: bool,
+    /// Mount lifecycle status when explicit Deployment delegation is enabled.
+    mount_status: Option<MountReconciliationStatus>,
+}
+
+/// Explicit opt-in annotation required on a delegated Deployment.
+const MOUNT_OPT_IN_ANNOTATION: &str = "grid.praxis-proxy.io/mount-reconciliation";
+/// `GridNetwork` identity annotation required on a delegated Deployment.
+const MOUNT_NETWORK_ANNOTATION: &str = "grid.praxis-proxy.io/network";
+/// `GatewayRef` identity annotation required on a delegated Deployment.
+const MOUNT_GATEWAY_ANNOTATION: &str = "grid.praxis-proxy.io/gateway";
+/// Chart marker for the Grid-serving TLS projection that remains Helm-owned.
+const GRID_SERVING_TLS_ANNOTATION: &str = "grid.praxis-proxy.io/grid-serving-tls";
+/// Fixed path read by the Grid-serving peer pollers.
+const GRID_SERVING_TLS_MOUNT_PATH: &str = "/etc/praxis/tls";
+/// Annotation recording the volume names currently owned by Grid.
+const OWNED_MOUNTS_ANNOTATION: &str = "grid.praxis-proxy.io/owned-mounts";
+/// Pod-template annotation recording the desired mount-requirement revision.
+const MOUNT_REVISION_ANNOTATION: &str = "grid.praxis-proxy.io/mount-revision";
+/// Pod-template annotation recording the rendered Praxis config revision.
+const CONFIG_REVISION_ANNOTATION: &str = "grid.praxis-proxy.io/config-revision";
+/// Pod-template annotation recording the hashed Secret revision.
+const SECRET_REVISION_ANNOTATION: &str = "grid.praxis-proxy.io/secret-revision";
+/// Deployment annotation recording Secret resource versions, without Secret data.
+const SECRET_RESOURCE_VERSIONS_ANNOTATION: &str = "grid.praxis-proxy.io/secret-resource-versions";
+/// Reserved prefix for projected volume names owned by Grid.
+const GRID_MOUNT_PREFIX: &str = "grid-mount-";
+
+/// A second, bounded config slot lets old and new Pod revisions retain their matching files.
+fn alternate_consumer_config_map_name(base: &str) -> String {
+    let digest = gateway_mounts::config_revision(base);
+    format!("grid-consumer-config-{}", digest.chars().take(16).collect::<String>())
+}
+
+/// Reuse only a config slot that the completed Deployment rollout no longer mounts.
+fn inactive_consumer_config_map_name(base: &str, active: &str) -> String {
+    if active == base {
+        alternate_consumer_config_map_name(base)
+    } else {
+        base.to_owned()
+    }
+}
+
+/// Render Praxis config and requirements, optionally reconciling a delegated gateway.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exact GridNetwork/gateway inputs define this immutable render"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "render, publish requirements, and apply config as one gateway operation"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "render result crosses the optional delegated async boundary"
+)]
 async fn apply_consumer_config_for_gateway(
     overlay: &routing_overlay::RoutingOverlay,
     network_name: &str,
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
+    tls: &crate::crd::grid_network::TlsConfig,
+    observed_generation: i64,
     client: &Client,
-) -> Result<(), OperatorError> {
-    let config_yaml = Box::pin(render_consumer_config_or_remove(overlay, gw_ref, cc, client)).await?;
-    let cm = consumer_config::build_consumer_config_map(
-        &config_yaml,
-        &cc.config_map_name,
-        &gw_ref.namespace,
-        network_name,
-        &gw_ref.name,
-    );
-    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
-    if Box::pin(config_map_current(&api, &cc.config_map_name, &cm)).await? {
-        return Ok(());
-    }
-    api.patch(
-        &cc.config_map_name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&cm),
-    )
-    .await?;
-
-    info!(
-        config_map = %cc.config_map_name,
-        namespace = %gw_ref.namespace,
-        "applied consumer Praxis config ConfigMap"
-    );
-    Ok(())
-}
-
-/// Render consumer config or remove a stale inference config when none remains.
-async fn render_consumer_config_or_remove(
-    overlay: &routing_overlay::RoutingOverlay,
-    gw_ref: &GatewayRef,
-    cc: &ConsumerConfig,
-    client: &Client,
-) -> Result<String, OperatorError> {
-    match consumer_config::generate_consumer_praxis_config_with_telemetry(
+) -> Result<ConsumerApplyOutcome, OperatorError> {
+    let rendered = consumer_config::render_consumer_config(
         overlay,
         &cc.credential_mount_base,
         &cc.cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
+        tls,
+        &gw_ref.name,
+        &gw_ref.namespace,
         cc.telemetry.as_ref(),
-    ) {
-        Ok(config) => Ok(config),
-        Err(error @ ConsumerConfigError::NoInferenceCandidates) => {
-            let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
-            if api.get_opt(&cc.config_map_name).await?.is_some() {
-                api.delete(&cc.config_map_name, &DeleteParams::default()).await?;
-                info!(
-                    config_map = %cc.config_map_name,
-                    namespace = %gw_ref.namespace,
-                    "removed stale consumer Praxis config with no inference candidates"
-                );
+        cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
+    )?;
+    if let Some(mounts) = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled) {
+        let mut attempts = 0;
+        let (status, config_applied) = loop {
+            let result = Box::pin(reconcile_delegated_gateway(
+                &rendered,
+                network_name,
+                gw_ref,
+                cc,
+                mounts,
+                tls,
+                observed_generation,
+                client,
+            ))
+            .await;
+            if result.as_ref().is_err_and(OperatorError::is_conflict) && attempts < 2 {
+                attempts += 1;
+                continue;
             }
-            Err(error.into())
-        },
-        Err(error) => Err(error.into()),
+            break result?;
+        };
+        return Ok(ConsumerApplyOutcome {
+            config_applied,
+            mount_status: Some(status),
+        });
     }
+
+    let requirements = mount_requirements_document(&rendered, network_name, gw_ref);
+    let requirements_revision = gateway_mounts::requirements_revision(&requirements)?;
+    apply_mount_requirements_document(&requirements, network_name, gw_ref, cc, client).await?;
+    apply_consumer_config_map(&rendered.config_yaml, network_name, gw_ref, cc, client).await?;
+    Ok(ConsumerApplyOutcome {
+        config_applied: true,
+        mount_status: Some(requirements_rendered_status(
+            gw_ref,
+            requirements_revision,
+            observed_generation,
+        )),
+    })
+}
+
+/// Assemble the identity and reference-only input for projected mounts.
+fn mount_requirements_document(
+    rendered: &consumer_config::ConsumerRenderResult,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+) -> consumer_config::MountRequirementsDocument {
+    consumer_config::MountRequirementsDocument {
+        schema_version: "v1".to_owned(),
+        network: network_name.to_owned(),
+        gateway: consumer_config::RequirementGateway {
+            name: gw_ref.name.clone(),
+            namespace: gw_ref.namespace.clone(),
+        },
+        requirements: rendered.requirements.clone(),
+    }
+}
+
+/// Add the chart-owned Grid-serving TLS projection to delegated requirements.
+///
+/// The chart keeps this projection when `gridServing` is enabled. Recording its
+/// references still validates the files and Secret revisions, while the
+/// `GridServingTls` purpose prevents the operator from claiming the chart mount.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the helper combines one render with its exact owner configuration"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "all delegated requirements must be canonicalized as one document"
+)]
+fn delegated_mount_requirements_document(
+    rendered: &consumer_config::ConsumerRenderResult,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    tls: &crate::crd::grid_network::TlsConfig,
+    chart_managed_serving_tls: bool,
+) -> Result<consumer_config::MountRequirementsDocument, OperatorError> {
+    let mut document = mount_requirements_document(rendered, network_name, gw_ref);
+    if !chart_managed_serving_tls {
+        return Ok(document);
+    }
+    if cc.tls_cert_mount_path != GRID_SERVING_TLS_MOUNT_PATH {
+        return Err(mount_failure(
+            "GridServingTlsPathMismatch",
+            format!("gridServing requires consumerConfig.tlsCertMountPath={GRID_SERVING_TLS_MOUNT_PATH:?}"),
+        )
+        .into());
+    }
+    let ca_ref = tls.ca_secret_ref.as_ref().ok_or_else(|| {
+        mount_failure(
+            "GridServingTlsReferenceMissing",
+            "Grid serving requires tls.caSecretRef",
+        )
+    })?;
+    let site_ref = tls.site_secret_ref.as_ref().ok_or_else(|| {
+        mount_failure(
+            "GridServingTlsReferenceMissing",
+            "Grid serving requires tls.siteSecretRef",
+        )
+    })?;
+
+    for requirement in &mut document.requirements {
+        if matches!(
+            requirement.purpose,
+            consumer_config::MountPurpose::GridPeerCa | consumer_config::MountPurpose::GridSiteIdentity
+        ) {
+            requirement.purpose = consumer_config::MountPurpose::GridServingTls;
+        }
+    }
+    add_chart_serving_tls_item(&mut document, gw_ref, &ca_ref.namespace, &ca_ref.name, "ca.crt");
+    for key in ["tls.crt", "tls.key"] {
+        add_chart_serving_tls_item(&mut document, gw_ref, &site_ref.namespace, &site_ref.name, key);
+    }
+    for requirement in &mut document.requirements {
+        requirement.items.sort();
+        requirement.items.dedup();
+    }
+    document.requirements.sort_by(|left, right| {
+        (
+            &left.purpose,
+            &left.final_hop,
+            &left.secret.namespace,
+            &left.secret.name,
+        )
+            .cmp(&(
+                &right.purpose,
+                &right.final_hop,
+                &right.secret.namespace,
+                &right.secret.name,
+            ))
+    });
+    Ok(document)
+}
+
+/// Merge one chart-owned serving TLS key into the stable requirements list.
+fn add_chart_serving_tls_item(
+    document: &mut consumer_config::MountRequirementsDocument,
+    gw_ref: &GatewayRef,
+    namespace: &str,
+    name: &str,
+    key: &str,
+) {
+    let item = consumer_config::RequirementItem {
+        key: key.to_owned(),
+        path: format!("{GRID_SERVING_TLS_MOUNT_PATH}/{key}"),
+    };
+    if let Some(requirement) = document.requirements.iter_mut().find(|requirement| {
+        requirement.purpose == consumer_config::MountPurpose::GridServingTls
+            && requirement.secret.namespace == namespace
+            && requirement.secret.name == name
+    }) {
+        if !requirement.items.contains(&item) {
+            requirement.items.push(item);
+        }
+        return;
+    }
+    document.requirements.push(consumer_config::MountRequirement {
+        purpose: consumer_config::MountPurpose::GridServingTls,
+        final_hop: gw_ref.name.clone(),
+        secret: consumer_config::RequirementSecret {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        },
+        items: vec![item],
+    });
+}
+
+/// Confirm that the chart's read-only TLS mount supplies each serving file.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validate every external TLS file against its mounted Secret source"
+)]
+fn validate_chart_managed_serving_tls(
+    requirements: &consumer_config::MountRequirementsDocument,
+    deployment: &Deployment,
+    delegation: &MountReconciliation,
+) -> Result<(), OperatorError> {
+    let template = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.spec.as_ref())
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the delegated Deployment has no pod spec"))?;
+    let container = template
+        .containers
+        .iter()
+        .find(|container| container.name == delegation.container_name)
+        .ok_or_else(|| mount_failure("ContainerMissing", "the named Praxis container is absent"))?;
+    let volumes = template.volumes.as_deref().unwrap_or_default();
+    let mounts = container.volume_mounts.as_deref().unwrap_or_default();
+
+    for requirement in requirements
+        .requirements
+        .iter()
+        .filter(|requirement| requirement.purpose == consumer_config::MountPurpose::GridServingTls)
+    {
+        for item in &requirement.items {
+            let path = Path::new(&item.path);
+            let parent = path.parent().and_then(Path::to_str).unwrap_or_default();
+            let relative = path
+                .strip_prefix(parent)
+                .ok()
+                .and_then(Path::to_str)
+                .unwrap_or_default();
+            let mount = mounts
+                .iter()
+                .find(|mount| mount.mount_path == parent && mount.read_only == Some(true));
+            let supplied = mount
+                .and_then(|mount| volumes.iter().find(|volume| volume.name == mount.name))
+                .and_then(|volume| serde_json::to_value(volume).ok())
+                .is_some_and(|volume| {
+                    volume_projects_secret_key(&volume, &requirement.secret.name, &item.key, relative)
+                });
+            if parent != GRID_SERVING_TLS_MOUNT_PATH || !supplied {
+                return Err(mount_failure(
+                    "ChartTlsMountMissing",
+                    format!(
+                        "the chart-managed TLS mount does not provide {}/{} at {:?}",
+                        requirement.secret.name, item.key, item.path
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check a serialized Secret or projected volume for one key-to-file mapping.
+fn volume_projects_secret_key(volume: &Value, secret_name: &str, key: &str, path: &str) -> bool {
+    let matches_source = |source: &Value, name_field: &str| {
+        if source.get(name_field).and_then(Value::as_str) != Some(secret_name) {
+            return false;
+        }
+        let Some(items) = source.get("items").and_then(Value::as_array) else {
+            return path == key;
+        };
+        items.iter().any(|item| {
+            item.get("key").and_then(Value::as_str) == Some(key)
+                && item.get("path").and_then(Value::as_str) == Some(path)
+        })
+    };
+
+    if volume
+        .get("secret")
+        .is_some_and(|source| matches_source(source, "secretName"))
+    {
+        return true;
+    }
+    volume
+        .pointer("/projected/sources")
+        .and_then(Value::as_array)
+        .is_some_and(|sources| {
+            sources
+                .iter()
+                .filter_map(|source| source.get("secret"))
+                .any(|source| matches_source(source, "name"))
+        })
+}
+
+/// Publish the reference-only requirements document as a `ConfigMap`.
+async fn apply_mount_requirements_document(
+    requirements: &consumer_config::MountRequirementsDocument,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    client: &Client,
+) -> Result<(), OperatorError> {
+    let requirements_config_map_name = gateway_mounts::requirements_config_map_name(&cc.config_map_name);
+    let config_map = consumer_config::build_mount_requirements_config_map(
+        requirements,
+        &requirements_config_map_name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    )?;
+    let config_maps: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    config_maps
+        .patch(
+            &requirements_config_map_name,
+            &PatchParams::apply(FIELD_MANAGER),
+            &Patch::Apply(&config_map),
+        )
+        .await
+        .map_err(|_error| {
+            mount_failure(
+                "RequirementsApplyFailed",
+                "could not apply the reference-only requirements ConfigMap",
+            )
+        })?;
+    Ok(())
+}
+
+/// Build status for requirements published without Deployment delegation.
+fn requirements_rendered_status(
+    gw_ref: &GatewayRef,
+    requirements_revision: String,
+    observed_generation: i64,
+) -> MountReconciliationStatus {
+    MountReconciliationStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        deployment_name: None,
+        phase: MountReconciliationPhase::RequirementsRendered,
+        requirements_revision,
+        applied_revision: String::new(),
+        reason: String::new(),
+        message: "reference-only mount requirements were published; Deployment remains owner-managed".to_owned(),
+        observed_generation,
+        deployment_generation: 0,
+    }
+}
+
+/// Apply the operator-owned Praxis config `ConfigMap` after mounts are staged.
+async fn apply_consumer_config_map(
+    config_yaml: &str,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    client: &Client,
+) -> Result<(), OperatorError> {
+    apply_consumer_config_map_named(config_yaml, network_name, gw_ref, &cc.config_map_name, client).await
+}
+
+/// Publish a config into a selected slot before switching the delegated Pod template to it.
+async fn apply_consumer_config_map_named(
+    config_yaml: &str,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    config_map_name: &str,
+    client: &Client,
+) -> Result<(), OperatorError> {
+    let cm = consumer_config::build_consumer_config_map(
+        config_yaml,
+        config_map_name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    );
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    if Box::pin(config_map_current(&api, config_map_name, &cm)).await? {
+        return Ok(());
+    }
+    api.patch(
+        config_map_name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&cm),
+    )
+    .await?;
+    info!(
+        config_map = %config_map_name,
+        namespace = %gw_ref.namespace,
+        "applied consumer Praxis config ConfigMap"
+    );
+    Ok(())
 }
 
 /// Whether `name` already holds `desired`'s data, so applying it would change nothing.
@@ -2594,6 +3197,806 @@ async fn config_map_current(api: &Api<ConfigMap>, name: &str, desired: &ConfigMa
         tracing::debug!(config_map = %name, "consumer Praxis config unchanged");
     }
     Ok(current)
+}
+
+/// Keep a strategic patch tied to the Deployment version used to compute mount ownership.
+fn guarded_deployment_patch(mut patch: Value, deployment: &Deployment) -> Result<Value, OperatorError> {
+    let version = deployment
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the delegated Deployment has no resourceVersion"))?;
+    let metadata = patch
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the Deployment patch has no metadata"))?;
+    metadata.insert("resourceVersion".to_owned(), json!(version));
+    Ok(patch)
+}
+
+/// Preserve conflict errors so the caller can retry from a fresh Deployment read.
+async fn patch_delegated_deployment(
+    deployments: &Api<Deployment>,
+    name: &str,
+    deployment: &Deployment,
+    patch: Value,
+    failure_message: &'static str,
+) -> Result<(), OperatorError> {
+    let patch = guarded_deployment_patch(patch, deployment)?;
+    match deployments
+        .patch(name, &PatchParams::default(), &Patch::Strategic(patch))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if matches!(&error, kube::Error::Api(status) if status.code == 409) => Err(error.into()),
+        Err(_) => Err(mount_failure("DeploymentPatchFailed", failure_message).into()),
+    }
+}
+
+/// Switch config source, Secret projections, and their revisions in one Pod-template update.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the staged patch keeps config, mounts, and revisions in one write"
+)]
+fn staged_config_mount_patch(
+    mut volume_mutations: Vec<Value>,
+    mount_additions: &[Value],
+    config_volume_name: &str,
+    next_config_name: &str,
+    container_name: &str,
+    deployment_annotations: &Value,
+    template_annotations: &Value,
+) -> Value {
+    volume_mutations.push(json!({"name": config_volume_name, "configMap": {"name": next_config_name}}));
+    let mut pod_spec_patch = serde_json::Map::new();
+    pod_spec_patch.insert("volumes".to_owned(), Value::Array(volume_mutations));
+    if !mount_additions.is_empty() {
+        pod_spec_patch.insert(
+            "containers".to_owned(),
+            json!([{"name": container_name, "volumeMounts": mount_additions}]),
+        );
+    }
+    json!({
+        "metadata": {"annotations": deployment_annotations},
+        "spec": {"template": {
+            "metadata": {"annotations": template_annotations},
+            "spec": pod_spec_patch
+        }}
+    })
+}
+
+/// Validate and reconcile one explicitly delegated gateway Deployment.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ordered mount, config, rollout, and prune steps are one lifecycle state machine"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "Kubernetes Deployment state and strategic patch payloads cross async API calls"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lifecycle uses exact render, ownership, rollout, and API inputs"
+)]
+async fn reconcile_delegated_gateway(
+    rendered: &consumer_config::ConsumerRenderResult,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    delegation: &MountReconciliation,
+    tls: &crate::crd::grid_network::TlsConfig,
+    observed_generation: i64,
+    client: &Client,
+) -> Result<(MountReconciliationStatus, bool), OperatorError> {
+    let Some(deployment_name) = delegation
+        .deployment_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+    else {
+        return Err(mount_failure(
+            "InvalidDelegation",
+            "deploymentName is required when mount reconciliation is enabled",
+        )
+        .into());
+    };
+    if delegation.container_name.trim().is_empty() {
+        return Err(mount_failure(
+            "InvalidDelegation",
+            "containerName is required when mount reconciliation is enabled",
+        )
+        .into());
+    }
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    let deployment = deployments
+        .get_opt(deployment_name)
+        .await
+        .map_err(|error| {
+            mount_failure(
+                "DeploymentReadFailed",
+                format!("could not read the delegated Deployment: {error}"),
+            )
+        })?
+        .ok_or_else(|| mount_failure("DeploymentMissing", "the delegated Deployment does not exist"))?;
+    let chart_managed_serving_tls =
+        validate_deployment_delegation(&deployment, network_name, gw_ref, delegation, &cc.config_map_name)?;
+    let requirements =
+        delegated_mount_requirements_document(rendered, network_name, gw_ref, cc, tls, chart_managed_serving_tls)?;
+    let requirements_revision = gateway_mounts::requirements_revision(&requirements)?;
+    let resource_versions = validate_required_secrets(&requirements, &gw_ref.namespace, client).await?;
+    if chart_managed_serving_tls {
+        validate_chart_managed_serving_tls(&requirements, &deployment, delegation)?;
+    }
+    apply_mount_requirements_document(&requirements, network_name, gw_ref, cc, client).await?;
+    let secret_revision = gateway_mounts::secret_revision(&resource_versions)?;
+    let desired_mounts = gateway_mounts::desired_mounts(&requirements)?;
+    let pod_template = deployment
+        .spec
+        .as_ref()
+        .map(|spec| &spec.template)
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the delegated Deployment has no pod template"))?;
+    let template = pod_template
+        .spec
+        .as_ref()
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the delegated Deployment has no pod spec"))?;
+    let target_container = template
+        .containers
+        .iter()
+        .find(|container| container.name == delegation.container_name)
+        .ok_or_else(|| mount_failure("ContainerMissing", "the named Praxis container is absent"))?;
+    let volumes = template.volumes.as_deref().unwrap_or_default();
+    let target_mounts = target_container.volume_mounts.as_deref().unwrap_or_default();
+    let config_volume_name = target_mounts
+        .iter()
+        .find(|mount| mount.mount_path == "/etc/praxis")
+        .map(|mount| mount.name.as_str())
+        .ok_or_else(|| mount_failure("ConfigSourceMismatch", "the Praxis config mount is absent"))?;
+    let active_config_name = volumes
+        .iter()
+        .find(|volume| volume.name == config_volume_name)
+        .and_then(|volume| volume.config_map.as_ref())
+        .map(|source| source.name.as_str())
+        .ok_or_else(|| mount_failure("ConfigSourceMismatch", "the Praxis config source is absent"))?;
+    let mut owned_mounts = read_owned_mounts(&deployment)?;
+    let expected_names: BTreeSet<String> = desired_mounts.iter().map(|mount| mount.volume_name.clone()).collect();
+    let mut additions = Vec::new();
+    let mut mount_additions = Vec::new();
+    for desired in &desired_mounts {
+        let desired_volume = &desired.volume;
+        let desired_mount = &desired.volume_mount;
+        let current_volume = volumes.iter().find(|volume| volume.name == desired.volume_name);
+        let current_mount = target_mounts
+            .iter()
+            .find(|mount| mount.mount_path == desired.mount_path);
+        if current_volume.is_some() && !owned_mounts.contains(&desired.volume_name) {
+            return Err(mount_failure(
+                "OwnershipConflict",
+                format!(
+                    "reserved volume name {:?} is already used outside Grid ownership",
+                    desired.volume_name
+                ),
+            )
+            .into());
+        }
+        if current_mount.is_some() && !owned_mounts.contains(&desired.volume_name) {
+            return Err(mount_failure(
+                "OwnershipConflict",
+                format!(
+                    "mount path {:?} is already used outside Grid ownership",
+                    desired.mount_path
+                ),
+            )
+            .into());
+        }
+        if let Some(volume) = current_volume {
+            if serde_json::to_value(volume)? != *desired_volume {
+                // The owned volume name is derived from its mount path. When a
+                // Secret reference changes at that same path (for example the
+                // Grid CA reference), replace only the Grid-owned volume entry.
+                additions.extend(owned_volume_mutation_patch(
+                    template,
+                    &delegation.container_name,
+                    &desired.volume_name,
+                    Some(desired_volume),
+                )?);
+            }
+        } else {
+            additions.push(desired_volume.clone());
+        }
+        if let Some(volume_mount) = current_mount {
+            if serde_json::to_value(volume_mount)? != *desired_mount {
+                return Err(mount_failure(
+                    "OwnershipConflict",
+                    format!("Grid-owned mount path {:?} has unexpected settings", desired.mount_path),
+                )
+                .into());
+            }
+        } else {
+            if target_mounts.iter().any(|mount| mount.name == desired.volume_name) {
+                return Err(mount_failure(
+                    "OwnershipConflict",
+                    format!(
+                        "reserved volume name {:?} is mounted at another path",
+                        desired.volume_name
+                    ),
+                )
+                .into());
+            }
+            mount_additions.push(desired_mount.clone());
+        }
+        owned_mounts.insert(desired.volume_name.clone());
+    }
+    if volumes
+        .iter()
+        .any(|volume| volume.name.starts_with(GRID_MOUNT_PREFIX) && !owned_mounts.contains(&volume.name))
+    {
+        return Err(mount_failure(
+            "OwnershipConflict",
+            "a reserved Grid mount volume is present without Grid ownership state",
+        )
+        .into());
+    }
+
+    let template_annotations = pod_template
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.annotations.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let has_mount_revision = template_annotations
+        .get(MOUNT_REVISION_ANNOTATION)
+        .is_some_and(|revision| revision == &requirements_revision);
+    let config_revision = gateway_mounts::config_revision(&rendered.config_yaml);
+    let resource_versions_json = serde_json::to_string(&resource_versions)?;
+    let owned_mounts_json = serde_json::to_string(&owned_mounts.iter().collect::<Vec<_>>())?;
+    let current_owned_mounts_json = deployment
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(OWNED_MOUNTS_ANNOTATION));
+    let active_cm = consumer_config::build_consumer_config_map(
+        &rendered.config_yaml,
+        active_config_name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    );
+    let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    let active_config_current = Box::pin(config_map_current(&config_api, active_config_name, &active_cm)).await?;
+    let needs_revision_rollout = !additions.is_empty()
+        || !mount_additions.is_empty()
+        || !has_mount_revision
+        || current_owned_mounts_json != Some(&owned_mounts_json)
+        || template_annotations.get(CONFIG_REVISION_ANNOTATION) != Some(&config_revision)
+        || template_annotations.get(SECRET_REVISION_ANNOTATION) != Some(&secret_revision)
+        || deployment
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|values| values.get(SECRET_RESOURCE_VERSIONS_ANNOTATION))
+            != Some(&resource_versions_json)
+        || !active_config_current;
+    if !deployment_rollout_ready(&deployment) {
+        return Ok((
+            mount_status(
+                gw_ref,
+                Some(delegation),
+                MountReconciliationPhase::WaitingForRollout,
+                &requirements_revision,
+                "",
+                "waiting for the previous Deployment revision to finish before changing config and mounts",
+                "",
+                observed_generation,
+                deployment.metadata.generation.unwrap_or(0),
+            ),
+            false,
+        ));
+    }
+    if needs_revision_rollout {
+        let next_config_name = inactive_consumer_config_map_name(&cc.config_map_name, active_config_name);
+        let config_shared = template
+            .containers
+            .iter()
+            .filter(|container| container.name != delegation.container_name)
+            .any(|container| {
+                container
+                    .volume_mounts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|mount| mount.name == config_volume_name)
+            })
+            || template
+                .init_containers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|container| {
+                    container
+                        .volume_mounts
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|mount| mount.name == config_volume_name)
+                });
+        if config_shared {
+            return Err(mount_failure(
+                "OwnershipConflict",
+                "the delegated Praxis config volume is also mounted outside the target container",
+            )
+            .into());
+        }
+        apply_consumer_config_map_named(&rendered.config_yaml, network_name, gw_ref, &next_config_name, client).await?;
+        let patch = staged_config_mount_patch(
+            additions,
+            &mount_additions,
+            config_volume_name,
+            &next_config_name,
+            &delegation.container_name,
+            &json!({
+                OWNED_MOUNTS_ANNOTATION: owned_mounts_json,
+                SECRET_RESOURCE_VERSIONS_ANNOTATION: resource_versions_json
+            }),
+            &json!({
+                MOUNT_REVISION_ANNOTATION: requirements_revision,
+                CONFIG_REVISION_ANNOTATION: config_revision,
+                SECRET_REVISION_ANNOTATION: secret_revision
+            }),
+        );
+        patch_delegated_deployment(
+            &deployments,
+            deployment_name,
+            &deployment,
+            patch,
+            "could not stage the matching Praxis config and Secret mounts",
+        )
+        .await?;
+        return Ok((
+            mount_status(
+                gw_ref,
+                Some(delegation),
+                MountReconciliationPhase::WaitingForRollout,
+                &requirements_revision,
+                "",
+                "the matching Praxis config and Secret mounts were staged; waiting for the Deployment rollout",
+                "",
+                observed_generation,
+                deployment.metadata.generation.unwrap_or(0),
+            ),
+            true,
+        ));
+    }
+
+    let stale_names: BTreeSet<String> = owned_mounts.difference(&expected_names).cloned().collect();
+    let mut mount_deletions = Vec::new();
+    let mut volume_deletions = Vec::new();
+    for name in &stale_names {
+        for volume_mount in target_mounts.iter().filter(|mount| &mount.name == name) {
+            mount_deletions.push(json!({
+                "name": volume_mount.name,
+                "mountPath": volume_mount.mount_path,
+                "$patch": "delete"
+            }));
+        }
+        if volumes.iter().any(|volume| &volume.name == name) {
+            volume_deletions.extend(owned_volume_mutation_patch(
+                template,
+                &delegation.container_name,
+                name,
+                None,
+            )?);
+        }
+    }
+    if !stale_names.is_empty() {
+        let owned_json = serde_json::to_string(&expected_names.iter().collect::<Vec<_>>())?;
+        let mut pod_spec_patch = serde_json::Map::new();
+        if !volume_deletions.is_empty() {
+            pod_spec_patch.insert("volumes".to_owned(), Value::Array(volume_deletions));
+        }
+        if !mount_deletions.is_empty() {
+            pod_spec_patch.insert(
+                "containers".to_owned(),
+                json!([{"name": delegation.container_name, "volumeMounts": mount_deletions}]),
+            );
+        }
+        let patch = json!({
+            "metadata": {"annotations": {OWNED_MOUNTS_ANNOTATION: owned_json}},
+            "spec": {"template": {"spec": pod_spec_patch}}
+        });
+        patch_delegated_deployment(
+            &deployments,
+            deployment_name,
+            &deployment,
+            patch,
+            "could not remove obsolete Grid-owned mounts",
+        )
+        .await?;
+        return Ok((
+            mount_status(
+                gw_ref,
+                Some(delegation),
+                MountReconciliationPhase::MountsReconciling,
+                &requirements_revision,
+                &config_revision,
+                "the config rollout is available; obsolete Grid-owned mounts were removed",
+                "",
+                observed_generation,
+                deployment.metadata.generation.unwrap_or(0),
+            ),
+            true,
+        ));
+    }
+
+    Ok((
+        mount_status(
+            gw_ref,
+            Some(delegation),
+            MountReconciliationPhase::Ready,
+            &requirements_revision,
+            &config_revision,
+            "required Secret files are mounted in available pods with the matching config revision",
+            "",
+            observed_generation,
+            deployment.metadata.generation.unwrap_or(0),
+        ),
+        true,
+    ))
+}
+
+/// Build a Grid-owned volume replacement or deletion patch after checking all
+/// consumers outside the target container.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep ownership checks and the matching mutation patch in one policy helper"
+)]
+fn owned_volume_mutation_patch(
+    pod_spec: &k8s_openapi::api::core::v1::PodSpec,
+    target_container_name: &str,
+    volume_name: &str,
+    replacement: Option<&Value>,
+) -> Result<Vec<Value>, OperatorError> {
+    let mounts_volume = |container: &k8s_openapi::api::core::v1::Container| {
+        container
+            .volume_mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|mount| mount.name == volume_name)
+    };
+    let shared_regular = pod_spec
+        .containers
+        .iter()
+        .filter(|container| container.name != target_container_name)
+        .any(&mounts_volume);
+    let shared_init = pod_spec
+        .init_containers
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(mounts_volume);
+    if shared_regular || shared_init {
+        return Err(mount_failure(
+            "OwnershipConflict",
+            format!("Grid-owned volume {volume_name:?} is also mounted outside the target container"),
+        )
+        .into());
+    }
+
+    match replacement {
+        Some(volume) if volume.is_object() => {
+            Ok(vec![json!({"name": volume_name, "$patch": "delete"}), volume.clone()])
+        },
+        Some(_) => Err(mount_failure("DeploymentInvalid", "desired volume was not an object").into()),
+        None => Ok(vec![json!({"name": volume_name, "$patch": "delete"})]),
+    }
+}
+
+/// Confirm the Deployment's explicit opt-in and selected container identity.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validate explicit owner annotations and selected container together"
+)]
+fn validate_deployment_delegation(
+    deployment: &Deployment,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    delegation: &MountReconciliation,
+    config_map_name: &str,
+) -> Result<bool, OperatorError> {
+    let annotations = deployment.metadata.annotations.as_ref();
+    let owns = annotations.is_some_and(|annotations| {
+        annotations
+            .get(MOUNT_OPT_IN_ANNOTATION)
+            .is_some_and(|value| value == "enabled")
+            && annotations
+                .get(MOUNT_NETWORK_ANNOTATION)
+                .is_some_and(|value| value == network_name)
+            && annotations
+                .get(MOUNT_GATEWAY_ANNOTATION)
+                .is_some_and(|value| value == &gw_ref.name)
+    });
+    if !owns {
+        return Err(mount_failure(
+            "OwnershipMismatch",
+            "Deployment opt-in annotations do not name this GridNetwork and gatewayRef",
+        )
+        .into());
+    }
+    let pod_spec = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.spec.as_ref())
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the delegated Deployment has no pod spec"))?;
+    let container = pod_spec
+        .containers
+        .iter()
+        .find(|container| container.name == delegation.container_name)
+        .ok_or_else(|| mount_failure("ContainerMissing", "the named Praxis container is absent"))?;
+    validate_deployment_config_source(pod_spec, container, config_map_name)?;
+    Ok(annotations.is_some_and(|annotations| {
+        annotations
+            .get(GRID_SERVING_TLS_ANNOTATION)
+            .is_some_and(|value| value == "chart-managed")
+    }))
+}
+
+/// Verify that the selected container receives Grid's generated praxis.yaml.
+#[expect(
+    clippy::too_many_lines,
+    reason = "mount path, volume source, and key projection form one fail-closed config-source check"
+)]
+fn validate_deployment_config_source(
+    pod_spec: &k8s_openapi::api::core::v1::PodSpec,
+    container: &k8s_openapi::api::core::v1::Container,
+    config_map_name: &str,
+) -> Result<(), OperatorError> {
+    let mut config_mounts = container
+        .volume_mounts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|mount| mount.mount_path == "/etc/praxis");
+    let config_mount = config_mounts.next().ok_or_else(|| {
+        mount_failure(
+            "ConfigSourceMismatch",
+            "the Praxis container has no /etc/praxis config mount",
+        )
+    })?;
+    if config_mounts.next().is_some()
+        || config_mount.sub_path.is_some()
+        || config_mount.sub_path_expr.is_some()
+        || container
+            .volume_mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|mount| mount.mount_path == "/etc/praxis/praxis.yaml")
+    {
+        return Err(mount_failure(
+            "ConfigSourceMismatch",
+            "the Praxis config mount is ambiguous or shadowed",
+        )
+        .into());
+    }
+    let config_map = pod_spec
+        .volumes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|volume| volume.name == config_mount.name)
+        .and_then(|volume| volume.config_map.as_ref())
+        .ok_or_else(|| {
+            mount_failure(
+                "ConfigSourceMismatch",
+                "the Praxis config mount is not a ConfigMap volume",
+            )
+        })?;
+    let projects_config = config_map.items.as_deref().is_none_or(|items| {
+        items.is_empty()
+            || items
+                .iter()
+                .any(|item| item.key == "praxis.yaml" && item.path == "praxis.yaml")
+    });
+    let valid_name =
+        config_map.name == config_map_name || config_map.name == alternate_consumer_config_map_name(config_map_name);
+    if !valid_name || config_map.optional == Some(true) || !projects_config {
+        return Err(mount_failure(
+            "ConfigSourceMismatch",
+            "the Praxis config mount does not project the generated praxis.yaml",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Read only Secret key presence and resource versions for a requirements document.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validate same-namespace Secret references, keys, and versions in one pass"
+)]
+async fn validate_required_secrets(
+    document: &consumer_config::MountRequirementsDocument,
+    gateway_namespace: &str,
+    client: &Client,
+) -> Result<BTreeMap<String, String>, OperatorError> {
+    let mut required = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for requirement in &document.requirements {
+        if requirement.secret.namespace != gateway_namespace {
+            return Err(mount_failure(
+                "SecretNamespaceMismatch",
+                format!(
+                    "Secret {}/{} is outside gateway namespace {gateway_namespace:?}",
+                    requirement.secret.namespace, requirement.secret.name
+                ),
+            )
+            .into());
+        }
+        for item in &requirement.items {
+            required
+                .entry((requirement.secret.namespace.clone(), requirement.secret.name.clone()))
+                .or_default()
+                .insert(item.key.clone());
+        }
+    }
+    let mut resource_versions = BTreeMap::new();
+    for ((namespace, name), keys) in required {
+        let api: Api<Secret> = Api::namespaced(client.clone(), &namespace);
+        let secret = api
+            .get_opt(&name)
+            .await
+            .map_err(|error| {
+                mount_failure(
+                    "SecretReadFailed",
+                    format!("could not read Secret {namespace}/{name}: {error}"),
+                )
+            })?
+            .ok_or_else(|| mount_failure("MissingSecret", format!("Secret {namespace}/{name} does not exist")))?;
+        for key in keys {
+            if secret
+                .data
+                .as_ref()
+                .and_then(|data| data.get(&key))
+                .is_none_or(|bytes| bytes.0.is_empty())
+            {
+                return Err(mount_failure(
+                    "MissingSecretKey",
+                    format!("Secret {namespace}/{name} has no nonempty key {key:?}"),
+                )
+                .into());
+            }
+        }
+        let resource_version = secret.metadata.resource_version.ok_or_else(|| {
+            mount_failure(
+                "SecretReadFailed",
+                format!("Secret {namespace}/{name} has no resourceVersion"),
+            )
+        })?;
+        resource_versions.insert(format!("{namespace}/{name}"), resource_version);
+    }
+    Ok(resource_versions)
+}
+
+/// Parse the exact set of Grid-owned volumes persisted on the Deployment.
+fn read_owned_mounts(deployment: &Deployment) -> Result<BTreeSet<String>, OperatorError> {
+    let Some(encoded) = deployment
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(OWNED_MOUNTS_ANNOTATION))
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let names: Vec<String> = serde_json::from_str(encoded).map_err(|_error| {
+        mount_failure(
+            "OwnershipConflict",
+            "Grid-owned mount state annotation is not valid JSON",
+        )
+    })?;
+    if names.iter().any(|name| !name.starts_with(GRID_MOUNT_PREFIX)) {
+        return Err(mount_failure(
+            "OwnershipConflict",
+            "Grid-owned mount state contains an unreserved volume name",
+        )
+        .into());
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// Check whether the current Deployment generation has fully replaced old replicas.
+fn deployment_rollout_ready(deployment: &Deployment) -> bool {
+    let replicas = deployment.spec.as_ref().and_then(|spec| spec.replicas).unwrap_or(1);
+    let generation = deployment.metadata.generation.unwrap_or(0);
+    deployment.status.as_ref().is_some_and(|status| {
+        replicas > 0
+            && status.observed_generation.unwrap_or(0) >= generation
+            && status.updated_replicas.unwrap_or(0) == replicas
+            && status.available_replicas.unwrap_or(0) >= replicas
+            && status.replicas.unwrap_or(0) == replicas
+            && status.unavailable_replicas.unwrap_or(0) == 0
+    })
+}
+
+/// Build one per-gateway mount status with no Secret payload data.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "status fields are assembled explicitly to keep lifecycle facts visible"
+)]
+fn mount_status(
+    gw_ref: &GatewayRef,
+    delegation: Option<&MountReconciliation>,
+    phase: MountReconciliationPhase,
+    requirements_revision: &str,
+    applied_revision: &str,
+    message: &str,
+    reason: &str,
+    observed_generation: i64,
+    deployment_generation: i64,
+) -> MountReconciliationStatus {
+    MountReconciliationStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        deployment_name: delegation.and_then(|mounts| mounts.deployment_name.clone()),
+        phase,
+        requirements_revision: requirements_revision.to_owned(),
+        applied_revision: applied_revision.to_owned(),
+        reason: reason.to_owned(),
+        message: message.to_owned(),
+        observed_generation,
+        deployment_generation,
+    }
+}
+
+/// Create a mount error whose message is safe to surface in status and logs.
+fn mount_failure(reason: &'static str, message: impl Into<String>) -> crate::error::GatewayMountFailure {
+    crate::error::GatewayMountFailure::new(reason, message)
+}
+
+/// Build a sanitized status entry after mount reconciliation failed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "maps stable failure categories to the public mount lifecycle status"
+)]
+fn mount_reconciliation_status_error(
+    gw_ref: &GatewayRef,
+    delegation: Option<&MountReconciliation>,
+    err: &OperatorError,
+    observed_generation: i64,
+) -> MountReconciliationStatus {
+    let (reason, message) = match err {
+        OperatorError::MountReconciliation(failure) => (failure.reason, failure.message.clone()),
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::MountPathConflict { .. }) => {
+            ("MountPathConflict", err.to_string())
+        },
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::InvalidMountPath { .. }) => {
+            ("InvalidMountPath", err.to_string())
+        },
+        OperatorError::Certificate(_)
+        | OperatorError::Kube(_)
+        | OperatorError::Json(_)
+        | OperatorError::NotFound(_)
+        | OperatorError::OverlayRender(_)
+        | OperatorError::ConsumerConfigRender(_)
+        | OperatorError::SwimKeyConfig(_)
+        | OperatorError::InvalidResource(_) => (
+            "MountReconciliationFailed",
+            "gateway mount reconciliation failed".to_owned(),
+        ),
+    };
+    let phase = if matches!(reason, "MissingSecret" | "MissingSecretKey") {
+        MountReconciliationPhase::WaitingForSecret
+    } else {
+        MountReconciliationPhase::Error
+    };
+    mount_status(
+        gw_ref,
+        delegation,
+        phase,
+        "",
+        "",
+        &message,
+        reason,
+        observed_generation,
+        0,
+    )
 }
 
 /// Result of applying one routing overlay `ConfigMap` for a single gateway.
@@ -3499,6 +4902,7 @@ async fn update_status(
     membership: Option<&MembershipSnapshot>,
     distributed_provider_count: u32,
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
+    mount_reconciliation_statuses: Vec<MountReconciliationStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
     identity: Option<SiteIdentityStatus>,
@@ -3514,7 +4918,8 @@ async fn update_status(
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
         phase: phase.clone(),
-        consumer_config_status: consumer_config_statuses,
+        consumer_config_status: keep_consumer_config_status_at(network, &consumer_config_statuses),
+        mount_reconciliation_status: keep_mount_reconciliation_status_at(network, &mount_reconciliation_statuses),
         overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
         identity,
@@ -3683,6 +5088,7 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::PlaintextWithSni { .. }) => "PlaintextWithSni",
         OperatorError::ConsumerConfigRender(ConsumerConfigError::NoInferenceCandidates) => "NoInferenceCandidates",
         OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
+        OperatorError::MountReconciliation(failure) => failure.reason,
         OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
         OperatorError::Certificate(_)
         | OperatorError::Json(_)
@@ -4336,7 +5742,7 @@ async fn reconcile_site_cert_pem(
 }
 
 /// The applied `GridSite` for a discovered peer, named for the identity the probe verifies.
-fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bool) -> serde_json::Value {
+fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bool) -> Value {
     let mut spec = serde_json::json!({ "gridNetworkRef": site.grid_network_ref });
     if !site.egress_address.is_empty()
         && let Some(fields) = spec.as_object_mut()
@@ -4566,12 +5972,11 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 mod tests {
     use super::*;
 
-
     #[test]
     fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {
         let ready = |value: f64| signals::Observation {
             metric: readiness::READY_SIGNAL.to_owned(),
-            labels: std::collections::BTreeMap::new(),
+            labels: BTreeMap::new(),
             value,
             timestamp_ms: None,
         };
@@ -4590,7 +5995,7 @@ mod tests {
 
 
     #[expect(clippy::expect_used, reason = "test fixture")]
-    fn provider_with_status(status: &serde_json::Value) -> InferenceProvider {
+    fn provider_with_status(status: &Value) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
@@ -4607,7 +6012,7 @@ mod tests {
         .expect("provider")
     }
 
-    fn ready_condition_json(status: &str, reason: &str) -> serde_json::Value {
+    fn ready_condition_json(status: &str, reason: &str) -> Value {
         serde_json::json!({
             "type": "Ready", "status": status, "reason": reason, "message": "m",
             "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
@@ -4644,7 +6049,7 @@ mod tests {
         );
     }
 
-    fn network_with_modes(spec: &serde_json::Value) -> GridNetwork {
+    fn network_with_modes(spec: &Value) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridNetwork",
@@ -5839,6 +7244,39 @@ mod tests {
         assert!(has_withdrawal_finalizer(&network));
     }
 
+    #[test]
+    fn withdrawal_finalizer_updates_preserve_other_finalizers_and_are_idempotent() {
+        let mut finalizers = vec!["other.example/finalizer".to_owned()];
+
+        assert!(
+            set_withdrawal_finalizer(&mut finalizers, true),
+            "adding the withdrawal finalizer must change the list"
+        );
+        assert_eq!(
+            finalizers,
+            ["other.example/finalizer", GRID_NETWORK_WITHDRAWAL_FINALIZER,],
+            "adding the withdrawal finalizer must preserve unrelated entries"
+        );
+        assert!(
+            !set_withdrawal_finalizer(&mut finalizers, true),
+            "adding an existing withdrawal finalizer must be idempotent"
+        );
+
+        assert!(
+            set_withdrawal_finalizer(&mut finalizers, false),
+            "removing the withdrawal finalizer must change the list"
+        );
+        assert_eq!(
+            finalizers,
+            ["other.example/finalizer"],
+            "removing the withdrawal finalizer must preserve unrelated entries"
+        );
+        assert!(
+            !set_withdrawal_finalizer(&mut finalizers, false),
+            "removing an absent withdrawal finalizer must be idempotent"
+        );
+    }
+
     /// The operator self-signs only a grid with neither Secret, never over an existing CA.
     #[test]
     fn the_operator_never_replaces_an_existing_grid_ca() {
@@ -5979,6 +7417,7 @@ mod tests {
             overlay_status: Vec::new(),
             budget_status: Vec::new(),
             identity: None,
+            mount_reconciliation_status: Vec::new(),
         };
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 
@@ -6164,7 +7603,7 @@ mod tests {
         if let Some(id) = site_id_annotation {
             let mut annotations = serde_json::Map::new();
             annotations.insert(ANNOTATION_SITE_ID.to_owned(), id.into());
-            metadata.insert("annotations".to_owned(), serde_json::Value::Object(annotations));
+            metadata.insert("annotations".to_owned(), Value::Object(annotations));
             metadata.insert(
                 "labels".to_owned(),
                 serde_json::json!({ LABEL_AUTO_DISCOVERED: "true" }),
@@ -6178,8 +7617,8 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridSite",
-            "metadata": serde_json::Value::Object(metadata),
-            "spec": serde_json::Value::Object(spec),
+            "metadata": Value::Object(metadata),
+            "spec": Value::Object(spec),
         }))
         .unwrap_or_else(|_| std::process::abort())
     }
@@ -6503,15 +7942,9 @@ mod tests {
     #[test]
     fn peer_identities_spiffe_enrolled_outranks_discovered_stub() {
         let mut stub = peer_grid_site("net-remote", Some("remote"), &[]);
-        stub.metadata.labels = Some(std::collections::BTreeMap::from([(
-            "from".to_owned(),
-            "stub".to_owned(),
-        )]));
+        stub.metadata.labels = Some(BTreeMap::from([("from".to_owned(), "stub".to_owned())]));
         let mut enrolled = peer_grid_site("remote", None, &[]);
-        enrolled.metadata.labels = Some(std::collections::BTreeMap::from([(
-            "from".to_owned(),
-            "enrolled".to_owned(),
-        )]));
+        enrolled.metadata.labels = Some(BTreeMap::from([("from".to_owned(), "enrolled".to_owned())]));
         for order in [vec![stub.clone(), enrolled.clone()], vec![enrolled, stub]] {
             let identities = peer_identities(&order, PeerTrustMode::Spiffe);
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
@@ -6602,14 +8035,13 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", false);
         assert_eq!(
-            spec.pointer("/spec/egress/tls/serverName")
-                .and_then(serde_json::Value::as_str),
+            spec.pointer("/spec/egress/tls/serverName").and_then(Value::as_str),
             Some("remote.grid.internal")
         );
         assert_eq!(
             spec.pointer("/metadata/annotations")
                 .and_then(|a| a.get(ANNOTATION_SITE_ID))
-                .and_then(serde_json::Value::as_str),
+                .and_then(Value::as_str),
             Some("remote")
         );
         let applied: GridSite = serde_json::from_value(spec).unwrap_or_else(|_| std::process::abort());
@@ -7273,6 +8705,100 @@ mod tests {
         }
     }
 
+    fn make_serving_tls() -> crate::crd::grid_network::TlsConfig {
+        crate::crd::grid_network::TlsConfig {
+            ca_secret_ref: Some(crate::crd::grid_network::SecretRef {
+                name: "grid-ca".to_owned(),
+                namespace: "praxis-system".to_owned(),
+                key: None,
+            }),
+            site_secret_ref: Some(crate::crd::grid_network::SecretRef {
+                name: "grid-site".to_owned(),
+                namespace: "praxis-system".to_owned(),
+                key: None,
+            }),
+            swim_key_ref: None,
+        }
+    }
+
+    #[test]
+    fn grid_serving_tls_is_a_chart_owned_requirement_without_consumer_candidates() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let cc = make_consumer_config("consumer-config");
+        let rendered = consumer_config::ConsumerRenderResult {
+            config_yaml: "listeners: []".to_owned(),
+            requirements: Vec::new(),
+        };
+        let requirements =
+            delegated_mount_requirements_document(&rendered, "production", &gw, &cc, &make_serving_tls(), true)
+                .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(requirements.requirements.len(), 2);
+        assert!(
+            requirements
+                .requirements
+                .iter()
+                .all(|requirement| { requirement.purpose == consumer_config::MountPurpose::GridServingTls })
+        );
+        let desired = gateway_mounts::desired_mounts(&requirements).unwrap_or_else(|_| std::process::abort());
+        assert!(desired.is_empty());
+        assert!(requirements.requirements.iter().any(|requirement| {
+            requirement.secret.name == "grid-ca"
+                && requirement
+                    .items
+                    .iter()
+                    .any(|item| item.path == "/etc/praxis/tls/ca.crt")
+        }));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the chart TLS fixture exercises every required projected file"
+    )]
+    fn chart_managed_serving_tls_must_match_the_secret_refs_and_files() {
+        let deployment: Deployment = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "inference-gw"},
+            "spec": {"template": {"spec": {
+                "containers": [{"name": "praxis", "volumeMounts": [
+                    {"name": "tls", "mountPath": "/etc/praxis/tls", "readOnly": true}
+                ]}],
+                "volumes": [{"name": "tls", "projected": {"sources": [
+                    {"secret": {"name": "grid-site", "items": [
+                        {"key": "tls.crt", "path": "tls.crt"},
+                        {"key": "tls.key", "path": "tls.key"}
+                    ]}},
+                    {"secret": {"name": "grid-ca", "items": [
+                        {"key": "ca.crt", "path": "ca.crt"}
+                    ]}}
+                ]}}]
+            }}}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let requirements = delegated_mount_requirements_document(
+            &consumer_config::ConsumerRenderResult {
+                config_yaml: "listeners: []".to_owned(),
+                requirements: Vec::new(),
+            },
+            "production",
+            &make_gw_ref("inference-gw", "praxis-system"),
+            &make_consumer_config("consumer-config"),
+            &make_serving_tls(),
+            true,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let delegation = MountReconciliation {
+            enabled: true,
+            deployment_name: Some("inference-gw".to_owned()),
+            container_name: "praxis".to_owned(),
+        };
+
+        validate_chart_managed_serving_tls(&requirements, &deployment, &delegation)
+            .unwrap_or_else(|_| std::process::abort());
+    }
+
     fn rendered_overlay_status(gw: &GatewayRef) -> OverlayRevisionStatus {
         OverlayRevisionStatus {
             gateway_name: gw.name.clone(),
@@ -7708,6 +9234,483 @@ mod tests {
             status.message.contains("praxis-consumer-config"),
             "message must name the ConfigMap"
         );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "serializing a fixed status fixture cannot fail")]
+    fn requirements_only_status_does_not_claim_a_deployment_is_ready() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let status = requirements_rendered_status(&gw, "requirements-digest".to_owned(), 7);
+        assert_eq!(status.phase, MountReconciliationPhase::RequirementsRendered);
+        assert_eq!(status.requirements_revision, "requirements-digest");
+        assert!(status.applied_revision.is_empty());
+        assert!(status.deployment_name.is_none());
+        assert_eq!(status.observed_generation, 7);
+        let serialized = serde_json::to_string(&status).expect("serialize status");
+        assert!(!serialized.contains("deploymentName"));
+        assert!(!serialized.contains("private-key"));
+    }
+
+    #[test]
+    fn secret_namespace_mismatch_requires_a_spec_change() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for (reason, expected_phase) in [
+            ("MissingSecret", MountReconciliationPhase::WaitingForSecret),
+            ("MissingSecretKey", MountReconciliationPhase::WaitingForSecret),
+            ("SecretNamespaceMismatch", MountReconciliationPhase::Error),
+        ] {
+            let error = OperatorError::MountReconciliation(mount_failure(reason, "test failure"));
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(status.phase, expected_phase, "incorrect phase for {reason}");
+            assert_eq!(status.reason, reason, "status must retain the specific failure reason");
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the rollout status transitions are exercised against one Deployment fixture"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "deserializing a fixed Deployment fixture must succeed"
+    )]
+    fn delegated_gateway_readiness_requires_current_generation_and_all_replicas() {
+        let mut deployment: Deployment = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "inference-gw", "generation": 5},
+            "spec": {
+                "replicas": 2,
+                "selector": {"matchLabels": {"app": "inference-gw"}},
+                "template": {
+                    "metadata": {"labels": {"app": "inference-gw"}},
+                    "spec": {"containers": [{"name": "praxis", "image": "praxis"}]}
+                }
+            },
+            "status": {"observedGeneration": 5, "replicas": 2, "updatedReplicas": 2, "availableReplicas": 2}
+        }))
+        .expect("valid deployment fixture");
+        assert!(deployment_rollout_ready(&deployment));
+
+        if let Some(status) = deployment.status.as_mut() {
+            status.available_replicas = Some(1);
+        }
+        assert!(!deployment_rollout_ready(&deployment));
+        if let Some(status) = deployment.status.as_mut() {
+            status.available_replicas = Some(2);
+            status.observed_generation = Some(4);
+        }
+        assert!(!deployment_rollout_ready(&deployment));
+        if let Some(status) = deployment.status.as_mut() {
+            status.observed_generation = Some(5);
+            status.replicas = Some(3);
+        }
+        assert!(
+            !deployment_rollout_ready(&deployment),
+            "an old surge replica must block rollout completion"
+        );
+        if let Some(status) = deployment.status.as_mut() {
+            status.replicas = Some(2);
+            status.unavailable_replicas = Some(1);
+        }
+        assert!(
+            !deployment_rollout_ready(&deployment),
+            "unavailable replicas must block rollout completion"
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the Deployment fixture keeps the config volume and target container together"
+    )]
+    fn delegated_config_source_fixture() -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "gateway",
+                "annotations": {
+                    (MOUNT_OPT_IN_ANNOTATION): "enabled",
+                    (MOUNT_NETWORK_ANNOTATION): "production",
+                    (MOUNT_GATEWAY_ANNOTATION): "gateway"
+                }
+            },
+            "spec": {
+                "selector": {"matchLabels": {"app": "gateway"}},
+                "template": {
+                    "metadata": {"labels": {"app": "gateway"}},
+                    "spec": {
+                        "containers": [{
+                            "name": "praxis",
+                            "image": "praxis:test",
+                            "volumeMounts": [{"name": "config", "mountPath": "/etc/praxis", "readOnly": true}]
+                        }],
+                        "volumes": [{
+                            "name": "config",
+                            "configMap": {
+                                "name": "praxis-consumer-config",
+                                "items": [{"key": "praxis.yaml", "path": "praxis.yaml"}]
+                            }
+                        }]
+                    }
+                }
+            }
+        })
+    }
+
+    fn delegated_config_source_check(value: Value) -> Result<bool, OperatorError> {
+        let deployment: Deployment = serde_json::from_value(value).unwrap_or_else(|_| std::process::abort());
+        let delegation = MountReconciliation {
+            enabled: true,
+            deployment_name: Some("gateway".to_owned()),
+            container_name: "praxis".to_owned(),
+        };
+        validate_deployment_delegation(
+            &deployment,
+            "production",
+            &make_gw_ref("gateway", "praxis-system"),
+            &delegation,
+            "praxis-consumer-config",
+        )
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "config source validation cases share one Deployment fixture"
+    )]
+    fn delegated_config_source_requires_the_expected_config_map_and_projection() {
+        let valid = delegated_config_source_fixture();
+        assert!(matches!(delegated_config_source_check(valid.clone()), Ok(false)));
+        let mut alternate = valid.clone();
+        let source_name = alternate
+            .pointer_mut("/spec/template/spec/volumes/0/configMap/name")
+            .unwrap_or_else(|| std::process::abort());
+        *source_name = json!(alternate_consumer_config_map_name("praxis-consumer-config"));
+        assert!(
+            matches!(delegated_config_source_check(alternate), Ok(false)),
+            "a Grid-managed alternate config slot must remain a valid delegated source"
+        );
+
+        for (pointer, replacement) in [
+            (
+                "/spec/template/spec/volumes/0/configMap/name",
+                json!("old-praxis-config"),
+            ),
+            ("/spec/template/spec/containers/0/volumeMounts", json!([])),
+            (
+                "/spec/template/spec/volumes/0/configMap/items/0/key",
+                json!("other.yaml"),
+            ),
+            (
+                "/spec/template/spec/volumes/0/configMap/items/0/path",
+                json!("other.yaml"),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            let target = invalid.pointer_mut(pointer).unwrap_or_else(|| std::process::abort());
+            *target = replacement;
+            assert!(
+                matches!(
+                    delegated_config_source_check(invalid),
+                    Err(OperatorError::MountReconciliation(failure)) if failure.reason == "ConfigSourceMismatch"
+                ),
+                "invalid config source at {pointer} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one patch must carry config, Secret volume, revision, and resourceVersion together"
+    )]
+    fn config_and_secret_projection_switch_in_one_version_guarded_patch() {
+        let mut fixture = delegated_config_source_fixture();
+        let metadata = fixture
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| std::process::abort());
+        metadata.insert("resourceVersion".to_owned(), json!("42"));
+        let deployment: Deployment = serde_json::from_value(fixture).unwrap_or_else(|_| std::process::abort());
+        let base = "praxis-consumer-config";
+        let alternate = inactive_consumer_config_map_name(base, base);
+        assert_eq!(
+            inactive_consumer_config_map_name(base, &alternate),
+            base,
+            "the next complete rollout reuses the now-inactive base slot"
+        );
+        let patch = staged_config_mount_patch(
+            vec![json!({"name": "grid-mount-ca", "projected": {"sources": [{"secret": {"name": "new-ca"}}]}})],
+            &[json!({"name": "grid-mount-ca", "mountPath": "/etc/praxis/tls"})],
+            "config",
+            &alternate,
+            "praxis",
+            &json!({OWNED_MOUNTS_ANNOTATION: "[\"grid-mount-ca\"]"}),
+            &json!({MOUNT_REVISION_ANNOTATION: "mount-2", CONFIG_REVISION_ANNOTATION: "config-2"}),
+        );
+        let guarded = guarded_deployment_patch(patch, &deployment).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            guarded.pointer("/metadata/resourceVersion"),
+            Some(&json!("42")),
+            "a concurrent Deployment writer must cause the whole stage to conflict"
+        );
+        let mut unversioned = deployment;
+        unversioned.metadata.resource_version = None;
+        assert!(
+            matches!(
+                guarded_deployment_patch(guarded.clone(), &unversioned),
+                Err(OperatorError::MountReconciliation(failure)) if failure.reason == "DeploymentInvalid"
+            ),
+            "the operator must not patch a Deployment without a concurrency precondition"
+        );
+        let volumes = guarded
+            .pointer("/spec/template/spec/volumes")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            volumes.iter().any(|volume| {
+                volume.get("name") == Some(&json!("config"))
+                    && volume.pointer("/configMap/name") == Some(&json!(alternate))
+            }),
+            "the new Pod revision must mount the inactive config slot"
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume.get("name") == Some(&json!("grid-mount-ca"))),
+            "the matching Secret projection must be in the same Pod-template patch"
+        );
+        assert_eq!(
+            guarded.pointer(&format!(
+                "/spec/template/metadata/annotations/{}",
+                MOUNT_REVISION_ANNOTATION.replace('/', "~1")
+            )),
+            Some(&json!("mount-2")),
+            "the staged Pod revision must carry the matching mount revision"
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the preserved Deployment and all of its consumers visible as one regression fixture"
+    )]
+    fn mount_ownership_test_deployment_value() -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "gateway",
+                "labels": {"app.kubernetes.io/managed-by": "helm"},
+                "annotations": {"helm.sh/release": "gateway"}
+            },
+            "spec": {
+                "replicas": 2,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}
+                },
+                "selector": {"matchLabels": {"app": "gateway"}},
+                "template": {
+                    "metadata": {
+                        "labels": {"app": "gateway"},
+                        "annotations": {"unrelated": "preserve"}
+                    },
+                    "spec": {
+                        "serviceAccountName": "gateway",
+                        "terminationGracePeriodSeconds": 30,
+                        "containers": [
+                            {
+                                "name": "praxis",
+                                "image": "praxis:test",
+                                "volumeMounts": [
+                                    {"name": "grid-credential", "mountPath": "/run/secrets/grid", "readOnly": true},
+                                    {"name": "praxis-config", "mountPath": "/etc/praxis", "readOnly": true}
+                                ]
+                            },
+                            {
+                                "name": "metrics-sidecar",
+                                "image": "metrics:test",
+                                "volumeMounts": [
+                                    {"name": "metrics-data", "mountPath": "/var/metrics"}
+                                ]
+                            }
+                        ],
+                        "initContainers": [
+                            {
+                                "name": "init-config",
+                                "image": "busybox:test",
+                                "command": ["sh", "-c", "true"],
+                                "volumeMounts": [
+                                    {"name": "init-data", "mountPath": "/init"}
+                                ]
+                            }
+                        ],
+                        "volumes": [
+                            {"name": "grid-credential", "secret": {"secretName": "credential-old"}},
+                            {"name": "praxis-config", "configMap": {"name": "praxis-config"}},
+                            {"name": "metrics-data", "emptyDir": {}},
+                            {"name": "init-data", "configMap": {"name": "init-config"}}
+                        ]
+                    }
+                }
+            }
+        })
+    }
+
+    fn mount_ownership_test_deployment() -> Deployment {
+        serde_json::from_value(mount_ownership_test_deployment_value()).unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn mount_ownership_test_pod_spec(deployment: &Deployment) -> &k8s_openapi::api::core::v1::PodSpec {
+        let Some(pod_spec) = deployment.spec.as_ref().and_then(|spec| spec.template.spec.as_ref()) else {
+            std::process::abort();
+        };
+        pod_spec
+    }
+
+    fn append_mount_to_test_container(value: &mut Value, container_list: &str, container_index: usize, mount: Value) {
+        let Some(containers) = value
+            .get_mut("spec")
+            .and_then(|spec| spec.get_mut("template"))
+            .and_then(|template| template.get_mut("spec"))
+            .and_then(|spec| spec.get_mut(container_list))
+            .and_then(Value::as_array_mut)
+        else {
+            std::process::abort();
+        };
+        let Some(container) = containers.get_mut(container_index) else {
+            std::process::abort();
+        };
+        let Some(mounts) = container.get_mut("volumeMounts").and_then(Value::as_array_mut) else {
+            std::process::abort();
+        };
+        mounts.push(mount);
+    }
+
+    fn assert_mount_ownership_test_deployment_unchanged(deployment: &Deployment, original: &Value) {
+        let current = serde_json::to_value(deployment).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(current, *original, "the ownership check must not mutate the Deployment");
+        assert_eq!(current.pointer("/spec/strategy/type"), Some(&json!("RollingUpdate")));
+        assert_eq!(
+            current.pointer("/spec/template/metadata/annotations/unrelated"),
+            Some(&json!("preserve"))
+        );
+        assert_eq!(
+            current.pointer("/spec/template/spec/containers/1/volumeMounts/0/name"),
+            Some(&json!("metrics-data"))
+        );
+        assert_eq!(
+            current.pointer("/spec/template/spec/initContainers/0/volumeMounts/0/name"),
+            Some(&json!("init-data"))
+        );
+    }
+
+    fn is_mount_ownership_conflict(error: &OperatorError) -> bool {
+        matches!(error, OperatorError::MountReconciliation(failure) if failure.reason == "OwnershipConflict")
+    }
+
+    #[test]
+    fn replacing_shared_grid_volume_with_sidecar_is_rejected_without_deployment_changes() {
+        let mut value = mount_ownership_test_deployment_value();
+        append_mount_to_test_container(
+            &mut value,
+            "containers",
+            1,
+            json!({"name": "grid-credential", "mountPath": "/run/shared/grid", "readOnly": true}),
+        );
+        let deployment: Deployment = serde_json::from_value(value).unwrap_or_else(|_| std::process::abort());
+        let original = serde_json::to_value(&deployment).unwrap_or_else(|_| std::process::abort());
+        let replacement = json!({"name": "grid-credential", "secret": {"secretName": "credential-new"}});
+        let result = owned_volume_mutation_patch(
+            mount_ownership_test_pod_spec(&deployment),
+            "praxis",
+            "grid-credential",
+            Some(&replacement),
+        );
+
+        let error = result.err().unwrap_or_else(|| std::process::abort());
+        assert!(is_mount_ownership_conflict(&error));
+        assert_mount_ownership_test_deployment_unchanged(&deployment, &original);
+    }
+
+    #[test]
+    fn replacing_shared_grid_volume_with_init_container_is_rejected_without_deployment_changes() {
+        let mut value = mount_ownership_test_deployment_value();
+        append_mount_to_test_container(
+            &mut value,
+            "initContainers",
+            0,
+            json!({"name": "grid-credential", "mountPath": "/run/shared/grid", "readOnly": true}),
+        );
+        let deployment: Deployment = serde_json::from_value(value).unwrap_or_else(|_| std::process::abort());
+        let original = serde_json::to_value(&deployment).unwrap_or_else(|_| std::process::abort());
+        let replacement = json!({"name": "grid-credential", "secret": {"secretName": "credential-new"}});
+        let result = owned_volume_mutation_patch(
+            mount_ownership_test_pod_spec(&deployment),
+            "praxis",
+            "grid-credential",
+            Some(&replacement),
+        );
+
+        let error = result.err().unwrap_or_else(|| std::process::abort());
+        assert!(is_mount_ownership_conflict(&error));
+        assert_mount_ownership_test_deployment_unchanged(&deployment, &original);
+    }
+
+    #[test]
+    fn deleting_stale_grid_volume_with_init_container_is_rejected_without_deployment_changes() {
+        let mut value = mount_ownership_test_deployment_value();
+        append_mount_to_test_container(
+            &mut value,
+            "initContainers",
+            0,
+            json!({"name": "grid-credential", "mountPath": "/run/shared/grid", "readOnly": true}),
+        );
+        let deployment: Deployment = serde_json::from_value(value).unwrap_or_else(|_| std::process::abort());
+        let original = serde_json::to_value(&deployment).unwrap_or_else(|_| std::process::abort());
+        let result = owned_volume_mutation_patch(
+            mount_ownership_test_pod_spec(&deployment),
+            "praxis",
+            "grid-credential",
+            None,
+        );
+
+        let error = result.err().unwrap_or_else(|| std::process::abort());
+        assert!(is_mount_ownership_conflict(&error));
+        assert_mount_ownership_test_deployment_unchanged(&deployment, &original);
+    }
+
+    #[test]
+    fn unshared_grid_volume_rotation_and_deletion_preserve_unrelated_deployment_state() {
+        let deployment = mount_ownership_test_deployment();
+        let original = serde_json::to_value(&deployment).unwrap_or_else(|_| std::process::abort());
+        let replacement = json!({"name": "grid-credential", "secret": {"secretName": "credential-new"}});
+        let replacement_patch = owned_volume_mutation_patch(
+            mount_ownership_test_pod_spec(&deployment),
+            "praxis",
+            "grid-credential",
+            Some(&replacement),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let deletion_patch = owned_volume_mutation_patch(
+            mount_ownership_test_pod_spec(&deployment),
+            "praxis",
+            "grid-credential",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            replacement_patch,
+            vec![json!({"name": "grid-credential", "$patch": "delete"}), replacement]
+        );
+        assert_eq!(
+            deletion_patch,
+            vec![json!({"name": "grid-credential", "$patch": "delete"})]
+        );
+        assert_mount_ownership_test_deployment_unchanged(&deployment, &original);
     }
 
     #[test]
@@ -8335,7 +10338,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_agent_tool_provider(name: &str, network: &str, tools: &[&str]) -> AgentToolProvider {
-        let tools_json: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let tools_json: Vec<Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "AgentToolProvider",
@@ -8355,7 +10358,7 @@ mod tests {
         spec_tools: &[&str],
         discovered: &[&str],
     ) -> AgentToolProvider {
-        let tools_json: Vec<serde_json::Value> = spec_tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let tools_json: Vec<Value> = spec_tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
         let discovered_json: Vec<&str> = discovered.to_vec();
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",

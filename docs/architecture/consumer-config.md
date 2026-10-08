@@ -37,16 +37,46 @@ clusterEndpoints:
 Key differences:
 
 - `sni` moves from a top-level field to `transport.sni`.
-- `transport.mode` is the security switch (`mutual_tls` or explicit
-  insecure/dev-only `plaintext`), not `sni` presence.
+- `transport.mode` is the security switch (`mutual_tls`, server-authenticated
+  `tls`, or explicit insecure/dev-only `plaintext`), not `sni` presence.
 - Missing `transport` fails closed — the operator will not render the cluster entry.
-- `plaintext` must not set `sni` (rejected as likely misconfiguration).
+- `plaintext` must not set a nonblank `sni` (rejected as likely misconfiguration).
+
+### Custom backend CA Secret namespace
+
+`clusterEndpoints[].transport.caSecretRef` is namespace-local to the target
+gateway. Specify the Secret `name` and, optionally, its `key`; the Secret must
+exist in the namespace from that entry's `GatewayRef.namespace`:
+
+```yaml
+transport:
+  mode: tls
+  sni: api.example.internal
+  caSecretRef:
+    name: api-provider-ca
+    # key: ca.crt
+```
+
+This is a field-specific API change: remove `namespace` from existing
+`transport.caSecretRef` values and ensure the Secret is in the target gateway
+namespace before applying the updated `GridNetwork`. Kubernetes prunes unknown
+fields from CRD requests: `Warn` mode accepts the object and reports a warning,
+while `Ignore` mode drops the field silently. `Strict` mode rejects the request;
+`kubectl --validate=true` uses strict validation where supported. Existing
+objects accepted under the previous schema should be updated from a manifest
+with the field removed. Do not rely on an old namespace value or move/copy
+Secrets across namespaces. This change does not affect
+`GridNetwork.spec.tls.caSecretRef`, provider credential references, or provider
+health-check TLS references; those keep their existing explicit namespace
+behavior.
 
 ## Implemented: GatewayRef.consumerConfig
 
 When `spec.gatewayRefs[].consumerConfig.enabled: true`, the `GridNetwork`
-controller renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace on
-every reconcile.  The generated config includes:
+controller renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace
+when consumer configuration renders successfully. An empty candidate overlay
+produces a fail-closed 503-only config without route filters. For nonempty
+candidates, the generated config includes:
 
 **Validation status:** `verify-api-fallback-native` proves end-to-end runtime
 consumption of the operator-generated `ConfigMap`.  The xtask harness reads the
@@ -66,9 +96,9 @@ The generated config is a complete, runnable Praxis config containing:
     candidates are present — token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
     cluster must have a matching `consumerConfig.clusterEndpoints[]` entry with
-    endpoint address and explicit `transport` configuration (`mutual_tls` or
-    `plaintext`).  Missing transport fails closed — the operator will not
-    silently render a plain-HTTP cluster when transport intent is absent
+    endpoint address and explicit `transport` configuration (`mutual_tls`,
+    `tls`, or `plaintext`). Missing transport fails closed: the operator will
+    not silently render a plain-HTTP cluster when transport intent is absent.
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
@@ -81,9 +111,10 @@ gateway Deployment with a Secret-backed environment reference. See
 Praxis 0.7.1 trace-linkage limitation.
 
 This generated config covers the direct API-provider path where the consumer
-gateway is often also the final-hop gateway for the provider API call.  Remote
-provider sites follow the same SecretRef contract, but the provider credential
-should be mounted only where the final backend call is made.
+gateway is also the final-hop gateway for the provider API call. A credential
+reference is rendered and mounted only on the gateway whose local site matches
+the candidate's site. Remote candidates therefore receive their credentials at
+the provider site's final backend hop, rather than at an earlier gateway.
 
 The generated config requires a Praxis AI image that contains the
 `credential_inject` filter. AGN can render the config and project
@@ -97,6 +128,117 @@ field reference.
 
 After enabling `consumerConfig.enabled: true` for a gateway, the `GridNetwork`
 status reports the outcome under `status.consumerConfigStatus[]`.
+
+### Delegated mount reconciliation
+
+Secret mount management remains opt-in. Set
+`consumerConfig.mountReconciliation.enabled: true` and name the exact Deployment
+and Praxis container. The operator verifies that the Deployment carries the
+matching explicit opt-in annotations and mounts the generated `praxis.yaml`
+ConfigMap at `/etc/praxis` before it patches volumes or mounts.
+`charts/praxis-gateway` can add those annotations with
+`mountReconciliation.enabled`; its `mountReconciliation.network` and
+`mountReconciliation.gatewayRef` must match the GridNetwork and `GatewayRef`.
+
+Point the chart at the operator-generated config map with
+`config.existingConfigMap: praxis-consumer-config` and keep
+`gatewayConfig.render: false`. List the credential Secret names in
+`mountReconciliation.managedCredentialNames`, and keep
+`mountReconciliation.releaseHelmMounts: false` for the preparation phase. The
+chart retains all credential and TLS mounts during this phase. For an existing
+release, move `consumerConfig.credentialMountBase` and (when consumer mTLS is
+used without Grid serving) `consumerConfig.tlsCertMountPath` to paths that do
+not overlap Helm mounts. Grid installs its mounts and rolls the generated
+config while the prior Helm files remain available. After
+`mountReconciliationStatus: Ready`, set `releaseHelmMounts: true` and upgrade
+the chart to remove only the selected old credential mounts and, without Grid
+serving, the old TLS projection. Listener TLS and other chart-managed Secret
+mounts remain Helm-owned.
+
+With `gridServing.enabled`, the chart retains its TLS projection at
+`/etc/praxis/tls` permanently because the serving pollers read those files.
+The chart adds a marker that lets Grid validate those Secret keys and include
+their resource versions in rollout decisions without taking ownership of the
+mount. The chart's `tls.existingSecret` and `tls.caSecret` must match the
+GridNetwork's site identity and CA references; the chart enforces the fixed
+mount path.
+
+Create the referenced ConfigMap with a valid bootstrap `praxis.yaml` before
+installing the gateway. Once the bootstrap Deployment is ready, Grid writes the
+generated config to an inactive, Grid-managed ConfigMap slot and changes the
+Pod template's config source, Secret projections, and revision annotations in
+one patch. Old pods keep their previous config and projections during rollout.
+Grid waits until no old replicas remain before reusing the inactive slot or
+pruning obsolete mounts. This also lets a new Deployment become ready before
+Grid replaces the bootstrap config. This verifies the Kubernetes rollout, not
+Praxis acceptance of populated routes. The current generated inline candidates
+include `admission_state` and `selection_group`, which the tested Praxis image
+rejects. Populated-route use requires the versioned-overlay config in
+[Grid #270](https://github.com/praxis-proxy/grid/pull/270), a compatible image
+containing [Praxis AI #1539](https://github.com/praxis-proxy/ai/pull/1539), and
+an unmodified generated-config request probe. Until then, do not release
+Helm-owned mounts for a populated route based on Deployment or mount `Ready`
+status alone.
+
+The operator publishes a reference-only ConfigMap named
+`grid-mount-requirements-<first 16 hex characters of SHA-256(configMapName)>`,
+with its document under `mount-requirements.json`. It verifies every
+referenced Secret and required key in the gateway namespace, and adds only its
+reserved volumes and the selected container's mounts. It stages the matching
+Praxis configuration and Secret mounts in the same Pod revision, including for
+Secret reference and key changes. When a reference is removed, the old mount
+remains until pods with the new config are ready, then Grid removes only mounts
+recorded as Grid-owned.
+If the last provider disappears, the operator distributes an empty authoritative
+routing overlay and renders the generated consumer config as a 503-only response
+with no `intelligent_route` filter. For delegated mounts, the empty overlay is
+published before the 503-only config is reconciled, so consumers using the
+watched overlay stop selecting providers even if config reconciliation fails.
+A static-only consumer still needs the 503-only config to apply and reload.
+Obsolete Grid-owned mounts are pruned only after the matching config rollout is
+ready. Other Deployment fields, containers, volumes, mounts, and Helm resources
+are preserved.
+
+For delegated mounts, all credential, Grid CA, site identity, and custom backend
+CA Secrets must be in the gateway namespace. For server-authenticated `tls`
+endpoints, `clusterEndpoints[].transport.caSecretRef` selects a CA Secret from
+that gateway namespace; its key defaults to `ca.crt`. Mutual TLS uses the Grid
+CA and site identity from `GridNetwork.spec.tls`. Secret contents and private
+keys are never copied into generated ConfigMaps, status, or logs.
+The operator does not maintain a per-reference Secret allowlist: an
+`InferenceProvider` author can select a Secret key in the gateway namespace for
+the final-hop credential. Restrict `InferenceProvider` writes to trusted
+control-plane users and keep only gateway-authorized credentials in that
+namespace. The chart's `managedCredentialNames` supports mount handoff; it is
+not an authorization list.
+When mount reconciliation is disabled, the operator still renders the mTLS
+file paths but leaves their mounts with the gateway owner; Grid CA and site
+identity Secret references are required only for delegated mounts.
+Disabling mount reconciliation or deleting the `GridNetwork` does not remove
+previously Grid-owned Deployment mounts. Hand ownership back to the Deployment
+manager or remove those mounts explicitly after moving the gateway off the
+generated configuration. Before disabling delegation, move the Deployment's
+config volume back to `consumerConfig.configMapName` and wait for its rollout;
+the alternate slot is only maintained while delegation is enabled. Do not
+treat disabling the feature as credential revocation; revoke or rotate the
+Secret and verify the Deployment separately.
+
+`consumerConfigStatus[].phase: Rendered` means the config map was rendered and
+applied. It does not mean the gateway has restarted or become ready. With mount
+reconciliation enabled, `mountReconciliationStatus[]` reports
+`MountsReconciling`, `WaitingForSecret`, `WaitingForRollout`, `Ready`, or
+`Error`. `Ready` requires a completed Deployment rollout with no old replicas;
+the selected Praxis container must mount Grid's generated ConfigMap and
+`praxis.yaml` key at `/etc/praxis`. Secret resource versions are hashed before
+they are placed in pod annotations; Secret values are never used as rollout
+metadata.
+A deliberately scaled-to-zero Deployment stays `WaitingForRollout` until pods
+are started and a complete rollout proves the mounts and config are present.
+
+The operator's `grid-operator-resources` RoleBinding needs `deployments` `get`
+and `patch` in the gateway namespace for this opt-in feature. With a nonempty
+candidate overlay and the feature disabled, the operator publishes the
+requirements document but does not read or patch gateway Deployments.
 
 ### Reading consumer config status
 
@@ -143,7 +285,7 @@ Example failure output:
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
 | `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
-| `MissingSni` | `Error` | A `mutual_tls` cluster endpoint has no (or blank) `sni` — mTLS requires a server name |
+| `MissingSni` | `Error` | A `mutual_tls` or `tls` cluster endpoint has no (or blank) `sni`; TLS requires a server name |
 | `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
 | `ConsumerConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
 | `ConsumerConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
@@ -179,13 +321,13 @@ cluster before restarting or rolling out the consumer gateway.
 
 A cluster endpoint has no `transport` field.  The operator requires every
 `clusterEndpoints[]` entry to declare explicit transport intent — either
-`mutual_tls` (with `sni`) or `plaintext`.  Add a `transport` block to the
+`mutual_tls` or `tls` (both with `sni`), or `plaintext`. Add a `transport` block to the
 identified endpoint.  The operator will not guess whether a cluster should use
 TLS or plaintext.
 
 **Phase is `Error` / reason `MissingSni`**
 
-A `mutual_tls` cluster endpoint has a blank or missing `sni` field.  The `sni`
+A `mutual_tls` or `tls` cluster endpoint has a blank or missing `sni` field. The `sni`
 must match the Subject Alternative Name in the provider gateway's server
 certificate.  Add a non-blank `sni` to the endpoint's `transport` block.
 
@@ -206,11 +348,12 @@ Listener and other startup settings still require a restart. The routing
 overlay is a separate file that `intelligent_route` validates and reloads. See
 [Reload and rollout](#reload-and-rollout) below.
 
-When no inference candidates remain, the operator removes its generated static
-consumer `ConfigMap` so a future start cannot load stale routes. That deletion
-does not revoke routes already loaded by a running static-only consumer; use a
-rollout or explicit reload for that path. The dynamic overlay and grid serving
-config publish an empty authoritative candidate set and fail closed in process.
+When no inference candidates remain, the operator distributes an empty
+authoritative routing overlay and updates its generated consumer `ConfigMap` to
+a 503-only response with no `intelligent_route` filter. The ConfigMap update
+does not itself restart gateway pods; use a supported file reload or restart
+when the running gateway does not reload it. The empty overlay also fails closed
+for routes already using the dynamic overlay.
 
 ## Edge-ingress deployments
 
@@ -242,9 +385,12 @@ deployment architecture.
 
 ## Reload and rollout
 
-The operator applies the consumer Praxis `ConfigMap` on every reconcile. The
-consumer gateway pod is not owned by the operator and is not automatically
-restarted when the complete generated Praxis configuration changes.
+Without delegated mount reconciliation, the operator applies the consumer
+Praxis `ConfigMap` on each changed render, but does not automatically restart
+gateway pods. With delegation enabled, Grid alternates between the configured
+ConfigMap and a Grid-managed slot. It writes the inactive slot before one
+Pod-template update switches the config source and required Secret mounts, then
+waits for that Deployment rollout to complete.
 
 A Praxis build with file watching applies supported `praxis.yaml` changes
 after the mounted file refreshes. Invalid replacements retain the running
@@ -258,6 +404,10 @@ kubectl rollout restart deployment/praxis-consumer -n <namespace>
 Check the [Praxis reload reference][praxis-reload] for settings supported by
 your image. Mounted Secret changes are separate from `praxis.yaml` changes;
 do not assume every filter reloads its credential or certificate files.
+
+Delegated mount reconciliation detects endpoint and Secret reference changes
+and Secret rotations. The Deployment owner remains responsible for any
+startup-only configuration changes outside that delegation.
 
 The dynamic routing overlay reloads independently. The current `grid-gateway`
 also watches `serving-config.json` and the signals pollers' identity files every
