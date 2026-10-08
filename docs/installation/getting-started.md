@@ -29,6 +29,9 @@ LoadBalancer address in one cluster is reachable from the other.
 for c in hub site; do kind create cluster --name "$c"; done
 ```
 
+Under rootless Podman, kind needs systemd delegation: run each create as
+`systemd-run --scope --user -p Delegate=yes kind create cluster --name "$c"`.
+
 Pick the LoadBalancer addresses from the high end of that network's IPv4
 subnet, read from the hub node, so they work under either runtime. Kind nodes
 take low addresses, so `.230` through `.249` are free when no other kind clusters
@@ -104,9 +107,9 @@ helm upgrade --install grid-operator $CHARTS/grid-operator --version $VERSION \
 
 helm upgrade --install grid-site $CHARTS/grid-site --version $VERSION \
   --kube-context kind-hub -n grid \
-  --set gridNetwork.gridId=grid-1 --set gridSite.name=hub \
+  --set gridNetwork.gridId=grid-1 --set gridSite.name=hub --set gridSite.region=us-east \
   --set gridNetwork.peerTrust.mode=spiffe --set gridNetwork.signalTransport.mode=poll \
-  --set peers.site-a.address=$SITE_GW_IP:8080 \
+  --set peers.site-a.address=$SITE_GW_IP:8080 --set peers.site-a.region=us-west \
   --set "gridNetwork.gatewayRefs[0].name=grid-gateway" \
   --set "gridNetwork.gatewayRefs[0].namespace=grid" \
   --set "gridNetwork.gatewayRefs[0].localSiteName=hub"
@@ -199,8 +202,9 @@ helm upgrade --install grid-operator $CHARTS/grid-operator --version $VERSION \
 
 helm upgrade --install grid-site $CHARTS/grid-site --version $VERSION \
   --kube-context kind-site -n grid \
-  --set gridNetwork.gridId=grid-1 --set gridSite.name=site-a \
+  --set gridNetwork.gridId=grid-1 --set gridSite.name=site-a --set gridSite.region=us-west \
   --set gridNetwork.peerTrust.mode=spiffe --set gridNetwork.signalTransport.mode=poll \
+  --set peers.hub.region=us-east \
   --set inferenceProviders.model.endpoint=http://$MODEL_IP:8000 \
   --set inferenceProviders.model.model=$MODEL
 
@@ -218,15 +222,21 @@ The site operator redeems its invite on first start and writes the site
 identity, `spiffe://grid.internal/site/site-a`. The site gateway admits only the
 hub's SPIFFE ID.
 
+Each site declares the other as a peer. Declaring a peer turns on site
+discovery and the TLS the signals endpoint serves with. Under SPIFFE there is no
+digest to pin, so each names the other's region.
+
 ## Send a Request
 
-Check that the hub sees the site, then send a request through the hub gateway.
+Wait for the hub to verify the site, then send a request through the hub
+gateway.
 
 ```bash
-kubectl --context kind-hub get gridsites
+kubectl --context kind-hub wait gridsite/grid-site-a \
+  --for=jsonpath='{.status.phase}'=Active --timeout=10m
 kubectl --context kind-hub -n grid port-forward service/grid-gateway 8080:8080 &
 curl -sS -D - http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"ping\"}]}"
+  -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"ping\"}], \"max_tokens\": 16}"
 ```
 
 The response carries `x-grid-provider-site: site-a`, the site that served it.
