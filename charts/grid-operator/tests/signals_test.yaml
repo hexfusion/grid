@@ -215,3 +215,117 @@ tests:
           content:
             name: GRID_SWIM_SEEDS
             value: "seed-a:7946"
+
+  - it: sets the peer poll interval only when asked
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 5
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+            value: "5"
+
+  - it: leaves the interval to the operator when unset
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+          any: true
+
+  - it: refuses an interval the operator would exit on
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: -5
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses a non-numeric interval
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: often
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses zero, which Helm would drop for the default without saying so
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 0
+    asserts:
+      - failedTemplate: {}
+
+  - it: takes one second, the floor
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 1
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+            value: "1"
+
+  - it: refuses an interval past what the operator can parse
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: "18446744073709551616"
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses an interval past the ceiling
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 100000
+    asserts:
+      - failedTemplate: {}
+
+  - it: takes the ceiling
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 99999
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+            value: "99999"
