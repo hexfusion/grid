@@ -109,6 +109,30 @@ tests:
             - action: labeldrop
               regex: cluster
 
+  - it: leaves the scrape timeout to Prometheus unless it is set
+    template: templates/servicemonitor.yaml
+    set:
+      metricsListener.serviceMonitor.enabled: true
+      metricsListener.serviceMonitor.caConfigMap: {name: openshift-service-ca.crt, key: service-ca.crt}
+    asserts:
+      - notExists:
+          path: spec.endpoints[0].scrapeTimeout
+
+  - it: scrapes with the timeout it is given, for an interval under Prometheus's default
+    template: templates/servicemonitor.yaml
+    set:
+      metricsListener.serviceMonitor.enabled: true
+      metricsListener.serviceMonitor.caConfigMap: {name: openshift-service-ca.crt, key: service-ca.crt}
+      metricsListener.serviceMonitor.interval: 5s
+      metricsListener.serviceMonitor.scrapeTimeout: 5s
+    asserts:
+      - equal:
+          path: spec.endpoints[0].interval
+          value: 5s
+      - equal:
+          path: spec.endpoints[0].scrapeTimeout
+          value: "5s"
+
   - it: refuses the listener without the NetworkPolicy
     template: templates/deployment.yaml
     set:

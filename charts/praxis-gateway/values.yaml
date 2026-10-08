@@ -357,6 +357,10 @@ metricsListener:
     enabled: false
     # -- Scrape interval.
     interval: 30s
+    # -- Scrape timeout. Unset leaves Prometheus's default of 10s, which Prometheus
+    # refuses when it exceeds the interval, so an interval under 10s needs this set
+    # to at most the interval.
+    scrapeTimeout: ""
     # -- ConfigMap holding the CA that signed the metrics cert. Required when enabled.
     caConfigMap:
       name: ""
