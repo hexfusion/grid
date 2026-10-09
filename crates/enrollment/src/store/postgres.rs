@@ -20,6 +20,8 @@ static SCHEMA_ENROLLMENTS: &str = include_str!("../../db/schema/0002_create_site
 static SCHEMA_RENEWAL: &str = include_str!("../../db/schema/0003_site_enrollment_renewal.up.sql");
 /// Advisory-lock key that serializes schema application across instances.
 const SCHEMA_LOCK_KEY: i64 = 0x671D_E401;
+/// Advisory-lock class for mints, keyed with a hash of the site name.
+const MINT_LOCK_CLASS: i32 = 0x671D_E402;
 
 /// Records held in Postgres.
 #[derive(Debug, Clone)]
@@ -57,8 +59,36 @@ impl PgStore {
         Ok(Self { pool })
     }
 
-    /// Record a token.
+    /// Record a token, unless the name is held or a live token pins it.
+    ///
+    /// A per-name advisory lock serializes the check and the insert.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the lock, check, and insert read as one transaction"
+    )]
     pub(super) async fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(backend)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+            .bind(MINT_LOCK_CLASS)
+            .bind(&token.site_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let (enrolled, outstanding): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM site_enrollments WHERE site_name = $1),
+                    EXISTS (SELECT 1 FROM site_tokens
+                             WHERE site_name = $1 AND redeemed_at IS NULL AND expires_at > NOW())",
+        )
+        .bind(&token.site_name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if enrolled {
+            return Err(StoreError::NameTaken);
+        }
+        if outstanding {
+            return Err(StoreError::TokenOutstanding);
+        }
         let token_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO site_tokens
@@ -71,9 +101,10 @@ impl PgStore {
         .bind(&token.grid_network_ref)
         .bind(&token.issued_by)
         .bind(token.expires_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
         Ok(token_id)
     }
 
@@ -110,9 +141,9 @@ impl PgStore {
     /// Redeem a token by digest, sign under its pin, and record the enrollment.
     ///
     /// One transaction covers the guarded consume, the sign, and the audit
-    /// insert. A failing sign or a name conflict rolls it back, so the token is
-    /// spent only when the certificate is issued. The guarded update is the row
-    /// lock that serializes concurrent redemptions of one token.
+    /// insert. A failing sign rolls it back, so the token is spent only when the
+    /// certificate is issued; a name conflict revokes it. The guarded update is the
+    /// row lock that serializes concurrent redemptions of one token.
     #[expect(
         clippy::too_many_lines,
         reason = "the consume, sign, and audit insert read as one transaction"
@@ -143,11 +174,16 @@ impl PgStore {
 
         // Sign inside the transaction. A failure returns here, and the dropped
         // transaction rolls the consume back, so the token is not spent.
-        let issued = sign(&pin)?;
+        let issued = match sign(&pin) {
+            Err(StoreError::NameTaken) => return Self::forfeit(tx, token_id).await,
+            signed => signed?,
+        };
 
+        // DO NOTHING keeps the transaction usable to forfeit the token.
         let inserted = sqlx::query(
             "INSERT INTO site_enrollments (id, site_token_id, site_name, public_key_sha256, spiffe_id, not_after)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (site_name) DO NOTHING",
         )
         .bind(enrollment_id)
         .bind(token_id)
@@ -156,15 +192,28 @@ impl PgStore {
         .bind(&issued.spiffe_id)
         .bind(issued.not_after())
         .execute(&mut *tx)
-        .await;
-        match inserted {
-            Ok(_done) => {},
-            Err(err) if is_unique_violation(&err) => return Err(StoreError::NameTaken),
-            Err(err) => return Err(backend(err)),
+        .await
+        .map_err(backend)?;
+        if inserted.rows_affected() == 0 {
+            return Self::forfeit(tx, token_id).await;
         }
 
         tx.commit().await.map_err(backend)?;
         Ok((enrollment_id, issued))
+    }
+
+    /// Commit the removal of a token that lost its name, and refuse the redeem.
+    async fn forfeit(
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        token_id: Uuid,
+    ) -> Result<(Uuid, Issued), StoreError> {
+        sqlx::query("DELETE FROM site_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Err(StoreError::NameTaken)
     }
 
     /// The name's record, locked for this transaction, with whether it is reserved.
@@ -357,11 +406,6 @@ fn held_from(row: &sqlx::postgres::PgRow) -> Result<Held, sqlx::Error> {
         frozen: row.try_get("frozen")?,
         seed_generation: generation.and_then(|value| u64::try_from(value).ok()),
     })
-}
-
-/// Whether an error is the unique index refusing a duplicate.
-fn is_unique_violation(err: &sqlx::Error) -> bool {
-    matches!(err.as_database_error().and_then(sqlx::error::DatabaseError::code), Some(code) if code == "23505")
 }
 
 /// Wrap any backend failure.
