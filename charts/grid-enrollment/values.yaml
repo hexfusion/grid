@@ -43,8 +43,13 @@ ca:
   # Replace an existing CA in place. Off by default: regenerating the CA
   # invalidates every certificate it has issued. If the CA key Secret is lost while
   # the CA bundle still exists, bootstrap refuses to mint a new CA, since that would
-  # split the grid: restore the key from backup, or set this to start a new grid.
+  # split the grid: restore the key from backup, or set this and confirmRotation to
+  # start a new grid.
   forceRegenerate: false
+  # -- The service records the SHA-256 of the CA's public key in the database and
+  # refuses to start with a CA on any other key. To start a new grid on purpose, set this to the OLD
+  # fingerprint the refusal names, exactly as printed. Clear it once the new CA serves.
+  confirmRotation: ""
   provided:
     # Reference to a pre-created {tls.crt,tls.key} Secret. Never inline the key
     # in values: Helm persists release values (helm get values, GitOps, CI logs).

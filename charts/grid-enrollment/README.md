@@ -68,6 +68,9 @@ The bootstrap writes three Secrets:
 
 Generation is idempotent and runs only when the CA is absent. `ca.forceRegenerate`
 replaces the CA in place, which invalidates every certificate it has issued.
+The service records the fingerprint of the CA's public key in the database and
+refuses a CA with another key unless `ca.confirmRotation` is set to the old
+fingerprint. A CA certificate renewed on the same key is accepted.
 
 ## Bring your own (overrides)
 
