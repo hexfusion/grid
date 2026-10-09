@@ -279,4 +279,7 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
   Secret as narrow as access to `grid-ca-key`.
 - The service keeps each site's current and previous key, so a rotation whose
   answer was lost retries safely. Any other valid key is a fork.
+- The service signs only EC keys on P-256 or P-384, at enrollment and at
+  rotation, and refuses any other key with 400 `invalid_csr`. The operator
+  generates P-256 keys.
 - Enrollment and invites are specified in the repository's `api` directory.

@@ -703,3 +703,22 @@ async fn a_reserved_names_seeded_key_cannot_enroll_a_spoke() {
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "key_reused");
 }
+
+#[tokio::test]
+async fn an_rsa_key_is_refused_on_rotation_and_the_record_is_kept() {
+    let grid = grid(&[]);
+    let first = enroll(&grid, "site-a").await;
+    for rsa in [
+        include_str!("../../certs/tests/fixtures/requests/rsa-1024.csr"),
+        include_str!("../../certs/tests/fixtures/requests/rsa-2048.csr"),
+    ] {
+        let (status, body) = renew_with(&grid, Some(&first), rsa).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_csr");
+    }
+    assert_eq!(
+        renew(&grid, "site-a", Some(&first)).await.status,
+        StatusCode::OK,
+        "the current key still rotates"
+    );
+}

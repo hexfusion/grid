@@ -455,6 +455,22 @@ async fn a_malformed_csr_is_refused_on_enroll() {
     assert_eq!(retry, StatusCode::CREATED, "a malformed CSR does not spend the token");
 }
 
+#[tokio::test]
+async fn an_rsa_key_is_refused_on_enroll_without_spending_the_token() {
+    let app = service();
+    let (token, _id) = mint(&app, "site-d").await;
+    for rsa in [
+        include_str!("../../certs/tests/fixtures/requests/rsa-1024.csr"),
+        include_str!("../../certs/tests/fixtures/requests/rsa-2048.csr"),
+    ] {
+        let (status, body) = enroll(&app, &token, rsa).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_csr");
+    }
+    let (retry, _) = enroll(&app, &token, &plain_csr()).await;
+    assert_eq!(retry, StatusCode::CREATED, "the token is still unspent");
+}
+
 /// An issued site certificate must not be a CA, or a compromised site could mint
 /// sub-certificates for names it was never granted.
 #[tokio::test]

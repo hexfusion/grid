@@ -330,11 +330,13 @@ impl IntoResponse for ApiError {
 fn signing_error(err: EnrollError) -> ApiError {
     match err {
         EnrollError::Signing(detail) => ApiError::Internal(detail),
-        EnrollError::TooLarge | EnrollError::Malformed | EnrollError::BadSignature | EnrollError::InvalidSiteName => {
-            ApiError::BadRequest {
-                code: ErrorCode::InvalidCsr,
-                message: err.to_string(),
-            }
+        EnrollError::TooLarge
+        | EnrollError::Malformed
+        | EnrollError::BadSignature
+        | EnrollError::UnsupportedKey
+        | EnrollError::InvalidSiteName => ApiError::BadRequest {
+            code: ErrorCode::InvalidCsr,
+            message: err.to_string(),
         },
     }
 }

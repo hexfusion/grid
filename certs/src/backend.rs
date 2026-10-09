@@ -25,6 +25,37 @@ pub(crate) use openssl_backend::{
     sign_csr, sign_message, verify_leaf_signature, verify_message,
 };
 
+/// Refuse a request key other than an uncompressed EC point on a named P-256 or
+/// P-384 curve: the keys this grid issues and its peers verify.
+pub(crate) fn check_request_key(spki_der: &[u8]) -> Result<(), BackendError> {
+    use x509_parser::{
+        oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_NIST_EC_P384},
+        prelude::FromDer as _,
+        x509::SubjectPublicKeyInfo,
+    };
+
+    let (rest, spki) = SubjectPublicKeyInfo::from_der(spki_der).map_err(|_bad| BackendError::ParseCsr)?;
+    if !rest.is_empty() || spki.algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY {
+        return Err(BackendError::UnsupportedKey);
+    }
+    // Explicit curve parameters are not an OID, so they fall through and are refused.
+    let point_len = match spki
+        .algorithm
+        .parameters
+        .as_ref()
+        .and_then(|params| params.as_oid().ok())
+    {
+        Some(curve) if curve == OID_EC_P256 => 65,
+        Some(curve) if curve == OID_NIST_EC_P384 => 97,
+        _ => return Err(BackendError::UnsupportedKey),
+    };
+    let point = &spki.subject_public_key.data;
+    if point.len() != point_len || point.first() != Some(&0x04) {
+        return Err(BackendError::UnsupportedKey);
+    }
+    Ok(())
+}
+
 /// What a certificate should say, independent of the backend that mints it.
 ///
 /// `is_ca` selects the extension set: a CA gets basic-constraints and cert-sign
@@ -92,6 +123,8 @@ pub(crate) enum BackendError {
     ParseCsr,
     /// A certificate request's self-signature does not verify.
     CsrBadSignature,
+    /// A certificate request's key is not an EC key on P-256 or P-384.
+    UnsupportedKey,
     /// A CA certificate could not be parsed.
     InvalidCaCert,
     /// A CA private key could not be parsed.
