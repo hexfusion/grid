@@ -331,6 +331,7 @@ serde_yaml.workspace = true
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
 certs = { path = "../certs", default-features = false, features = ["verifier"] }
+httpdate = "1.0.3"
 rustls = { version = "0.23.45", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
 

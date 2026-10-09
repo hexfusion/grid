@@ -520,7 +520,7 @@ applied; check `mountReconciliationStatus: Ready` before treating the gateway
 as ready.
 
 When `gridServing.enabled` is set, Helm keeps its read-only TLS projection at
-`/etc/praxis/tls` through both handoff phases because the peer pollers read
+`/etc/praxis/tls` through both handoff phases because the signals poller reads
 those files. The GridNetwork's `tls.caSecretRef` and `tls.siteSecretRef` must
 match the chart's `tls.caSecret` and `tls.existingSecret`; Grid validates the
 mounted Secret keys and rolls the gateway when their resource versions change.
@@ -529,15 +529,16 @@ The chart rejects a different `tls.mountPath` for Grid serving.
 ### Cross-site routing in AGN
 
 With `gridServing.enabled`, the consumer gateway reads the serving config the
-grid operator writes (under `signalTransport: poll`) and polls each peer's
-`/v1/site/signals` over mTLS with the grid identity at `tls.mountPath`. It routes
+grid operator writes (under `signalTransport: poll`) and polls its local operator's
+`/v1/site/signals` over mTLS with the grid identity at `tls.mountPath`, which
+relays every site the operator collects from. It routes
 each model to the least-loaded admitted site. The chosen candidate's cluster must
 name a `gatewayConfig.backends` cluster, so give each backend the operator's
 candidate cluster (the provider's `routingClusterRef`, else its name).
 
 A `grid-gateway` built from the current source re-reads `serving-config.json`
 every five seconds after the kubelet updates the mounted ConfigMap. It applies
-candidate, peer, address, and pin changes without a pod restart. Invalid updates
+candidate and operator address changes without a pod restart. Invalid updates
 keep the last accepted serving settings and topology. Changes to mounted
 identity files can still restart signals pollers using those accepted settings.
 Check gateway logs and

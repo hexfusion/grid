@@ -259,6 +259,10 @@ pub struct PeerSettings {
     pub trust: PeerTrustMode,
     /// Port dialed for a peer that gossips no signals endpoint.
     pub peer_port: u16,
+    /// How often this operator polls each peer.
+    pub peer_interval: Duration,
+    /// The most one peer poll may take, attempts included.
+    pub peer_budget: Duration,
 }
 
 impl Default for PeerSettings {
@@ -267,6 +271,8 @@ impl Default for PeerSettings {
             local_signals_addr: None,
             trust: PeerTrustMode::default(),
             peer_port: signals::DEFAULT_PEER_PORT,
+            peer_interval: Duration::from_secs(30),
+            peer_budget: Duration::from_secs(10),
         }
     }
 }
@@ -1501,7 +1507,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         routing_overlay::apply_stale_gc_filter(&remote_crdt_providers, membership.as_ref(), &stale_policy);
 
     let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
-    let serving = serving_source(&ctx, membership.as_ref());
+    let serving = serving_source(&ctx);
 
     // List tool providers once; shared between overlay rendering and CRDT publishing.
     let tool_providers = list_all_agent_tool_providers(client).await?;
@@ -2455,12 +2461,8 @@ struct OverlayOutcome {
     serving_retry: Option<Duration>,
 }
 
-/// Gossip the serving config renders from, present only under poll.
+/// What the serving config renders from, present only under poll.
 struct ServingSource<'src> {
-    /// Dialable `(site, signals endpoint)` members.
-    members: Vec<(&'src str, String)>,
-    /// Declared leaf digests per member, empty outside pin trust.
-    pins: BTreeMap<String, Vec<String>>,
     /// Write coalescing state.
     gate: &'src WriteGate,
     /// Peer addressing resolved at startup.
@@ -2471,33 +2473,12 @@ struct ServingSource<'src> {
     refused: &'src serving_config::RefusedSites,
 }
 
-/// Build the serving source from membership, `None` outside poll mode.
-fn serving_source<'src>(
-    ctx: &'src OperatorCtx,
-    membership: Option<&'src MembershipSnapshot>,
-) -> Option<ServingSource<'src>> {
+/// Build the serving source, `None` outside poll mode.
+fn serving_source(ctx: &OperatorCtx) -> Option<ServingSource<'_>> {
     if ctx.signal_mode != SignalMode::Poll {
         return None;
     }
-    let encrypted = ctx.swim().is_some_and(|swim| swim.is_encrypted());
-    let identities = ctx.peer_identities();
-    let settings = &ctx.peer_settings;
-    let dialable = membership
-        .map(|snapshot| {
-            serving_config::dialable_members(snapshot, &identities, settings.trust, encrypted, settings.peer_port)
-        })
-        .unwrap_or_default();
-    let mut pins = BTreeMap::new();
-    let mut members = Vec::with_capacity(dialable.len());
-    for (site, endpoint, declared) in dialable {
-        if !declared.is_empty() {
-            pins.insert(site.to_owned(), declared);
-        }
-        members.push((site, endpoint));
-    }
     Some(ServingSource {
-        members,
-        pins,
         gate: &ctx.serving_writes,
         settings: &ctx.peer_settings,
         scrape_interval: ctx.scrape_interval,
@@ -2524,11 +2505,11 @@ fn render_serving_text(
         provider_hop_sni: &provider_hop_sni,
         tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
-        pins: &source.pins,
         scrape_interval: source.scrape_interval,
+        peer_interval: source.settings.peer_interval,
+        peer_budget: source.settings.peer_budget,
     };
-    let members = source.members.iter().map(|(site, endpoint)| (*site, endpoint.as_str()));
-    serving_config::to_text(&serving_config::render(overlay, members, &inputs)).map_err(OperatorError::Json)
+    serving_config::to_text(&serving_config::render(overlay, &inputs)).map_err(OperatorError::Json)
 }
 
 /// No candidate can receive hop context after an authoritative withdrawal.

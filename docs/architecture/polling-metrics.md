@@ -1,27 +1,28 @@
 # Polling Cross-Site Load Signals
 
-A gateway prefers the least-loaded peer serving a model, so it needs each peer's
-load. Each gateway polls its peers over mutual TLS, records the readings in a
-local store, and orders cross-site candidates from it. Wire format and store:
+A gateway prefers the least-loaded site serving a model, so it needs each site's
+load. Each operator polls its peers over mutual TLS and relays what it collected;
+each gateway polls its local operator, records the readings in a local store, and
+orders cross-site candidates from it. Wire format and store:
 [Signals](signals.md). Selection: [Routing](routing.md), [Scoring](scoring.md).
 Peer identity: [Authentication](auth.md).
 
 ## The Poll Path
 
-Polling is direct per peer, not through a relay, and readings are attributed to
-one verified identity.
+The operator polls each peer directly and attributes readings to one verified
+identity. The gateway reads the operator's relay over the same mutual TLS.
 
 | Step | What happens |
 |---|---|
 | Dial | Mutual TLS to the peer's `/v1/site/signals`, both ends presenting Grid site certificates. |
 | Verify | The certificate is checked against the Grid CA and its SPIFFE identity, then the verified identity is compared to the site the poller dialed. A valid Grid peer answering for another site is refused. |
 | Read | Under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
-| Store | Keyed on the verified identity, never on anything the body carries, so no peer can inject readings as another. A body label disagreeing with the verified owner is dropped. |
+| Store | Keyed on the verified identity, never on anything the body carries, so no peer can inject readings as another. A body label disagreeing with the verified owner is dropped. The gateway keys on the body's site label only for rows its own operator served, since that operator stamped each from the leaf it verified. |
 | Bound | Only the contract names and EPP pool averages the gateway routes on, a DNS-1123 `grid_provider`, a finite non-negative value (at most one for `grid_provider_ready` and `grid_provider_error_ratio`), and the peer's first 64 providers by name. Custom `signalNames` are dropped. Refusals count in `grid_peer_signals_refused_total{peer,reason}`. |
 
 A gateway polls only while serving, since one that is not serving has no routing
-decision to inform. Live connections are proportional to the serving gateways,
-not to the grid.
+decision to inform. Each gateway holds one connection, to its operator, so live
+WAN connections are proportional to the operators, not to the gateways.
 
 Poll and route meet at the store, and only there. Ordering runs off the request
 path, reading each candidate's recent worst load into a least-loaded-first list.

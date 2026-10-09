@@ -173,6 +173,8 @@ async fn main() {
         local_signals_addr: config.signals.local_addr(),
         trust,
         peer_port: config.signals.peer_port,
+        peer_interval: std::time::Duration::from_secs(config.signals.peer_interval_secs),
+        peer_budget: std::time::Duration::from_secs(config.signals.peer_budget_secs),
     };
     let ctx = Arc::new(
         OperatorCtx::new(client.clone(), None, signal_mode)

@@ -1650,6 +1650,51 @@ mod tests {
         }
     }
 
+    /// A plain HTTP peer for `site` answering `body` once.
+    async fn peer_serving(site: &str, body: String) -> PeerSite {
+        PeerSite {
+            name: site.to_owned(),
+            url: serve_once(body).await,
+            pins: Vec::new(),
+        }
+    }
+
+    /// Serve `body` to the first request, returning the URL to dial.
+    async fn serve_once(body: String) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            drop(stream.read(&mut request).await);
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            drop(stream.write_all(response.as_bytes()).await);
+        });
+        format!("http://{addr}{SIGNALS_PATH}")
+    }
+
+    /// Through the real poll path: a row naming another site is refused and an unlabeled row is
+    /// stamped with the dialed peer, so a relaying peer cannot speak for a third site.
+    #[tokio::test]
+    async fn a_polled_row_is_bound_to_the_dialed_peer() {
+        crate::init_process_crypto();
+        let body = "inference_pool_average_queue_size{grid_site=\"west\",grid_provider=\"pool\"} 1\n\
+                    inference_pool_average_queue_size{grid_provider=\"own\"} 2\n"
+            .to_owned();
+        let sites = [peer_serving("east", body).await];
+        let poll = PollPeers {
+            attempts: 1,
+            ..PollPeers::default()
+        };
+        let round = poll.collect(&sites).await;
+        let rows = round.get("east").expect("east polled");
+        assert_eq!(rows.len(), 1, "the row naming west is refused: {rows:?}");
+        let row = rows.first().expect("one row");
+        assert_eq!(row.labels.get(SITE_LABEL).map(String::as_str), Some("east"));
+        assert_eq!(row.labels.get("grid_provider").map(String::as_str), Some("own"));
+    }
+
     /// The slow peer answers only after the fast one is published, so a round that waited would hang.
     #[tokio::test]
     async fn a_slow_peer_does_not_hold_back_a_fast_one() {
