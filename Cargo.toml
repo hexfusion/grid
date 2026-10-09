@@ -4,7 +4,7 @@ members = [
     "certs",
     "crdt",
     "enrollment",
-    "fleet-dashboard",
+    "crates/fleet-dashboard",
     "mock-providers",
     "operator",
     "overlay-sync",
