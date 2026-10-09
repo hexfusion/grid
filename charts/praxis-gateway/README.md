@@ -545,6 +545,14 @@ Check gateway logs and
 `grid_serving_config_reload_total{result="applied"}` for acceptance; the
 `grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
 
+Upgrade order across the operator and this gateway: under SPIFFE peer trust roll
+the gateway first, since a new gateway reads an old operator's serving config.
+Under pin trust roll the operator first and the gateway right after it: an old
+operator renders `pins` the new gateway refuses, and an old gateway holds its last
+accepted config only while its pod keeps running. A gateway pod that restarts
+between the two rollouts exits at startup and crash-loops until the gateway
+rolls, so do not leave the two rollouts apart.
+
 The same watcher detects changes to the mounted CA, client certificate, and
 key, and rebuilds the signals pollers. This refreshes their mTLS identity; it
 does not renew certificates or change provider-listener TLS settings. Older
