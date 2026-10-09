@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use super::{IngressMode, images};
+use super::IngressMode;
 
 // ---------------------------------------------------------------------------
 // Environment Variables
@@ -163,18 +163,6 @@ pub(crate) fn should_skip_kind_image_loading() -> bool {
 
 /// Import a host image into a run-owned Kind node using only its linux/amd64
 /// image content. This avoids OCI-index imports failing when the local Docker
-/// Build the save arguments, adding `--platform` only for engines that accept it.
-///
-/// Podman has no such flag and stores one platform per image, so passing it fails
-/// the save outright and `ctr` then reports an unrecognized image format.
-fn save_args<'img>(engine: &str, image: &'img str) -> Vec<&'img str> {
-    if engine == "docker" {
-        vec!["save", "--platform", "linux/amd64", image]
-    } else {
-        vec!["save", image]
-    }
-}
-
 /// store has only the linux/amd64 child content.
 #[expect(
     clippy::too_many_lines,
@@ -182,7 +170,7 @@ fn save_args<'img>(engine: &str, image: &'img str) -> Vec<&'img str> {
 )]
 pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let control_plane = format!("{kind_name}-control-plane");
-    let engine = images::docker_engine();
+    let engine = kind_engine();
     let mut save = Command::new(&engine)
         .args(save_args(&engine, image))
         .stdout(Stdio::piped())
@@ -226,12 +214,50 @@ pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Resul
     Ok(())
 }
 
+/// The engine Kind put its nodes in, resolved the way Kind resolves it.
+///
+/// `KIND_EXPERIMENTAL_PROVIDER` wins when set. Otherwise Kind uses Docker when a
+/// real one answers and Podman only as the fallback, so a host carrying both has
+/// its nodes in Docker and a `podman exec` would find no control plane. The
+/// `podman-docker` shim answers `docker -v` with `podman version`, which is what
+/// separates a real Docker from the emulation.
+fn kind_engine() -> String {
+    if let Ok(declared) = env::var("KIND_EXPERIMENTAL_PROVIDER") {
+        let declared = declared.trim();
+        if !declared.is_empty() {
+            return declared.to_owned();
+        }
+    }
+    let real_docker = Command::new("docker")
+        .arg("-v")
+        .output()
+        .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).starts_with("Docker version"));
+    if real_docker {
+        "docker".to_owned()
+    } else {
+        "podman".to_owned()
+    }
+}
+
+/// Build the save arguments, adding `--platform` only for engines that accept it.
+///
+/// Podman has no such flag and stores one platform per image, so passing it fails
+/// the save outright and `ctr` then reports an unrecognized image format.
+fn save_args<'img>(engine: &str, image: &'img str) -> Vec<&'img str> {
+    if engine == "docker" {
+        vec!["save", "--platform", "linux/amd64", image]
+    } else {
+        vec!["save", image]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+
     #[test]
     fn save_args_pass_platform_only_to_docker() {
         for (engine, want) in [
