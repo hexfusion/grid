@@ -460,8 +460,43 @@ impl SignalStore {
     /// For a `Local` caller only, the site's own data plane, which is entitled
     /// to the whole grid view. Access policy scopes peer reads, not the site.
     #[must_use]
+    #[cfg(test)]
     pub fn render_unrestricted(&self, target: Option<&str>, collect: &[String]) -> (String, Duration) {
         self.render_with(target, collect, &std::collections::BTreeSet::new())
+    }
+
+    /// Render for this site's own gateway: contract series only, each target cut
+    /// at [`MAX_RENDER_LINES_PER_TARGET`], and whole targets dropped once the body
+    /// would pass `budget` bytes.
+    ///
+    /// The gateway reads every site from one response under its own byte
+    /// ceiling, past which the whole poll fails and every site goes unmeasured.
+    /// Bounding here turns that cliff into a counted loss of the last targets.
+    #[must_use]
+    pub fn render_bounded(&self, target: Option<&str>, collect: &[String], budget: usize) -> Rendered {
+        let Ok(guard) = self.inner.read() else {
+            return Rendered::default();
+        };
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
+        let now_ms = wall_millis(now_wall, Duration::ZERO);
+        let mut rendered = Rendered::default();
+        for (name, held) in guard.iter() {
+            if held.expires_at <= now || target.is_some_and(|t| t != name) {
+                continue;
+            }
+            let age = now.saturating_duration_since(held.collected_at);
+            let collected_at_ms = wall_millis(now_wall, age);
+            let (block, block_oldest, cut) = render_contract_block(&held.samples, collect, collected_at_ms, now_ms);
+            rendered.lines_cut = rendered.lines_cut.saturating_add(cut);
+            if rendered.body.len().saturating_add(block.len()) > budget {
+                rendered.targets_dropped = rendered.targets_dropped.saturating_add(1);
+                continue;
+            }
+            rendered.body.push_str(&block);
+            rendered.oldest = rendered.oldest.max(block_oldest);
+        }
+        rendered
     }
 
     /// Shared render body over a precomputed set of denied targets.
@@ -1370,6 +1405,61 @@ fn stamp_origin(observations: Vec<Observation>, peer: &str) -> Vec<Observation> 
     kept
 }
 
+/// The most a bounded render returns, three quarters of the gateway's 1 MiB read ceiling.
+pub const MAX_RELAY_BYTES: usize = 768 * 1024;
+
+/// Lines one target may contribute to a bounded render.
+pub const MAX_RENDER_LINES_PER_TARGET: usize = 4096;
+
+/// A bounded render and what it left out.
+#[derive(Debug, Default)]
+pub struct Rendered {
+    /// Exposition text, whole lines only.
+    pub body: String,
+    /// Age of the oldest sample emitted.
+    pub oldest: Duration,
+    /// Targets skipped because the body would have passed the budget.
+    pub targets_dropped: usize,
+    /// Lines cut past the per-target cap.
+    pub lines_cut: usize,
+}
+
+/// Whether `metric` is one of the series a gateway routes on.
+#[must_use]
+pub fn is_peer_signal(metric: &str) -> bool {
+    PEER_SIGNAL_NAMES.contains(&metric)
+}
+
+/// One target's contract series as exposition text, its oldest sample age, and
+/// the lines cut past [`MAX_RENDER_LINES_PER_TARGET`].
+fn render_contract_block(
+    samples: &[Observation],
+    collect: &[String],
+    collected_at_ms: i64,
+    now_ms: i64,
+) -> (String, Duration, usize) {
+    let mut block = String::new();
+    let mut oldest = Duration::ZERO;
+    let mut lines = 0_usize;
+    let mut cut = 0_usize;
+    for sample in samples.iter().filter(|sample| is_peer_signal(&sample.metric)) {
+        if !collect.is_empty() && !collect.iter().any(|c| c == &sample.metric) {
+            continue;
+        }
+        if lines >= MAX_RENDER_LINES_PER_TARGET {
+            cut = cut.saturating_add(1);
+            continue;
+        }
+        let stamp_ms = sample.timestamp_ms.unwrap_or(collected_at_ms);
+        render_sample(&mut block, sample, stamp_ms);
+        block.push('\n');
+        lines = lines.saturating_add(1);
+        let sample_age = Duration::from_millis(u64::try_from(now_ms.saturating_sub(stamp_ms)).unwrap_or(0));
+        oldest = oldest.max(sample_age);
+    }
+    (block, oldest, cut)
+}
+
 /// The largest relayed-sample age treated as plausible, one day.
 ///
 /// A larger apparent age means the peer's clock is skewed or the timestamp is
@@ -1892,6 +1982,84 @@ mod tests {
         let got: Vec<Option<i64>> = samples.iter().map(|o| o.timestamp_ms).collect();
         // Age preserved on this clock. Future, implausible, and missing all fall back.
         assert_eq!(got, vec![Some(now_ms - 30_000), None, None, None]);
+    }
+
+    /// `n` lines of one contract series for `target`, under distinct labels.
+    fn stocked(target: &str, n: usize) -> (String, Vec<Observation>) {
+        let samples = (0..n)
+            .map(|i| Observation {
+                metric: "inference_pool_per_pod_queue_size".to_owned(),
+                labels: BTreeMap::from([
+                    ("grid_provider".to_owned(), target.to_owned()),
+                    ("pod".to_owned(), format!("p{i}")),
+                ]),
+                value: 1.0,
+                timestamp_ms: None,
+            })
+            .collect();
+        (target.to_owned(), samples)
+    }
+
+    /// One unlabeled sample of `metric`.
+    fn plain(metric: &str) -> Observation {
+        Observation {
+            metric: metric.to_owned(),
+            labels: BTreeMap::new(),
+            value: 1.0,
+            timestamp_ms: None,
+        }
+    }
+
+    #[test]
+    fn the_bounded_render_carries_contract_series_only() {
+        let store = SignalStore::new();
+        let samples = vec![plain("vendor_private_gauge"), plain("inference_pool_ready_pods")];
+        store.refresh(
+            BTreeMap::from([("pool-a".to_owned(), samples)]),
+            Duration::from_secs(60),
+        );
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        assert!(rendered.body.contains("inference_pool_ready_pods"), "{}", rendered.body);
+        assert!(
+            !rendered.body.contains("vendor_private_gauge"),
+            "a non-contract series is not relayed"
+        );
+        let (unrestricted, _) = store.render_unrestricted(None, &[]);
+        assert!(
+            unrestricted.contains("vendor_private_gauge"),
+            "the unbounded render still has it"
+        );
+    }
+
+    #[test]
+    fn a_target_past_the_line_cap_is_cut_and_the_others_still_render() {
+        let store = SignalStore::new();
+        let big = stocked("pool-big", MAX_RENDER_LINES_PER_TARGET + 10);
+        let small = stocked("pool-small", 1);
+        store.refresh(BTreeMap::from([big, small]), Duration::from_secs(60));
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        let big_lines = rendered.body.lines().filter(|line| line.contains("pool-big")).count();
+        assert_eq!(big_lines, MAX_RENDER_LINES_PER_TARGET, "cut at the cap");
+        assert_eq!(rendered.lines_cut, 10);
+        assert!(rendered.body.contains("pool-small"), "the small target still renders");
+        assert_eq!(rendered.targets_dropped, 0);
+    }
+
+    #[test]
+    fn a_body_past_the_budget_drops_whole_targets_and_never_a_line() {
+        let store = SignalStore::new();
+        store.refresh(
+            BTreeMap::from([stocked("pool-a", 20), stocked("pool-b", 20)]),
+            Duration::from_secs(60),
+        );
+        let one = store.render_bounded(Some("pool-a"), &[], MAX_RELAY_BYTES).body.len();
+        // Room for one target and a bit: the second must go whole, not in part.
+        let rendered = store.render_bounded(None, &[], one + one / 2);
+        assert_eq!(rendered.targets_dropped, 1, "{}", rendered.body);
+        assert_eq!(rendered.body.len(), one, "the first target is intact");
+        assert!(rendered.body.ends_with('\n') && rendered.body.lines().all(|line| line.contains("pool-a")));
+        let all = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        assert_eq!(all.targets_dropped, 0, "under the budget nothing is dropped");
     }
 
     #[test]
