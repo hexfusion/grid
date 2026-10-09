@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use super::IngressMode;
+use super::{IngressMode, images};
 
 // ---------------------------------------------------------------------------
 // Environment Variables
@@ -163,6 +163,18 @@ pub(crate) fn should_skip_kind_image_loading() -> bool {
 
 /// Import a host image into a run-owned Kind node using only its linux/amd64
 /// image content. This avoids OCI-index imports failing when the local Docker
+/// Build the save arguments, adding `--platform` only for engines that accept it.
+///
+/// Podman has no such flag and stores one platform per image, so passing it fails
+/// the save outright and `ctr` then reports an unrecognized image format.
+fn save_args<'img>(engine: &str, image: &'img str) -> Vec<&'img str> {
+    if engine == "docker" {
+        vec!["save", "--platform", "linux/amd64", image]
+    } else {
+        vec!["save", image]
+    }
+}
+
 /// store has only the linux/amd64 child content.
 #[expect(
     clippy::too_many_lines,
@@ -170,8 +182,9 @@ pub(crate) fn should_skip_kind_image_loading() -> bool {
 )]
 pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let control_plane = format!("{kind_name}-control-plane");
-    let mut save = Command::new("docker")
-        .args(["save", "--platform", "linux/amd64", image])
+    let engine = images::docker_engine();
+    let mut save = Command::new(&engine)
+        .args(save_args(&engine, image))
         .stdout(Stdio::piped())
         .spawn()?;
     let Some(save_stdout) = save.stdout.take() else {
@@ -179,7 +192,7 @@ pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Resul
         drop(save.wait());
         return Err("docker save did not provide stdout".into());
     };
-    let import_status = Command::new("docker")
+    let import_status = Command::new(&engine)
         .args([
             "exec",
             "--privileged",
@@ -205,7 +218,7 @@ pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Resul
     };
     let save_status = save.wait()?;
     if !save_status.success() {
-        return Err(format!("docker save failed for {image}").into());
+        return Err(format!("{engine} save failed for {image}").into());
     }
     if !import_status.success() {
         return Err(format!("failed to import {image} into {control_plane}").into());
@@ -219,6 +232,20 @@ pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn save_args_pass_platform_only_to_docker() {
+        for (engine, want) in [
+            ("docker", vec!["save", "--platform", "linux/amd64", "img:tag"]),
+            ("podman", vec!["save", "img:tag"]),
+        ] {
+            assert_eq!(
+                save_args(engine, "img:tag"),
+                want,
+                "{engine} save must only be given flags it accepts"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
