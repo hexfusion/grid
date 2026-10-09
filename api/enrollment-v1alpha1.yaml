@@ -60,8 +60,9 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           description: |
-            An enrollment holds the name (name_taken), or an unredeemed,
-            unexpired token already pins it (token_outstanding).
+            An enrollment holds the name (name_taken), its enrollment was
+            deleted and allowDeletedName is not set (name_deleted), or an
+            unredeemed, unexpired token already pins it (token_outstanding).
           content:
             application/json:
               schema:
@@ -125,8 +126,10 @@ paths:
                 $ref: '#/components/schemas/Error'
         '409':
           description: |
-            The pinned name is already held by an issued member. The token is
-            spent, so it cannot claim the name later.
+            The pinned name is already held by an issued member (name_taken), or
+            the signing request's key was enrolled before (key_reused); the
+            token stays unspent. The name's enrollment was deleted and the token
+            does not opt in (name_deleted); that spends the token.
           content:
             application/json:
               schema:
@@ -172,10 +175,12 @@ paths:
       summary: Delete a site's enrollment
       description: |
         Deletes the enrollment record that holds a site name. The site can no
-        longer rotate, its current certificate stays valid until it expires, and
-        the name is released so the site can enroll again with a new token. This
-        is also how a site frozen after a rotation fork recovers. A reserved
-        name's record comes from the enrollment bootstrap and is refused here.
+        longer rotate, and its current certificate stays valid until it expires.
+        The name is recorded as deleted: enrolling it again takes a token minted
+        with allowDeletedName. Every key the name enrolled stays refused under
+        any name. This is also how a site frozen after a rotation fork recovers,
+        with a new key. A reserved name's record comes from the enrollment
+        bootstrap and is refused here.
       security:
         - gridAdminAuth: []
       parameters:
@@ -215,7 +220,7 @@ paths:
         certificate and submits a signing request for a new key. Returns a new
         certificate for the name the presented certificate carries. No token is
         involved. A name with no enrollment record, a key that is not the site's
-        current one, or a request that reuses a held key is refused. A grid
+        current one, or a request for any key ever enrolled is refused. A grid
         with rotations turned off refuses every rotation with 503.
       security:
         - siteCertificateAuth: []
@@ -333,6 +338,13 @@ components:
             604800 (seven days).
           minimum: 1
           maximum: 604800
+        allowDeletedName:
+          type: boolean
+          default: false
+          description: |
+            Lets the token enroll a name whose enrollment a grid-admin deleted.
+            Without it, a deleted name is refused at mint and at enroll. Keys
+            the deleted enrollment held stay refused either way.
 
     EnrollmentToken:
       type: object
@@ -465,6 +477,8 @@ components:
         | name_taken | 409 | Another enrollment holds the site name. |
         | reserved_site | 409 | The name is the enrollment bootstrap's. |
         | token_outstanding | 409 | A live token already pins the site name. |
+        | name_deleted | 409 | The name's enrollment was deleted; mint with allowDeletedName. |
+        | key_reused | 409 | The signing request's key was enrolled before. |
         | internal | 500 | The service could not complete the request. |
         | rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
       required: [error, message]
@@ -487,6 +501,8 @@ components:
             - name_taken
             - reserved_site
             - token_outstanding
+            - name_deleted
+            - key_reused
             - internal
             - rotation_disabled
         message:

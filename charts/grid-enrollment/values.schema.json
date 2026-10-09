@@ -493,6 +493,10 @@
                 "minimum": 1,
                 "maximum": 604800
               },
+              "allowDeletedName": {
+                "type": "boolean",
+                "description": "Mint a token that may enroll a name whose enrollment was deleted."
+              },
               "cluster": {
                 "type": "string",
                 "description": "ManagedCluster name to target when it differs from the site name.",
@@ -524,6 +528,10 @@
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 604800
+              },
+              "allowDeletedName": {
+                "type": "boolean",
+                "description": "Mint a token that may enroll a name whose enrollment was deleted."
               },
               "cluster": {
                 "type": "string",

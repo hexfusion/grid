@@ -4,7 +4,10 @@
 //! added without every caller becoming generic. A MaaS deployment points this at
 //! the Postgres it already runs. A standalone grid brings its own.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -31,6 +34,14 @@ pub enum StoreError {
     /// A live token already pins this name.
     #[error("a live site token already pins this site name")]
     TokenOutstanding,
+
+    /// The name's enrollment was deleted, and the token does not opt in to it.
+    #[error("site name was deleted")]
+    NameDeleted,
+
+    /// The key was enrolled before, under this or another name.
+    #[error("key was enrolled before")]
+    KeyReused,
 
     /// The presented token is not usable.
     ///
@@ -69,6 +80,9 @@ pub struct NewSiteToken {
 
     /// When the token stops being usable.
     pub expires_at: OffsetDateTime,
+
+    /// Whether the token may enroll a name whose enrollment was deleted.
+    pub allow_deleted_name: bool,
 }
 
 /// The pinned name a redeemed token yields. The only source of a member's name.
@@ -152,8 +166,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::NameTaken`] if an enrollment holds the name,
-    /// [`StoreError::TokenOutstanding`] if an unredeemed, unexpired token already
-    /// pins it, and [`StoreError::Backend`] if the backend failed.
+    /// [`StoreError::NameDeleted`] if the name's enrollment was deleted and the
+    /// token does not opt in, [`StoreError::TokenOutstanding`] if an unredeemed,
+    /// unexpired token already pins it, and [`StoreError::Backend`] if the backend
+    /// failed.
     pub async fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         match self {
             Self::Memory(store) => store.mint_site_token(token),
@@ -208,14 +224,16 @@ impl Store {
     /// guarded consume is the authoritative gate against a double redemption. The
     /// returned identifier is the issued-enrollment row's.
     ///
-    /// A token that loses its name is revoked, so it cannot claim the name later.
+    /// A token refused for a deleted name is revoked. A taken name or a reused key
+    /// leaves it unspent.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::TokenInvalid`] if the token is missing, already
     /// redeemed, or expired, [`StoreError::NameTaken`] if an issued member
-    /// already holds the pinned name, and [`StoreError::Backend`] if signing or
-    /// the backend failed.
+    /// already holds the pinned name, [`StoreError::NameDeleted`] if the name was
+    /// deleted and the token does not opt in, [`StoreError::KeyReused`] if the key
+    /// was ever enrolled, and [`StoreError::Backend`] if signing or the backend failed.
     pub async fn redeem_and_issue<F>(&self, token_sha256: &str, sign: F) -> Result<(Uuid, Issued), StoreError>
     where
         F: FnOnce(&Pin) -> Result<Issued, StoreError> + Send,
@@ -228,7 +246,7 @@ impl Store {
 
     /// Admit a renewal against the name's record, sign, and record the new key, as one step.
     ///
-    /// A fork freezes the record before it is refused.
+    /// A fork freezes the record before it is refused, and a new key ever enrolled is refused.
     ///
     /// # Errors
     ///
@@ -268,7 +286,9 @@ impl Store {
         }
     }
 
-    /// Delete a name's enrollment record, ending its renewals and releasing the name.
+    /// Delete a name's enrollment record, ending its renewals.
+    ///
+    /// The name is recorded as deleted and its keys stay enrolled, so neither is reused by default.
     ///
     /// # Errors
     ///
@@ -307,6 +327,12 @@ struct Inner {
 
     /// When the latest certificate issued for a name expires.
     not_after: HashMap<String, OffsetDateTime>,
+
+    /// Every key ever enrolled, never removed.
+    enrolled_keys: HashSet<String>,
+
+    /// Names whose enrollment was deleted.
+    deleted_names: HashSet<String>,
 }
 
 impl Inner {
@@ -327,6 +353,8 @@ struct TokenRow {
     site_name: String,
     /// When the token stops being usable.
     expires_at: OffsetDateTime,
+    /// Whether it may enroll a deleted name.
+    allow_deleted_name: bool,
     /// The enrollment that spent it, once redeemed.
     redeemed_by: Option<Uuid>,
 }
@@ -364,11 +392,14 @@ impl MemoryStore {
         }
     }
 
-    /// Record a token, unless the name is held or a live token pins it.
+    /// Record a token, unless the name is held, deleted without opt-in, or pinned by a live token.
     fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
         if inner.issued_names.contains_key(&token.site_name) {
             return Err(StoreError::NameTaken);
+        }
+        if !token.allow_deleted_name && inner.deleted_names.contains(&token.site_name) {
+            return Err(StoreError::NameDeleted);
         }
         let now = self.now();
         if inner
@@ -386,6 +417,7 @@ impl MemoryStore {
                 token_sha256: token.token_sha256,
                 site_name: token.site_name,
                 expires_at: token.expires_at,
+                allow_deleted_name: token.allow_deleted_name,
                 redeemed_by: None,
             },
         );
@@ -438,28 +470,36 @@ impl MemoryStore {
             .get(token_sha256)
             .copied()
             .ok_or(StoreError::TokenInvalid)?;
-        let pin = inner
+        let (pin, allow_deleted_name) = inner
             .tokens
             .get(&token_id)
             .filter(|row| row.redeemed_by.is_none() && row.expires_at > now)
-            .map(|row| Pin {
-                site_name: row.site_name.clone(),
+            .map(|row| {
+                let pin = Pin {
+                    site_name: row.site_name.clone(),
+                };
+                (pin, row.allow_deleted_name)
             })
             .ok_or(StoreError::TokenInvalid)?;
 
         // Sign before consuming, so a signing failure leaves the token unspent.
         let signed = if inner.issued_names.contains_key(&pin.site_name) {
             Err(StoreError::NameTaken)
+        } else if !allow_deleted_name && inner.deleted_names.contains(&pin.site_name) {
+            Err(StoreError::NameDeleted)
         } else {
             sign(&pin)
         };
         let issued = match signed {
-            Err(StoreError::NameTaken) => {
+            Err(lost @ StoreError::NameDeleted) => {
                 inner.forget(token_id);
-                return Err(StoreError::NameTaken);
+                return Err(lost);
             },
             signed => signed?,
         };
+        if !inner.enrolled_keys.insert(issued.public_key_sha256.clone()) {
+            return Err(StoreError::KeyReused);
+        }
 
         let enrollment_id = Uuid::new_v4();
         if let Some(row) = inner.tokens.get_mut(&token_id) {
@@ -476,11 +516,16 @@ impl MemoryStore {
     }
 
     /// Admit a renewal, sign, and record the new key under one lock.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the decide, sign, and record read as one step under the lock"
+    )]
     fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
     where
         F: FnOnce() -> Result<Issued, StoreError>,
     {
-        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let mut guard = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let inner = &mut *guard;
         let Some((held, _reserved)) = inner.issued_names.get_mut(&renewal.site_name) else {
             return Err(Refusal::UnknownSite.into());
         };
@@ -491,9 +536,13 @@ impl MemoryStore {
             },
             decided => decided?,
         };
+        if action == RenewAction::Rotate && inner.enrolled_keys.contains(&renewal.requested_key) {
+            return Err(Refusal::KeyReused.into());
+        }
         let replaced_key = held.current_key.clone();
         let issued = sign()?;
         if action == RenewAction::Rotate {
+            inner.enrolled_keys.insert(renewal.requested_key.clone());
             held.previous_key = Some(std::mem::replace(&mut held.current_key, renewal.requested_key.clone()));
             held.recorded_at = self.now();
         }
@@ -501,7 +550,7 @@ impl MemoryStore {
         if let Some(until) = issued.not_after() {
             inner.not_after.insert(renewal.site_name.clone(), until);
         }
-        drop(inner);
+        drop(guard);
         Ok(Renewed {
             id,
             action,
@@ -529,6 +578,7 @@ impl MemoryStore {
             };
             inner.issued_names.insert(seed.site_name.clone(), (held, true));
             inner.not_after.remove(&seed.site_name);
+            inner.enrolled_keys.insert(seed.key_sha256.clone());
         }
         drop(inner);
         Ok(seeded)
@@ -553,6 +603,9 @@ impl MemoryStore {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
         let removed = inner.issued_names.remove(site_name);
         inner.not_after.remove(site_name);
+        if removed.is_some() {
+            inner.deleted_names.insert(site_name.to_owned());
+        }
         drop(inner);
         removed.map(drop).ok_or(StoreError::NotFound)
     }

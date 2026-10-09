@@ -13,6 +13,7 @@ fn invite(site: &str) -> EnrollmentTokenRequest {
         site_name: site.to_owned(),
         grid_network_ref: "grid".to_owned(),
         expires_in_secs: Some(600),
+        allow_deleted_name: false,
     }
 }
 

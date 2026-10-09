@@ -208,7 +208,8 @@ db:
     caConfigMapName: ""
     caConfigMapKey: ca.crt
 
-# -- Sites to invite, keyed by site name: network (default grid), expiresInSecs, and
+# -- Sites to invite, keyed by site name: network (default grid), expiresInSecs,
+# allowDeletedName to invite a site whose enrollment was deleted, and
 # cluster when the ManagedCluster is named something other than the site. Each run skips
 # sites whose invite Secret exists. The older list of {siteName, gridNetworkRef,
 # expiresInSecs} still renders.

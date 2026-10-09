@@ -126,7 +126,8 @@ gives up after 15, and exits so Kubernetes restarts it.
   `invites`, and copy the new token to the site.
 - **Site name held** (`site name already enrolled`): a redeemed token holds its
   name. An enrollment admin runs `DELETE /v1alpha1/enrollments/<siteName>`, then
-  you invite the site again. That needs `delete` on `enrollments` in group
+  you invite the site again with `invites.<siteName>.allowDeletedName=true`, and
+  the site enrolls with a new key. That needs `delete` on `enrollments` in group
   `grid.praxis.fast`, which the `enrollment-admin` Role grants to
   `enrollment.enrollmentAdmins.subjects` and to no one by default. Without that
   access, enroll under a new site name.
@@ -159,7 +160,8 @@ Requirements:
    with GitOps or a policy that enforces its contents. An older copy holds a
    replaced key, so the site freezes at its next rotation.
 7. If an identity already expired, delete the site's enrollment and its identity
-   Secret, invite it again, and restart the operator.
+   Secret, invite it again with `allowDeletedName`, and restart the operator.
+   Both steps need `enrollment-admin`.
 
 Watch `grid_site_identity_expiry_timestamp_seconds` and
 `grid_site_identity_rotations_total` on the operator. `GridNetwork`
@@ -181,9 +183,11 @@ rotation back on before then, or the site must re-enroll.
 
 If a stale key asks to rotate, the service freezes the site and logs `rotation
 fork` at warning level. A grid-admin recovers it by deleting the site's
-enrollment, and the site re-enrolls. To see why a site cannot rotate, read `GET
-/v1alpha1/enrollments/{siteName}`. It returns `state` (`active` or `frozen`),
-key digests, and `notAfter`, and needs `get` on `enrollments`.
+enrollment, and the site re-enrolls with a new key under a token minted with
+`allowDeletedName`. A deleted enrollment's keys are never enrolled again. To see
+why a site cannot rotate, read `GET /v1alpha1/enrollments/{siteName}`. It
+returns `state` (`active` or `frozen`), key digests, and `notAfter`, and needs
+`get` on `enrollments`.
 
 With `enrollment.authz=local`, every admin in the token table can read and
 delete enrollments.
@@ -235,7 +239,7 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
 | Symptom | Check | Fix |
 | --- | --- | --- |
 | `site token rejected (...)` | The token expired or was revoked. | Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and copy the new token. |
-| `site name already enrolled (...)` | An earlier attempt spent a token for this name. | An enrollment admin runs `DELETE /v1alpha1/enrollments/<siteName>`, then invite the site again. Without that access, enroll under a new site name. |
+| `site name already enrolled (...)` | An earlier attempt spent a token for this name. | An enrollment admin runs `DELETE /v1alpha1/enrollments/<siteName>`, then invite the site again with `allowDeletedName`. Without that access, enroll under a new site name. |
 | `reaching the enrollment service failed after 10 attempts` | `enrollment.url` from the site. | Make it reachable. |
 | `TLS to the enrollment service failed, check GRID_ENROLL_CA_FILE` | The CA that issued the enrollment serving certificate. | Set `enrollment.caBundle` to it. |
 | `returned CA is not the pinned grid CA` | The attempt spent the token. | Set `enrollment.gridCaBundle` to the grid CA and enroll under a new site name. |
@@ -243,8 +247,8 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
 | `rotation disabled: peerTrust pin needs re-enrollment and re-pinning at expiry` | `status.identity.notAfter`. | Expected under pin trust. Re-enroll before expiry and update the digest peers pin. |
 | `site identity rotation failed` with `rotation_disabled` (503) | Whether `enrollment.rotation.enabled=false` on grid-enrollment. | Set it back to `true` before `notAfter`. |
 | `site identity rotation failed` with `rotation unauthenticated` and `identity_required` (401) | The Route must be passthrough. A reencrypt Route drops the client certificate. | Switch to passthrough. |
-| `site identity rotation failed` with `rotation refused` and `identity_refused` (403) | Enrollment log for `rotation fork` or `rotation refused`. `GET /v1alpha1/enrollments/<siteName>` shows `state: frozen`. | Delete the site's enrollment, and the site re-enrolls. For the hub, see Recover the hub identity. |
-| `site identity expired and cannot rotate; re-enroll this site with a new site token` | `status.identity.reason` is `IdentityExpired`. | Delete the site's enrollment and its identity Secret, invite it again, and restart the operator. |
+| `site identity rotation failed` with `rotation refused` and `identity_refused` (403) | Enrollment log for `rotation fork` or `rotation refused`. `GET /v1alpha1/enrollments/<siteName>` shows `state: frozen`. | Delete the site's enrollment and invite it again with `allowDeletedName`, both as an enrollment admin, and the site re-enrolls. For the hub, see Recover the hub identity. |
+| `site identity expired and cannot rotate; re-enroll this site with a new site token` | `status.identity.reason` is `IdentityExpired`. | As an enrollment admin, delete the site's enrollment and its identity Secret, invite it again with `allowDeletedName`, and restart the operator. |
 | CA bootstrap Job fails with `Restore Secret grid-ca-key from backup` | The message names why: a missing key Secret, a key for a different CA, or an unparsable distributed copy. | Restore the right `grid-ca-key` and run `helm upgrade`. To start a new grid on purpose, set `ca.forceRegenerate`, and every site must re-enroll. |
 | CA bootstrap Job fails with `built without --features bootstrap` | The image build. | Use a default build, which includes `sar` and `bootstrap`. |
 | `route.host is required` | A passthrough Route renders without a host. | Set `route.host` to `<name>.apps.<cluster-domain>`, or set `route.enabled=false`. Under an umbrella chart, prefix both with the subchart name. |
