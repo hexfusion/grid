@@ -216,9 +216,22 @@ site must re-enroll.
   days.
 - The grid CA lasts 10 years. The CA cannot be rotated. `ca.forceRegenerate`
   re-issues every leaf and invalidates every enrolled site's trust anchor.
-- The service reloads the CA from its Secret every minute. A change logs
-  `signing CA changed on disk` at warning level. Alert on it, since an unplanned
-  change splits trust between sites enrolled before and after.
+- The service records the SHA-256 fingerprint of the CA's public key in the
+  database on first start and refuses a CA with any other key, at startup and
+  on reload, even when every CA Secret was deleted and bootstrap minted a new
+  one. A CA certificate renewed on the same key is accepted. The refusal names
+  both fingerprints. On upgrade, the first start records whichever CA is
+  loaded.
+- To start a new grid on purpose, run `helm upgrade` with
+  `ca.forceRegenerate=true` and `ca.confirmRotation=<old fingerprint>`, the
+  recorded fingerprint exactly as the refusal prints it. The chart passes it as
+  `ENROLLMENT_CONFIRM_CA_ROTATION`. It admits only a replacement of that CA.
+  Clear both values on the next upgrade.
+- The service reloads the CA from its Secret every minute. A confirmed change
+  logs `signing CA changed on disk` at warning level, and an unconfirmed one
+  logs `signing CA reload refused` at error level and keeps the current CA.
+  Alert on both, since an unplanned change splits trust between sites enrolled
+  before and after.
 - After a CA change, sites holding certificates from the old CA cannot rotate
   and must re-enroll.
 
@@ -249,7 +262,8 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
 | `site identity rotation failed` with `rotation unauthenticated` and `identity_required` (401) | The Route must be passthrough. A reencrypt Route drops the client certificate. | Switch to passthrough. |
 | `site identity rotation failed` with `rotation refused` and `identity_refused` (403) | Enrollment log for `rotation fork` or `rotation refused`. `GET /v1alpha1/enrollments/<siteName>` shows `state: frozen`. | Delete the site's enrollment and invite it again with `allowDeletedName`, both as an enrollment admin, and the site re-enrolls. For the hub, see Recover the hub identity. |
 | `site identity expired and cannot rotate; re-enroll this site with a new site token` | `status.identity.reason` is `IdentityExpired`. | As an enrollment admin, delete the site's enrollment and its identity Secret, invite it again with `allowDeletedName`, and restart the operator. |
-| CA bootstrap Job fails with `Restore Secret grid-ca-key from backup` | The message names why: a missing key Secret, a key for a different CA, or an unparsable distributed copy. | Restore the right `grid-ca-key` and run `helm upgrade`. To start a new grid on purpose, set `ca.forceRegenerate`, and every site must re-enroll. |
+| CA bootstrap Job fails with `Restore Secret grid-ca-key from backup` | The message names why: a missing key Secret, a key for a different CA, or an unparsable distributed copy. | Restore the right `grid-ca-key` and run `helm upgrade`. To start a new grid on purpose, set `ca.forceRegenerate` and `ca.confirmRotation` to the old CA fingerprint, and every site must re-enroll. |
+| Enrollment pod exits with `the database records grid CA <old>, but the loaded CA is <new>` | A CA other than the one the database records was minted or restored. | Restore the CA with fingerprint `<old>` and run `helm upgrade`. To start a new grid on purpose, set `ca.confirmRotation=<old>`, and every site must re-enroll. |
 | CA bootstrap Job fails with `built without --features bootstrap` | The image build. | Use a default build, which includes `sar` and `bootstrap`. |
 | `route.host is required` | A passthrough Route renders without a host. | Set `route.host` to `<name>.apps.<cluster-domain>`, or set `route.enabled=false`. Under an umbrella chart, prefix both with the subchart name. |
 | `TokenReview` or `SubjectAccessReview` calls fail | `enrollment.authz=kube` needs the `sar` feature. | Use a default image and set `enrollment.serviceAccount.create=true`. |

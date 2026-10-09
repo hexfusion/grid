@@ -20,6 +20,8 @@ static SCHEMA_ENROLLMENTS: &str = include_str!("../../db/schema/0002_create_site
 static SCHEMA_RENEWAL: &str = include_str!("../../db/schema/0003_site_enrollment_renewal.up.sql");
 /// Enrolled-key history and deleted names.
 static SCHEMA_HISTORY: &str = include_str!("../../db/schema/0004_enrollment_history.up.sql");
+/// The grid CA the records belong to.
+static SCHEMA_CA_ANCHOR: &str = include_str!("../../db/schema/0005_grid_ca_anchor.up.sql");
 /// Advisory-lock key that serializes schema application across instances.
 const SCHEMA_LOCK_KEY: i64 = 0x671D_E401;
 /// Advisory-lock class for mints, keyed with a hash of the site name.
@@ -58,6 +60,10 @@ impl PgStore {
             .map_err(backend)?;
         sqlx::raw_sql(SCHEMA_RENEWAL).execute(&mut *tx).await.map_err(backend)?;
         sqlx::raw_sql(SCHEMA_HISTORY).execute(&mut *tx).await.map_err(backend)?;
+        sqlx::raw_sql(SCHEMA_CA_ANCHOR)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
         tx.commit().await.map_err(backend)?;
         Ok(Self { pool })
     }
@@ -440,6 +446,37 @@ impl PgStore {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    /// The recorded grid CA fingerprint, if any.
+    pub(super) async fn recorded_ca(&self) -> Result<Option<String>, StoreError> {
+        sqlx::query_scalar("SELECT fingerprint_sha256 FROM grid_ca_anchor")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)
+    }
+
+    /// Record `fingerprint` if `expected` is what is recorded now; guarded so racing replicas cannot both win.
+    pub(super) async fn swap_recorded_ca(&self, expected: Option<&str>, fingerprint: &str) -> Result<bool, StoreError> {
+        let written = match expected {
+            None => {
+                sqlx::query("INSERT INTO grid_ca_anchor (fingerprint_sha256) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+                    .bind(fingerprint)
+                    .execute(&self.pool)
+                    .await
+            },
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE grid_ca_anchor SET fingerprint_sha256 = $2, recorded_at = NOW()
+                      WHERE fingerprint_sha256 = $1",
+                )
+                .bind(expected)
+                .bind(fingerprint)
+                .execute(&self.pool)
+                .await
+            },
+        };
+        Ok(written.map_err(backend)?.rows_affected() == 1)
     }
 
     /// Ping the pool, for the readiness probe.

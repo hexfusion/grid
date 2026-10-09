@@ -15,7 +15,11 @@
 
 use std::sync::{Arc, LazyLock};
 
-use enrollment::{Issued, NewSiteToken, Pin, Store, StoreError};
+use enrollment::{
+    CaAction, Issued, NewSiteToken, Pin, Store, StoreError,
+    ca::{AnchorError, Anchored, anchor},
+    ca_action,
+};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -794,4 +798,91 @@ async fn rotation_to_a_key_ever_enrolled_is_refused() {
     let record = store.enrollment(&west).await.expect("read").expect("held");
     assert!(!record.held.frozen, "a refused reuse does not freeze");
     assert_eq!(record.held.current_key, key('c'));
+}
+/// Clear the recorded grid CA, standing in for a new database.
+async fn forget_ca() {
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("database url");
+    let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
+    sqlx::query("DELETE FROM grid_ca_anchor")
+        .execute(&pool)
+        .await
+        .expect("clear the anchor");
+}
+
+/// A freshly minted CA's fingerprint.
+fn minted_ca() -> String {
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    certs::canonical_fingerprint(&ca.cert_pem).expect("fingerprint")
+}
+
+/// A first start records a CA, then an attacker deletes the CA key Secret and every
+/// distributed copy, so bootstrap mints a new one and the service restarts.
+/// Returns the restarted store, the recorded fingerprint, and the minted one.
+async fn restarted_with_a_minted_ca() -> Option<(Store, MutexGuard<'static, ()>, String, String)> {
+    let (store, guard) = store().await?;
+    forget_ca().await;
+    let original = minted_ca();
+    assert_eq!(
+        anchor(&store, &original, None).await.expect("first start"),
+        Anchored::Recorded,
+        "the first start records the CA"
+    );
+    drop(store);
+    assert_eq!(
+        ca_action(None, false, &[]),
+        CaAction::Mint,
+        "with every Secret gone bootstrap mints"
+    );
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("database url");
+    let restarted = Store::postgres(&url).await.expect("restart");
+    Some((restarted, guard, original, minted_ca()))
+}
+
+#[tokio::test]
+async fn a_ca_minted_after_its_secrets_were_deleted_is_refused() {
+    let Some((store, _guard, original, minted)) = restarted_with_a_minted_ca().await else {
+        return;
+    };
+    let refused = anchor(&store, &minted, None).await;
+    assert!(
+        matches!(&refused, Err(AnchorError::Mismatch { recorded, loaded }) if *recorded == original && *loaded == minted),
+        "{refused:?}"
+    );
+    let truncated = original.get(..63).expect("fingerprint");
+    let upper = original.to_ascii_uppercase();
+    let padded = format!(" {original}");
+    for wrong in ["", truncated, &upper, &padded, &minted, "not-a-fingerprint"] {
+        assert!(
+            anchor(&store, &minted, Some(wrong)).await.is_err(),
+            "the override {wrong:?} does not name the recorded CA"
+        );
+    }
+    assert_eq!(store.recorded_ca().await.expect("read"), Some(original));
+}
+
+#[tokio::test]
+async fn starting_over_needs_the_old_fingerprint_confirmed() {
+    let Some((store, _guard, original, minted)) = restarted_with_a_minted_ca().await else {
+        return;
+    };
+    assert_eq!(
+        anchor(&store, &minted, Some(&original)).await.expect("start over"),
+        Anchored::Replaced { previous: original },
+    );
+    assert_eq!(store.recorded_ca().await.expect("read"), Some(minted));
+}
+
+/// Two replicas racing a first start with different CAs: only one is recorded.
+#[tokio::test]
+async fn racing_first_starts_record_one_ca() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    forget_ca().await;
+    let (left, right) = (minted_ca(), minted_ca());
+    let (first, second) = tokio::join!(anchor(&store, &left, None), anchor(&store, &right, None));
+    assert!(
+        first.is_ok() != second.is_ok(),
+        "exactly one CA wins: {first:?} {second:?}"
+    );
 }

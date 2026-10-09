@@ -73,6 +73,10 @@ spec:
               value: /etc/grid-ca/tls.key
             - name: ENROLLMENT_CA_COMMON_NAME
               value: {{ .Values.ca.commonName | quote }}
+            {{- with .Values.ca.confirmRotation }}
+            - name: ENROLLMENT_CONFIRM_CA_ROTATION
+              value: {{ . | quote }}
+            {{- end }}
             # In-process TLS serving cert (file paths).
             - name: ENROLLMENT_TLS_CERT
               value: /etc/grid-tls/tls.crt

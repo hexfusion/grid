@@ -286,6 +286,31 @@ impl Store {
         }
     }
 
+    /// The fingerprint of the grid CA these records belong to, `None` before one is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] if the backend failed.
+    pub async fn recorded_ca(&self) -> Result<Option<String>, StoreError> {
+        match self {
+            Self::Memory(store) => store.recorded_ca(),
+            Self::Postgres(store) => store.recorded_ca().await,
+        }
+    }
+
+    /// Record `fingerprint` as the grid CA when `expected` is the one recorded now,
+    /// `None` meaning none is. Returns whether it was recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] if the backend failed.
+    pub async fn swap_recorded_ca(&self, expected: Option<&str>, fingerprint: &str) -> Result<bool, StoreError> {
+        match self {
+            Self::Memory(store) => store.swap_recorded_ca(expected, fingerprint),
+            Self::Postgres(store) => store.swap_recorded_ca(expected, fingerprint).await,
+        }
+    }
+
     /// Delete a name's enrollment record, ending its renewals.
     ///
     /// The name is recorded as deleted and its keys stay enrolled, so neither is reused by default.
@@ -333,6 +358,9 @@ struct Inner {
 
     /// Names whose enrollment was deleted.
     deleted_names: HashSet<String>,
+
+    /// The fingerprint of the grid CA these records belong to.
+    ca_fingerprint: Option<String>,
 }
 
 impl Inner {
@@ -596,6 +624,27 @@ impl MemoryStore {
                 held: held.clone(),
                 reserved: *reserved,
             }))
+    }
+
+    /// Read the recorded CA under the lock.
+    fn recorded_ca(&self) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_poisoned| poisoned())?
+            .ca_fingerprint
+            .clone())
+    }
+
+    /// Swap the recorded CA under the lock when `expected` is current.
+    fn swap_recorded_ca(&self, expected: Option<&str>, fingerprint: &str) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let swapped = inner.ca_fingerprint.as_deref() == expected;
+        if swapped {
+            inner.ca_fingerprint = Some(fingerprint.to_owned());
+        }
+        drop(inner);
+        Ok(swapped)
     }
 
     /// Delete a record under the lock.

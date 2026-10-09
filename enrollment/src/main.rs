@@ -6,6 +6,7 @@ use axum_server::Handle;
 use enrollment::{
     AppState, GridAdmins, SharedCa, Store,
     authz::Authorizer,
+    ca::{Anchored, CONFIRM_ROTATION_VAR, RecordedCa},
     router,
     tls::{PeerAcceptor, TlsAcceptor, TlsConfig},
 };
@@ -135,8 +136,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_unset| format!("{TLS_KEY_PATH} is required: the CA-signing service must not serve in the clear"))?;
     let tls = load_tls(&tls_cert, &tls_key, &ca.cert_pem)?;
 
+    let store = open_store().await?;
+    let confirm = std::env::var(CONFIRM_ROTATION_VAR).ok();
+    anchor_ca(&store, &ca.cert_pem, confirm.as_deref()).await?;
+
     let state = Arc::new(AppState {
-        store: open_store().await?,
+        store,
         ca: SharedCa::new(ca),
         // Boxed: the Kubernetes-RBAC authorizer builds a large future under the sar
         // feature, kept off the startup stack frame.
@@ -151,7 +156,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(reload_tls(tls.clone(), tls_cert, tls_key, Arc::clone(&state)));
     // Reload the signing CA the same way, so a regenerated or restored CA signs
     // new site certificates without a restart.
-    tokio::spawn(reload_ca(Arc::clone(&state), common_name, ca_cert_path, ca_key_path));
+    tokio::spawn(reload_ca(
+        Arc::clone(&state),
+        confirm,
+        common_name,
+        ca_cert_path,
+        ca_key_path,
+    ));
     // Apply reserved-name seeds now and as bootstrap rewrites them.
     if let Ok(dir) = std::env::var(RESERVED_SEEDS_DIR) {
         let mut reported = std::collections::HashMap::new();
@@ -240,13 +251,40 @@ async fn reload_tls(config: TlsConfig, cert_path: String, key_path: String, stat
     }
 }
 
+/// Refuse a CA other than the one the database records, since bootstrap's guard reads deletable Secrets.
+async fn anchor_ca(store: &Store, cert_pem: &str, confirm: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let fingerprint = certs::cert_public_key_sha256(cert_pem)?;
+    let anchored = enrollment::ca::anchor(store, &fingerprint, confirm).await?;
+    if let Anchored::Replaced { previous } = &anchored {
+        tracing::warn!(
+            old_fingerprint = %previous,
+            new_fingerprint = %fingerprint,
+            "grid CA replaced as {CONFIRM_ROTATION_VAR} confirmed; every site must re-enroll"
+        );
+    } else {
+        tracing::info!(%fingerprint, ?anchored, "grid CA checked against the database record");
+    }
+    Ok(())
+}
+
 /// Reload the signing CA from disk on an interval, swapping it in when its
 /// certificate changes. A reload that fails keeps the current CA.
 #[expect(
     clippy::infinite_loop,
     reason = "a background reloader runs for the life of the process"
 )]
-async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String, key_path: String) {
+#[expect(clippy::too_many_lines, reason = "read, check, swap, and log read as one tick")]
+async fn reload_ca(
+    state: Arc<AppState>,
+    confirm: Option<String>,
+    common_name: String,
+    cert_path: String,
+    key_path: String,
+) {
+    let record = RecordedCa {
+        store: &state.store,
+        confirm: confirm.as_deref(),
+    };
     let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
     ticker.tick().await;
     loop {
@@ -262,7 +300,8 @@ async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String,
         let reloaded = match material {
             Ok((cert, key)) => state
                 .ca
-                .reload(&common_name, &cert, &key)
+                .reload(record, &common_name, &cert, &key)
+                .await
                 .map_err(|err| err.to_string()),
             Err(err) => Err(err.to_string()),
         };
@@ -273,7 +312,7 @@ async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String,
                 "signing CA changed on disk; new site certificates are signed by the new CA"
             ),
             Ok(None) => {},
-            Err(err) => tracing::warn!(%err, "signing CA reload failed, keeping the current CA"),
+            Err(err) => tracing::error!(%err, "signing CA reload refused, keeping the current CA"),
         }
     }
 }
@@ -519,7 +558,7 @@ async fn build_authorizer() -> Result<Authorizer, Box<dyn std::error::Error>> {
 mod tests {
     #[cfg(not(feature = "bootstrap"))]
     use super::reject_bootstrap_without_feature;
-    use super::require_db_tls;
+    use super::{anchor_ca, require_db_tls};
 
     #[cfg(not(feature = "bootstrap"))]
     #[test]
@@ -537,6 +576,18 @@ mod tests {
     fn a_non_bootstrap_invocation_is_allowed() -> Result<(), Box<dyn std::error::Error>> {
         let args = ["enrollment"].map(std::ffi::OsString::from);
         reject_bootstrap_without_feature(args)
+    }
+
+    #[tokio::test]
+    async fn a_freshly_minted_ca_does_not_start_against_a_recorded_one() -> Result<(), Box<dyn std::error::Error>> {
+        let store = enrollment::Store::memory();
+        let original = certs::generate_ca("grid-ca")?;
+        anchor_ca(&store, &original.cert_pem, None).await?;
+        let minted = certs::generate_ca("grid-ca")?;
+        let refused = anchor_ca(&store, &minted.cert_pem, None).await;
+        assert!(refused.is_err(), "a different CA must not start");
+        let old = certs::cert_public_key_sha256(&original.cert_pem)?;
+        anchor_ca(&store, &minted.cert_pem, Some(&old)).await
     }
 
     #[test]
