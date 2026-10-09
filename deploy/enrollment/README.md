@@ -59,8 +59,13 @@ exits, so a rolling deploy does not cut off an enrollment mid-issue.
 
 Grid-admin authorization. `ENROLLMENT_AUTHZ` selects who may mint and revoke
 tokens. `local`, the default, reads a grid-admin token table from
-`ENROLLMENT_GRID_ADMIN_TOKENS`, one `name:token` line per grid-admin, where an
-empty table admits nobody and is the safe direction. `kube` defers to Kubernetes
+`ENROLLMENT_GRID_ADMIN_TOKENS`, one `name:token` or `name:token:roles` line per
+grid-admin, where an empty table admits nobody and is the safe direction. Roles
+are a comma-separated list of `grid-admin` and `enrollment-admin`. No list means
+`grid-admin`, which mints and revokes tokens and reads enrollments.
+Deleting an enrollment, or minting with `allowDeletedName`, needs
+`enrollment-admin`. An unknown, repeated, or empty
+role list fails startup, and a token must not contain `:`. `kube` defers to Kubernetes
 RBAC through TokenReview and SubjectAccessReview on the `enrollmenttokens`
 resource, through the `sar` feature. Under `kube`, a bearer must be bound to
 `ENROLLMENT_TOKEN_AUDIENCE` (default `grid-enrollment`), and reviews are scoped

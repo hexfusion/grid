@@ -161,7 +161,8 @@ pub struct EnrollmentToken {
 pub struct EnrollmentTokenRequest {
     /**Lets the token enroll a name whose enrollment a grid-admin deleted.
 Without it, a deleted name is refused at mint and at enroll. Keys
-the deleted enrollment held stay refused either way.
+the deleted enrollment held stay refused either way. Setting it also
+needs the right to delete enrollments.
 */
     #[serde(rename = "allowDeletedName", default)]
     pub allow_deleted_name: bool,

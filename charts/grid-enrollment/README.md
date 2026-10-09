@@ -86,9 +86,13 @@ Each override takes a Secret reference, so no key material is inlined in values.
 | `enrollment.csrRecord.enabled` | `true` under `authz=kube`: each enrollment is recorded as a `CertificateSigningRequest`, approved and completed by the service, off the request path. The API server deletes an issued request about an hour after approval; the API server's audit log keeps the history when its policy covers these writes at `Request` level or above with a persistent backend. The service's own enrollment record is separate and always kept | `false` keeps no Kubernetes record; also the setting for Kubernetes 1.26 to 1.29, which lack the policy API |
 | `enrollment.csrRecord.signerName` | `grid.praxis.fast/site` | one per enrollment service on a cluster, since the policy admits only this release's service for it |
 | `enrollment.csrRecord.policy.enabled` | `true`: two `ValidatingAdmissionPolicies`, one letting only the service file under the signer name, one confining the service to that name (Kubernetes 1.30). Required while the record is on | `false` is refused; turn the record off on clusters without the v1 policy API |
-| `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (name:token lines) |
+| `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (`name:token` or `name:token:roles` lines, see below) |
 
 The installing principal must itself hold `approve` and `sign` on the signer name, or RBAC escalation prevention refuses the record roles.
+
+## Local grid-admin roles
+
+Under `enrollment.authz=local` each table line is `name:token` or `name:token:roles`, where `roles` is a comma-separated list of `grid-admin` and `enrollment-admin`, matching the Roles kube mode binds. A line with no roles is `grid-admin`: mint and revoke tokens, and read enrollments. Deleting an enrollment, or minting with `allowDeletedName`, needs `enrollment-admin`. Role names are exact and lowercase. An unknown, repeated, or empty role list fails startup, and a token must not contain `:`. The generated table holds one `admin:<token>` line, a grid-admin without `enrollment-admin`, as kube mode binds `enrollment-admin` to nobody by default. To delete enrollments, add a line such as `security:<token>:enrollment-admin` to the Secret and restart the service.
 
 ## Site invites
 

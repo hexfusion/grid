@@ -351,7 +351,7 @@ mod live {
         let state = Arc::new(AppState {
             store: Store::memory(),
             ca: SharedCa::new(ca),
-            authorizer: Authorizer::Local(GridAdmins::from_table("admin: good-admin\n")),
+            authorizer: Authorizer::Local(GridAdmins::from_table("admin: good-admin\n").expect("table")),
             cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
             reserved_sites: Vec::new(),
             renewals_enabled: true,
