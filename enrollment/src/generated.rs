@@ -196,6 +196,7 @@ Retry-After when present, and stop on 401 and 403.
 | timeout | 408 | The request ran past the server's limit. |
 | name_taken | 409 | Another enrollment holds the site name. |
 | reserved_site | 409 | The name is the enrollment bootstrap's. |
+| token_outstanding | 409 | A live token already pins the site name. |
 | internal | 500 | The service could not complete the request. |
 | rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
 */
@@ -246,6 +247,8 @@ pub enum ErrorError {
     NameTaken,
     #[serde(rename = "reserved_site")]
     ReservedSite,
+    #[serde(rename = "token_outstanding")]
+    TokenOutstanding,
     #[serde(rename = "internal")]
     Internal,
     #[serde(rename = "rotation_disabled")]
@@ -267,6 +270,7 @@ impl ::std::fmt::Display for ErrorError {
             Self::Timeout => f.write_str("timeout"),
             Self::NameTaken => f.write_str("name_taken"),
             Self::ReservedSite => f.write_str("reserved_site"),
+            Self::TokenOutstanding => f.write_str("token_outstanding"),
             Self::Internal => f.write_str("internal"),
             Self::RotationDisabled => f.write_str("rotation_disabled"),
         }
@@ -291,6 +295,7 @@ impl ::std::str::FromStr for ErrorError {
             "timeout" => Ok(Self::Timeout),
             "name_taken" => Ok(Self::NameTaken),
             "reserved_site" => Ok(Self::ReservedSite),
+            "token_outstanding" => Ok(Self::TokenOutstanding),
             "internal" => Ok(Self::Internal),
             "rotation_disabled" => Ok(Self::RotationDisabled),
             _ => Err("invalid value".into()),

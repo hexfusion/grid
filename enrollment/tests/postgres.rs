@@ -185,9 +185,9 @@ async fn a_redeemed_token_cannot_be_revoked() {
     );
 }
 
-/// The partial unique index, not the process, is what guarantees this.
+/// A name an enrollment holds, or a live token pins, is refused at mint.
 #[tokio::test]
-async fn two_sites_cannot_hold_one_name() {
+async fn a_name_mints_one_live_token_and_none_once_held() {
     let Some((store, _guard)) = store().await else {
         return;
     };
@@ -198,22 +198,148 @@ async fn two_sites_cannot_hold_one_name() {
         .mint_site_token(new_token(&site, &first))
         .await
         .expect("mint first");
-    store.redeem_and_issue(&first, sign_for).await.expect("first enroll");
+    let second = store.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(
+        matches!(second, Err(StoreError::TokenOutstanding)),
+        "a live token already pins the name, got {second:?}"
+    );
 
-    let second = unique("digest");
+    store.redeem_and_issue(&first, sign_for).await.expect("first enroll");
+    let held = store.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(
+        matches!(held, Err(StoreError::NameTaken)),
+        "an enrolled name is refused, got {held:?}"
+    );
+}
+
+/// Concurrent mints of one name: the per-name lock, not the process, lets one through.
+#[tokio::test]
+async fn concurrent_mints_of_one_name_leave_one_live_token() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("mint-race");
+    let store = Arc::new(store);
+    let racers: Vec<_> = std::iter::repeat_with(|| {
+        let (store, token) = (Arc::clone(&store), new_token(&site, &unique("digest")));
+        tokio::spawn(async move { store.mint_site_token(token).await })
+    })
+    .take(8)
+    .collect();
+    let mut minted = 0_usize;
+    for racer in racers {
+        let result = racer.await.expect("join");
+        assert!(
+            matches!(result, Ok(_) | Err(StoreError::TokenOutstanding)),
+            "a racing mint either wins or finds the live token, got {result:?}"
+        );
+        minted = minted.saturating_add(usize::from(result.is_ok()));
+    }
+    assert_eq!(minted, 1, "exactly one mint wins the name");
+}
+
+/// An expired, unredeemed token holds nothing; a live one holds the name.
+#[tokio::test]
+async fn an_expired_token_frees_the_name_but_a_live_one_holds_it() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("expired");
+    let mut expired = new_token(&site, &unique("digest"));
+    expired.expires_at = OffsetDateTime::now_utc().saturating_sub(Duration::seconds(1));
+    store.mint_site_token(expired).await.expect("mint expired");
     store
-        .mint_site_token(new_token(&site, &second))
+        .mint_site_token(new_token(&site, &unique("digest")))
         .await
-        .expect("mint second");
-    let again = store.redeem_and_issue(&second, sign_for).await;
+        .expect("an expired token does not hold the name");
+    let again = store.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(matches!(again, Err(StoreError::TokenOutstanding)), "got {again:?}");
+}
+
+/// Mints racing a redeem never leave a live token beside the enrollment.
+#[tokio::test]
+async fn a_mint_racing_a_redeem_leaves_no_live_token_beside_the_enrollment() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("mint-redeem");
+    let digest = unique("digest");
+    store.mint_site_token(new_token(&site, &digest)).await.expect("mint");
+    let store = Arc::new(store);
+    let redeem = spawn_redeem(&store, digest);
+    let minters: Vec<_> = std::iter::repeat_with(|| {
+        let (store, token) = (Arc::clone(&store), new_token(&site, &unique("digest")));
+        tokio::spawn(async move { store.mint_site_token(token).await })
+    })
+    .take(8)
+    .collect();
+    redeem.await.expect("join").expect("the live token redeems");
+    for minter in minters {
+        let result = minter.await.expect("join");
+        assert!(
+            matches!(result, Err(StoreError::TokenOutstanding | StoreError::NameTaken)),
+            "no mint lands while the name is pinned or held, got {result:?}"
+        );
+    }
+}
+
+/// A row written before mint refused a second live token for a name.
+async fn insert_legacy_token(site: &str, digest: &str) {
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("url");
+    let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
+    sqlx::query(
+        "INSERT INTO site_tokens (id, token_sha256, site_name, grid_network_ref, issued_by, expires_at)
+         VALUES ($1, $2, $3, 'demo-grid', 'sam', NOW() + INTERVAL '1 hour')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(digest)
+    .bind(site)
+    .execute(&pool)
+    .await
+    .expect("insert legacy token");
+}
+
+/// A token that loses its name at redeem is spent, even after the holder is deleted.
+#[tokio::test]
+async fn a_token_that_loses_its_name_cannot_claim_it_later() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("loser");
+    let (winner, loser) = (unique("digest"), unique("digest"));
+    store.mint_site_token(new_token(&site, &winner)).await.expect("mint");
+    Box::pin(insert_legacy_token(&site, &loser)).await;
+    store.redeem_and_issue(&winner, sign_for).await.expect("first enroll");
+
+    let lost = store.redeem_and_issue(&loser, sign_for).await;
+    assert!(matches!(lost, Err(StoreError::NameTaken)), "got {lost:?}");
     assert!(
-        matches!(again, Err(StoreError::NameTaken)),
-        "a name an issued member holds must be refused, got {again:?}"
+        !store.token_valid(&loser).await.expect("peek"),
+        "the refusal spends the losing token"
     );
+
+    store.delete_enrollment(&site).await.expect("delete");
+    let later = store.redeem_and_issue(&loser, sign_for).await;
     assert!(
-        store.token_valid(&second).await.expect("peek"),
-        "the refused redeem rolls back, so the second token is not spent"
+        matches!(later, Err(StoreError::TokenInvalid)),
+        "the losing token cannot claim the released name, got {later:?}"
     );
+}
+
+/// A token that loses to the signer's own refusal is spent the same way.
+#[tokio::test]
+async fn a_token_refused_by_the_signer_is_spent() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let digest = unique("digest");
+    store
+        .mint_site_token(new_token(&unique("reserved"), &digest))
+        .await
+        .expect("mint");
+    let refused = store.redeem_and_issue(&digest, |_pin| Err(StoreError::NameTaken)).await;
+    assert!(matches!(refused, Err(StoreError::NameTaken)), "got {refused:?}");
+    assert!(!store.token_valid(&digest).await.expect("peek"), "the token is spent");
 }
 
 /// Redeem `digest` on its own task, so two can race the same store.
@@ -255,7 +381,7 @@ async fn concurrent_redeems_spend_a_token_once() {
 }
 
 /// Two racers redeeming different tokens that pin the same name: the unique index,
-/// not the process, holds the name, so exactly one wins and the other is refused.
+/// not the process, holds the name, so exactly one wins and the loser is spent.
 #[tokio::test]
 async fn concurrent_redeems_of_one_name_leave_one_holder() {
     let Some((store, _guard)) = store().await else {
@@ -268,14 +394,11 @@ async fn concurrent_redeems_of_one_name_leave_one_holder() {
         .mint_site_token(new_token(&site, &first_digest))
         .await
         .expect("mint first");
-    store
-        .mint_site_token(new_token(&site, &second_digest))
-        .await
-        .expect("mint second");
+    Box::pin(insert_legacy_token(&site, &second_digest)).await;
 
     let store = Arc::new(store);
-    let first = spawn_redeem(&store, first_digest);
-    let second = spawn_redeem(&store, second_digest);
+    let first = spawn_redeem(&store, first_digest.clone());
+    let second = spawn_redeem(&store, second_digest.clone());
     let first = first.await.expect("join first");
     let second = second.await.expect("join second");
 
@@ -287,6 +410,12 @@ async fn concurrent_redeems_of_one_name_leave_one_holder() {
         name_taken, 1,
         "the loser is refused as name taken, got {first:?} and {second:?}"
     );
+    for digest in [first_digest, second_digest] {
+        assert!(
+            !store.token_valid(&digest).await.expect("peek"),
+            "both tokens are spent"
+        );
+    }
 }
 
 /// The invariant: the token is spent only when the certificate is issued.

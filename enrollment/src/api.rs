@@ -91,6 +91,10 @@ pub enum ApiError {
     #[error("site name is already taken")]
     NameTaken,
 
+    /// A live site token already pins the name.
+    #[error("a live site token already pins this site name")]
+    TokenOutstanding,
+
     /// The caller presented no grid-admin credential, or one that is not known.
     #[error("a grid-admin credential is required")]
     Unauthorized,
@@ -148,6 +152,7 @@ impl From<StoreError> for ApiError {
         match err {
             StoreError::NotFound => Self::NotFound,
             StoreError::NameTaken => Self::NameTaken,
+            StoreError::TokenOutstanding => Self::TokenOutstanding,
             StoreError::TokenInvalid => Self::InvalidToken,
             StoreError::Refused(_) => Self::IdentityRefused,
             StoreError::Backend(detail) => Self::Internal(detail),
@@ -227,6 +232,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 ErrorCode::NameTaken,
                 "another member already holds this site name".to_owned(),
+            ),
+            Self::TokenOutstanding => (
+                StatusCode::CONFLICT,
+                ErrorCode::TokenOutstanding,
+                "a live site token already pins this site name; revoke it or let it expire first".to_owned(),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -368,7 +378,8 @@ async fn enforce_timeout(request: Request, next: Next) -> Response {
 /// Mint a site token so a site can enroll under a name the grid-admin pins.
 ///
 /// The pin is validated here, so a bad name fails at mint rather than at the
-/// site's enroll. The token is returned once, and only its digest is stored.
+/// site's enroll. The token is returned once, and only its digest is stored. A
+/// name an enrollment holds, or a live token already pins, is refused.
 #[expect(
     clippy::too_many_lines,
     reason = "validate, mint, store, and build the response read as one flow"
@@ -798,6 +809,7 @@ mod error_codes {
             ApiError::NoEnrollment,
             ApiError::NameTaken,
             ApiError::ReservedSite,
+            ApiError::TokenOutstanding,
             ApiError::Internal(String::new()),
             ApiError::RotationDisabled,
         ]
@@ -819,6 +831,7 @@ mod error_codes {
             (404, "not_found"),
             (409, "name_taken"),
             (409, "reserved_site"),
+            (409, "token_outstanding"),
             (500, "internal"),
             (503, "rotation_disabled"),
         ]

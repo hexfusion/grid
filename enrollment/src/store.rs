@@ -28,6 +28,10 @@ pub enum StoreError {
     #[error("site name is already taken")]
     NameTaken,
 
+    /// A live token already pins this name.
+    #[error("a live site token already pins this site name")]
+    TokenOutstanding,
+
     /// The presented token is not usable.
     ///
     /// One error for missing, already redeemed, and expired, so a caller cannot
@@ -147,7 +151,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Backend`] if the backend failed.
+    /// Returns [`StoreError::NameTaken`] if an enrollment holds the name,
+    /// [`StoreError::TokenOutstanding`] if an unredeemed, unexpired token already
+    /// pins it, and [`StoreError::Backend`] if the backend failed.
     pub async fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         match self {
             Self::Memory(store) => store.mint_site_token(token),
@@ -201,6 +207,8 @@ impl Store {
     /// If it fails, the transaction rolls back and the token stays unspent. The
     /// guarded consume is the authoritative gate against a double redemption. The
     /// returned identifier is the issued-enrollment row's.
+    ///
+    /// A token that loses its name is revoked, so it cannot claim the name later.
     ///
     /// # Errors
     ///
@@ -301,6 +309,15 @@ struct Inner {
     not_after: HashMap<String, OffsetDateTime>,
 }
 
+impl Inner {
+    /// Drop a token, as revoke does.
+    fn forget(&mut self, token_id: Uuid) {
+        if let Some(row) = self.tokens.remove(&token_id) {
+            self.by_digest.remove(&row.token_sha256);
+        }
+    }
+}
+
 /// One site token held in memory.
 #[derive(Debug, Clone)]
 struct TokenRow {
@@ -347,9 +364,20 @@ impl MemoryStore {
         }
     }
 
-    /// Record a token.
+    /// Record a token, unless the name is held or a live token pins it.
     fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        if inner.issued_names.contains_key(&token.site_name) {
+            return Err(StoreError::NameTaken);
+        }
+        let now = self.now();
+        if inner
+            .tokens
+            .values()
+            .any(|row| row.site_name == token.site_name && row.redeemed_by.is_none() && row.expires_at > now)
+        {
+            return Err(StoreError::TokenOutstanding);
+        }
         let token_id = Uuid::new_v4();
         inner.by_digest.insert(token.token_sha256.clone(), token_id);
         inner.tokens.insert(
@@ -372,8 +400,8 @@ impl MemoryStore {
     fn revoke_site_token(&self, token_id: Uuid) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
         let outstanding = inner.tokens.get(&token_id).is_some_and(|row| row.redeemed_by.is_none());
-        if outstanding && let Some(row) = inner.tokens.remove(&token_id) {
-            inner.by_digest.remove(&row.token_sha256);
+        if outstanding {
+            inner.forget(token_id);
         }
         drop(inner);
         outstanding.then_some(()).ok_or(StoreError::NotFound)
@@ -394,6 +422,10 @@ impl MemoryStore {
     ///
     /// One lock covers the guard, the sign, and the record, so the token is spent
     /// only when the certificate is issued and a name check cannot race a record.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the guard, sign, and record read as one step under the lock"
+    )]
     fn redeem_and_issue<F>(&self, token_sha256: &str, sign: F) -> Result<(Uuid, Issued), StoreError>
     where
         F: FnOnce(&Pin) -> Result<Issued, StoreError>,
@@ -415,12 +447,19 @@ impl MemoryStore {
             })
             .ok_or(StoreError::TokenInvalid)?;
 
-        if inner.issued_names.contains_key(&pin.site_name) {
-            return Err(StoreError::NameTaken);
-        }
-
         // Sign before consuming, so a signing failure leaves the token unspent.
-        let issued = sign(&pin)?;
+        let signed = if inner.issued_names.contains_key(&pin.site_name) {
+            Err(StoreError::NameTaken)
+        } else {
+            sign(&pin)
+        };
+        let issued = match signed {
+            Err(StoreError::NameTaken) => {
+                inner.forget(token_id);
+                return Err(StoreError::NameTaken);
+            },
+            signed => signed?,
+        };
 
         let enrollment_id = Uuid::new_v4();
         if let Some(row) = inner.tokens.get_mut(&token_id) {
