@@ -83,7 +83,11 @@ Each override takes a Secret reference, so no key material is inlined in values.
 | `db.type` | `builtin` Postgres | `external` + `db.external.connectionUrlSecretRef` |
 | `db.builtin.pvcAnnotations` | none | annotations on the builtin DB PVC, which holds every site record; under Argo CD set `argocd.argoproj.io/sync-options: Prune=false,Delete=false` |
 | `enrollment.authz` | `kube` (SAR, needs the sar-feature image) | `local` (standalone grid-admin token table) |
-| `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (name:token lines) |
+| `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (`name:token` or `name:token:roles` lines, see below) |
+
+## Local grid-admin roles
+
+Under `enrollment.authz=local` each table line is `name:token` or `name:token:roles`, where `roles` is a comma-separated list of `grid-admin` and `enrollment-admin`, matching the Roles kube mode binds. A line with no roles is `grid-admin`: mint and revoke tokens, and read enrollments. Deleting an enrollment, or minting with `allowDeletedName`, needs `enrollment-admin`. Role names are exact and lowercase. An unknown, repeated, or empty role list fails startup, and a token must not contain `:`. The generated table holds one `admin:<token>` line, a grid-admin without `enrollment-admin`, as kube mode binds `enrollment-admin` to nobody by default. To delete enrollments, add a line such as `security:<token>:enrollment-admin` to the Secret and restart the service.
 
 ## Site invites
 

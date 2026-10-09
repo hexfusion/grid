@@ -121,8 +121,11 @@ enrollment:
     enabled: true
   # kube (default): SAR via TokenReview + SubjectAccessReview, the in-cluster path
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).
-  # local: the standalone grid-admin-token table, for non-kube deploys. The table has no
-  # roles, so every token in it may mint and revoke tokens and read and delete enrollments.
+  # local: the standalone grid-admin-token table, for non-kube deploys. Lines are
+  # name:token or name:token:roles, roles from grid-admin and enrollment-admin, comma
+  # separated. No roles means grid-admin: mint and revoke tokens, and read
+  # enrollments. Deleting an enrollment, or minting with allowDeletedName, needs
+  # enrollment-admin. An unknown role fails startup.
   authz: kube                        # kube | local
   # Audience a grid-admin token must be bound to under authz=kube, e.g.
   # kubectl create token <sa> --audience grid-enrollment --duration 10m.
@@ -146,7 +149,7 @@ enrollment:
     subjects: []
   gridAdminTokens:
     generate: true                   # the bootstrap Job creates a grid-admin-token Secret once
-    existingSecretRef: ""            # BYO Secret with key "tokens" (name:token lines)
+    existingSecretRef: ""            # BYO Secret with key "tokens" (name:token[:roles] lines)
   serviceAccount:
     create: true
     name: ""

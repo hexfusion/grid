@@ -39,7 +39,7 @@ enrollment and its database. On upgrade it keeps the CA.
 | `route.enabled` | `auto` (default) renders the Route only when the cluster serves `route.openshift.io/v1`. `true` or `false` forces it. |
 | `route.tls.termination` | Keep `passthrough`. The chart rejects `edge`, and rejects `reencrypt` while rotation is on. |
 | `db.type` | `builtin` runs Postgres in the chart. `external` reads the URL from the Secret in `db.external.connectionUrlSecretRef`. |
-| `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a grid-admin token table. |
+| `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a grid-admin token table whose lines may carry roles. |
 | `enrollment.certLifetimeSecs` | Site certificate lifetime. Empty means 180 days. |
 | `enrollment.rotation.enabled` | `true` (default). See [Rotation](#5-rotation). |
 | `image.digest`, `db.builtin.imageDigest` | Pin the enrollment and builtin Postgres images. |
@@ -182,15 +182,16 @@ rotation back on before then, or the site must re-enroll.
 ### Frozen sites
 
 If a stale key asks to rotate, the service freezes the site and logs `rotation
-fork` at warning level. A grid-admin recovers it by deleting the site's
-enrollment, and the site re-enrolls with a new key under a token minted with
-`allowDeletedName`. A deleted enrollment's keys are never enrolled again. To see
+fork` at warning level. An enrollment admin recovers it by deleting the site's
+enrollment and minting a token with `allowDeletedName`, and the site re-enrolls
+with a new key. A deleted enrollment's keys are never enrolled again. To see
 why a site cannot rotate, read `GET /v1alpha1/enrollments/{siteName}`. It
 returns `state` (`active` or `frozen`), key digests, and `notAfter`, and needs
 `get` on `enrollments`.
 
-With `enrollment.authz=local`, every admin in the token table can read and
-delete enrollments.
+With `enrollment.authz=local`, every admin in the token table can read
+enrollments, and only a line with the `enrollment-admin` role can delete them.
+See the chart README for the table format.
 
 After the enrollment database is restored from a backup, sites that rotated
 since the snapshot get `identity_refused` (logged on the hub as `record_behind`)

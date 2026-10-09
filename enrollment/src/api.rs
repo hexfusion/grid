@@ -409,12 +409,23 @@ async fn enforce_timeout(request: Request, next: Next) -> Response {
 async fn mint_site_token(
     State(state): State<Arc<AppState>>,
     GridAdmin(admin): GridAdmin,
+    headers: HeaderMap,
     Json(input): Json<EnrollmentTokenRequest>,
 ) -> Result<(StatusCode, Json<EnrollmentToken>), ApiError> {
     validate_site_name(&input.site_name).map_err(|err| ApiError::BadRequest {
         code: ErrorCode::InvalidSiteName,
         message: err.to_string(),
     })?;
+    // Re-admitting a deleted name undoes a delete, so it needs the right to delete.
+    if input.allow_deleted_name {
+        let presented = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+        let undelete = Operation {
+            resource: "enrollments",
+            verb: "delete",
+            subresource: None,
+        };
+        state.authorizer.decide(presented, undelete).await?;
+    }
     if state.reserved_sites.contains(&input.site_name) {
         return Err(ApiError::NameTaken);
     }

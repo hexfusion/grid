@@ -22,13 +22,15 @@ use tower::ServiceExt as _;
 /// The grid-admin credential the tests mint with.
 const TOKEN: &str = "t0ken";
 
-/// A service with a fresh CA, an empty store, and one grid-admin.
+/// A service with a fresh CA, an empty store, and one grid-admin that may also delete.
 fn service() -> axum::Router {
     let ca = certs::generate_ca("test-grid-ca").expect("ca");
     router(Arc::new(AppState {
         store: Store::memory(),
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
+        authorizer: Authorizer::Local(
+            GridAdmins::from_table("tester: t0ken: grid-admin,enrollment-admin\n").expect("table"),
+        ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: Vec::new(),
         renewals_enabled: true,
@@ -41,7 +43,9 @@ fn service_reserving(store: Store, reserved: &str) -> axum::Router {
     router(Arc::new(AppState {
         store,
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
+        authorizer: Authorizer::Local(
+            GridAdmins::from_table("tester: t0ken: grid-admin,enrollment-admin\n").expect("table"),
+        ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: vec![reserved.to_owned()],
         renewals_enabled: true,
@@ -703,4 +707,157 @@ async fn a_spelling_variant_of_a_deleted_name_is_not_a_new_name() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{variant:?}: {body}");
         assert_eq!(body["error"], "invalid_site_name", "{variant:?}");
     }
+}
+
+/// A table with a default grid-admin, a full admin, and a deleter-only entry.
+const ROLE_TABLE: &str = "\
+ops:t0ken
+root:full-token:grid-admin,enrollment-admin
+security:delete-token:enrollment-admin
+";
+
+fn service_with_roles() -> axum::Router {
+    let ca = certs::generate_ca("test-grid-ca").expect("ca");
+    router(Arc::new(AppState {
+        store: Store::memory(),
+        ca: SharedCa::new(ca),
+        authorizer: Authorizer::Local(GridAdmins::from_table(ROLE_TABLE).expect("table")),
+        cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
+        reserved_sites: Vec::new(),
+        renewals_enabled: true,
+    }))
+}
+
+async fn call_with(app: &axum::Router, bearer: &str, method: &str, path: &str, body: Option<Value>) -> StatusCode {
+    send(
+        app,
+        method,
+        path,
+        body,
+        &[("authorization", format!("Bearer {bearer}"))],
+    )
+    .await
+    .0
+}
+
+/// Mint and enroll `site` as the default grid-admin.
+async fn enrolled(app: &axum::Router, site: &str) {
+    let (token, _token_id) = mint(app, site).await;
+    let (status, _issued) = enroll(app, &token, &plain_csr()).await;
+    assert_eq!(status, StatusCode::CREATED, "{site} enrolls");
+}
+
+#[tokio::test]
+async fn a_grid_admin_without_enrollment_admin_cannot_delete_an_enrollment() {
+    let app = service_with_roles();
+    enrolled(&app, "site-kept").await;
+
+    let (refused, body) = call_as_admin(&app, "DELETE", "/v1alpha1/enrollments/site-kept", None).await;
+    assert_eq!(refused, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "forbidden");
+    for (method, path) in [
+        ("DELETE", "/v1alpha1/enrollments/site-kept/"),
+        ("DELETE", "/v1alpha1//enrollments/site-kept"),
+        ("DELETE", "/v1alpha1/enrollments/%73ite-kept"),
+        ("DELETE", "/V1ALPHA1/enrollments/site-kept"),
+        ("DELETE", "/v1alpha1/enrollments/site-kept?force=true"),
+        ("PUT", "/v1alpha1/enrollments/site-kept"),
+        ("PATCH", "/v1alpha1/enrollments/site-kept"),
+        ("POST", "/v1alpha1/enrollments/site-kept"),
+    ] {
+        let status = call_with(&app, TOKEN, method, path, None).await;
+        assert!(
+            status.is_client_error() && status != StatusCode::NO_CONTENT,
+            "{method} {path}: {status}"
+        );
+    }
+    let (read, record) = call_as_admin(&app, "GET", "/v1alpha1/enrollments/site-kept", None).await;
+    assert_eq!(
+        read,
+        StatusCode::OK,
+        "a grid-admin still reads, and the record survived: {record}"
+    );
+}
+
+#[tokio::test]
+async fn a_default_entry_keeps_mint_revoke_and_read() {
+    let app = service_with_roles();
+    let (_token, token_id) = mint(&app, "site-ops").await;
+    let status = call_with(
+        &app,
+        TOKEN,
+        "DELETE",
+        &format!("/v1alpha1/enrollmenttokens/{token_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "a default entry revokes");
+    enrolled(&app, "site-read").await;
+    let read = call_with(&app, TOKEN, "GET", "/v1alpha1/enrollments/site-read", None).await;
+    assert_eq!(read, StatusCode::OK, "a default entry reads enrollments");
+}
+
+#[tokio::test]
+async fn an_enrollment_admin_can_delete_an_enrollment() {
+    let app = service_with_roles();
+    enrolled(&app, "site-a").await;
+    enrolled(&app, "site-b").await;
+    assert_eq!(
+        call_with(&app, "full-token", "DELETE", "/v1alpha1/enrollments/site-a", None).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call_with(&app, "delete-token", "DELETE", "/v1alpha1/enrollments/site-b", None).await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn an_enrollment_admin_alone_cannot_mint_or_revoke() {
+    let app = service_with_roles();
+    let (_token, token_id) = mint(&app, "site-z").await;
+    let mint_body = json!({ "siteName": "site-y", "gridNetworkRef": "demo-grid" });
+    assert_eq!(
+        call_with(
+            &app,
+            "delete-token",
+            "POST",
+            "/v1alpha1/enrollmenttokens",
+            Some(mint_body)
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call_with(
+            &app,
+            "delete-token",
+            "DELETE",
+            &format!("/v1alpha1/enrollmenttokens/{token_id}"),
+            None
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn re_admitting_a_deleted_name_needs_the_right_to_delete() {
+    let app = service_with_roles();
+    enrolled(&app, "site-gone").await;
+    assert_eq!(
+        call_with(&app, "full-token", "DELETE", "/v1alpha1/enrollments/site-gone", None).await,
+        StatusCode::NO_CONTENT
+    );
+    let readmit = json!({ "siteName": "site-gone", "gridNetworkRef": "demo-grid", "allowDeletedName": true });
+    assert_eq!(
+        call_with(&app, TOKEN, "POST", "/v1alpha1/enrollmenttokens", Some(readmit.clone())).await,
+        StatusCode::FORBIDDEN,
+        "a grid-admin alone cannot undo a delete"
+    );
+    assert_eq!(
+        call_with(&app, "full-token", "POST", "/v1alpha1/enrollmenttokens", Some(readmit)).await,
+        StatusCode::CREATED,
+        "grid-admin with enrollment-admin re-admits the name"
+    );
 }

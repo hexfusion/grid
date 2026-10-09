@@ -480,15 +480,15 @@ fn load_cert_lifetime() -> time::Duration {
 /// Read the grid-admin token table.
 ///
 /// No table means nobody can mint, rather than anybody.
-fn load_grid_admins() -> Result<GridAdmins, std::io::Error> {
+fn load_grid_admins() -> Result<GridAdmins, Box<dyn std::error::Error>> {
     let admins = match std::env::var(GRID_ADMIN_TOKENS) {
-        Ok(path) => GridAdmins::from_table(&std::fs::read_to_string(&path)?),
+        Ok(path) => GridAdmins::from_table(&std::fs::read_to_string(&path)?).map_err(|error| error.to_string())?,
         Err(_unset) => GridAdmins::default(),
     };
 
     if admins.is_empty() {
         tracing::warn!(
-            "no grid-admin tokens configured, so no site token can be minted: set {GRID_ADMIN_TOKENS} to a file of name:token lines"
+            "no grid-admin tokens configured, so no site token can be minted: set {GRID_ADMIN_TOKENS} to a file of name:token[:roles] lines"
         );
     } else {
         tracing::info!(grid_admins = admins.len(), "grid-admin tokens loaded");
