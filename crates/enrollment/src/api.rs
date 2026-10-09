@@ -99,6 +99,14 @@ pub enum ApiError {
     #[error("a live site token already pins this site name")]
     TokenOutstanding,
 
+    /// The name's enrollment was deleted, and the token does not opt in to it.
+    #[error("the site name was deleted")]
+    NameDeleted,
+
+    /// The signing request's key was enrolled before.
+    #[error("the key was enrolled before")]
+    KeyReused,
+
     /// The caller presented no grid-admin credential, or one that is not known.
     #[error("a grid-admin credential is required")]
     Unauthorized,
@@ -157,6 +165,8 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound => Self::NotFound,
             StoreError::NameTaken => Self::NameTaken,
             StoreError::TokenOutstanding => Self::TokenOutstanding,
+            StoreError::NameDeleted => Self::NameDeleted,
+            StoreError::KeyReused => Self::KeyReused,
             StoreError::TokenInvalid => Self::InvalidToken,
             StoreError::Refused(_) => Self::IdentityRefused,
             StoreError::Backend(detail) => Self::Internal(detail),
@@ -241,6 +251,16 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 ErrorCode::TokenOutstanding,
                 "a live site token already pins this site name; revoke it or let it expire first".to_owned(),
+            ),
+            Self::NameDeleted => (
+                StatusCode::CONFLICT,
+                ErrorCode::NameDeleted,
+                "this site name's enrollment was deleted; mint with allowDeletedName to enroll it again".to_owned(),
+            ),
+            Self::KeyReused => (
+                StatusCode::CONFLICT,
+                ErrorCode::KeyReused,
+                "this key was enrolled before; enroll with a new key".to_owned(),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -434,6 +454,7 @@ async fn mint_site_token(
             grid_network_ref: input.grid_network_ref,
             issued_by: admin.clone(),
             expires_at,
+            allow_deleted_name: input.allow_deleted_name,
         })
         .await?;
 
@@ -715,7 +736,7 @@ async fn get_enrollment(
     }))
 }
 
-/// Delete a site's enrollment: its renewals end and the name is released to re-enroll.
+/// Delete a site's enrollment: its renewals end, and its name and keys are not reused by default.
 async fn delete_enrollment(
     State(state): State<Arc<AppState>>,
     GridAdmin(admin): GridAdmin,
@@ -732,7 +753,7 @@ async fn delete_enrollment(
             err.into()
         }
     })?;
-    tracing::info!(site = %site_name, %admin, "site enrollment deleted; the name may re-enroll");
+    tracing::info!(site = %site_name, %admin, "site enrollment deleted; the name re-enrolls only with allowDeletedName");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -837,6 +858,8 @@ mod error_codes {
             ApiError::NameTaken,
             ApiError::ReservedSite,
             ApiError::TokenOutstanding,
+            ApiError::NameDeleted,
+            ApiError::KeyReused,
             ApiError::Internal(String::new()),
             ApiError::RotationDisabled,
         ]
@@ -859,6 +882,8 @@ mod error_codes {
             (409, "name_taken"),
             (409, "reserved_site"),
             (409, "token_outstanding"),
+            (409, "name_deleted"),
+            (409, "key_reused"),
             (500, "internal"),
             (503, "rotation_disabled"),
         ]

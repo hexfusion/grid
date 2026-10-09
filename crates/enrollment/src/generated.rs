@@ -158,6 +158,12 @@ pub struct EnrollmentToken {
 ///What a grid-admin submits to mint a token.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct EnrollmentTokenRequest {
+    /**Lets the token enroll a name whose enrollment a grid-admin deleted.
+Without it, a deleted name is refused at mint and at enroll. Keys
+the deleted enrollment held stay refused either way.
+*/
+    #[serde(rename = "allowDeletedName", default)]
+    pub allow_deleted_name: bool,
     /**How long the token stays usable, in seconds. A default applies when
 unset. An explicit value must be greater than zero and at most
 604800 (seven days).
@@ -197,6 +203,8 @@ Retry-After when present, and stop on 401 and 403.
 | name_taken | 409 | Another enrollment holds the site name. |
 | reserved_site | 409 | The name is the enrollment bootstrap's. |
 | token_outstanding | 409 | A live token already pins the site name. |
+| name_deleted | 409 | The name's enrollment was deleted; mint with allowDeletedName. |
+| key_reused | 409 | The signing request's key was enrolled before. |
 | internal | 500 | The service could not complete the request. |
 | rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
 */
@@ -249,6 +257,10 @@ pub enum ErrorError {
     ReservedSite,
     #[serde(rename = "token_outstanding")]
     TokenOutstanding,
+    #[serde(rename = "name_deleted")]
+    NameDeleted,
+    #[serde(rename = "key_reused")]
+    KeyReused,
     #[serde(rename = "internal")]
     Internal,
     #[serde(rename = "rotation_disabled")]
@@ -271,6 +283,8 @@ impl ::std::fmt::Display for ErrorError {
             Self::NameTaken => f.write_str("name_taken"),
             Self::ReservedSite => f.write_str("reserved_site"),
             Self::TokenOutstanding => f.write_str("token_outstanding"),
+            Self::NameDeleted => f.write_str("name_deleted"),
+            Self::KeyReused => f.write_str("key_reused"),
             Self::Internal => f.write_str("internal"),
             Self::RotationDisabled => f.write_str("rotation_disabled"),
         }
@@ -296,6 +310,8 @@ impl ::std::str::FromStr for ErrorError {
             "name_taken" => Ok(Self::NameTaken),
             "reserved_site" => Ok(Self::ReservedSite),
             "token_outstanding" => Ok(Self::TokenOutstanding),
+            "name_deleted" => Ok(Self::NameDeleted),
+            "key_reused" => Ok(Self::KeyReused),
             "internal" => Ok(Self::Internal),
             "rotation_disabled" => Ok(Self::RotationDisabled),
             _ => Err("invalid value".into()),
