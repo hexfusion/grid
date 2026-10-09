@@ -39,7 +39,8 @@ else. The token pins the name, so a submission cannot assert one.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct EnrollmentRequest {
     /**PKCS#10 certificate signing request, PEM encoded. The private key
-stays with the requester and is never sent.
+stays with the requester and is never sent. The key must be an EC
+key on P-256 or P-384.
 */
     pub csr: ::std::string::String,
 }
@@ -189,7 +190,7 @@ Retry-After when present, and stop on 401 and 403.
 
 | Code | Status | Meaning |
 |---|---|---|
-| invalid_csr | 400 | The signing request does not parse or verify. |
+| invalid_csr | 400 | The signing request does not parse or verify, or its key is not EC P-256 or P-384. |
 | invalid_site_name | 400 | The site name is not a DNS label. |
 | invalid_token_ttl | 400 | The token lifetime is out of range. |
 | missing_grid_network | 400 | The token request names no grid. |
