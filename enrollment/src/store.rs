@@ -148,9 +148,8 @@ impl Store {
 
     /// A store backed by Postgres, with the schema applied.
     ///
-    /// This connects with whatever the URL specifies. The TLS posture of a
-    /// production URL is enforced by the caller before this point (the binary
-    /// refuses a plaintext-capable sslmode at startup), so tests can still point
+    /// This connects with whatever the URL specifies. The binary refuses any
+    /// sslmode short of verify-full before this point, so tests can still point
     /// this at a local plaintext database.
     ///
     /// # Errors

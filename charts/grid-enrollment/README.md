@@ -103,7 +103,7 @@ The builtin Postgres serves TLS with a cert the bootstrap Job issues from the
 generated CA, and the service refuses a plaintext DB. A provided CA
 (`ca.method=provided`) does not run the bootstrap Job, so it issues no DB cert.
 Provided-CA installs must therefore use an external DB (`db.type=external`) whose
-URL sets `sslmode` (verify-full for FIPS).
+URL sets `sslmode=verify-full`.
 
 Postgres reads its serving cert at pod start. Each bootstrap run compares the
 builtin DB Deployment's `grid.praxis.fast/db-serving-cert-sha256` pod

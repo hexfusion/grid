@@ -413,32 +413,16 @@ async fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
     }
 }
 
-/// Refuse a Postgres URL that could cross the network in plaintext.
+/// Refuse a Postgres URL whose server certificate is not fully verified.
 ///
-/// The store holds token digests, pinned names, and grid-admin identities, so the
-/// database hop must be encrypted. sslmode disable, allow, and prefer permit a
-/// plaintext fallback and are rejected before any connection. A fips build then
-/// requires verify-full and fails closed on anything less, since the FIPS posture
-/// rests on a fully verified server. A default build accepts require and verify-ca
-/// with a warning that verify-full is the intended posture.
+/// Parsed by the connection's own parser, so every spelling is judged as it will connect.
 fn require_db_tls(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mode = PgConnectOptions::from_str(url)?.get_ssl_mode();
-    if matches!(mode, PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer) {
+    if !matches!(PgConnectOptions::from_str(url)?.get_ssl_mode(), PgSslMode::VerifyFull) {
         return Err(format!(
-            "{DB_CONNECTION_URL} must require TLS: set sslmode=verify-full, or at least require. disable, allow, and prefer permit a plaintext fallback"
+            "{DB_CONNECTION_URL} must set sslmode=verify-full with a CA bundle (sslrootcert): \
+             a lesser mode leaves the server certificate unverified"
         )
         .into());
-    }
-    if !matches!(mode, PgSslMode::VerifyFull) {
-        #[cfg(feature = "fips")]
-        return Err(format!(
-            "{DB_CONNECTION_URL} must set sslmode=verify-full in a fips build: a lesser mode leaves the server certificate unverified"
-        )
-        .into());
-        #[cfg(not(feature = "fips"))]
-        tracing::warn!(
-            "Postgres TLS is on but the server certificate is not fully verified. Set sslmode=verify-full with a CA bundle to close a man-in-the-middle path"
-        );
     }
     Ok(())
 }
@@ -591,53 +575,43 @@ mod tests {
     }
 
     #[test]
-    fn a_url_that_permits_plaintext_is_refused() {
+    fn a_url_short_of_verify_full_is_refused_in_every_build() {
+        // These fall back to PGSSLMODE, as the connection does, so judge them only without it.
+        if std::env::var_os("PGSSLMODE").is_none() {
+            for url in [
+                "postgres://u:p@h/db",
+                "postgres://u:p@h/db?SSLMODE=verify-full",
+                "postgres://u:p@h/db?sslmode=",
+            ] {
+                assert!(require_db_tls(url).is_err(), "{url} must be refused");
+            }
+        }
         for url in [
-            "postgres://u:p@h/db",
             "postgres://u:p@h/db?sslmode=disable",
             "postgres://u:p@h/db?sslmode=allow",
             "postgres://u:p@h/db?sslmode=prefer",
+            "postgres://u:p@h/db?sslmode=require",
+            "postgres://u:p@h/db?sslmode=verify-ca",
+            "postgres://u:p@h/db?sslmode=Require",
+            "postgres://u:p@h/db?sslmode=VERIFY-CA",
+            "postgres://u:p@h/db?sslmode=verify-full&sslmode=require",
+            "postgres://u:p@h/db?sslmode=verify-full&ssl-mode=verify-ca",
+            "postgres://u:p@h/db?ssl-mode=require",
+            "postgres://u:p@h/db?sslmode=%72equire",
+            "postgres://u:p@h/db?sslmode=verify-full%20",
         ] {
-            assert!(
-                require_db_tls(url).is_err(),
-                "{url} permits a plaintext fallback and must be refused"
-            );
+            assert!(require_db_tls(url).is_err(), "{url} must be refused");
         }
     }
 
     #[test]
     fn verify_full_is_accepted() {
-        assert!(
-            require_db_tls("postgres://u:p@h/db?sslmode=verify-full").is_ok(),
-            "verify-full fully verifies the server and must be accepted in every build"
-        );
-    }
-
-    #[cfg(not(feature = "fips"))]
-    #[test]
-    fn a_partially_verified_url_is_accepted_outside_fips() {
         for url in [
-            "postgres://u:p@h/db?sslmode=require",
-            "postgres://u:p@h/db?sslmode=verify-ca",
+            "postgres://u:p@h/db?sslmode=verify-full",
+            "postgres://u:p@h/db?ssl-mode=verify-full",
+            "postgres://u:p@h/db?sslmode=require&sslmode=verify-full",
         ] {
-            assert!(
-                require_db_tls(url).is_ok(),
-                "{url} encrypts the hop and must be accepted in a default build"
-            );
-        }
-    }
-
-    #[cfg(feature = "fips")]
-    #[test]
-    fn a_partially_verified_url_is_refused_under_fips() {
-        for url in [
-            "postgres://u:p@h/db?sslmode=require",
-            "postgres://u:p@h/db?sslmode=verify-ca",
-        ] {
-            assert!(
-                require_db_tls(url).is_err(),
-                "{url} leaves the server unverified and a fips build must fail closed"
-            );
+            assert!(require_db_tls(url).is_ok(), "{url} fully verifies the server");
         }
     }
 }
