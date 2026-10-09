@@ -8,6 +8,7 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
 
@@ -331,6 +332,7 @@ serde_yaml.workspace = true
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
 certs = { path = "../certs", default-features = false, features = ["verifier"] }
+httpdate = { workspace = true }
 rustls = { version = "0.23.45", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
 
