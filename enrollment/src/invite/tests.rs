@@ -586,4 +586,63 @@ mod live {
             "failures double and never reset"
         );
     }
+
+    /// Hold `site` with a record that came from no token, as a seeded or deleted name does.
+    async fn hold(state: &AppState, site: &str) {
+        state
+            .store
+            .seed_reserved(&enrollment::SeedRecord {
+                site_name: site.to_owned(),
+                key_sha256: "e".repeat(64),
+                generation: 1,
+                issued_at: time::OffsetDateTime::now_utc(),
+            })
+            .await
+            .expect("seed");
+    }
+
+    /// A live token for `site` that no Secret holds, as after its Secret was deleted.
+    async fn outstanding(state: &AppState, site: &str, token: &str) {
+        state
+            .store
+            .mint_site_token(enrollment::NewSiteToken {
+                token_sha256: digest(token),
+                site_name: site.to_owned(),
+                grid_network_ref: "demo-grid".to_owned(),
+                issued_by: "admin".to_owned(),
+                expires_at: time::OffsetDateTime::now_utc().saturating_add(time::Duration::hours(1)),
+                allow_deleted_name: false,
+            })
+            .await
+            .expect("mint");
+    }
+
+    #[tokio::test]
+    async fn refusals_that_need_no_new_token_do_not_fail_the_run() {
+        let (state, mut minter, _admin) = serve("good-admin").await;
+        hold(&state, "site-enrolled").await;
+        hold(&state, "site-deleted").await;
+        state.store.delete_enrollment("site-deleted").await.expect("delete");
+        outstanding(&state, "site-outstanding", "lost-token").await;
+        let secrets = Fake::new(OnCreate::Store);
+
+        for (site, want) in [
+            ("site-enrolled", Invited::Enrolled),
+            ("site-outstanding", Invited::Outstanding),
+            ("site-deleted", Invited::Deleted),
+        ] {
+            let got = invite_one(&secrets, &mut minter, "grid-invite-", &invite(site)).await;
+            assert_eq!(got.expect(site), want, "{site}");
+        }
+        let invites = [
+            invite("site-enrolled"),
+            invite("site-outstanding"),
+            invite("site-deleted"),
+        ];
+        invite_all(&secrets, &mut minter, "grid-invite-", &invites)
+            .await
+            .expect("the run succeeds");
+        assert!(secrets.seen().is_empty(), "nothing is minted or stored");
+        assert!(live(&state, "lost-token").await, "the outstanding token is not revoked");
+    }
 }

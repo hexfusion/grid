@@ -91,7 +91,7 @@ Under `enrollment.authz=local` each table line is `name:token` or `name:token:ro
 
 ## Site invites
 
-Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800, optional `allowDeletedName` to invite a site whose enrollment was deleted) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
+Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800, optional `allowDeletedName` to invite a site whose enrollment was deleted) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. It also skips, without failing, a site that is enrolled, one whose live token it cannot store because its Secret was deleted (rerun after that token expires), and one whose enrollment was deleted. An entry with `allowDeletedName` also needs the invite ServiceAccount bound to the enrollment-admin Role. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
 
 ## Hub site identity
 
