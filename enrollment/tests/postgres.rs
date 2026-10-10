@@ -31,7 +31,14 @@ static DB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// A store against the test database and the exclusive lock over it, or `None`
 /// when no database is configured.
 async fn store() -> Option<(Store, MutexGuard<'static, ()>)> {
-    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").ok()?;
+    let Ok(url) = std::env::var("ENROLLMENT_TEST_DATABASE_URL") else {
+        // CI sets this, so a dropped database fails the run instead of skipping every test.
+        assert!(
+            std::env::var_os("ENROLLMENT_REQUIRE_TEST_DATABASE").is_none(),
+            "ENROLLMENT_REQUIRE_TEST_DATABASE is set but ENROLLMENT_TEST_DATABASE_URL is not"
+        );
+        return None;
+    };
     let guard = DB_LOCK.lock().await;
     let store = Store::postgres(&url).await.expect("connect to the test database");
     Some((store, guard))
