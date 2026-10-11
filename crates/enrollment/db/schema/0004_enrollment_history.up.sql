@@ -28,3 +28,10 @@ INSERT INTO enrolled_keys (public_key_sha256, site_name, enrolled_at)
 SELECT previous_public_key_sha256, site_name, issued_at FROM site_enrollments
  WHERE previous_public_key_sha256 IS NOT NULL
 ON CONFLICT DO NOTHING;
+
+-- Names deleted before the history existed: a redeemed token with no enrollment left.
+INSERT INTO deleted_site_names (site_name)
+SELECT DISTINCT t.site_name FROM site_tokens t
+ WHERE t.redeemed_at IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM site_enrollments e WHERE e.site_name = t.site_name)
+ON CONFLICT DO NOTHING;

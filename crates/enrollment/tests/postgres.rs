@@ -360,6 +360,38 @@ async fn a_token_that_loses_its_name_cannot_claim_it_after_a_delete() {
     );
 }
 
+/// A name deleted before the history existed is still a deleted name after the upgrade.
+#[tokio::test]
+async fn a_name_deleted_before_the_upgrade_is_backfilled_as_deleted() {
+    let Some((store, guard)) = store().await else {
+        return;
+    };
+    let site = unique("predeleted");
+    let digest = unique("digest");
+    store.mint_site_token(new_token(&site, &digest)).await.expect("mint");
+    store.redeem_and_issue(&digest, sign_for).await.expect("enroll");
+    // The pre-upgrade delete: the enrollment goes, the redeemed token and no tombstone stay.
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("url");
+    let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
+    sqlx::query("DELETE FROM site_enrollments WHERE site_name = $1")
+        .bind(&site)
+        .execute(&pool)
+        .await
+        .expect("legacy delete");
+    sqlx::query("DELETE FROM deleted_site_names WHERE site_name = $1")
+        .bind(&site)
+        .execute(&pool)
+        .await
+        .expect("no tombstone");
+    drop(store);
+
+    // Starting again applies the schema, as an upgrade does.
+    let upgraded = Store::postgres(&url).await.expect("reconnect");
+    let refused = upgraded.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(matches!(refused, Err(StoreError::NameDeleted)), "got {refused:?}");
+    drop(guard);
+}
+
 /// A token the signer refuses for a taken name stays unspent.
 #[tokio::test]
 async fn a_token_refused_by_the_signer_is_not_spent() {
