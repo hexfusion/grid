@@ -32,11 +32,13 @@
 
 ## Operations
 
-- [Fleet Dashboard](../fleet-dashboard/README.md) — optional hub web UI drawing
+- [Fleet Dashboard](../crates/fleet-dashboard/README.md) — optional hub web UI drawing
   every site on a map with health from its own Prometheus; deployed only when
   you install its chart.
 - [Adding an Inference Provider](adding-provider.md) — step-by-step
   workflow for in-cluster, existing-service, and external HTTPS providers.
+- [Metrics Reference](metrics.md) — every metric the operator and the gateway
+  export, with types, labels, and what each one means.
 - [Operations](architecture/operations.md) — local environment setup,
   validation commands, and operator workflows.
 - [CI Kind E2E](architecture/ci-kind-e2e.md) — validation tiers, gate sequence,
