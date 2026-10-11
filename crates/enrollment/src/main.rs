@@ -310,9 +310,7 @@ async fn reload_ca(
         }
         .await;
         let reloaded = match material {
-            Ok((cert, key)) => state
-                .ca
-                .reload(record, &common_name, &cert, &key)
+            Ok((cert, key)) => Box::pin(state.ca.reload(record, &common_name, &cert, &key))
                 .await
                 .map_err(|err| err.to_string()),
             Err(err) => Err(err.to_string()),

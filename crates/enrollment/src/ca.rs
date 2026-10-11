@@ -88,27 +88,41 @@ impl SharedCa {
             self.check_record(record.store, &held.cert_pem).await?;
             return Ok(None);
         }
-        // Load first so the record never moves to a CA that cannot sign.
-        let ca = certs::load_ca(common_name, key_pem, cert_pem)?;
-        // The anchor is the key, so a certificate renewed on the same key passes.
-        anchor(record.store, &certs::cert_public_key_sha256(cert_pem)?, record.confirm).await?;
-        *self.ca.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(ca);
-        self.anchored.store(true, Ordering::Release);
-        Ok(Some((current, incoming)))
+        let admitted = async {
+            // Load first so the record never moves to a CA that cannot sign.
+            let ca = certs::load_ca(common_name, key_pem, cert_pem)?;
+            // The anchor is the key, so a certificate renewed on the same key passes.
+            anchor(record.store, &certs::cert_public_key_sha256(cert_pem)?, record.confirm).await?;
+            Ok::<_, ReloadError>(ca)
+        }
+        .await;
+        match admitted {
+            Ok(ca) => {
+                *self.ca.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(ca);
+                self.anchored.store(true, Ordering::Release);
+                Ok(Some((current, incoming)))
+            },
+            Err(refused) => {
+                // The held CA is kept, so it must still be the recorded one to sign.
+                drop(self.check_record(record.store, &held.cert_pem).await);
+                Err(refused)
+            },
+        }
     }
 
-    /// Withhold signing while the database records a key other than the held CA's.
+    /// Sign only while the database records the held CA's key, recording it if the record is gone.
     async fn check_record(&self, store: &Store, cert_pem: &str) -> Result<(), ReloadError> {
         let held = certs::cert_public_key_sha256(cert_pem)?;
-        match store.recorded_ca().await.map_err(AnchorError::from)? {
-            Some(recorded) if recorded != held => {
-                self.anchored.store(false, Ordering::Release);
-                Err(mismatch(&recorded, &held).into())
-            },
-            _ => {
+        match anchor(store, &held, None).await {
+            Ok(_) => {
                 self.anchored.store(true, Ordering::Release);
                 Ok(())
             },
+            Err(refused @ AnchorError::Mismatch { .. }) => {
+                self.anchored.store(false, Ordering::Release);
+                Err(refused.into())
+            },
+            Err(failed) => Err(failed.into()),
         }
     }
 }
@@ -477,8 +491,8 @@ mod tests {
         assert_eq!(shared.current().cert_pem, original, "the current CA is kept");
         assert_eq!(
             store.recorded_ca().await.expect("read"),
-            None,
-            "material that does not load records nothing"
+            Some(certs::cert_public_key_sha256(&original).expect("fingerprint")),
+            "material that does not load is never recorded, only the CA still held"
         );
     }
 
@@ -512,5 +526,57 @@ mod tests {
             shared.signer().is_none(),
             "a CA the database no longer records must not sign"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_ca_withholds_a_held_ca_the_record_has_moved_past() {
+        let (old_fp, ca) = fresh();
+        let (new_fp, _) = fresh();
+        let (_, third) = fresh();
+        let shared = SharedCa::new(ca);
+        let store = Store::memory();
+        anchor(&store, &old_fp, None).await.expect("first start");
+        anchor(&store, &new_fp, Some(&old_fp))
+            .await
+            .expect("another replica confirms");
+
+        let refused = shared
+            .reload(unconfirmed(&store), "grid-ca", &third.cert_pem, &third.key_pem)
+            .await;
+        assert!(
+            matches!(refused, Err(ReloadError::Anchor(AnchorError::Mismatch { .. }))),
+            "{refused:?}"
+        );
+        assert!(shared.signer().is_none(), "the kept CA is no longer the recorded one");
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_ca_keeps_signing_with_the_recorded_one() {
+        let (old_fp, ca) = fresh();
+        let (_, other) = fresh();
+        let shared = SharedCa::new(ca);
+        let store = Store::memory();
+        anchor(&store, &old_fp, None).await.expect("first start");
+
+        let refused = shared
+            .reload(unconfirmed(&store), "grid-ca", &other.cert_pem, &other.key_pem)
+            .await;
+        assert!(refused.is_err(), "an unconfirmed CA is refused");
+        assert!(shared.signer().is_some(), "the held CA is still the recorded one");
+    }
+
+    #[tokio::test]
+    async fn a_missing_record_is_restored_to_the_held_ca() {
+        let (fingerprint, ca) = fresh();
+        let (cert, key) = (ca.cert_pem.clone(), ca.key_pem.clone());
+        let shared = SharedCa::new(ca);
+        let store = Store::memory();
+
+        shared
+            .reload(unconfirmed(&store), "grid-ca", &cert, &key)
+            .await
+            .expect("an empty record takes the held CA");
+        assert!(shared.signer().is_some(), "the held CA is now the recorded one");
+        assert_eq!(store.recorded_ca().await.expect("read"), Some(fingerprint));
     }
 }
