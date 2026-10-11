@@ -118,11 +118,12 @@ impl SharedCa {
                 self.anchored.store(true, Ordering::Release);
                 Ok(())
             },
-            Err(refused @ AnchorError::Mismatch { .. }) => {
+            // Any refusal, a mismatch or a store that cannot be read, withholds the
+            // signer: an unverifiable record is not a verified one.
+            Err(refused) => {
                 self.anchored.store(false, Ordering::Release);
                 Err(refused.into())
             },
-            Err(failed) => Err(failed.into()),
         }
     }
 }
