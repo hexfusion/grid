@@ -56,7 +56,9 @@ fn grid_with(reserved: &[&str], renewals_enabled: bool) -> Grid {
         store: Store::memory(),
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(
-            GridAdmins::from_table("tester: t0ken: grid-admin,enrollment-admin\n").expect("table"),
+            GridAdmins::from_table("tester: t0ken\n")
+                .with_roles("tester: grid-admin,enrollment-admin\n")
+                .expect("roles"),
         ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: reserved.iter().map(|site| (*site).to_owned()).collect(),

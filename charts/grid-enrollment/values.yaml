@@ -121,11 +121,14 @@ enrollment:
     enabled: true
   # kube (default): SAR via TokenReview + SubjectAccessReview, the in-cluster path
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).
-  # local: the standalone grid-admin-token table, for non-kube deploys. Lines are
-  # name:token or name:token:roles, roles from grid-admin and enrollment-admin, comma
-  # separated. No roles means grid-admin: mint and revoke tokens, and read
+  # local: the standalone grid-admin-token table, for non-kube deploys. Lines in the
+  # "tokens" key are name:token, where the token is everything after the first colon
+  # and may contain any character. Roles come from an optional "roles" key of
+  # name:role[,role] lines, from grid-admin and enrollment-admin, comma separated. A
+  # name with no roles line is grid-admin: mint and revoke tokens, and read
   # enrollments. Deleting an enrollment, or minting with allowDeletedName, needs
-  # enrollment-admin. An unknown role fails startup.
+  # enrollment-admin. An unknown role, or a roles line naming nobody in the token
+  # table, fails startup.
   authz: kube                        # kube | local
   # Record each enrollment as a CertificateSigningRequest on this cluster, under
   # signer grid.praxis.fast/site: created, approved on the invite's authority and
@@ -166,7 +169,7 @@ enrollment:
     subjects: []
   gridAdminTokens:
     generate: true                   # the bootstrap Job creates a grid-admin-token Secret once
-    existingSecretRef: ""            # BYO Secret with key "tokens" (name:token[:roles] lines)
+    existingSecretRef: ""            # BYO Secret with key "tokens" (name:token), optional "roles"
   serviceAccount:
     create: true
     name: ""

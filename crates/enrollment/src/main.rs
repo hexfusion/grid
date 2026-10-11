@@ -40,6 +40,9 @@ const LISTEN_ADDR: &str = "ENROLLMENT_LISTEN_ADDR";
 const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 /// Table of grid-admins allowed to mint and revoke site tokens.
 const GRID_ADMIN_TOKENS: &str = "ENROLLMENT_GRID_ADMIN_TOKENS";
+/// Path to the optional role table. Roles live apart from the tokens so a
+/// token's meaning never depends on the token's own characters.
+const GRID_ADMIN_ROLES: &str = "ENROLLMENT_GRID_ADMIN_ROLES";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
 /// Set to `false` to refuse every renewal.
@@ -553,18 +556,38 @@ fn load_cert_lifetime() -> time::Duration {
     lifetime
 }
 
+/// A file's contents, `None` when it is not there.
+fn read_optional(path: &str) -> Result<Option<String>, std::io::Error> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Read the grid-admin token table.
 ///
 /// No table means nobody can mint, rather than anybody.
 fn load_grid_admins() -> Result<GridAdmins, Box<dyn std::error::Error>> {
     let admins = match std::env::var(GRID_ADMIN_TOKENS) {
-        Ok(path) => GridAdmins::from_table(&std::fs::read_to_string(&path)?).map_err(|error| error.to_string())?,
+        Ok(path) => {
+            let admins = GridAdmins::from_table(&std::fs::read_to_string(&path)?);
+            match std::env::var(GRID_ADMIN_ROLES)
+                .ok()
+                .map(|roles| read_optional(&roles))
+                .transpose()?
+            {
+                // A Secret without the key mounts no file, so absent means no roles.
+                Some(Some(roles)) => admins.with_roles(&roles).map_err(|error| error.to_string())?,
+                Some(None) | None => admins,
+            }
+        },
         Err(_unset) => GridAdmins::default(),
     };
 
     if admins.is_empty() {
         tracing::warn!(
-            "no grid-admin tokens configured, so no site token can be minted: set {GRID_ADMIN_TOKENS} to a file of name:token[:roles] lines"
+            "no grid-admin tokens configured, so no site token can be minted: set {GRID_ADMIN_TOKENS} to a file of name:token lines"
         );
     } else {
         tracing::info!(grid_admins = admins.len(), "grid-admin tokens loaded");

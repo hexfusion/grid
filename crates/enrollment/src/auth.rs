@@ -65,10 +65,26 @@ impl TableAdmin {
 pub enum TableError {
     /// A role list names no role, an unknown one, or one twice.
     #[error(
-        "grid-admin token table line {line} ({name}): the role list must name each of grid-admin or \
-         enrollment-admin at most once, and a token must not contain ':'"
+        "grid-admin role table line {line} ({name}): the role list must name each of grid-admin or \
+         enrollment-admin at most once"
     )]
     Roles {
+        /// The 1-based line number.
+        line: usize,
+        /// The entry's name.
+        name: String,
+    },
+    /// A role line names somebody the token table does not.
+    #[error("grid-admin role table line {line}: {name} has no token")]
+    UnknownAdmin {
+        /// The 1-based line number.
+        line: usize,
+        /// The entry's name.
+        name: String,
+    },
+    /// Two role lines name one admin.
+    #[error("grid-admin role table line {line}: {name} already has roles")]
+    DuplicateRoles {
         /// The 1-based line number.
         line: usize,
         /// The entry's name.
@@ -86,23 +102,61 @@ pub struct GridAdmins {
 impl GridAdmins {
     /// Read a token table.
     ///
-    /// One `name:token` or `name:token:role,role` per line, with roles from
-    /// `grid-admin` and `enrollment-admin`; no role list means `grid-admin`.
-    /// Blank lines and lines starting with `#` are skipped, as is a line with
-    /// no separator, name, or token.
+    /// One `name:token` per line, where the token is everything after the first
+    /// `:` and may contain any character. Every admin starts as `grid-admin`;
+    /// [`Self::with_roles`] narrows that. Blank lines and lines starting with
+    /// `#` are skipped, as is a line with no separator, name, or token.
+    #[must_use]
+    pub fn from_table(text: &str) -> Self {
+        let mut by_digest = HashMap::new();
+        for line in text.lines() {
+            if let Some((token_digest, admin)) = parse_line(line) {
+                by_digest.insert(token_digest, admin);
+            }
+        }
+        Self { by_digest }
+    }
+
+    /// Apply a role table, replacing the default `grid-admin` for each name it
+    /// lists.
+    ///
+    /// One `name:role[,role]` per line, with roles from `grid-admin` and
+    /// `enrollment-admin`. A name the table does not list keeps `grid-admin`.
+    /// Roles live here rather than on the token line so that a token's meaning
+    /// never depends on the token's own characters.
     ///
     /// # Errors
     ///
     /// [`TableError::Roles`] for a role list that is empty, names an unknown
-    /// role, or repeats one. The error never carries the token.
-    pub fn from_table(text: &str) -> Result<Self, TableError> {
-        let mut by_digest = HashMap::new();
+    /// role, or repeats one; [`TableError::UnknownAdmin`] for a name with no
+    /// token; [`TableError::DuplicateRoles`] for a name listed twice.
+    pub fn with_roles(mut self, text: &str) -> Result<Self, TableError> {
+        let mut seen: Vec<String> = Vec::new();
         for (index, line) in text.lines().enumerate() {
-            if let Some((token_digest, admin)) = parse_line(index.saturating_add(1), line)? {
-                by_digest.insert(token_digest, admin);
+            let line_number = index.saturating_add(1);
+            let Some((name, roles)) = parse_roles_line(line_number, line)? else {
+                continue;
+            };
+            if seen.contains(&name) {
+                return Err(TableError::DuplicateRoles {
+                    line: line_number,
+                    name,
+                });
             }
+            let mut matched = false;
+            for admin in self.by_digest.values_mut().filter(|admin| admin.name == name) {
+                admin.roles.clone_from(&roles);
+                matched = true;
+            }
+            if !matched {
+                return Err(TableError::UnknownAdmin {
+                    line: line_number,
+                    name,
+                });
+            }
+            seen.push(name);
         }
-        Ok(Self { by_digest })
+        Ok(self)
     }
 
     /// The entry a token belongs to, if any.
@@ -127,36 +181,50 @@ impl GridAdmins {
     }
 }
 
-/// One table line as its token digest and entry, `None` for a line that is skipped.
-fn parse_line(line_number: usize, line: &str) -> Result<Option<(String, TableAdmin)>, TableError> {
+/// A parsed role line, `None` for a line that is skipped.
+type RoleLine = Option<(String, Vec<Role>)>;
+
+/// One role line as its name and roles, `None` for a line that is skipped.
+fn parse_roles_line(line_number: usize, line: &str) -> Result<RoleLine, TableError> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return Ok(None);
     }
-    let Some((name, rest)) = line.split_once(':') else {
+    let Some((name, list)) = line.split_once(':') else {
         return Ok(None);
     };
-    let (token, roles) = rest
-        .split_once(':')
-        .map_or((rest, None), |(token, roles)| (token, Some(roles)));
-    let (name, token) = (name.trim(), token.trim());
-    if name.is_empty() || token.is_empty() {
+    let name = name.trim();
+    if name.is_empty() {
         return Ok(None);
     }
-    let roles = match roles {
-        None => vec![Role::GridAdmin],
-        Some(list) => parse_roles(list).ok_or_else(|| TableError::Roles {
-            line: line_number,
-            name: name.to_owned(),
-        })?,
-    };
-    Ok(Some((
+    let roles = parse_roles(list.trim()).ok_or_else(|| TableError::Roles {
+        line: line_number,
+        name: name.to_owned(),
+    })?;
+    Ok(Some((name.to_owned(), roles)))
+}
+
+/// One token line as its digest and entry, `None` for a line that is skipped.
+///
+/// The token is the whole remainder after the first `:`, so a token carrying a
+/// `:` keeps its meaning.
+fn parse_line(line: &str) -> Option<(String, TableAdmin)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (name, token) = line.split_once(':')?;
+    let (name, token) = (name.trim(), token.trim());
+    if name.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some((
         digest(token),
         TableAdmin {
             name: name.to_owned(),
-            roles,
+            roles: vec![Role::GridAdmin],
         },
-    )))
+    ))
 }
 
 /// A comma-separated role list, or `None` if it is empty, unknown, or repeats a role.
@@ -189,7 +257,50 @@ mod tests {
     use super::*;
 
     fn table(text: &str) -> GridAdmins {
-        GridAdmins::from_table(text).expect("table")
+        GridAdmins::from_table(text)
+    }
+
+    #[test]
+    fn a_legacy_colon_token_keeps_its_meaning() {
+        let admins = GridAdmins::from_table("alice:abc:grid-admin\n");
+        let alice = admins
+            .resolve("abc:grid-admin")
+            .expect("the whole remainder is the token");
+        assert_eq!(alice.name, "alice");
+        assert_eq!(alice.roles, vec![Role::GridAdmin]);
+        assert!(admins.resolve("abc").is_none(), "the prefix is not a credential");
+    }
+
+    #[test]
+    fn a_legacy_line_never_gains_a_role() {
+        let admins = GridAdmins::from_table("alice:abc:enrollment-admin\n");
+        let alice = admins
+            .resolve("abc:enrollment-admin")
+            .expect("the whole remainder is the token");
+        assert_eq!(alice.roles, vec![Role::GridAdmin], "a token cannot name its own role");
+    }
+
+    #[test]
+    fn roles_come_only_from_the_role_table() {
+        let admins = GridAdmins::from_table("bob:t\n")
+            .with_roles("bob:enrollment-admin\n")
+            .expect("roles");
+        assert_eq!(admins.resolve("t").expect("bob").roles, vec![Role::EnrollmentAdmin]);
+
+        let orphan = GridAdmins::from_table("bob:t\n").with_roles("carol:grid-admin\n");
+        assert!(
+            matches!(&orphan, Err(TableError::UnknownAdmin { line: 1, name }) if name == "carol"),
+            "a role line with no token is refused: {orphan:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_listed_twice_in_the_role_table_is_refused() {
+        let parsed = GridAdmins::from_table("bob:t\n").with_roles("bob:grid-admin\nbob:enrollment-admin\n");
+        assert!(
+            matches!(&parsed, Err(TableError::DuplicateRoles { line: 2, name }) if name == "bob"),
+            "the second line is refused rather than winning: {parsed:?}"
+        );
     }
 
     #[test]
@@ -256,63 +367,70 @@ mod tests {
 
     #[test]
     fn an_entry_without_roles_is_a_grid_admin_only() {
-        let admins = table("alice:one\nbob:two:grid-admin,enrollment-admin\ncarol:three:enrollment-admin\n");
-        assert_eq!(roles(&admins, "one"), [Role::GridAdmin]);
+        let admins = GridAdmins::from_table("alice:one\nbob:two\ncarol:three\n")
+            .with_roles("bob:grid-admin,enrollment-admin\ncarol:enrollment-admin\n")
+            .expect("roles");
+        assert_eq!(roles(&admins, "one"), [Role::GridAdmin], "unlisted keeps the default");
         assert_eq!(roles(&admins, "two"), [Role::GridAdmin, Role::EnrollmentAdmin]);
         assert_eq!(roles(&admins, "three"), [Role::EnrollmentAdmin]);
     }
 
     #[test]
     fn whitespace_around_roles_is_trimmed() {
-        let admins = table("alice: one : grid-admin , enrollment-admin \n");
+        let admins = GridAdmins::from_table("alice: one \n")
+            .with_roles(" alice : grid-admin , enrollment-admin \n")
+            .expect("roles");
         assert_eq!(roles(&admins, "one"), [Role::GridAdmin, Role::EnrollmentAdmin]);
     }
 
     #[test]
     fn a_bad_role_list_fails_the_whole_table() {
-        for line in [
-            "alice:one:root",
-            "alice:one:Grid-Admin",
-            "alice:one:ENROLLMENT-ADMIN",
-            "alice:one:grid admin",
-            "alice:one:",
-            "alice:one: ",
-            "alice:one:,",
-            "alice:one:grid-admin,",
-            "alice:one:grid-admin,,enrollment-admin",
-            "alice:one:grid-admin,grid-admin",
-            "alice:one:enrollment-admin, enrollment-admin",
-            "alice:one:grid-admin;enrollment-admin",
-            "alice:one:grid-admin:enrollment-admin",
-            "alice:one:*",
+        for list in [
+            "root",
+            "Grid-Admin",
+            "ENROLLMENT-ADMIN",
+            "grid admin",
+            "",
+            " ",
+            ",",
+            "grid-admin,",
+            "grid-admin,,enrollment-admin",
+            "grid-admin,grid-admin",
+            "enrollment-admin, enrollment-admin",
+            "grid-admin;enrollment-admin",
+            "grid-admin:enrollment-admin",
+            "*",
         ] {
-            let parsed = GridAdmins::from_table(&format!("bob:two\n{line}\n"));
+            let parsed =
+                GridAdmins::from_table("bob:two\nalice:one\n").with_roles(&format!("bob:grid-admin\nalice:{list}\n"));
             assert!(
                 matches!(&parsed, Err(TableError::Roles { line: 2, name }) if name == "alice"),
-                "{line:?} must fail, got {parsed:?}"
+                "{list:?} must fail, got {parsed:?}"
             );
         }
     }
 
     #[test]
-    fn a_token_with_a_colon_fails_without_echoing_it() {
-        let parsed = GridAdmins::from_table("alice:se:cret-tail\n");
-        let error = parsed.expect_err("a colon in a token is refused");
-        let message = error.to_string();
+    fn a_role_error_does_not_echo_a_token() {
+        let parsed = GridAdmins::from_table("alice:se:cret-tail\n").with_roles("alice:root\n");
+        let message = parsed.expect_err("an unknown role is refused").to_string();
         assert!(
             !message.contains("cret-tail"),
             "the token's tail is not echoed: {message}"
         );
-        assert!(message.contains("must not contain ':'"), "{message}");
     }
 
     #[test]
     fn a_token_that_spells_a_role_does_not_escalate_silently() {
         let admins = table("alice:x:enrollment-admin\n");
-        assert!(
-            admins.resolve("x:enrollment-admin").is_none(),
-            "the colon splits the roles off"
+        let alice = admins
+            .resolve("x:enrollment-admin")
+            .expect("the whole remainder is the token");
+        assert_eq!(
+            alice.roles,
+            vec![Role::GridAdmin],
+            "a token spelling a role does not grant it"
         );
-        assert_eq!(roles(&admins, "x"), [Role::EnrollmentAdmin]);
+        assert!(admins.resolve("x").is_none(), "the prefix is not a credential");
     }
 }

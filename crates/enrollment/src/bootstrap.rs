@@ -1477,7 +1477,7 @@ mod tests {
     #[test]
     fn the_generated_admin_is_a_grid_admin_without_enrollment_admin() {
         let data = admin_tokens("abc");
-        let admins = enrollment::GridAdmins::from_table(data.get("tokens").expect("tokens")).expect("table");
+        let admins = enrollment::GridAdmins::from_table(data.get("tokens").expect("tokens"));
         let admin = admins.resolve("abc").expect("the generated token resolves");
         assert_eq!(admin.roles, [enrollment::auth::Role::GridAdmin]);
     }

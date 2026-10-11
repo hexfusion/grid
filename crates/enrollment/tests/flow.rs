@@ -29,7 +29,9 @@ fn service() -> axum::Router {
         store: Store::memory(),
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(
-            GridAdmins::from_table("tester: t0ken: grid-admin,enrollment-admin\n").expect("table"),
+            GridAdmins::from_table("tester: t0ken\n")
+                .with_roles("tester: grid-admin,enrollment-admin\n")
+                .expect("roles"),
         ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: Vec::new(),
@@ -46,7 +48,9 @@ fn service_reserving(store: Store, reserved: &str) -> axum::Router {
         store,
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(
-            GridAdmins::from_table("tester: t0ken: grid-admin,enrollment-admin\n").expect("table"),
+            GridAdmins::from_table("tester: t0ken\n")
+                .with_roles("tester: grid-admin,enrollment-admin\n")
+                .expect("roles"),
         ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: vec![reserved.to_owned()],
@@ -716,8 +720,13 @@ async fn a_spelling_variant_of_a_deleted_name_is_not_a_new_name() {
 /// A table with a default grid-admin, a full admin, and a deleter-only entry.
 const ROLE_TABLE: &str = "\
 ops:t0ken
-root:full-token:grid-admin,enrollment-admin
-security:delete-token:enrollment-admin
+root:full-token
+security:delete-token
+";
+
+const ROLES: &str = "\
+root:grid-admin,enrollment-admin
+security:enrollment-admin
 ";
 
 fn service_with_roles() -> axum::Router {
@@ -725,7 +734,7 @@ fn service_with_roles() -> axum::Router {
     router(Arc::new(AppState {
         store: Store::memory(),
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table(ROLE_TABLE).expect("table")),
+        authorizer: Authorizer::Local(GridAdmins::from_table(ROLE_TABLE).with_roles(ROLES).expect("roles")),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: Vec::new(),
         renewals_enabled: true,
