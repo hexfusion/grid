@@ -6,7 +6,10 @@
 
 use std::{
     collections::BTreeSet,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{
+        Arc, PoisonError, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use certs::CaCert;
@@ -19,7 +22,12 @@ pub const CONFIRM_ROTATION_VAR: &str = "ENROLLMENT_CONFIRM_CA_ROTATION";
 /// The current signing CA. A handler takes one [`SharedCa::current`] snapshot per
 /// request, so the certificate it signs and the CA it returns always match.
 #[derive(Debug)]
-pub struct SharedCa(RwLock<Arc<CaCert>>);
+pub struct SharedCa {
+    /// The CA in use.
+    ca: RwLock<Arc<CaCert>>,
+    /// Whether the database last recorded this CA's key; signing stops when it does not.
+    anchored: AtomicBool,
+}
 
 /// Why a CA reload was refused. The current CA stays in use.
 #[derive(Debug, thiserror::Error)]
@@ -39,13 +47,22 @@ impl SharedCa {
     /// Hold `ca` as the current signing CA.
     #[must_use]
     pub fn new(ca: CaCert) -> Self {
-        Self(RwLock::new(Arc::new(ca)))
+        Self {
+            ca: RwLock::new(Arc::new(ca)),
+            anchored: AtomicBool::new(true),
+        }
     }
 
     /// The current signing CA.
     #[must_use]
     pub fn current(&self) -> Arc<CaCert> {
-        Arc::clone(&self.0.read().unwrap_or_else(PoisonError::into_inner))
+        Arc::clone(&self.ca.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The CA to sign with, or `None` while the database records another CA.
+    #[must_use]
+    pub fn signer(&self) -> Option<Arc<CaCert>> {
+        self.anchored.load(Ordering::Acquire).then(|| self.current())
     }
 
     /// Swap in the CA from `cert_pem` and `key_pem` when its certificate differs
@@ -64,16 +81,35 @@ impl SharedCa {
         key_pem: &str,
     ) -> Result<Option<(String, String)>, ReloadError> {
         let incoming = certs::canonical_fingerprint(cert_pem)?;
-        let current = certs::canonical_fingerprint(&self.current().cert_pem)?;
+        let held = self.current();
+        let current = certs::canonical_fingerprint(&held.cert_pem)?;
         if incoming == current {
+            // Another replica may have confirmed a rotation this mount has not seen yet.
+            self.check_record(record.store, &held.cert_pem).await?;
             return Ok(None);
         }
         // Load first so the record never moves to a CA that cannot sign.
         let ca = certs::load_ca(common_name, key_pem, cert_pem)?;
         // The anchor is the key, so a certificate renewed on the same key passes.
         anchor(record.store, &certs::cert_public_key_sha256(cert_pem)?, record.confirm).await?;
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(ca);
+        *self.ca.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(ca);
+        self.anchored.store(true, Ordering::Release);
         Ok(Some((current, incoming)))
+    }
+
+    /// Withhold signing while the database records a key other than the held CA's.
+    async fn check_record(&self, store: &Store, cert_pem: &str) -> Result<(), ReloadError> {
+        let held = certs::cert_public_key_sha256(cert_pem)?;
+        match store.recorded_ca().await.map_err(AnchorError::from)? {
+            Some(recorded) if recorded != held => {
+                self.anchored.store(false, Ordering::Release);
+                Err(mismatch(&recorded, &held).into())
+            },
+            _ => {
+                self.anchored.store(true, Ordering::Release);
+                Ok(())
+            },
+        }
     }
 }
 
@@ -443,6 +479,38 @@ mod tests {
             store.recorded_ca().await.expect("read"),
             None,
             "material that does not load records nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_ca_stops_signing_once_another_replica_confirms_a_rotation() {
+        let (old_fp, ca) = fresh();
+        let (new_fp, _) = fresh();
+        let (cert, key) = (ca.cert_pem.clone(), ca.key_pem.clone());
+        let shared = SharedCa::new(ca);
+        let store = Store::memory();
+        anchor(&store, &old_fp, None).await.expect("first start");
+        assert!(
+            shared
+                .reload(unconfirmed(&store), "grid-ca", &cert, &key)
+                .await
+                .expect("unchanged")
+                .is_none(),
+            "an unchanged mount swaps nothing"
+        );
+        assert!(shared.signer().is_some(), "the recorded CA signs");
+
+        anchor(&store, &new_fp, Some(&old_fp))
+            .await
+            .expect("another replica confirms");
+        let refused = shared.reload(unconfirmed(&store), "grid-ca", &cert, &key).await;
+        assert!(
+            matches!(refused, Err(ReloadError::Anchor(AnchorError::Mismatch { .. }))),
+            "{refused:?}"
+        );
+        assert!(
+            shared.signer().is_none(),
+            "a CA the database no longer records must not sign"
         );
     }
 }

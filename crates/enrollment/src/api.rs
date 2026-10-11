@@ -159,6 +159,11 @@ impl From<AuthzError> for ApiError {
     }
 }
 
+/// The refusal while the held CA is not the one the database records.
+fn ca_withheld() -> ApiError {
+    ApiError::Internal("the signing CA is not the grid CA the database records".to_owned())
+}
+
 impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
         match err {
@@ -523,7 +528,7 @@ async fn enroll(
     let csr = input.csr;
     let validity = Validity::starting_now(state.cert_lifetime);
     // One snapshot, so the certificate and the CA returned with it always match.
-    let ca = state.ca.current();
+    let ca = state.ca.signer().ok_or_else(ca_withheld)?;
     let (enrollment_id, issued) = Box::pin(state.store.redeem_and_issue(&token_sha256, |pin: &Pin| {
         // A token minted before the name was reserved still cannot claim it.
         if state.reserved_sites.contains(&pin.site_name) {
@@ -645,7 +650,7 @@ async fn renew(
         presented_not_before: leaf.not_before,
     };
     let validity = Validity::starting_now(state.cert_lifetime);
-    let ca = state.ca.current();
+    let ca = state.ca.signer().ok_or_else(ca_withheld)?;
     let csr = input.csr;
     let signed = Box::pin(state.store.renew_and_issue(&renewal, || {
         sign_csr(&ca, &renewal.site_name, &csr, validity)
