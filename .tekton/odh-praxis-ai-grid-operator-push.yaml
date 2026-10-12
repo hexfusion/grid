@@ -26,7 +26,7 @@ spec:
   - name: output-image
     value: quay.io/opendatahub/odh-praxis-ai-grid-operator:odh-stable
   - name: dockerfile
-    value: deploy/operator/Containerfile
+    value: deploy/operator/Dockerfile.konflux
   - name: path-context
     value: .
   pipelineRef:
