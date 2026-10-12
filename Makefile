@@ -14,7 +14,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit lint gateway-lint lint-extra fmt doc audit \
-	generate-api-types codegen-check generate-crds crds-check \
+	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
@@ -102,6 +102,15 @@ generate-crds:
 crds-check:
 	./scripts/generate-deployment-crds.sh --check
 
+# Regenerate the operator install manifests in deploy/operator (platform base) and
+# deploy/overlays/kind from charts/grid-operator and the values.yaml in each directory.
+generate-deploy:
+	./scripts/generate-deployment-operator.sh
+
+# Fail if the checked-in install manifests no longer match the chart.
+deploy-check:
+	./scripts/generate-deployment-operator.sh --check
+
 audit:
 	cargo audit
 	cargo deny check
@@ -183,13 +192,13 @@ overlay-sync-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
 fleet-dashboard-image: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
 
-# Builds the dashboard UI and stages it where fleet-dashboard/build.rs embeds it.
+# Builds the dashboard UI and stages it where crates/fleet-dashboard/build.rs embeds it.
 fleet-dashboard-web:
-	npm --prefix fleet-dashboard/web ci --no-audit --no-fund
-	npm --prefix fleet-dashboard/web run build
-	rm -rf fleet-dashboard/webui/dist && mkdir -p fleet-dashboard/webui && cp -r fleet-dashboard/web/dist fleet-dashboard/webui/dist
+	npm --prefix crates/fleet-dashboard/web ci --no-audit --no-fund
+	npm --prefix crates/fleet-dashboard/web run build
+	rm -rf crates/fleet-dashboard/webui/dist && mkdir -p crates/fleet-dashboard/webui && cp -r crates/fleet-dashboard/web/dist crates/fleet-dashboard/webui/dist
 
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
