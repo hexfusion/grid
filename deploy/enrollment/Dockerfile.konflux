@@ -1,0 +1,37 @@
+# Konflux build for the AI Grid enrollment service (RHOAI onboarding, RHOAIENG-95092).
+# The single UBI build file for both ODH and RHOAI Konflux. FROM images pinned to
+# @sha256 inline, which is the only form renovate's dockerfile manager tracks.
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:866c52a4f649b2e027e0eafeede5f37dd13ac58ab63bbe2950d7928334312a4c AS build
+
+# rust/cargo come as RPMs because rustup cannot be prefetched under hermetic mode.
+# The prefetched repo exists only there, so a build without it uses the system repos.
+RUN REPOS=/cachi2/output/deps/rpm/$(uname -m)/repos.d; \
+    [ -d "$REPOS" ] && SETOPT="--setopt=reposdir=$REPOS" || SETOPT=""; \
+    dnf install -y --nodocs --setopt=install_weak_deps=0 $SETOPT \
+        gcc gcc-c++ make cmake rust cargo \
+    && dnf clean all
+
+WORKDIR /src
+COPY . .
+# sar: the ENROLLMENT_AUTHZ=kube default (TokenReview + SubjectAccessReview).
+# bootstrap: the `enrollment bootstrap` subcommand the chart's pre-install Job runs.
+# --locked: under prefetch a build free to re-resolve can drift from what was fetched.
+# --ignore-rust-version: UBI ships 1.92, the manifests declare 1.96.
+RUN cargo build --release --locked --ignore-rust-version -p enrollment --bin enrollment \
+        --features sar,bootstrap \
+    && cp target/release/enrollment /usr/local/bin/enrollment
+
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:d34666200b64d5a183c867487fd2f48ee8547eb18134e5647099970e26f08af9
+
+COPY --from=build --chmod=0555 /usr/local/bin/enrollment /usr/local/bin/enrollment
+
+USER 65532:65532
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/enrollment"]
+
+LABEL com.redhat.component="odh-praxis-ai-grid-enrollment-container" \
+      name="odh-praxis-ai-grid-enrollment-rhel9" \
+      description="Enrollment service for AI Grid site onboarding" \
+      summary="Enrollment service for AI Grid site onboarding" \
+      io.k8s.display-name="odh-praxis-ai-grid-enrollment" \
+      io.k8s.description="odh-praxis-ai-grid-enrollment"
