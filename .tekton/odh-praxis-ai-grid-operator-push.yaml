@@ -25,6 +25,9 @@ spec:
     value: '{{revision}}'
   - name: output-image
     value: quay.io/opendatahub/odh-praxis-ai-grid-operator:odh-stable
+  - name: additional-tags
+    value:
+    - '{{revision}}'
   - name: dockerfile
     value: deploy/operator/Dockerfile.konflux
   - name: path-context

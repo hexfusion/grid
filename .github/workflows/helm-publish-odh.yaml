@@ -1,0 +1,151 @@
+name: Publish Helm Chart
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  HELM_VERSION: v3.17.3
+  CHART_NAME: praxis-ai-grid-operator-chart
+  CHART_REGISTRY: oci://ghcr.io/opendatahub-io/praxis-ai-grid-operator
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install YAML parser
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Prepare chart with the Tekton image
+        id: prepare
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          python3 <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+
+          import yaml
+
+          pipeline = yaml.safe_load(pathlib.Path(
+              ".tekton/odh-praxis-ai-grid-operator-push.yaml"
+          ).read_text())
+          params = {param["name"]: param["value"] for param in pipeline["spec"]["params"]}
+          image = params["output-image"]
+          repository, tag = image.rsplit(":", 1)
+          chart = pathlib.Path(os.environ["RUNNER_TEMP"]) / os.environ["CHART_NAME"]
+          shutil.copytree("charts/grid-operator", chart)
+
+          values_path = chart / "values.yaml"
+          values = yaml.safe_load(values_path.read_text())
+          values["image"].update(repository=repository, tag=tag, digest="",
+                                 pullPolicy="Always")
+          values_path.write_text(yaml.safe_dump(values, sort_keys=False))
+
+          metadata_path = chart / "Chart.yaml"
+          metadata = yaml.safe_load(metadata_path.read_text())
+          metadata["name"] = os.environ["CHART_NAME"]
+          short_sha = subprocess.check_output(
+              ["git", "rev-parse", "--short", "HEAD"], text=True
+          ).strip()
+          metadata["version"] = f"{metadata['version']}+{short_sha}"
+          metadata["appVersion"] = tag
+          metadata["home"] = os.environ["SOURCE_URL"]
+          metadata["sources"] = [os.environ["SOURCE_URL"]]
+          metadata.setdefault("annotations", {}).update({
+              "org.opencontainers.image.source": os.environ["SOURCE_URL"],
+              "org.opencontainers.image.revision": os.environ["GITHUB_SHA"],
+          })
+          metadata_path.write_text(yaml.safe_dump(metadata, sort_keys=False))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={metadata['version']}\nimage={image}\n")
+          PY
+
+      - name: Validate and package chart
+        env:
+          OPERATOR_IMAGE: ${{ steps.prepare.outputs.image }}
+          CHART_VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          helm lint "${RUNNER_TEMP}/${CHART_NAME}" --strict
+          helm package "${RUNNER_TEMP}/${CHART_NAME}" --destination "${RUNNER_TEMP}/helm-packages"
+          helm template "${CHART_NAME}" "${RUNNER_TEMP}/helm-packages/${CHART_NAME}-${CHART_VERSION}.tgz" \
+            --namespace grid-system --show-only templates/deployment.yaml \
+            > "${RUNNER_TEMP}/operator.yaml"
+          python3 <<'PY'
+          import os
+          import pathlib
+
+          import yaml
+
+          deployment = yaml.safe_load((pathlib.Path(os.environ["RUNNER_TEMP"])
+                                      / "operator.yaml").read_text())
+          operator = deployment["spec"]["template"]["spec"]["containers"][0]
+          assert operator["image"] == os.environ["OPERATOR_IMAGE"], operator["image"]
+          assert operator["imagePullPolicy"] == "Always", operator["imagePullPolicy"]
+          PY
+
+      - name: Upload chart package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.CHART_NAME }}
+          path: ${{ runner.temp }}/helm-packages/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Download chart package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.CHART_NAME }}
+          path: ${{ runner.temp }}/helm-packages
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "${GHCR_TOKEN}" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish chart
+        env:
+          CHART_VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          helm push "${RUNNER_TEMP}/helm-packages/${CHART_NAME}-${CHART_VERSION}.tgz" "${CHART_REGISTRY}"
+          printf 'Published `%s/%s` version `%s`.\n' \
+            "${CHART_REGISTRY}" "${CHART_NAME}" "${CHART_VERSION}" >> "${GITHUB_STEP_SUMMARY}"
