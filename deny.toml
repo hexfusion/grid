@@ -5,6 +5,11 @@ ignore = [
     # bincode 2.x is unmaintained (RUSTSEC-2025-0141); it is a transitive
     # dependency via foca → swim and has no safe upstream upgrade path.
     { id = "RUSTSEC-2025-0141", reason = "transitive via foca→swim; no upstream fix available" },
+    # unsafe-libyaml 0.2.11 is unmaintained (RUSTSEC-2024-0449); it is a transitive
+    # dependency via serde_yaml, which is itself deprecated. The advisory states no
+    # safe upgrade exists, and serde_yaml_ng carries the same dependency, so the exit
+    # is a move to saphyr. Drop this once that lands.
+    { id = "RUSTSEC-2024-0449", reason = "transitive via serde_yaml; no upstream fix, exit is saphyr" },
 ]
 
 [licenses]
