@@ -41,8 +41,8 @@ const MANAGED_BY: &str = "grid-operator";
 const SITE_LABEL: &str = "grid.praxis.fast/site";
 
 /// Recovery hint for a spent token.
-const SPENT: &str =
-    "As an enrollment admin, delete the site's enrollment on the hub, then mint a new invite with allowDeletedName.";
+const SPENT: &str = "Delete the site's enrollment on the hub with enrollment-admin, then mint a new invite with \
+     allowDeletedName as a grid-admin that also holds enrollment-admin.";
 
 /// Auto-enroll configuration.
 #[derive(Args, Debug, Clone)]
@@ -115,7 +115,8 @@ pub enum EnrollError {
 
     /// The site name's enrollment was deleted and the token does not re-admit it.
     #[error(
-        "site name was deleted ({0}). The token is spent. As an enrollment admin, mint a new invite with allowDeletedName."
+        "site name was deleted ({0}). The token is spent. Mint a new invite with allowDeletedName as a grid-admin \
+         that also holds enrollment-admin."
     )]
     NameDeleted(String),
 

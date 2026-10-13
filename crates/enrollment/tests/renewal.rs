@@ -57,6 +57,7 @@ fn grid_with(reserved: &[&str], renewals_enabled: bool) -> Grid {
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(
             GridAdmins::from_table("tester: t0ken\n")
+                .expect("token table")
                 .with_roles("tester: grid-admin,enrollment-admin\n")
                 .expect("roles"),
         ),

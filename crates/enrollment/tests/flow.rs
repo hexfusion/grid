@@ -30,6 +30,7 @@ fn service() -> axum::Router {
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(
             GridAdmins::from_table("tester: t0ken\n")
+                .expect("token table")
                 .with_roles("tester: grid-admin,enrollment-admin\n")
                 .expect("roles"),
         ),
@@ -49,6 +50,7 @@ fn service_reserving(store: Store, reserved: &str) -> axum::Router {
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(
             GridAdmins::from_table("tester: t0ken\n")
+                .expect("token table")
                 .with_roles("tester: grid-admin,enrollment-admin\n")
                 .expect("roles"),
         ),
@@ -734,7 +736,12 @@ fn service_with_roles() -> axum::Router {
     router(Arc::new(AppState {
         store: Store::memory(),
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table(ROLE_TABLE).with_roles(ROLES).expect("roles")),
+        authorizer: Authorizer::Local(
+            GridAdmins::from_table(ROLE_TABLE)
+                .expect("token table")
+                .with_roles(ROLES)
+                .expect("roles"),
+        ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: Vec::new(),
         renewals_enabled: true,

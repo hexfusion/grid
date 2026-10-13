@@ -563,7 +563,7 @@ fn read_optional(path: &str) -> Result<Option<String>, std::io::Error> {
 fn load_grid_admins() -> Result<GridAdmins, Box<dyn std::error::Error>> {
     let admins = match std::env::var(GRID_ADMIN_TOKENS) {
         Ok(path) => {
-            let admins = GridAdmins::from_table(&std::fs::read_to_string(&path)?);
+            let admins = GridAdmins::from_table(&std::fs::read_to_string(&path)?)?;
             match std::env::var(GRID_ADMIN_ROLES)
                 .ok()
                 .map(|roles| read_optional(&roles))
