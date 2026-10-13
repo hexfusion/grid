@@ -63,6 +63,12 @@ impl TableAdmin {
 /// A grid-admin table that cannot be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum TableError {
+    /// A role line has no separator or no admin name.
+    #[error("grid-admin role table line {line}: expected name:role[,role] with a non-empty name")]
+    MalformedRoles {
+        /// The 1-based line number.
+        line: usize,
+    },
     /// A role list names no role, an unknown one, or one twice.
     #[error(
         "grid-admin role table line {line} ({name}): the role list must name each of grid-admin or \
@@ -129,7 +135,8 @@ impl GridAdmins {
     ///
     /// [`TableError::Roles`] for a role list that is empty, names an unknown
     /// role, or repeats one; [`TableError::UnknownAdmin`] for a name with no
-    /// token; [`TableError::DuplicateRoles`] for a name listed twice.
+    /// token; [`TableError::DuplicateRoles`] for a name listed twice; or
+    /// [`TableError::MalformedRoles`] for a line with no separator or name.
     pub fn with_roles(mut self, text: &str) -> Result<Self, TableError> {
         let mut seen: Vec<String> = Vec::new();
         for (index, line) in text.lines().enumerate() {
@@ -190,12 +197,12 @@ fn parse_roles_line(line_number: usize, line: &str) -> Result<RoleLine, TableErr
     if line.is_empty() || line.starts_with('#') {
         return Ok(None);
     }
-    let Some((name, list)) = line.split_once(':') else {
-        return Ok(None);
-    };
+    let (name, list) = line
+        .split_once(':')
+        .ok_or(TableError::MalformedRoles { line: line_number })?;
     let name = name.trim();
     if name.is_empty() {
-        return Ok(None);
+        return Err(TableError::MalformedRoles { line: line_number });
     }
     let roles = parse_roles(list.trim()).ok_or_else(|| TableError::Roles {
         line: line_number,
@@ -408,6 +415,21 @@ mod tests {
                 "{list:?} must fail, got {parsed:?}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_role_lines_fail_instead_of_leaving_default_privileges() {
+        for line in ["carol enrollment-admin", ":enrollment-admin", " : enrollment-admin"] {
+            let parsed = GridAdmins::from_table("carol:token\n").with_roles(&format!("# restricted admin\n\n{line}\n"));
+            assert!(
+                matches!(&parsed, Err(TableError::MalformedRoles { line: 3 })),
+                "{line:?} must fail, got {parsed:?}"
+            );
+        }
+        let admins = GridAdmins::from_table("carol:token\n")
+            .with_roles("# restricted admin\n\ncarol:enrollment-admin\n")
+            .expect("comments and blank lines remain valid");
+        assert_eq!(roles(&admins, "token"), [Role::EnrollmentAdmin]);
     }
 
     #[test]

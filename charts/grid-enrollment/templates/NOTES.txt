@@ -37,7 +37,7 @@ with an sslrootcert, or the service exits at startup. The chart cannot check thi
 {{- if .Values.enrollment.gridAdminTokens.existingSecretRef }}
   TOKEN=<token field of a name:token line in Secret/{{ .Values.enrollment.gridAdminTokens.existingSecretRef }}, key "tokens">
 {{- else }}
-  TOKEN=$(kubectl -n {{ $ns }} get secret {{ include "grid-enrollment.fullname" . }}-grid-admin-tokens -o jsonpath='{.data.tokens}' | base64 -d | head -1 | cut -d: -f2)
+  TOKEN=$(kubectl -n {{ $ns }} get secret {{ include "grid-enrollment.fullname" . }}-grid-admin-tokens -o jsonpath='{.data.tokens}' | base64 -d | head -1 | cut -d: -f2-)
 {{- end }}
 {{- else }}
   Grid-admins hold Role/{{ include "grid-enrollment.fullname" . }}-grid-admin in this namespace.

@@ -288,7 +288,6 @@ async fn anchor_ca(store: &Store, cert_pem: &str, confirm: Option<&str>) -> Resu
     clippy::infinite_loop,
     reason = "a background reloader runs for the life of the process"
 )]
-#[expect(clippy::too_many_lines, reason = "read, check, swap, and log read as one tick")]
 async fn reload_ca(
     state: Arc<AppState>,
     confirm: Option<String>,
@@ -304,20 +303,13 @@ async fn reload_ca(
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        // A cert read mid-rotation that does not match its key fails the load and
-        // is retried on the next tick.
-        let material = async {
-            let cert = tokio::fs::read_to_string(&cert_path).await?;
-            let key = tokio::fs::read_to_string(&key_path).await?;
-            Ok::<_, std::io::Error>((cert, key))
-        }
+        let reloaded = Box::pin(state.ca.reload_from_files(
+            record,
+            &common_name,
+            std::path::Path::new(&cert_path),
+            std::path::Path::new(&key_path),
+        ))
         .await;
-        let reloaded = match material {
-            Ok((cert, key)) => Box::pin(state.ca.reload(record, &common_name, &cert, &key))
-                .await
-                .map_err(|err| err.to_string()),
-            Err(err) => Err(err.to_string()),
-        };
         match reloaded {
             Ok(Some((old, new))) => tracing::warn!(
                 old_fingerprint = %old,

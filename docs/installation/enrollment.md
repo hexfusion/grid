@@ -41,7 +41,7 @@ enrollment and its database. On upgrade it keeps the CA.
 | `route.enabled` | `auto` (default) renders the Route only when the cluster serves `route.openshift.io/v1`. `true` or `false` forces it. |
 | `route.tls.termination` | Keep `passthrough`. The chart rejects `edge`, and rejects `reencrypt` while rotation is on. |
 | `db.type` | `builtin` runs Postgres in the chart. `external` reads the URL from the Secret in `db.external.connectionUrlSecretRef`. |
-| `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a grid-admin token table whose lines may carry roles. |
+| `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a `name:token` table and an optional separate `name:role[,role]` table. |
 | `enrollment.certLifetimeSecs` | Site certificate lifetime. Empty means 180 days. |
 | `enrollment.rotation.enabled` | `true` (default). See [Rotation](#5-rotation). |
 | `image.digest`, `db.builtin.imageDigest` | Pin the enrollment and builtin Postgres images. |
@@ -254,7 +254,9 @@ site must re-enroll.
   loaded.
 - To start a new grid on purpose, run `helm upgrade` with
   `ca.forceRegenerate=true` and `ca.confirmRotation=<old fingerprint>`, the
-  recorded fingerprint exactly as the refusal prints it. The chart passes it as
+  `fingerprint` from the service's `grid CA checked against the database record`
+  log line. This hashes the CA's public key; the bootstrap error's certificate
+  fingerprint is different. The chart passes it as
   `ENROLLMENT_CONFIRM_CA_ROTATION`. It admits only a replacement of that CA.
   Clear both values on the next upgrade.
 - The service reloads the CA from its Secret every minute. A confirmed change
@@ -292,7 +294,7 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
 | `site identity rotation failed` with `rotation unauthenticated` and `identity_required` (401) | The Route must be passthrough. A reencrypt Route drops the client certificate. | Switch to passthrough. |
 | `site identity rotation failed` with `rotation refused` and `identity_refused` (403) | Enrollment log for `rotation fork` or `rotation refused`. `GET /v1alpha1/enrollments/<siteName>` shows `state: frozen`. | Delete the site's enrollment with `enrollment-admin`, invite it again with `allowDeletedName` holding both `grid-admin` and `enrollment-admin`, and the site re-enrolls. For the hub, see Recover the hub identity. |
 | `site identity expired and cannot rotate; re-enroll this site with a new site token` | `status.identity.reason` is `IdentityExpired`. | Delete the site's enrollment with `enrollment-admin` and its identity Secret, invite it again with `allowDeletedName` holding both `grid-admin` and `enrollment-admin`, and restart the operator. |
-| CA bootstrap Job fails with `Restore Secret grid-ca-key from backup` | The message names why: a missing key Secret, a key for a different CA, or an unparsable distributed copy. | Restore the right `grid-ca-key` and run `helm upgrade`. To start a new grid on purpose, set `ca.forceRegenerate` and `ca.confirmRotation` to the old CA fingerprint, and every site must re-enroll. |
+| CA bootstrap Job fails with `Restore Secret grid-ca-key from backup` | The message names why: a missing key Secret, a key for a different CA, or an unparsable distributed copy. | Restore the right `grid-ca-key` and run `helm upgrade`. To start a new grid on purpose, set `ca.forceRegenerate=true` and `ca.confirmRotation` to the old public-key `fingerprint` from the service's `grid CA checked against the database record` log line, not the bootstrap error's certificate fingerprint. Every site must re-enroll. |
 | Enrollment pod exits with `DB_CONNECTION_URL must set sslmode=verify-full` | The external database URL uses a lesser mode, or none. A shared database such as MaaS's may. | Set `sslmode=verify-full` and `sslrootcert` in the URL Secret, mounting the database's CA with `db.external.caConfigMapName`, then restart the pod. |
 | Enrollment pod exits with `the database records grid CA <old>, but the loaded CA is <new>` | A CA other than the one the database records was minted or restored. | Restore the CA with fingerprint `<old>` and run `helm upgrade`. To start a new grid on purpose, set `ca.confirmRotation=<old>`, and every site must re-enroll. |
 | CA bootstrap Job fails with `built without --features bootstrap` | The image build. | Use a default build, which includes `sar` and `bootstrap`. |

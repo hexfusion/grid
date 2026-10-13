@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeSet,
+    path::Path,
     sync::{
         Arc, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -32,6 +33,9 @@ pub struct SharedCa {
 /// Why a CA reload was refused. The current CA stays in use.
 #[derive(Debug, thiserror::Error)]
 pub enum ReloadError {
+    /// The mounted certificate or key could not be read.
+    #[error("reading CA material: {0}")]
+    Read(#[from] std::io::Error),
     /// The new certificate could not be fingerprinted.
     #[error("CA certificate: {0}")]
     Certificate(#[from] certs::VerifyError),
@@ -65,6 +69,33 @@ impl SharedCa {
         self.anchored.load(Ordering::Acquire).then(|| self.current())
     }
 
+    /// Reload mounted CA material, checking the held CA's record even if a file cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReloadError`] if reading, loading, or anchoring the mounted CA fails.
+    pub async fn reload_from_files(
+        &self,
+        record: RecordedCa<'_>,
+        common_name: &str,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> Result<Option<(String, String)>, ReloadError> {
+        let material = async {
+            let cert = tokio::fs::read_to_string(cert_path).await?;
+            let key = tokio::fs::read_to_string(key_path).await?;
+            Ok::<_, std::io::Error>((cert, key))
+        }
+        .await;
+        match material {
+            Ok((cert, key)) => self.reload(record, common_name, &cert, &key).await,
+            Err(err) => {
+                drop(self.check_record(record.store, &self.current().cert_pem).await);
+                Err(err.into())
+            },
+        }
+    }
+
     /// Swap in the CA from `cert_pem` and `key_pem` when its certificate differs
     /// from the current one and [`anchor`] admits it against `record`. Returns the
     /// old and new fingerprints on a swap, or `None` when the CA is unchanged.
@@ -73,6 +104,10 @@ impl SharedCa {
     ///
     /// Returns [`ReloadError`] when the new material does not load or the
     /// database records another CA. The current CA is kept.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the CA validation and held-signer fallback together"
+    )]
     pub async fn reload(
         &self,
         record: RecordedCa<'_>,
@@ -80,8 +115,14 @@ impl SharedCa {
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<Option<(String, String)>, ReloadError> {
-        let incoming = certs::canonical_fingerprint(cert_pem)?;
         let held = self.current();
+        let incoming = match certs::canonical_fingerprint(cert_pem) {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                drop(self.check_record(record.store, &held.cert_pem).await);
+                return Err(err.into());
+            },
+        };
         let current = certs::canonical_fingerprint(&held.cert_pem)?;
         if incoming == current {
             // Another replica may have confirmed a rotation this mount has not seen yet.
@@ -112,8 +153,12 @@ impl SharedCa {
 
     /// Sign only while the database records the held CA's key, recording it if the record is gone.
     async fn check_record(&self, store: &Store, cert_pem: &str) -> Result<(), ReloadError> {
-        let held = certs::cert_public_key_sha256(cert_pem)?;
-        match anchor(store, &held, None).await {
+        let checked = async {
+            let held = certs::cert_public_key_sha256(cert_pem)?;
+            Ok::<_, ReloadError>(anchor(store, &held, None).await?)
+        }
+        .await;
+        match checked {
             Ok(_) => {
                 self.anchored.store(true, Ordering::Release);
                 Ok(())
@@ -122,7 +167,7 @@ impl SharedCa {
             // signer: an unverifiable record is not a verified one.
             Err(refused) => {
                 self.anchored.store(false, Ordering::Release);
-                Err(refused.into())
+                Err(refused)
             },
         }
     }
@@ -564,6 +609,94 @@ mod tests {
             .await;
         assert!(refused.is_err(), "an unconfirmed CA is refused");
         assert!(shared.signer().is_some(), "the held CA is still the recorded one");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "follow the held signer through record mismatch and recovery"
+    )]
+    async fn malformed_material_still_checks_the_held_signer_against_the_record() {
+        let (old_fp, ca) = fresh();
+        let (new_fp, _) = fresh();
+        let shared = SharedCa::new(ca);
+        let store = Store::memory();
+        anchor(&store, &old_fp, None).await.expect("first start");
+        shared
+            .reload(unconfirmed(&store), "grid-ca", "not a cert", "not a key")
+            .await
+            .expect_err("malformed certificate");
+        assert!(shared.signer().is_some(), "matching record keeps the held CA usable");
+        anchor(&store, &new_fp, Some(&old_fp))
+            .await
+            .expect("another replica rotates");
+        shared
+            .reload(unconfirmed(&store), "grid-ca", "not a cert", "not a key")
+            .await
+            .expect_err("malformed certificate after record change");
+        assert!(
+            shared.signer().is_none(),
+            "bad material cannot bypass the changed record"
+        );
+        anchor(&store, &old_fp, Some(&new_fp))
+            .await
+            .expect("restore the record");
+        shared
+            .reload(unconfirmed(&store), "grid-ca", "not a cert", "not a key")
+            .await
+            .expect_err("malformed certificate after record recovery");
+        assert!(
+            shared.signer().is_some(),
+            "the held CA can sign again when its record matches"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise missing certificate and key through mismatch and recovery"
+    )]
+    async fn unreadable_ca_files_still_check_the_held_signer_against_the_record() {
+        let (old_fp, ca) = fresh();
+        let (new_fp, _) = fresh();
+        let dir = std::env::temp_dir().join(format!("ca-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).expect("test directory");
+        let cert_path = dir.join("ca.crt");
+        let key_path = dir.join("ca.key");
+        let missing = dir.join("missing");
+        std::fs::write(&cert_path, &ca.cert_pem).expect("certificate");
+        std::fs::write(&key_path, &ca.key_pem).expect("key");
+        let shared = SharedCa::new(ca);
+        let store = Store::memory();
+        anchor(&store, &old_fp, None).await.expect("first start");
+
+        for (cert, key) in [(&missing, &key_path), (&cert_path, &missing)] {
+            let initial = shared
+                .reload_from_files(unconfirmed(&store), "grid-ca", cert, key)
+                .await;
+            assert!(matches!(initial, Err(ReloadError::Read(_))), "{initial:?}");
+            assert!(shared.signer().is_some(), "matching record keeps the held CA usable");
+            anchor(&store, &new_fp, Some(&old_fp))
+                .await
+                .expect("another replica rotates");
+            let reload = shared
+                .reload_from_files(unconfirmed(&store), "grid-ca", cert, key)
+                .await;
+            assert!(matches!(reload, Err(ReloadError::Read(_))), "{reload:?}");
+            assert!(
+                shared.signer().is_none(),
+                "an unreadable mount cannot bypass the changed record"
+            );
+            anchor(&store, &old_fp, Some(&new_fp))
+                .await
+                .expect("restore the record");
+            shared
+                .reload_from_files(unconfirmed(&store), "grid-ca", &cert_path, &key_path)
+                .await
+                .expect("recover");
+            assert!(shared.signer().is_some(), "a matching record restores signing");
+        }
+        std::fs::remove_dir_all(&dir).expect("remove test files");
     }
 
     #[tokio::test]

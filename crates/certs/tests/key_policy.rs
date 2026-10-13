@@ -52,11 +52,16 @@ fn seq(parts: &[Vec<u8>]) -> Vec<u8> {
 /// A request whose key is `point` labelled as `curve`, with `algorithm` named as its
 /// signature algorithm, signed by `key`.
 fn request(key: &KeyPair, curve: &[u8], point: &[u8], algorithm: &[u8]) -> String {
-    let name = seq(&[der(0x31, &seq(&[der(0x06, &[0x55, 0x04, 0x03]), der(0x0C, b"site-d")]))]);
     let spki = seq(&[
         seq(&[der(0x06, ID_EC_PUBLIC_KEY), der(0x06, curve)]),
         der(0x03, &[&[0x00], point].concat()),
     ]);
+    request_with_spki(key, spki, algorithm)
+}
+
+/// Sign the exact supplied SPKI encoding, including any deliberately malformed DER.
+fn request_with_spki(key: &KeyPair, spki: Vec<u8>, algorithm: &[u8]) -> String {
+    let name = seq(&[der(0x31, &seq(&[der(0x06, &[0x55, 0x04, 0x03]), der(0x0C, b"site-d")]))]);
     let info = seq(&[der(0x02, &[0x00]), name, spki, der(0xA0, &[])]);
     let signature = key.sign(&info).expect("sign");
     let csr = seq(&[
@@ -122,6 +127,47 @@ fn a_hand_built_request_passes_only_when_its_key_matches_its_curve() {
         (Err(EnrollError::UnsupportedKey), Some(EnrollError::UnsupportedKey)),
         "a compressed point"
     );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercise each alternate encoding for both supported curves"
+)]
+fn alternate_encodings_cannot_give_one_key_another_fingerprint() {
+    const ECDSA_WITH_SHA384: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
+    for (algorithm, curve, signature) in [
+        (&PKCS_ECDSA_P256_SHA256, PRIME256V1, ECDSA_WITH_SHA256),
+        (&PKCS_ECDSA_P384_SHA384, SECP384R1, ECDSA_WITH_SHA384),
+    ] {
+        let key = KeyPair::generate_for(algorithm).expect("key");
+        let spki = seq(&[
+            seq(&[der(0x06, ID_EC_PUBLIC_KEY), der(0x06, curve)]),
+            der(0x03, &[&[0x00], key.public_key_raw()].concat()),
+        ]);
+        verify_csr(&request_with_spki(&key, spki.clone(), signature)).expect("canonical encoding");
+        let nonminimal = [&[0x30, 0x81, spki[1]], &spki[2..]].concat();
+        let extra_parameter = seq(&[
+            seq(&[der(0x06, ID_EC_PUBLIC_KEY), der(0x06, curve), der(0x05, &[])]),
+            der(0x03, &[&[0x00], key.public_key_raw()].concat()),
+        ]);
+        let unused_bits = seq(&[
+            seq(&[der(0x06, ID_EC_PUBLIC_KEY), der(0x06, curve)]),
+            der(0x03, &[&[0x01], key.public_key_raw()].concat()),
+        ]);
+        for (name, encoded) in [
+            ("non-minimal sequence length", nonminimal),
+            ("extra algorithm parameter", extra_parameter),
+            ("nonzero unused bits", unused_bits),
+        ] {
+            let csr = request_with_spki(&key, encoded, signature);
+            let (submitted, signed) = refused(&csr);
+            assert!(
+                submitted.is_err() && signed.is_some(),
+                "{algorithm:?}: {name}: {submitted:?} {signed:?}"
+            );
+        }
+    }
 }
 
 #[test]

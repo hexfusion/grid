@@ -25,35 +25,24 @@ pub(crate) use openssl_backend::{
     sign_csr, sign_message, verify_leaf_signature, verify_message,
 };
 
-/// Refuse a request key other than an uncompressed EC point on a named P-256 or
-/// P-384 curve: the keys this grid issues and its peers verify.
+/// Refuse anything but the canonical DER encoding of an uncompressed P-256 or
+/// P-384 key, so one key cannot acquire another fingerprint through its encoding.
 pub(crate) fn check_request_key(spki_der: &[u8]) -> Result<(), BackendError> {
-    use x509_parser::{
-        oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_NIST_EC_P384},
-        prelude::FromDer as _,
-        x509::SubjectPublicKeyInfo,
-    };
-
-    let (rest, spki) = SubjectPublicKeyInfo::from_der(spki_der).map_err(|_bad| BackendError::ParseCsr)?;
-    if !rest.is_empty() || spki.algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY {
-        return Err(BackendError::UnsupportedKey);
+    /// P-256 `AlgorithmIdentifier` and BIT STRING header, including the uncompressed marker.
+    const P256: &[u8] =
+        b"\x30\x59\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x03\x42\x00\x04";
+    /// P-384 `AlgorithmIdentifier` and BIT STRING header, including the uncompressed marker.
+    const P384: &[u8] =
+        b"\x30\x76\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x22\x03\x62\x00\x04";
+    for (prefix, coordinates) in [(P256, 64), (P384, 96)] {
+        if spki_der
+            .strip_prefix(prefix)
+            .is_some_and(|point| point.len() == coordinates)
+        {
+            return Ok(());
+        }
     }
-    // Explicit curve parameters are not an OID, so they fall through and are refused.
-    let point_len = match spki
-        .algorithm
-        .parameters
-        .as_ref()
-        .and_then(|params| params.as_oid().ok())
-    {
-        Some(curve) if curve == OID_EC_P256 => 65,
-        Some(curve) if curve == OID_NIST_EC_P384 => 97,
-        _ => return Err(BackendError::UnsupportedKey),
-    };
-    let point = &spki.subject_public_key.data;
-    if point.len() != point_len || point.first() != Some(&0x04) {
-        return Err(BackendError::UnsupportedKey);
-    }
-    Ok(())
+    Err(BackendError::UnsupportedKey)
 }
 
 /// What a certificate should say, independent of the backend that mints it.

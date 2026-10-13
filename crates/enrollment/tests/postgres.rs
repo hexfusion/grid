@@ -838,6 +838,11 @@ async fn rotation_to_a_key_ever_enrolled_is_refused() {
     let record = store.enrollment(&west).await.expect("read").expect("held");
     assert!(!record.held.frozen, "a refused reuse does not freeze");
     assert_eq!(record.held.current_key, key('c'));
+    let reused = enroll_with(&store, &unique("fresh"), &key('b'), false).await;
+    assert!(
+        matches!(reused, Err(StoreError::KeyReused)),
+        "a key recorded only during rotation cannot enroll a fresh name: {reused:?}"
+    );
 }
 /// Clear the recorded grid CA, standing in for a new database.
 async fn forget_ca() {

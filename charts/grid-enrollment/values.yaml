@@ -224,9 +224,10 @@ db:
       servingSecretName: grid-db-serving-tls
   external:
     # Secret carrying the full connection URL under connectionUrlSecretKey.
-    # Point this at MaaS's maas-db-config to share its database. The URL must set
-    # sslmode=verify-full; the binary refuses any lesser mode. Set caConfigMapName
-    # so the client trusts the DB's issuer and reference it as sslrootcert in the URL.
+    # The URL must set sslmode=verify-full with sslrootcert=/etc/grid-db-ca/<caConfigMapKey>;
+    # the binary refuses any lesser mode. Set caConfigMapName so that file is the DB's issuer.
+    # On a shared Postgres server, use a database and role dedicated to enrollment, with
+    # its URL in a separate Secret: whoever can write these tables can mint site identities.
     connectionUrlSecretRef: ""
     connectionUrlSecretKey: DB_CONNECTION_URL
     # Optional CA bundle for the external DB, mounted at /etc/grid-db-ca (mirrors

@@ -269,7 +269,8 @@ fn settled(name: &str, site: &str, code: ErrorCode) -> Invited {
     if code == ErrorCode::TokenOutstanding {
         tracing::warn!(
             secret = %name, %site,
-            "a live token pins this site but Secret {name} is gone; rerun after it expires to invite again"
+            "a live token pins this site but Secret {name} is gone; revoke it by the token_id on the service's \
+             `site token minted` log line, or rerun after it expires"
         );
         Invited::Outstanding
     } else if code == ErrorCode::NameDeleted {
