@@ -60,7 +60,7 @@ use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
-    api::{ObjectMeta, PostParams},
+    api::{ObjectMeta, Patch, PatchParams, PostParams},
     runtime::{controller::Controller, watcher},
 };
 use operator::{
@@ -130,11 +130,24 @@ async fn main() {
     };
     let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready), metrics_tls));
 
-    if config.enrollment.enabled
-        && let Err(error) = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)).await
-    {
-        tracing::error!(%error, "site enrollment failed");
-        std::process::exit(1);
+    // Watched before enrolling, because enrolling retries a retryable failure
+    // for as long as it keeps failing and must still answer a SIGTERM.
+    let (trigger, shutdown) = operator::shutdown::Trigger::new();
+    tokio::spawn(watch_for_termination(trigger));
+
+    if config.enrollment.enabled {
+        let enrolled = tokio::select! {
+            biased;
+            () = shutdown.triggered() => {
+                tracing::info!("stood down before enrolling");
+                return;
+            },
+            result = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)) => result,
+        };
+        if let Err(error) = enrolled {
+            tracing::error!(%error, "site enrollment failed");
+            std::process::exit(1);
+        }
     }
     let GridModes {
         signal: signal_mode,
@@ -191,64 +204,142 @@ async fn main() {
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
 
-    // A round of peer polls can be in flight when the pod is told to terminate;
-    // the trigger lets it stand down cleanly rather than being dropped mid-await.
-    // Only installed with the feature, so the default path keeps today's signal
-    // disposition unchanged.
-    let (trigger, shutdown) = operator::shutdown::Trigger::new();
-    if signals_enabled {
-        tokio::spawn(watch_for_termination(trigger));
-    } else {
-        drop(trigger);
-    }
+    // Stop every state writer before leaving SWIM. Otherwise the leave event can
+    // drive one last reconcile that publishes every peer as dead or tries to
+    // reconfigure a runtime that has already stopped.
+    let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
+    let writers_shutdown = shutdown.clone();
+    let writer_client = client.clone();
+    let writer_ctx = Arc::clone(&ctx);
+    let writer_swim = swim_rx.clone();
+    let writer_site_name = ctx.site_name().map(str::to_owned);
+    let writer_scrape_interval = signals_enabled.then(|| config.signals.scrape_interval());
+    let writer_group = async move {
+        tokio::try_join!(
+            run_network_controller(writer_client.clone(), Arc::clone(&writer_ctx), writer_swim),
+            run_site_controller(writer_client.clone()),
+            run_provider_controller(writer_client.clone(), writer_site_name),
+            run_agent_tool_provider_controller(writer_client.clone()),
+            run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
+            run_model_discovery(writer_ctx, writer_client),
+        )
+        .map(|_joined| ())
+    };
+    let writers = stop_writers_on_shutdown(writers_shutdown, writers_done_tx, writer_group);
 
-    let result = tokio::try_join!(
-        start_swim(
-            client.clone(),
-            config.clone(),
-            Arc::clone(&ctx),
-            Arc::clone(&ready),
-            swim_tx,
-        ),
-        run_network_controller(client.clone(), Arc::clone(&ctx), swim_rx.clone()),
-        run_site_controller(client.clone()),
-        run_provider_controller(client.clone(), ctx.site_name().map(str::to_owned)),
-        run_agent_tool_provider_controller(client.clone()),
-        async { metrics_server.await? },
-        run_signals_server(
-            signals_enabled.then(|| SignalsListener {
-                bind: config.signals.addr,
-                client: client.clone(),
-                published: Published {
-                    site: ctx.signals(),
-                    peers: ctx.peers(),
-                },
-                peer_identities: ctx.peer_identities(),
-                trust,
-                max_per_peer: config.signals.max_per_peer,
-            }),
-            swim_rx.clone(),
-        ),
-        run_peer_poller(
-            signals_enabled.then(|| config.signals.clone()),
-            Arc::clone(&ctx),
-            swim_rx,
-            client.clone(),
-            shutdown.clone(),
-        ),
-        run_local_scraper(
-            signals_enabled.then(|| config.signals.scrape_interval()),
-            Arc::clone(&ctx),
-            client.clone(),
-        ),
-        run_model_discovery(Arc::clone(&ctx), client.clone()),
-    );
+    let standing_down = stand_down(shutdown.clone(), writers_done, swim_rx.clone());
+    let serving = async {
+        tokio::try_join!(
+            start_swim(
+                client.clone(),
+                config.clone(),
+                Arc::clone(&ctx),
+                Arc::clone(&ready),
+                swim_tx,
+            ),
+            writers,
+            async { metrics_server.await? },
+            run_signals_server(
+                signals_enabled.then(|| SignalsListener {
+                    bind: config.signals.addr,
+                    client: client.clone(),
+                    published: Published {
+                        site: ctx.signals(),
+                        peers: ctx.peers(),
+                        feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
+                    },
+                    peer_identities: ctx.peer_identities(),
+                    trust,
+                    max_per_peer: config.signals.max_per_peer,
+                }),
+                swim_rx.clone(),
+                shutdown.clone(),
+            ),
+            run_peer_poller(
+                signals_enabled.then(|| config.signals.clone()),
+                Arc::clone(&ctx),
+                swim_rx,
+                client.clone(),
+                shutdown.clone(),
+            ),
+        )
+        .map(|_joined| ())
+    };
+
+    // Standing down wins, and dropping the work closes every connection pool
+    // it owns. The listener drains while this waits, because both sides stay
+    // polled until one of them finishes.
+    let result = tokio::select! {
+        biased;
+        () = standing_down => Ok(()),
+        result = serving => result,
+    };
 
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
         std::process::exit(1);
     }
+    // The one line that distinguishes a clean exit from a SIGKILL in pod logs.
+    tracing::info!("stood down");
 }
+
+/// Cancel every state writer on shutdown, then release the leave barrier.
+async fn stop_writers_on_shutdown<E>(
+    shutdown: operator::shutdown::Shutdown,
+    done: operator::shutdown::Trigger,
+    writers: impl Future<Output = Result<(), E>>,
+) -> Result<(), E> {
+    // This drops after the unselected writer future, so observing `done` means
+    // no controller or background writer can make another state change.
+    let _done_on_drop = done;
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => Ok(()),
+        result = writers => result,
+    }
+}
+
+/// Resolve once the process should stop, after writers stop and the site leaves.
+///
+/// Writers stop before leave so the membership change cannot drive a final
+/// degraded overlay or touch the stopped SWIM runtime. The grace that follows
+/// is what the inbound listener drains in.
+async fn stand_down(
+    shutdown: operator::shutdown::Shutdown,
+    writers_done: operator::shutdown::Shutdown,
+    swim: SwimStartup,
+) {
+    shutdown.triggered().await;
+    writers_done.triggered().await;
+    let left = match settled(&swim) {
+        Some(handle) => {
+            handle.leave(LEAVE_WAIT).await;
+            true
+        },
+        None => false,
+    };
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
+    // The work is still polled through the grace, so SWIM can finish starting
+    // and advertise this site after the read above. Leaving a runtime that
+    // appeared in that window beats making peers wait for suspicion.
+    if let Some(handle) = settled(&swim).filter(|_| !left) {
+        handle.leave(LEAVE_WAIT).await;
+    }
+}
+
+/// The SWIM handle if one exists, read rather than awaited.
+///
+/// Awaiting would hold a stand-down for as long as a `LoadBalancer` address
+/// takes, which is unbounded.
+fn settled(swim: &SwimStartup) -> Option<Arc<swim_runtime::SwimHandle>> {
+    match &*swim.borrow() {
+        SwimStage::Settled(handle) => handle.clone(),
+        SwimStage::Starting => None,
+    }
+}
+
+/// How long in-flight work has after the cluster has been left.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where SWIM startup stands.
 #[derive(Clone)]
@@ -1322,6 +1413,8 @@ struct SignalsIdentity {
 /// Everything this operator publishes on the signals path.
 #[derive(Clone)]
 struct Published {
+    /// Independently persisted gateway diagnostic evidence.
+    feedback: operator::gateway_ages::GatewayFeedback,
     /// This site's own signals.
     site: operator::signals::SignalStore,
     /// What peers reported about themselves.
@@ -1353,6 +1446,7 @@ struct SignalsListener {
 async fn run_signals_server(
     listener: Option<SignalsListener>,
     swim: SwimStartup,
+    shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(listener) = listener else {
         return Ok(());
@@ -1361,24 +1455,25 @@ async fn run_signals_server(
     let advertised = swim_settled(swim)
         .await
         .and_then(|handle| handle.signals_address().map(str::to_owned));
-    let app = axum::Router::new()
-        .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
-        .with_state(listener.published.clone());
+    let app = signals_app(listener.published.clone());
 
     // The opt-in listener rebinds on every material change, so a transient
     // bind blip (a socket in TIME_WAIT across a rebind) must not be fatal to
     // reconcile and the metrics server through `try_join!`: a serve error logs
     // and retries rather than propagating.
-    #[expect(
-        clippy::infinite_loop,
-        reason = "serves for the process lifetime alongside the controllers"
-    )]
-    loop {
-        if let Err(error) = listener.serve_once(&app, advertised.as_deref()).await {
-            tracing::error!(%error, bind = ?listener.bind, "signals listener error; retrying");
-            tokio::time::sleep(SIGNALS_TLS_POLL).await;
+    while !shutdown.is_triggered() {
+        match listener.serve_once(&app, advertised.as_deref(), shutdown.clone()).await {
+            Ok(()) if !shutdown.is_triggered() => {
+                tracing::info!("signals TLS material changed; serving again");
+            },
+            Ok(()) => {},
+            Err(error) => {
+                tracing::error!(%error, bind = ?listener.bind, "signals listener error; retrying");
+                tokio::time::sleep(SIGNALS_TLS_POLL).await;
+            },
         }
     }
+    Ok(())
 }
 
 impl SignalsListener {
@@ -1387,6 +1482,7 @@ impl SignalsListener {
         &self,
         app: &axum::Router,
         advertised: Option<&str>,
+        shutdown: operator::shutdown::Shutdown,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tls, own) = Box::pin(signals_identity(&self.client)).await;
         let Some(tls) = tls else {
@@ -1411,9 +1507,7 @@ impl SignalsListener {
             app: app.clone(),
             identity,
         };
-        serve_signals_tls(listener, serving, admission, changed).await?;
-        tracing::info!("signals TLS material changed; serving again");
-        Ok(())
+        serve_signals_tls(listener, serving, admission, changed, shutdown).await
     }
 }
 
@@ -1510,16 +1604,27 @@ struct Serving {
 }
 
 /// Accept signals connections, deciding scope from the certificate presented.
+#[expect(
+    clippy::too_many_lines,
+    reason = "accept, admission, shutdown drain, and task ownership form one connection lifecycle"
+)]
 async fn serve_signals_tls(
     listener: tokio::net::TcpListener,
     serving: Serving,
     admission: Admission,
     changed: impl Future<Output = ()> + Send,
+    shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut changed = std::pin::pin!(changed);
     let mut shed_warned: Option<std::time::Instant> = None;
     loop {
         let accepted = tokio::select! {
+            biased;
+            () = shutdown.triggered() => {
+                // Stop accepting, then let what is already answering finish.
+                drain_connections(&admission.slots).await;
+                return Ok(());
+            },
             () = &mut changed => return Ok(()),
             accepted = listener.accept() => accepted,
         };
@@ -1533,11 +1638,34 @@ async fn serve_signals_tls(
             source,
             peers: admission.peers.clone(),
         };
-        let serve = Box::pin(serve_signals_connection(serving.clone(), stream, remote, handshaking));
+        let serve = Box::pin(serve_signals_connection(
+            serving.clone(),
+            stream,
+            remote,
+            handshaking,
+            shutdown.clone(),
+        ));
         tokio::spawn(async move {
             serve.await;
             drop(slot);
         });
+    }
+}
+
+/// Wait for every open signals connection to finish, up to [`SHUTDOWN_GRACE`].
+///
+/// Holding every permit means nothing is being served, which is the only way
+/// to know no peer is mid-answer. A peer still answering at the end of the
+/// grace loses its connection when the process goes.
+async fn drain_connections(slots: &Arc<tokio::sync::Semaphore>) {
+    let all = u32::try_from(SIGNALS_MAX_CONNECTIONS).unwrap_or(u32::MAX);
+    match tokio::time::timeout(SHUTDOWN_GRACE, slots.acquire_many(all)).await {
+        Ok(Ok(permits)) => {
+            drop(permits);
+            tracing::debug!("signals: every connection closed");
+        },
+        Ok(Err(_closed)) => {},
+        Err(_elapsed) => tracing::warn!("signals: connections still open at the end of the grace"),
     }
 }
 
@@ -1828,13 +1956,22 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
     not(feature = "fips"),
     expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "handshake shutdown, authenticated admission, and HTTP serving form one connection lifecycle"
+)]
 async fn serve_signals_connection(
     serving: Serving,
     tcp: tokio::net::TcpStream,
     remote: SocketAddr,
     handshaking: Handshaking,
+    shutdown: operator::shutdown::Shutdown,
 ) {
-    let accepted = tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT, tls_backend::accept(tcp, &serving.tls)).await;
+    let accepted = tokio::select! {
+        biased;
+        () = shutdown.triggered() => return,
+        accepted = tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT, tls_backend::accept(tcp, &serving.tls)) => accepted,
+    };
     // The source cap covers only the unauthenticated phase.
     drop(handshaking.source);
     let Ok(Ok(stream)) = accepted else {
@@ -1851,14 +1988,14 @@ async fn serve_signals_connection(
             let Some(slot) = handshaking.peers.acquire(&site) else {
                 operator::metrics::record_signals_shed("peer");
                 tracing::debug!(%remote, site, "signals site at its connection cap; answering 503");
-                Box::pin(serve_http(stream, unavailable(), Caller::Peer(None), remote)).await;
+                Box::pin(serve_http(stream, unavailable(), Caller::Peer(None), remote, shutdown)).await;
                 return;
             };
             Some(slot)
         },
         (_, None) => return,
     };
-    Box::pin(serve_http(stream, serving.app, caller, remote)).await;
+    Box::pin(serve_http(stream, serving.app, caller, remote, shutdown)).await;
     drop(slot);
 }
 
@@ -1868,14 +2005,13 @@ fn unavailable() -> axum::Router {
 }
 
 /// Serve HTTP on an authenticated stream with the scope `caller` earned, bounded by every signals timeout.
-#[cfg_attr(
-    not(feature = "fips"),
-    expect(
-        clippy::large_stack_frames,
-        reason = "async future over a rustls stream and a hyper connection"
-    )
-)]
-async fn serve_http(stream: tls_backend::ServerTlsStream, app: axum::Router, caller: Caller, remote: SocketAddr) {
+async fn serve_http(
+    stream: tls_backend::ServerTlsStream,
+    app: axum::Router,
+    caller: Caller,
+    remote: SocketAddr,
+    shutdown: operator::shutdown::Shutdown,
+) {
     // A shed caller gets one answer, then the connection closes.
     let keep_alive = caller != Caller::Peer(None);
     let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
@@ -1890,7 +2026,7 @@ async fn serve_http(stream: tls_backend::ServerTlsStream, app: axum::Router, cal
         .header_read_timeout(SIGNALS_HEADER_READ_TIMEOUT)
         .keep_alive(keep_alive)
         .serve_connection(io, service);
-    if let Err(error) = serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE).await {
+    if let Err(error) = Box::pin(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE, shutdown)).await {
         tracing::debug!(%remote, %error, "signals connection ended");
     }
 }
@@ -1899,6 +2035,7 @@ async fn serve_http(stream: tls_backend::ServerTlsStream, app: axum::Router, cal
 async fn serve_until_aged<Io, Service>(
     connection: hyper::server::conn::http1::Connection<Io, Service>,
     max_age: std::time::Duration,
+    shutdown: operator::shutdown::Shutdown,
 ) -> hyper::Result<()>
 where
     Io: hyper::rt::Read + hyper::rt::Write + Unpin,
@@ -1908,7 +2045,9 @@ where
 {
     let mut connection = std::pin::pin!(connection);
     tokio::select! {
+        biased;
         result = connection.as_mut() => return result,
+        () = shutdown.triggered() => {},
         () = tokio::time::sleep(max_age) => {},
     }
     connection.as_mut().graceful_shutdown();
@@ -1999,6 +2138,23 @@ impl<Stream: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadl
     }
 }
 
+/// Signals and feedback routes sharing the certificate-derived caller scope.
+fn signals_app(published: Published) -> axum::Router {
+    axum::Router::new()
+        .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
+        .route(grid_signals::feedback::INGEST_PATH, axum::routing::post(ingest_handler))
+        .with_state(published)
+}
+
+/// Accept completed ingests only from the certificate-proven local gateway.
+async fn ingest_handler(
+    axum::extract::State(published): axum::extract::State<Published>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    published.feedback.respond(caller == Caller::Local, request).await
+}
+
 /// Serve the coarse rollup, following the multi-target exporter pattern.
 ///
 /// `target` names one provider, `collect[]` names the signals wanted. Scope
@@ -2017,19 +2173,21 @@ async fn signals_handler(
 
     // Local, the site's own data plane, gets the whole grid view unscoped.
     // Access policy bounds peer reads, not the site reading itself.
+    let now = operator::signals::ClockReading::now();
     let (body, oldest) = match &caller {
         Caller::Local => {
             // One body under the gateway's read ceiling: the site first, so a
             // flood of relayed rows can only cost the last peers, never this site.
             let site = published
                 .site
-                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES);
+                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES, now);
             // Peers relay only to Local, and the peers store carries no access map.
             // A Peer(Some) relay would need per-target scoping added here.
             let peers = published.peers.render_bounded(
                 target,
                 &collect,
                 operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len()),
+                now,
             );
             operator::metrics::record_relay_truncated("site", &site);
             operator::metrics::record_relay_truncated("peers", &peers);
@@ -2037,10 +2195,10 @@ async fn signals_handler(
             body.push_str(&peers.body);
             (body, site.oldest.max(peers.oldest))
         },
-        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels)),
+        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels), now),
         Caller::Peer(None) => return refused(),
     };
-    served(body, oldest)
+    served(body, oldest, now.wall)
 }
 
 /// Refuse a caller this site will not serve.
@@ -2057,12 +2215,19 @@ fn refused() -> axum::response::Response {
         .into_response()
 }
 
-/// One exposition response, with `Age` bounding the whole body.
-fn served(body: String, oldest: std::time::Duration) -> axum::response::Response {
+/// One exposition response, with `Age` bounding the whole body and `Date` the
+/// wall reading its stamps were written from.
+///
+/// A reader takes each row's age as `Date` minus its stamp. hyper's own `Date` is
+/// cached and, after a backward clock step, stays frozen for about the size of
+/// the step, which would age every row by that much; an explicit `Date` wins over
+/// it.
+fn served(body: String, oldest: std::time::Duration, wall: SystemTime) -> axum::response::Response {
     (
         [
             (http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
             (http::header::AGE, &*oldest.as_secs().to_string()),
+            (http::header::DATE, &*httpdate::fmt_http_date(wall)),
         ],
         body,
     )
@@ -2294,6 +2459,7 @@ async fn run_peer_poller(
         client,
         settings,
         shutdown,
+        ages: operator::peer_ages::PeerAges::default(),
     }
     .run()
     .await;
@@ -2312,17 +2478,19 @@ struct PeerPoller {
     settings: operator::cli::SignalsArgs,
     /// Lets an in-flight round stand down when the process is stopping.
     shutdown: operator::shutdown::Shutdown,
+    /// Peers whose relayed ages the last rounds rejected, for the `GridNetwork` condition.
+    ages: operator::peer_ages::PeerAges,
 }
 
 impl PeerPoller {
     /// Rebuild and poll until shutdown.
-    async fn run(&self) {
+    async fn run(mut self) {
         while !self.shutdown.is_triggered() && self.cycle().await {}
         tracing::info!("peer signals poller stopped");
     }
 
     /// One build-and-poll cycle; `false` means shutdown arrived while idle.
-    async fn cycle(&self) -> bool {
+    async fn cycle(&mut self) -> bool {
         let own = Box::pin(sole_own_leaf(&self.client)).await;
         let Some(source) = Box::pin(peer_source(
             &self.client,
@@ -2356,7 +2524,7 @@ impl PeerPoller {
 
     /// Poll every interval until this site's material changes, or shutdown.
     async fn poll_until_changed(
-        &self,
+        &mut self,
         source: &operator::signals::PollPeers,
         changed: impl Future<Output = ()> + Send,
     ) {
@@ -2377,27 +2545,103 @@ impl PeerPoller {
         }
     }
 
-    /// Collect from every alive peer and replace what is published for them.
-    async fn poll_once(&self, source: &operator::signals::PollPeers) {
-        let targets = poll_targets(
+    /// Collect from every alive peer, replace what is published for them, and say
+    /// on the `GridNetwork` whose relayed ages are being rejected.
+    async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
+        let membership_ready = self.ctx.membership_hold().is_none();
+        let Some(sites) = poll_targets(
             &self.swim.snapshot(),
             &self.ctx.peer_identities(),
             source.trust,
             self.swim.is_encrypted(),
             self.swim.site_name(),
             self.settings.peer_port,
-        );
-        let Some(sites) = targets.filter(|sites| !sites.is_empty()) else {
+        ) else {
             return;
         };
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
         let ttl = self.settings.peer_ttl();
+        let mut answered = BTreeMap::new();
         source
-            .collect_each(&sites, |peer, observations| {
+            .collect_each(&sites, |peer, observations, rejected| {
+                answered.insert(peer.clone(), rejected);
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
             })
             .await;
+        // A round stood down by shutdown learned nothing, and writing would hold termination open.
+        if self.shutdown.is_triggered() {
+            return;
+        }
+        let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
+            Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
+        }
+    }
+}
+
+/// Observe a round only if membership converged before its target snapshot, so
+/// convergence during collection cannot make an old startup snapshot erase evidence.
+fn observe_peer_ages(
+    membership_ready: bool,
+    ages: &mut operator::peer_ages::PeerAges,
+    polled: &[String],
+    answered: &BTreeMap<String, usize>,
+) -> bool {
+    if !membership_ready {
+        return false;
+    }
+    ages.observe(polled, answered);
+    true
+}
+
+/// Write the `PeerTimeValid` condition on the sole `GridNetwork` when it changed.
+///
+/// Compared against the live status every round, so a restart, a recreated
+/// `GridNetwork` or an edited status is set right on the next round, and nothing
+/// is written while the condition already says this.
+async fn write_peer_ages(
+    client: &Client,
+    ages: &operator::peer_ages::PeerAges,
+    shutdown: &operator::shutdown::Shutdown,
+) {
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => {},
+        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, Box::pin(apply_peer_ages(client, ages))) => {
+            if result.is_err() {
+                tracing::warn!("peer ages condition write timed out; retrying next round");
+            }
+        },
+    }
+}
+
+/// Total lookup-and-patch budget, so diagnostic publication cannot hold peer
+/// freshness behind a slow Kubernetes API.
+const PEER_AGES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Look up the live network and apply its peer-age condition when changed.
+async fn apply_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) {
+    let Some(network) = Box::pin(sole_network(client)).await else {
+        return;
+    };
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return;
+    };
+    let Some((name, patch)) = operator::peer_ages::patch(&network, ages, &now) else {
+        return;
+    };
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    let params = PatchParams::apply(operator::peer_ages::FIELD_MANAGER).force();
+    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        Ok(_) if ages.rejecting().is_empty() => {
+            tracing::info!("relayed signal ages accepted from every polled peer");
+        },
+        Ok(_) => tracing::warn!(
+            peers = ?ages.rejecting(),
+            "relayed signal ages rejected from peers; check their clocks"
+        ),
+        Err(error) => tracing::warn!(%error, "peer ages condition not written; retrying next round"),
     }
 }
 
@@ -2458,6 +2702,7 @@ async fn peer_source(
         slow_after: std::time::Duration::from_millis(settings.peer_slow_ms),
         shutdown,
         trust,
+        transports: operator::signals::PeerTransports::default(),
     })
 }
 
@@ -2487,6 +2732,130 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn feedback_handler_refuses_every_peer_scope() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+        };
+        for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
+            let response = ingest_handler(
+                axum::extract::State(published.clone()),
+                axum::Extension(caller),
+                http::Request::new(axum::body::Body::empty()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                http::StatusCode::FORBIDDEN,
+                "neither authorized peers nor absent identities can publish gateway status"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_age_observation_waits_for_membership_release() {
+        let client = stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let ctx = OperatorCtx::new(client, None, SignalMode::Poll).hold_membership();
+        let mut ages = operator::peer_ages::PeerAges::default();
+        ages.observe(&["east".to_owned()], &BTreeMap::from([("east".to_owned(), 1)]));
+        let previous = ages.clone();
+        let live = ages
+            .condition(&[], "t0", Some(1))
+            .expect("rejection recorded before convergence");
+        let held_round = ctx.membership_hold().is_none();
+        ctx.release_membership();
+        assert!(
+            !observe_peer_ages(held_round, &mut ages, &[], &BTreeMap::new()),
+            "release during collection must not make a held startup snapshot publishable"
+        );
+        assert_eq!(ages, previous, "the membership hold must prevent evidence pruning");
+        let ready_round = ctx.membership_hold().is_none();
+        assert!(
+            observe_peer_ages(ready_round, &mut ages, &[], &BTreeMap::new()),
+            "the following converged round enables observation and publication"
+        );
+        assert_eq!(
+            ages.condition(std::slice::from_ref(&live), "t1", Some(1))
+                .map(|condition| condition.status),
+            Some("True".to_owned()),
+            "a genuinely empty snapshot after convergence clears rejection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_age_publication_bounds_stalled_lookups_and_patches() {
+        for stall_patch in [false, true] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = stalled_peer_ages_client(stall_patch, Arc::clone(&requests));
+            let ages = operator::peer_ages::PeerAges::default();
+            let shutdown = operator::shutdown::Shutdown::never();
+            let start = tokio::time::Instant::now();
+            let completed = tokio::time::timeout(
+                PEER_AGES_WRITE_TIMEOUT.saturating_add(std::time::Duration::from_secs(1)),
+                write_peer_ages(&client, &ages, &shutdown),
+            )
+            .await;
+            assert!(completed.is_ok(), "a stalled API must release the peer polling round");
+            assert_eq!(
+                start.elapsed(),
+                PEER_AGES_WRITE_TIMEOUT,
+                "one budget covers lookup and patch"
+            );
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                if stall_patch { 2 } else { 1 },
+                "the test must reach the intended stalled request"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_peer_age_publication_during_lookup_or_patch() {
+        for stall_patch in [false, true] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = stalled_peer_ages_client(stall_patch, Arc::clone(&requests));
+            let ages = operator::peer_ages::PeerAges::default();
+            let (trigger, shutdown) = operator::shutdown::Trigger::new();
+            let writing = tokio::spawn(async move { write_peer_ages(&client, &ages, &shutdown).await });
+            let expected_requests = if stall_patch { 2 } else { 1 };
+            wait_for_peer_age_requests(&requests, expected_requests).await;
+            let start = tokio::time::Instant::now();
+            trigger.trigger();
+            assert!(
+                writing.await.is_ok(),
+                "a stalled diagnostic must not hold termination open"
+            );
+            assert_eq!(
+                start.elapsed(),
+                std::time::Duration::ZERO,
+                "shutdown must beat the deadline"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_already_triggered_shutdown_skips_peer_age_publication() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = stalled_peer_ages_client(false, Arc::clone(&requests));
+        let ages = operator::peer_ages::PeerAges::default();
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        trigger.trigger();
+        write_peer_ages(&client, &ages, &shutdown).await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shutdown must not start a diagnostic request"
+        );
+    }
 
     #[test]
     fn a_swim_site_name_must_be_a_dns_label() {
@@ -2685,6 +3054,7 @@ mod tests {
             stream,
             remote,
             handshaking(&sources, &PeerSlots::new(1, 8)),
+            operator::shutdown::Shutdown::never(),
         ));
         tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT * 2, serve)
             .await
@@ -2728,6 +3098,24 @@ mod tests {
         east: certs::SiteCertOutput,
         /// The calling site.
         west: certs::SiteCertOutput,
+    }
+
+    /// Serve one fixture connection without lifecycle cancellation.
+    #[cfg(not(feature = "fips"))]
+    async fn serve_fixture(
+        serving: Serving,
+        stream: tokio::net::TcpStream,
+        remote: SocketAddr,
+        handshaking: Handshaking,
+    ) {
+        Box::pin(serve_signals_connection(
+            serving,
+            stream,
+            remote,
+            handshaking,
+            operator::shutdown::Shutdown::never(),
+        ))
+        .await;
     }
 
     #[cfg(not(feature = "fips"))]
@@ -2796,7 +3184,7 @@ mod tests {
                         app: app.clone(),
                         identity: identity.clone(),
                     };
-                    served.spawn(serve_signals_connection(serving, stream, remote, handshaking));
+                    served.spawn(serve_fixture(serving, stream, remote, handshaking));
                 }
                 served.join_all().await;
             });
@@ -2880,7 +3268,13 @@ mod tests {
                 let addr = listener.local_addr().expect("fixture");
                 let (rotate, rotated) = tokio::sync::oneshot::channel::<()>();
                 let changed = async move { drop(rotated.await) };
-                let server = tokio::spawn(serve_signals_tls(listener, serving, Admission::new(8), changed));
+                let server = tokio::spawn(serve_signals_tls(
+                    listener,
+                    serving,
+                    Admission::new(8),
+                    changed,
+                    operator::shutdown::Shutdown::never(),
+                ));
                 (addr, rotate, server)
             }
         };
@@ -3006,11 +3400,11 @@ mod tests {
         );
     }
 
-    /// A caller that keeps asking is closed once the connection reaches its maximum age.
-    #[tokio::test(start_paused = true)]
-    async fn a_busy_connection_closes_at_its_maximum_age() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let (mut client, server_io) = tokio::io::duplex(4096);
+    /// Serve a small successful response on an in-memory HTTP/1 connection.
+    async fn serve_ok_connection(
+        server_io: tokio::io::DuplexStream,
+        shutdown: operator::shutdown::Shutdown,
+    ) -> hyper::Result<()> {
         let service = hyper::service::service_fn(|_request: http::Request<hyper::body::Incoming>| {
             std::future::ready(Ok::<_, std::convert::Infallible>(http::Response::new(
                 http_body_util::Full::new(bytes::Bytes::from_static(b"ok")),
@@ -3020,7 +3414,44 @@ mod tests {
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(SIGNALS_HEADER_READ_TIMEOUT)
             .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
-        let server = tokio::spawn(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE));
+        Box::pin(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE, shutdown)).await
+    }
+
+    /// Serve one response whose completion the test controls.
+    async fn serve_gated_connection(
+        server_io: tokio::io::DuplexStream,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        shutdown: operator::shutdown::Shutdown,
+    ) -> hyper::Result<()> {
+        let service = hyper::service::service_fn(move |_request: http::Request<hyper::body::Incoming>| {
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                    bytes::Bytes::from_static(b"finished"),
+                )))
+            }
+        });
+        let connection = hyper::server::conn::http1::Builder::new()
+            .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
+        Box::pin(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE, shutdown)).await
+    }
+
+    /// Assert an async reader reaches EOF cleanly.
+    async fn expect_eof(stream: &mut (impl tokio::io::AsyncRead + Unpin)) {
+        use tokio::io::AsyncReadExt as _;
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.expect("closed connection");
+    }
+
+    /// A caller that keeps asking is closed once the connection reaches its maximum age.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_connection_closes_at_its_maximum_age() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_ok_connection(server_io, operator::shutdown::Shutdown::never()));
         let opened = tokio::time::Instant::now();
         let mut answer = [0_u8; 256];
         loop {
@@ -3036,6 +3467,70 @@ mod tests {
             opened.elapsed() >= SIGNALS_MAX_CONNECTION_AGE,
             "closed at its age, not before"
         );
+        assert!(server.await.expect("server task").is_ok(), "a graceful close");
+    }
+
+    /// Shutdown closes an idle keep-alive without waiting for its header timer or maximum age.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_closes_promptly_on_shutdown() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let server = tokio::spawn(serve_ok_connection(server_io, shutdown));
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        let mut answer = vec![0_u8; 256];
+        let read = client.read(&mut answer).await.expect("response");
+        answer.truncate(read);
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "request completed");
+
+        let stopped = tokio::time::Instant::now();
+        trigger.trigger();
+        assert!(server.await.expect("server task").is_ok(), "a graceful close");
+        assert!(
+            stopped.elapsed() < SIGNALS_HEADER_READ_TIMEOUT,
+            "shutdown must beat the idle header timer"
+        );
+        expect_eof(&mut client).await;
+    }
+
+    /// Graceful shutdown lets the request already being answered finish before closing.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_finishes_the_in_flight_response() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let server = tokio::spawn(serve_gated_connection(
+            server_io,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            shutdown,
+        ));
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        entered.notified().await;
+        trigger.trigger();
+        assert!(
+            !server.is_finished(),
+            "the in-flight response holds graceful shutdown open"
+        );
+
+        release.notify_one();
+        let mut answer = Vec::new();
+        tokio::time::timeout(SIGNALS_WRITE_TIMEOUT, client.read_to_end(&mut answer))
+            .await
+            .expect("connection close bound")
+            .expect("response and EOF");
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "the response completed");
+        assert!(answer.ends_with(b"finished"), "the complete body was written");
         assert!(server.await.expect("server task").is_ok(), "a graceful close");
     }
 
@@ -3447,5 +3942,595 @@ mod tests {
         let data = revision_lease_data(&lease);
         assert_eq!(parse_revision_value(&data, REVISION_HIGH_KEY), Some(20));
         assert_eq!(parse_revision_value(&data, NODE_GENERATION_HIGH_KEY), Some(40));
+    }
+
+    /// A listener fixture serving `mesh`'s CA with an east leaf, admitting west.
+    #[cfg(not(feature = "fips"))]
+    fn serving_for(mesh: &Mesh) -> Serving {
+        let leaf = certs::generate_site_cert(&mesh.ca, "east").expect("fixture");
+        let peers = operator::signals::PeerIdentities::new();
+        peers.set(BTreeMap::from([(
+            "west".to_owned(),
+            operator::signals::PeerRecord {
+                labels: gpu(),
+                pins: Vec::new(),
+            },
+        )]));
+        Serving {
+            tls: tls_backend::build_server_config(
+                mesh.ca.cert_pem.as_bytes(),
+                leaf.cert_pem.as_bytes(),
+                leaf.key_pem.as_bytes(),
+            )
+            .expect("fixture"),
+            app: ok_app(),
+            identity: SignalsIdentity {
+                peers,
+                own: None,
+                trust: operator::signals::PeerTrustMode::Spiffe,
+            },
+        }
+    }
+
+    /// The drain holds for a peer mid-answer, and gives up at the grace.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_waits_for_an_open_connection_and_then_gives_up() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(SIGNALS_MAX_CONNECTIONS));
+        let held = Arc::clone(&slots).try_acquire_owned().expect("a slot");
+
+        let waiting = tokio::time::Instant::now();
+        drain_connections(&slots).await;
+        assert!(
+            waiting.elapsed() >= SHUTDOWN_GRACE,
+            "a peer mid-answer must hold the drain open"
+        );
+
+        drop(held);
+        let idle = tokio::time::Instant::now();
+        drain_connections(&slots).await;
+        assert!(
+            idle.elapsed() < SHUTDOWN_GRACE,
+            "with nothing open the drain must not wait out the grace"
+        );
+    }
+
+    /// The signal closes the listener, where before only SIGKILL did.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn the_listener_stops_accepting_once_the_signal_is_given() {
+        let mesh = Mesh::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let addr = listener.local_addr().expect("fixture");
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let server = tokio::spawn(serve_signals_tls(
+            listener,
+            serving_for(&mesh),
+            Admission::new(8),
+            std::future::pending(),
+            shutdown,
+        ));
+
+        let mut polling = mesh.connect(addr).await;
+        assert!(get(&mut polling).await.starts_with(b"HTTP/1.1 200"), "serves before");
+
+        let started = tokio::time::Instant::now();
+        trigger.trigger();
+        server
+            .await
+            .expect("server task")
+            .expect("the listener stands down cleanly");
+        assert!(
+            started.elapsed() < SHUTDOWN_GRACE,
+            "an idle connection releases its drain slot"
+        );
+
+        expect_eof(&mut polling).await;
+
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the listener socket must be closed once the signal is given"
+        );
+    }
+
+    /// A stage with no handle has nothing to leave, at either read.
+    #[test]
+    fn a_site_with_no_swim_runtime_has_no_handle_to_leave() {
+        let (tx, rx) = tokio::sync::watch::channel(SwimStage::Starting);
+        assert!(settled(&rx).is_none(), "starting carries no handle");
+        tx.send_replace(SwimStage::Settled(None));
+        assert!(settled(&rx).is_none(), "settled without a runtime carries no handle");
+    }
+
+    /// Stand-down cannot start its leave grace until every state writer has stopped.
+    #[tokio::test(start_paused = true)]
+    async fn stand_down_waits_for_writers_before_the_grace() {
+        let (shutdown_tx, shutdown) = operator::shutdown::Trigger::new();
+        let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
+        let (_swim_tx, swim) = tokio::sync::watch::channel(SwimStage::Settled(None));
+        let standing_down = tokio::spawn(stand_down(shutdown, writers_done, swim));
+
+        shutdown_tx.trigger();
+        tokio::time::advance(SHUTDOWN_GRACE * 2).await;
+        tokio::task::yield_now().await;
+        assert!(!standing_down.is_finished(), "writers hold the leave barrier");
+
+        writers_done_tx.trigger();
+        tokio::task::yield_now().await;
+        assert!(!standing_down.is_finished(), "the grace begins only after writers stop");
+        tokio::time::advance(SHUTDOWN_GRACE).await;
+        standing_down.await.expect("stand-down task");
+    }
+
+    /// The completion latch fires only after cancellation drops the writer future.
+    #[tokio::test]
+    async fn writer_completion_means_the_writers_are_dropped() {
+        struct MarkDropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for MarkDropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = MarkDropped(Arc::clone(&dropped));
+        let writers = async move {
+            let _marker = marker;
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
+        };
+        let (shutdown_tx, shutdown) = operator::shutdown::Trigger::new();
+        let (done_tx, done) = operator::shutdown::Trigger::new();
+        let stopping = tokio::spawn(stop_writers_on_shutdown(shutdown, done_tx, writers));
+
+        shutdown_tx.trigger();
+        done.triggered().await;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "the writer future drops before the completion latch fires"
+        );
+        stopping.await.expect("writer group").expect("stopped");
+    }
+
+    /// `Date` uses the render's wall reading to approximate message origination
+    /// time, as specified by [RFC 9110 Section 6.6.1].
+    ///
+    /// [RFC 9110 Section 6.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-6.6.1
+    #[test]
+    fn a_signals_response_is_dated_from_the_reading_it_was_rendered_at() {
+        let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let response = served(String::new(), std::time::Duration::from_secs(7), stepped_back);
+        let header = |name: http::header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header(http::header::DATE),
+            Some(httpdate::fmt_http_date(stepped_back)),
+            "the Date is the render's wall reading, not the server's cached clock"
+        );
+        assert_eq!(header(http::header::AGE).as_deref(), Some("7"));
+    }
+
+    /// hyper writes its cached `Date` only when a response carries none, so the
+    /// render's own `Date` is the only one a reader gets.
+    /// `Date` carries the origination time per [RFC 9110 Section 6.6.1]; duplicate
+    /// field lines are forbidden for this non-list field per [RFC 9110 Section 5.2].
+    ///
+    /// [RFC 9110 Section 6.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-6.6.1
+    /// [RFC 9110 Section 5.2]: https://datatracker.ietf.org/doc/html/rfc9110#section-5.2
+    #[tokio::test]
+    async fn the_explicit_date_is_the_only_date_on_the_wire() {
+        let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let answer = served_on_the_wire(stepped_back).await;
+        let dates: Vec<&str> = answer
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("date"))
+            .map(|(_, value)| value.trim())
+            .collect();
+        assert_eq!(
+            dates,
+            [httpdate::fmt_http_date(stepped_back)],
+            "the render's Date replaces hyper's cached one rather than joining it"
+        );
+    }
+
+    /// The raw HTTP/1.1 answer hyper writes for an empty exposition rendered at `wall`.
+    async fn served_on_the_wire(wall: SystemTime) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let service = hyper::service::service_fn(move |_request: http::Request<hyper::body::Incoming>| {
+            std::future::ready(Ok::<_, std::convert::Infallible>(served(
+                String::new(),
+                std::time::Duration::ZERO,
+                wall,
+            )))
+        });
+        let connection = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive(false)
+            .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
+        let server = tokio::spawn(connection);
+        client
+            .write_all(b"GET /v1/site/signals HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.expect("response");
+        assert!(
+            server.await.expect("server task").is_ok(),
+            "one answer, then a clean close"
+        );
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_relayed_row_reads_its_own_age_against_the_response_date() {
+        let client = stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+        };
+        published.peers.refresh(
+            BTreeMap::from([("east".to_owned(), vec![row_aged(std::time::Duration::from_secs(30))])]),
+            std::time::Duration::from_secs(60),
+        );
+        let response = signals_handler(
+            axum::extract::State(published),
+            axum::Extension(Caller::Local),
+            axum::extract::Query(Vec::new()),
+        )
+        .await;
+        let date = date_ms_of(&response);
+        let stamp = last_stamp_of(response).await;
+        assert!(
+            (29_000..=31_000).contains(&(date - stamp)),
+            "Date minus the stamp is the row's 30 s age: {}",
+            date - stamp
+        );
+    }
+
+    /// One relayed contract row, already `age` old when collected.
+    fn row_aged(age: std::time::Duration) -> operator::signals::Observation {
+        operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([("grid_provider".to_owned(), "pool-a".to_owned())]),
+            value: 1.0,
+            timestamp_ms: None,
+            age,
+        }
+    }
+
+    /// The `Date` a response carries, epoch milliseconds.
+    fn date_ms_of(response: &axum::response::Response) -> i64 {
+        response
+            .headers()
+            .get(http::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| httpdate::parse_http_date(text).ok())
+            .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
+            .map(|since| i64::try_from(since.as_millis()).expect("fits i64"))
+            .expect("the response carries its own Date")
+    }
+
+    /// The trailing stamp of the last row a response carries.
+    async fn last_stamp_of(response: axum::response::Response) -> i64 {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8_lossy(&body)
+            .trim_end()
+            .rsplit_once(' ')
+            .and_then(|(_, stamp)| stamp.parse().ok())
+            .expect("a stamped row")
+    }
+
+    /// Wait until the mock receives a request, failing instead of spinning if
+    /// the expected lookup or patch was never made.
+    async fn wait_for_peer_age_requests(requests: &std::sync::atomic::AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while requests.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the intended diagnostic request is reached");
+    }
+
+    /// A Kubernetes client whose list or status patch never produces a response.
+    fn stalled_peer_ages_client(stall_patch: bool, requests: Arc<std::sync::atomic::AtomicUsize>) -> Client {
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if !stall_patch || request.method() == http::Method::PATCH {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let body = serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridNetworkList",
+                    "items": [{
+                        "apiVersion": "grid.praxis.fast/v1alpha1",
+                        "kind": "GridNetwork",
+                        "metadata": { "name": "grid", "generation": 1 },
+                        "spec": { "seeds": [], "gridId": "test-id" }
+                    }]
+                });
+                Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body.to_string())))
+            }
+        });
+        Client::new(service, "default")
+    }
+
+    /// Real Kubernetes and mutual-TLS feedback proof for the isolated CI cluster.
+    #[cfg(not(feature = "fips"))]
+    mod feedback_contract {
+        use super::*;
+
+        /// Object owned only by this isolated contract test.
+        const NETWORK: &str = "gateway-feedback-contract";
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated pre-install hub Kind cluster and checked-in CRD"]
+        async fn tls_feedback_persists_against_real_kubernetes() {
+            let client = real_client().await;
+            let api: Api<GridNetwork> = Api::all(client.clone());
+            initialize(&api).await;
+            reject_invalid_schema(&api).await;
+            let writes = Arc::new(Writes::default());
+            let feedback_client = racing_client(client, Arc::clone(&writes));
+            let feedback =
+                operator::gateway_ages::GatewayFeedback::new(feedback_client, operator::shutdown::Shutdown::never());
+            let mesh = Mesh::new();
+            peer_is_forbidden(&mesh, feedback.clone(), &writes).await;
+            local_is_acknowledged(&mesh, feedback).await;
+            verify_writes(&writes);
+            verify_evidence(&api).await;
+            api.delete(NETWORK, &kube::api::DeleteParams::default())
+                .await
+                .expect("remove the test network");
+        }
+
+        // ---------------------------------------------------------------------------
+        // Test Utilities
+        // ---------------------------------------------------------------------------
+
+        /// Observed requests and actual API-server conflicts.
+        #[derive(Default)]
+        struct Writes {
+            /// Real API-server responses carrying HTTP 409.
+            conflicts: std::sync::atomic::AtomicUsize,
+            /// Forwarded status patches, including the retry.
+            patches: std::sync::atomic::AtomicUsize,
+        }
+
+        /// A real peer certificate must never cause a gateway status write.
+        async fn peer_is_forbidden(mesh: &Mesh, feedback: operator::gateway_ages::GatewayFeedback, writes: &Writes) {
+            let peer = post(mesh, mesh.west_is_pinned(), feedback).await;
+            assert!(
+                peer.starts_with("HTTP/1.1 403"),
+                "a real peer certificate cannot ingest: {peer}"
+            );
+            assert_eq!(
+                writes.patches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "peer makes no status write"
+            );
+        }
+
+        /// Only the local certificate earns an exact durable receipt.
+        async fn local_is_acknowledged(mesh: &Mesh, feedback: operator::gateway_ages::GatewayFeedback) {
+            let local = post(mesh, mesh.west_is_local(), feedback).await;
+            assert!(
+                local.starts_with("HTTP/1.1 204"),
+                "the real local certificate is acknowledged: {local}"
+            );
+            let headers = local.to_ascii_lowercase();
+            assert!(
+                headers.contains("x-grid-ingest-epoch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"),
+                "durable acknowledgment identifies the exact epoch"
+            );
+            assert!(
+                headers.contains("x-grid-ingest-sequence: 1\r\n"),
+                "durable acknowledgment identifies the exact sequence"
+            );
+        }
+
+        /// One actual stale-version rejection is followed by one fresh retry.
+        fn verify_writes(writes: &Writes) {
+            assert_eq!(
+                writes.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the API server really rejected a stale version"
+            );
+            assert_eq!(
+                writes.patches.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "one stale patch then one fresh retry"
+            );
+        }
+
+        /// Use only the explicit isolated cluster supplied by the CI harness.
+        async fn real_client() -> Client {
+            let context = std::env::var("GRID_FEEDBACK_TEST_CONTEXT").expect("explicit isolated Kind context");
+            let options = kube::config::KubeConfigOptions {
+                context: Some(context),
+                ..Default::default()
+            };
+            let config = kube::Config::from_kubeconfig(&options)
+                .await
+                .expect("isolated cluster credentials");
+            Client::try_from(config).expect("real Kubernetes client")
+        }
+
+        /// Create one network and independently publish the peer's condition.
+        async fn initialize(api: &Api<GridNetwork>) {
+            let before = api
+                .list(&kube::api::ListParams::default())
+                .await
+                .expect("list isolated cluster");
+            assert!(
+                before.items.is_empty(),
+                "the contract test must not touch existing networks"
+            );
+            let network = serde_json::from_value(serde_json::json!({"apiVersion":"grid.praxis.fast/v1alpha1","kind":"GridNetwork","metadata":{"name":NETWORK},"spec":{"seeds":[],"gridId":"feedback-test"}})).expect("network fixture");
+            api.create(&PostParams::default(), &network)
+                .await
+                .expect("create network through real CRD");
+            let peer = serde_json::json!({
+                "apiVersion":"grid.praxis.fast/v1alpha1", "kind":"GridNetwork", "metadata":{"name":NETWORK},
+                "status":{"conditions":[{"type":"PeerTimeValid","status":"False","reason":"TimestampOutOfRange","message":"peer rejection must survive gateway evidence","lastTransitionTime":"2026-10-14T00:00:00Z"}]}
+            });
+            api.patch_status(
+                NETWORK,
+                &PatchParams::apply(operator::peer_ages::FIELD_MANAGER),
+                &Patch::Apply(&peer),
+            )
+            .await
+            .expect("peer field manager");
+        }
+
+        /// An integer bound in the checked-in CRD must reject invalid status.
+        async fn reject_invalid_schema(api: &Api<GridNetwork>) {
+            let invalid = serde_json::json!({"status":{"gatewayAgeReports":[{"epoch":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","replica":"gateway","sequence":0,"skew":0,"rejected":false,"reportedRejected":false,"receivedAt":"2026-10-14T00:00:00Z"}]}});
+            let result = api
+                .patch_status(NETWORK, &PatchParams::default(), &Patch::Merge(&invalid))
+                .await;
+            assert!(
+                matches!(&result, Err(kube::Error::Api(error)) if error.code == 422),
+                "the API server enforces sequence minimum one: {result:?}"
+            );
+        }
+
+        /// Forward every request to the real API after one competing metadata write.
+        fn racing_client(client: Client, writes: Arc<Writes>) -> Client {
+            let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let (client, writes) = (client.clone(), Arc::clone(&writes));
+                async move {
+                    if request.method() == http::Method::PATCH
+                        && request.uri().path().ends_with("/status")
+                        && writes.patches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                    {
+                        let api: Api<GridNetwork> = Api::all(client.clone());
+                        let competing = serde_json::json!({"metadata":{"annotations":{"feedback-contract-race":"1"}}});
+                        api.patch_metadata(NETWORK, &PatchParams::default(), &Patch::Merge(&competing))
+                            .await?;
+                    }
+                    let response = client.send(request).await?;
+                    if response.status() == http::StatusCode::CONFLICT {
+                        writes.conflicts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok::<_, kube::Error>(response)
+                }
+            });
+            Client::new(service, "default")
+        }
+
+        /// Post the wire contract through the same router and TLS classification as production.
+        async fn post(
+            mesh: &Mesh,
+            identity: SignalsIdentity,
+            feedback: operator::gateway_ages::GatewayFeedback,
+        ) -> String {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+            let (addr, server) = mesh
+                .serve(identity, feedback_app(feedback), (&sources, &peers), 1)
+                .await;
+            let mut stream = mesh.connect(addr).await;
+            stream.write_all(wire_report().as_bytes()).await.expect("real TLS POST");
+            let mut answer = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut answer))
+                .await
+                .expect("bounded response")
+                .expect("read response");
+            server.await.expect("TLS server finished");
+            String::from_utf8(answer).expect("HTTP response")
+        }
+
+        /// The exact production router with the real status client under test.
+        fn feedback_app(feedback: operator::gateway_ages::GatewayFeedback) -> axum::Router {
+            signals_app(Published {
+                site: operator::signals::SignalStore::new(),
+                peers: operator::signals::SignalStore::new(),
+                feedback,
+            })
+        }
+
+        /// One empty-body version-one observation on the production POST path.
+        fn wire_report() -> String {
+            format!(
+                "POST {} HTTP/1.1\r\nHost: east\r\nConnection: close\r\nContent-Length: 0\r\nx-grid-ingest-version: 1\r\nx-grid-ingest-replica: gateway\r\nx-grid-ingest-epoch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nx-grid-ingest-sequence: 1\r\nx-grid-ingest-skew: 1\r\nx-grid-ingest-rejected: true\r\n\r\n",
+                grid_signals::feedback::INGEST_PATH
+            )
+        }
+
+        /// Both durable evidence and each writer's real SSA ownership survive the retry.
+        async fn verify_evidence(api: &Api<GridNetwork>) {
+            let network = api.get(NETWORK).await.expect("durable evidence");
+            verify_conditions(network.status.as_ref().expect("status persisted"));
+            let fields = serde_json::to_value(&network.metadata.managed_fields).expect("managed fields");
+            verify_owner(
+                &fields,
+                operator::peer_ages::FIELD_MANAGER,
+                "PeerTimeValid",
+                "GatewayAgesRejected",
+            );
+            verify_owner(
+                &fields,
+                operator::gateway_ages::FIELD_MANAGER,
+                "GatewayAgesRejected",
+                "PeerTimeValid",
+            );
+        }
+
+        /// A gateway's fresh rejection does not recover the independently rejected peer.
+        fn verify_conditions(status: &operator::crd::grid_network::GridNetworkStatus) {
+            let peer = status
+                .conditions
+                .iter()
+                .find(|held| held.type_ == "PeerTimeValid")
+                .expect("peer condition preserved");
+            assert_eq!(peer.status, "False", "gateway publication cannot recover the peer");
+            assert_eq!(peer.reason, "TimestampOutOfRange", "peer reason preserved");
+            let gateway = status
+                .conditions
+                .iter()
+                .find(|held| held.type_ == "GatewayAgesRejected")
+                .expect("gateway condition persisted");
+            assert_eq!(gateway.status, "True", "fresh gateway rejection persisted");
+            assert_eq!(status.gateway_age_reports.len(), 1, "one durable reporter");
+            assert!(
+                status
+                    .gateway_age_reports
+                    .first()
+                    .is_some_and(|report| report.sequence == 1 && report.rejected),
+                "exact accepted gateway evidence"
+            );
+        }
+
+        /// A real field manager owns its keyed condition without claiming the other's key.
+        fn verify_owner(fields: &serde_json::Value, manager: &str, own: &str, other: &str) {
+            let owner = fields
+                .as_array()
+                .expect("field managers")
+                .iter()
+                .find(|entry| entry.get("manager").and_then(serde_json::Value::as_str) == Some(manager))
+                .expect("independent manager");
+            let conditions = owner
+                .pointer("/fieldsV1/f:status/f:conditions")
+                .expect("owned condition fields");
+            let own_key = format!("k:{{\"type\":\"{own}\"}}");
+            let other_key = format!("k:{{\"type\":\"{other}\"}}");
+            assert!(conditions.get(&own_key).is_some(), "{manager} owns its keyed condition");
+            assert!(
+                conditions.get(&other_key).is_none(),
+                "{manager} cannot own the other condition"
+            );
+        }
     }
 }

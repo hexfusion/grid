@@ -43,6 +43,8 @@ pub mod metrics_scraper;
 pub mod metrics_tls;
 /// Short-lived tokens for the metrics scraper ServiceAccount.
 pub(crate) mod metrics_token;
+/// The `GridNetwork` condition naming peers whose relayed signal ages are rejected.
+pub mod peer_ages;
 pub mod readiness;
 /// Kubernetes resource builders.
 pub mod resources;
@@ -51,6 +53,8 @@ pub mod served_models;
 pub use resources::{tls_backend::init_process_crypto, trust_bundle::sha256_fingerprint};
 /// Provider gateway address self-discovery.
 pub mod gateway;
+/// Durable gateway ingest diagnostic feedback.
+pub mod gateway_ages;
 /// Shutdown signal for unwinding in-flight work cleanly.
 pub mod shutdown;
 /// Provider signals, served as a multi-target exporter.

@@ -13,6 +13,7 @@
 #   IMAGE_PREFIX        image repository prefix (default localhost/grid-)
 #   IMAGE_TAG           image tag (default e2e)
 #   SKIP_BUILD=1        use prebuilt <prefix>{operator,gateway,enrollment}:<tag> images
+#   GRID_FEEDBACK_CONTRACT_TEST=1  run the real API/TLS contract before install (CI pin leg)
 #   CONTAINER_TOOL      image build tool (default docker)
 #   FORGE_BIN           explicit executable override (default: pinned upstream Forge)
 #   KIND_CREATE_PREFIX  command prefix for cluster creation, e.g. the rootless podman
@@ -126,7 +127,28 @@ cmd_up() {
     done
     forge apply "$c"
   done
+  feedback_contract_test
 }
+
+# The CI-only test owns exactly one object and the CRD it installs on the empty hub.
+feedback_contract_test() (
+  [[ ${GRID_FEEDBACK_CONTRACT_TEST:-0} == 1 ]] || return 0
+  local crd=gridnetworks.grid.praxis.fast existing
+  existing=$(kubectl --context "$HUB_CTX" get crd "$crd" --ignore-not-found -o name) \
+    || die "cannot inspect the isolated hub CRDs"
+  [[ -z $existing ]] || die "feedback contract requires a hub without the GridNetwork CRD"
+  kubectl --context "$HUB_CTX" create -f "$ROOT/deploy/crds/gridnetwork.yaml" \
+    || die "cannot create the isolated feedback CRD"
+  trap 'contract_rc=$?
+        kubectl --context "$HUB_CTX" delete gridnetwork gateway-feedback-contract --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || contract_rc=1
+        kubectl --context "$HUB_CTX" delete crd gridnetworks.grid.praxis.fast --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || contract_rc=1
+        exit "$contract_rc"' EXIT
+  kubectl --context "$HUB_CTX" wait --for=condition=Established "crd/$crd" --timeout=60s
+  mkdir -p "$ARTIFACTS"
+  GRID_FEEDBACK_TEST_CONTEXT="$HUB_CTX" cargo test -p operator --bin operator \
+    tests::feedback_contract::tls_feedback_persists_against_real_kubernetes -- --ignored --exact \
+    2>&1 | tee "$ARTIFACTS/gateway-feedback-contract.log"
+)
 
 cmd_down() {
   resolve_forge
@@ -910,7 +932,7 @@ assert_renewal() {
     fail "frozen site renewal with its current leaf: HTTP $code"
   fi
 
-  # A grid-admin deletes the enrollment, mints an invite, and the site enrolls again.
+  # An enrollment admin deletes the enrollment, re-admits the name, and the site enrolls again.
   token=$(admin_token) || { fail "mint a grid-admin token"; return; }
   code=$(enroll_api "$out" DELETE "/enrollments/$SITE" -H @<(printf 'Authorization: Bearer %s\n' "$token"))
   if [[ $code == 204 ]]; then
@@ -919,7 +941,7 @@ assert_renewal() {
     fail "delete the $SITE enrollment: HTTP $code $(head -c 200 "$out.body" 2>/dev/null)"
     return
   fi
-  code=$(jq -cn --arg s "$SITE" '{siteName: $s, gridNetworkRef: "grid"}' \
+  code=$(jq -cn --arg s "$SITE" '{siteName: $s, gridNetworkRef: "grid", allowDeletedName: true}' \
     | enroll_api "$out" POST /enrollmenttokens -d @- -H @<(printf 'Authorization: Bearer %s\n' "$token"))
   if [[ $code != 201 ]] || ! jq -er .token "$out.body" >"$WORK/invite" 2>/dev/null; then
     fail "mint a new $SITE invite: HTTP $code $(head -c 200 "$out.body" 2>/dev/null)"

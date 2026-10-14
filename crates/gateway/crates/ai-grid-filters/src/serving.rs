@@ -16,7 +16,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use certs::spiffe_id;
-use grid_signals_client::{PeerScraper, Reporter, spawn_on_thread_held};
+use grid_client::{PeerScraper, Reporter, spawn_on_thread_held};
 use praxis_filter::FilterError;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use serde::{Deserialize, Serialize};
@@ -190,7 +190,7 @@ pub struct PeerServingConfig {
     /// `Duration::ZERO` to the poller's interval timer and panic its thread.
     #[serde(
         default = "default_interval_ms",
-        deserialize_with = "grid_signals_client::deserialize_interval_ms"
+        deserialize_with = "grid_client::deserialize_interval_ms"
     )]
     pub interval_ms: u64,
 
@@ -466,9 +466,12 @@ mod tests {
     fn the_documented_example_loads() {
         let json = include_str!("../../../../../examples/gateway/serving-config.json");
         let config: GridServingConfig = serde_json::from_str(json).expect("the example parses");
-        assert_eq!(config.candidates.len(), 2);
+        assert_eq!(config.candidates.len(), 2, "one model at each of two sites");
         assert_eq!(config.peers.len(), 1, "the gateway polls only its local operator");
-        assert_eq!(config.peers[0].interval_ms, 5000);
+        assert_eq!(
+            config.peers[0].interval_ms, 5_000,
+            "at the interval the operator renders for its gateway"
+        );
     }
 
     #[test]

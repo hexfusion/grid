@@ -10,7 +10,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv6Addr},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +19,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 pub use crate::crd::grid_network::PeerTrustMode;
 use crate::{
-    metrics_scraper::{MetricsScrapeError, scrape_metrics_with_date},
+    metrics_scraper::{MetricsScrapeError, PeerTransport, scrape_peer},
     resources::tls_backend::{self, ClientTlsConfig},
     swim::MemberRecord,
 };
@@ -52,13 +52,21 @@ pub struct Observation {
     pub labels: BTreeMap<String, String>,
     /// Reported value.
     pub value: f64,
-    /// Optional per-sample exposition timestamp, epoch milliseconds.
+    /// The per-sample exposition timestamp as parsed, epoch milliseconds.
     ///
-    /// `None` for a locally scraped sample, whose freshness is the target's
-    /// collection time. On a relayed peer sample the poller sets it to the
-    /// peer's age re-expressed on this site's clock, preserving per-sample
-    /// freshness across the relay.
+    /// Read once, to derive a relayed sample's [`age`], and never rendered:
+    /// every stamp this site serves is written at render.
+    ///
+    /// [`age`]: Self::age
     pub timestamp_ms: Option<i64>,
+    /// How old the sample already was when this site collected it.
+    ///
+    /// Zero for a locally scraped sample. On a relayed peer sample, the peer's
+    /// `Date` minus the sample's own stamp, both read on the peer's clock. A
+    /// render stamps the sample at its own wall reading less this age and the
+    /// time held since, so a step of this site's wall clock never lands in a
+    /// stored stamp.
+    pub age: Duration,
 }
 
 /// The label the EPP puts the pool on.
@@ -142,6 +150,7 @@ fn parse_sample(line: &str) -> Option<Observation> {
         labels,
         value,
         timestamp_ms,
+        age: Duration::ZERO,
     })
 }
 
@@ -214,6 +223,30 @@ pub fn attribute(observations: Vec<Observation>, site: &str, provider: &str) -> 
             o
         })
         .collect()
+}
+
+/// One reading of the two clocks a render needs.
+///
+/// Taken once per response and handed to every render in it, so each stamp and
+/// the response's `Date` come from the same wall reading and a reader recovers
+/// each age exactly.
+#[derive(Clone, Copy, Debug)]
+pub struct ClockReading {
+    /// The monotonic clock, which ages held values.
+    pub instant: Instant,
+    /// The wall clock, which stamps them and dates the response.
+    pub wall: SystemTime,
+}
+
+impl ClockReading {
+    /// Read both clocks now.
+    #[must_use]
+    pub fn now() -> Self {
+        Self {
+            instant: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
 }
 
 /// What is held for one target.
@@ -443,16 +476,18 @@ impl SignalStore {
     /// `reader` is the caller's site labels, from the connection not a parameter.
     /// A denied target is never rendered, so permission withholds data rather
     /// than trimming it after; `collect` narrows only within what is allowed.
-    /// Returns the body and the age of its oldest value, so `Age` bounds the
-    /// whole response.
+    /// Each sample is stamped at `now`'s wall reading less its age, so the
+    /// response's `Date` belongs to the same `now`. Returns the body and the age
+    /// of its oldest value, so `Age` bounds the whole response.
     #[must_use]
     pub fn render(
         &self,
         target: Option<&str>,
         collect: &[String],
         reader: Option<&BTreeMap<String, String>>,
+        now: ClockReading,
     ) -> (String, Duration) {
-        self.render_with(target, collect, &self.denied(reader))
+        self.render_with(target, collect, &self.denied(reader), now)
     }
 
     /// Render every target, applying no access policy.
@@ -461,8 +496,13 @@ impl SignalStore {
     /// to the whole grid view. Access policy scopes peer reads, not the site.
     #[must_use]
     #[cfg(test)]
-    pub fn render_unrestricted(&self, target: Option<&str>, collect: &[String]) -> (String, Duration) {
-        self.render_with(target, collect, &std::collections::BTreeSet::new())
+    pub fn render_unrestricted(
+        &self,
+        target: Option<&str>,
+        collect: &[String],
+        now: ClockReading,
+    ) -> (String, Duration) {
+        self.render_with(target, collect, &std::collections::BTreeSet::new(), now)
     }
 
     /// Render for this site's own gateway: contract series only, each target cut
@@ -472,22 +512,25 @@ impl SignalStore {
     /// The gateway reads every site from one response under its own byte
     /// ceiling, past which the whole poll fails and every site goes unmeasured.
     /// Bounding here turns that cliff into a counted loss of the last targets.
+    /// Stamped from `now` as [`Self::render`] is.
     #[must_use]
-    pub fn render_bounded(&self, target: Option<&str>, collect: &[String], budget: usize) -> Rendered {
+    pub fn render_bounded(
+        &self,
+        target: Option<&str>,
+        collect: &[String],
+        budget: usize,
+        now: ClockReading,
+    ) -> Rendered {
         let Ok(guard) = self.inner.read() else {
             return Rendered::default();
         };
-        let now = Instant::now();
-        let now_wall = SystemTime::now();
-        let now_ms = wall_millis(now_wall, Duration::ZERO);
         let mut rendered = Rendered::default();
         for (name, held) in guard.iter() {
-            if held.expires_at <= now || target.is_some_and(|t| t != name) {
+            if held.expires_at <= now.instant || target.is_some_and(|t| t != name) {
                 continue;
             }
-            let age = now.saturating_duration_since(held.collected_at);
-            let collected_at_ms = wall_millis(now_wall, age);
-            let (block, block_oldest, cut) = render_contract_block(&held.samples, collect, collected_at_ms, now_ms);
+            let held_for = now.instant.saturating_duration_since(held.collected_at);
+            let (block, block_oldest, cut) = render_contract_block(&held.samples, collect, held_for, now.wall);
             rendered.lines_cut = rendered.lines_cut.saturating_add(cut);
             if rendered.body.len().saturating_add(block.len()) > budget {
                 rendered.targets_dropped = rendered.targets_dropped.saturating_add(1);
@@ -505,17 +548,15 @@ impl SignalStore {
         target: Option<&str>,
         collect: &[String],
         denied: &std::collections::BTreeSet<String>,
+        now: ClockReading,
     ) -> (String, Duration) {
         let Ok(guard) = self.inner.read() else {
             return (String::new(), Duration::ZERO);
         };
-        let now = Instant::now();
-        let now_wall = SystemTime::now();
-        let now_ms = wall_millis(now_wall, Duration::ZERO);
         let mut out = String::new();
         let mut oldest = Duration::ZERO;
         for (name, held) in guard.iter() {
-            if held.expires_at <= now || target.is_some_and(|t| t != name) {
+            if held.expires_at <= now.instant || target.is_some_and(|t| t != name) {
                 continue;
             }
             if denied.contains(name.as_str()) {
@@ -523,18 +564,14 @@ impl SignalStore {
             }
             // TTL uses a monotonic instant; exposition wants epoch millis, so
             // derive from the age rather than store a wall clock that can jump.
-            let age = now.saturating_duration_since(held.collected_at);
-            let collected_at_ms = wall_millis(now_wall, age);
+            let held_for = now.instant.saturating_duration_since(held.collected_at);
             for sample in held.samples.iter() {
                 if collect.is_empty() || collect.iter().any(|c| c == &sample.metric) {
-                    // A relayed peer sample carries its own age-preserving stamp,
-                    // else the target's collection time.
-                    let stamp_ms = sample.timestamp_ms.unwrap_or(collected_at_ms);
-                    render_sample(&mut out, sample, stamp_ms);
+                    let age = held_for.saturating_add(sample.age);
+                    render_sample(&mut out, sample, wall_millis(now.wall, age));
                     out.push('\n');
                     // Age bounds the whole response by the oldest sample emitted.
-                    let sample_age = Duration::from_millis(u64::try_from(now_ms.saturating_sub(stamp_ms)).unwrap_or(0));
-                    oldest = oldest.max(sample_age);
+                    oldest = oldest.max(age);
                 }
             }
         }
@@ -572,8 +609,8 @@ impl SignalStore {
 
 /// Render one observation as an exposition line, stamped with `stamp_ms`.
 ///
-/// The trailing timestamp is load-bearing: the caller passes the target's
-/// collection time, or a relayed peer sample's own age-preserving stamp.
+/// The trailing timestamp is load-bearing: a reader takes the sample's age as the
+/// response `Date` less it.
 fn render_sample(out: &mut String, o: &Observation, stamp_ms: i64) {
     // Written into the caller's buffer rather than returned. Building a string
     // per label, collecting them, joining them and then formatting the result
@@ -602,7 +639,8 @@ fn render_sample(out: &mut String, o: &Observation, stamp_ms: i64) {
 /// Epoch milliseconds for an observation collected `age` ago.
 ///
 /// The consumer reads this against the response `Date`, so both ends of the
-/// subtraction come from this host's clock and no foreign clock is imported.
+/// subtraction come from one reading of this host's clock and no foreign clock
+/// is imported.
 fn wall_millis(now: SystemTime, age: Duration) -> i64 {
     let since_epoch = now
         .duration_since(UNIX_EPOCH)
@@ -774,7 +812,7 @@ pub fn dialable_signals_endpoint(member: &MemberRecord, fallback_port: u16) -> O
 }
 
 /// Refused `(site, endpoint)` pairs already warned, bounded.
-static REFUSED_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+static REFUSED_WARNED: std::sync::LazyLock<Mutex<std::collections::HashSet<(String, String)>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Refused pairs remembered before the set starts over.
@@ -783,7 +821,7 @@ const REFUSED_WARNED_MAX: usize = 1_024;
 /// Warn about a refused endpoint the first time a peer gossips it, `true` when warned.
 fn warn_refused_once(site: &str, endpoint: &str) -> bool {
     let endpoint: String = endpoint.chars().take(128).collect();
-    let mut warned = REFUSED_WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut warned = REFUSED_WARNED.lock().unwrap_or_else(PoisonError::into_inner);
     if warned.len() >= REFUSED_WARNED_MAX {
         warned.clear();
     }
@@ -818,85 +856,27 @@ pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
 /// Everything outside the RFC 3986 unreserved set is escaped in a query value.
 const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-/// Why a poll ended, at the granularity a response differs by.
-///
-/// Finer than success or failure, so "why is this peer not scored" is
-/// answerable: a refusal, a trust failure, and a 403 each call for a different
-/// response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PollOutcome {
-    /// The peer answered.
-    Ok,
-    /// No answer within the timeout.
-    Timeout,
-    /// The connection was refused or the host was unreachable.
-    Refused,
-    /// The TLS handshake or certificate verification failed.
-    Tls,
-    /// Any other transport failure.
-    Transport,
-    /// The peer answered with a 4xx.
-    ClientError,
-    /// The peer answered with a 5xx.
-    ServerError,
-    /// The body was not decodable.
-    Encoding,
-    /// This site is misconfigured for that peer.
-    Config,
-    /// The process is shutting down and the poll stood down.
-    Cancelled,
-}
-
-impl PollOutcome {
-    /// Label value, stable because dashboards and alerts are written against it.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Timeout => "timeout",
-            Self::Refused => "refused",
-            Self::Tls => "tls",
-            Self::Transport => "transport",
-            Self::ClientError => "client_error",
-            Self::ServerError => "server_error",
-            Self::Encoding => "encoding",
-            Self::Config => "config",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    /// Whether trying again within this round could plausibly help.
-    ///
-    /// Retrying a trust failure or a refusal to answer wastes the budget that a
-    /// genuinely transient failure needs, and turns one misconfiguration into a
-    /// burst against a peer that already said no.
-    #[must_use]
-    pub const fn is_retryable(self) -> bool {
-        matches!(
-            self,
-            Self::Timeout | Self::Refused | Self::Transport | Self::ServerError
-        )
-    }
-}
+use grid_client::RequestOutcome;
 
 /// Classify a scrape failure.
-fn classify(error: &MetricsScrapeError) -> PollOutcome {
+fn classify(error: &MetricsScrapeError) -> RequestOutcome {
     match error {
-        MetricsScrapeError::Timeout(_) => PollOutcome::Timeout,
+        MetricsScrapeError::Timeout(_) => RequestOutcome::Timeout,
         MetricsScrapeError::NonOkStatus { status, .. } => {
-            if (500..600).contains(status) {
-                PollOutcome::ServerError
-            } else {
-                PollOutcome::ClientError
+            match http::StatusCode::from_u16(*status).map(grid_client::from_status) {
+                // A 2xx carried in an error means the scrape failed while the
+                // status said it worked, so nothing was answered.
+                Ok(RequestOutcome::Ok) | Err(_) => RequestOutcome::Transport,
+                Ok(outcome) => outcome,
             }
         },
-        MetricsScrapeError::Encoding(_) => PollOutcome::Encoding,
-        MetricsScrapeError::BodyTooLarge(_) => PollOutcome::Transport,
+        MetricsScrapeError::Encoding(_) => RequestOutcome::Encoding,
+        MetricsScrapeError::BodyTooLarge(_) => RequestOutcome::Transport,
         MetricsScrapeError::InvalidUrl(_)
         | MetricsScrapeError::HttpWithTls(_)
         | MetricsScrapeError::TlsMaterial(_)
         | MetricsScrapeError::Credential(_)
-        | MetricsScrapeError::PlaintextCredential(_) => PollOutcome::Config,
+        | MetricsScrapeError::PlaintextCredential(_) => RequestOutcome::Config,
         MetricsScrapeError::Transport(inner) => classify_transport(&**inner),
     }
 }
@@ -908,25 +888,25 @@ fn classify(error: &MetricsScrapeError) -> PollOutcome {
 /// replaced. The chain is walked rather than the message matched, because an
 /// error string is not an interface.
 #[expect(clippy::wildcard_enum_match_arm, reason = "std::io::ErrorKind is non_exhaustive")]
-fn classify_transport(error: &(dyn std::error::Error + 'static)) -> PollOutcome {
+fn classify_transport(error: &(dyn std::error::Error + 'static)) -> RequestOutcome {
     let mut current = Some(error);
     while let Some(err) = current {
         if tls_backend::is_tls_error(err) {
-            return PollOutcome::Tls;
+            return RequestOutcome::Tls;
         }
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
             return match io.kind() {
                 std::io::ErrorKind::ConnectionRefused
                 | std::io::ErrorKind::HostUnreachable
                 | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::ConnectionReset => PollOutcome::Refused,
-                std::io::ErrorKind::TimedOut => PollOutcome::Timeout,
-                _ => PollOutcome::Transport,
+                | std::io::ErrorKind::ConnectionReset => RequestOutcome::Refused,
+                std::io::ErrorKind::TimedOut => RequestOutcome::Timeout,
+                _ => RequestOutcome::Transport,
             };
         }
         current = err.source();
     }
-    PollOutcome::Transport
+    RequestOutcome::Transport
 }
 
 /// Delay before attempt `attempt`, counting the first retry as zero.
@@ -997,6 +977,45 @@ impl std::fmt::Debug for PeerTlsMaterial {
     }
 }
 
+/// How long an unused peer connection is kept.
+///
+/// Above the default poll interval, but below the signals listener's 10s idle
+/// timeout and the idle window a stateful firewall is likely to enforce.
+const PEER_POOL_IDLE: Duration = Duration::from_secs(8);
+
+/// How long a peer transport may live before it is rebuilt.
+///
+/// A pooled connection is verified once, when it is made. Rebuilding forces a
+/// fresh handshake, and so a fresh leaf check, bounding how long a revoked or
+/// expired certificate stays reachable.
+const PEER_TRANSPORT_MAX_AGE: Duration = Duration::from_mins(1);
+
+/// Per-peer transports, with the pins each was built for.
+///
+/// Held across rounds because building one parses a private key and opens a
+/// connection. Keyed by peer with the pins in the value, because keying on the
+/// pins would leak an entry per rotation. Each entry owns a connection pool,
+/// so an entry is dropped once its peer leaves the grid or its transport
+/// reaches its age.
+#[derive(Default)]
+pub struct PeerTransports(Mutex<HashMap<String, HeldTransport>>);
+
+/// A peer's transport, the pins it was built for, and when it was built.
+struct HeldTransport {
+    /// The pins the transport verifies against.
+    pins: Vec<String>,
+    /// The client, whose pool outlives a round.
+    transport: Arc<PeerTransport>,
+    /// When it was built, which bounds how long a connection may live.
+    built: Instant,
+}
+
+impl std::fmt::Debug for PeerTransports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTransports").finish_non_exhaustive()
+    }
+}
+
 /// Reads each peer's signals endpoint over HTTP.
 pub struct PollPeers {
     /// Per-attempt request timeout.
@@ -1026,6 +1045,8 @@ pub struct PollPeers {
     pub budget: Duration,
     /// Duration past which a poll is counted as slow.
     pub slow_after: Duration,
+    /// Per-peer transports, held across rounds.
+    pub transports: PeerTransports,
     /// Signal that the process is stopping.
     ///
     /// Lets an in-flight round stand down cleanly; dropping the future instead
@@ -1048,6 +1069,7 @@ impl Default for PollPeers {
             slow_after: Duration::from_secs(1),
             shutdown: crate::shutdown::Shutdown::never(),
             trust: PeerTrustMode::Pin,
+            transports: PeerTransports::default(),
         }
     }
 }
@@ -1063,22 +1085,71 @@ impl PollPeers {
         // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
 
-        // Once per peer, not per attempt: this parses a private key.
-        let tls = match self.tls.as_ref().map(|m| peer_client_config(m, self.trust, peer, pins)) {
-            Some(Ok(config)) => Some(config),
-            Some(Err(error)) => {
+        let transport = match self.peer_transport(peer, pins) {
+            Ok(transport) => transport,
+            Err(error) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
-                guard.finish(PollOutcome::Config, 0);
+                guard.finish(RequestOutcome::Config, 0);
                 return None;
             },
-            None => None,
         };
         let (outcome, result) =
-            tokio::time::timeout(self.budget, self.attempt_until(peer, url, tls.as_ref(), guard.started))
+            tokio::time::timeout(self.budget, self.attempt_until(peer, url, &transport, guard.started))
                 .await
-                .unwrap_or((PollOutcome::Timeout, None));
+                .unwrap_or((RequestOutcome::Timeout, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
         result
+    }
+
+    /// The transport for `peer`, built on first use and rebuilt when its pins
+    /// change or it reaches [`PEER_TRANSPORT_MAX_AGE`].
+    ///
+    /// The build runs outside the lock; concurrent callers may keep different
+    /// usable transports for their rounds, and the last insert stays cached.
+    fn peer_transport(&self, peer: &str, pins: &[String]) -> Result<Arc<PeerTransport>, MetricsScrapeError> {
+        let held = self
+            .transports
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .filter(|held| held.pins == pins && held.built.elapsed() < PEER_TRANSPORT_MAX_AGE)
+            .map(|held| Arc::clone(&held.transport));
+        if let Some(transport) = held {
+            return Ok(transport);
+        }
+        let config = match self.tls.as_ref() {
+            Some(material) => Some(peer_client_config(material, self.trust, peer, pins)?),
+            None => None,
+        };
+        let transport = Arc::new(PeerTransport::new(config.as_ref(), Some(PEER_POOL_IDLE))?);
+        self.transports.0.lock().unwrap_or_else(PoisonError::into_inner).insert(
+            peer.to_owned(),
+            HeldTransport {
+                pins: pins.to_vec(),
+                transport: Arc::clone(&transport),
+                built: Instant::now(),
+            },
+        );
+        Ok(transport)
+    }
+
+    /// Drop the transports of peers no longer in the grid.
+    ///
+    /// Without this a departed peer keeps its material for the life of the
+    /// process.
+    fn retain_transports(&self, current: &[(String, String, Vec<String>)]) {
+        self.transports
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|peer, _| current.iter().any(|(name, ..)| name == peer));
+    }
+
+    /// How many peer transports are held.
+    #[cfg(all(test, not(feature = "fips")))]
+    fn held_transports(&self) -> usize {
+        self.transports.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// One request, abandoned if the process is stopping.
@@ -1089,12 +1160,12 @@ impl PollPeers {
     async fn scrape_or_stand_down(
         &self,
         url: &str,
-        tls: Option<&ClientTlsConfig>,
+        transport: &PeerTransport,
     ) -> Option<Result<(String, Option<SystemTime>), MetricsScrapeError>> {
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => None,
-            result = scrape_metrics_with_date(url, self.timeout, tls.cloned()) => Some(result),
+            result = scrape_peer(url, self.timeout, transport) => Some(result),
         }
     }
 
@@ -1117,25 +1188,25 @@ impl PollPeers {
         &self,
         peer: &str,
         url: &str,
-        tls: Option<&ClientTlsConfig>,
+        transport: &PeerTransport,
         started: Instant,
-    ) -> (PollOutcome, Option<(String, Option<SystemTime>)>) {
+    ) -> (RequestOutcome, Option<(String, Option<SystemTime>)>) {
         let attempts = self.attempts.max(1);
-        let mut outcome = PollOutcome::Transport;
+        let mut outcome = RequestOutcome::Transport;
         for attempt in 0..attempts {
             if self.shutdown.is_triggered() {
-                return (PollOutcome::Cancelled, None);
+                return (RequestOutcome::Cancelled, None);
             }
             if started.elapsed() >= self.budget {
                 break;
             }
 
-            let Some(scrape) = self.scrape_or_stand_down(url, tls).await else {
-                return (PollOutcome::Cancelled, None);
+            let Some(scrape) = self.scrape_or_stand_down(url, transport).await else {
+                return (RequestOutcome::Cancelled, None);
             };
 
             match scrape {
-                Ok(pair) => return (PollOutcome::Ok, Some(pair)),
+                Ok(pair) => return (RequestOutcome::Ok, Some(pair)),
                 Err(error) => {
                     outcome = classify(&error);
                     if attempt + 1 >= attempts || !outcome.is_retryable() {
@@ -1144,7 +1215,7 @@ impl PollPeers {
                     }
                     crate::metrics::record_peer_retry(peer, outcome.as_str());
                     if !self.wait_before_retry(peer, attempt, started).await {
-                        return (PollOutcome::Cancelled, None);
+                        return (RequestOutcome::Cancelled, None);
                     }
                 },
             }
@@ -1158,17 +1229,18 @@ impl PollPeers {
     /// tell silence from a site that genuinely has nothing to report.
     pub async fn collect(&self, sites: &[PeerSite]) -> BTreeMap<String, Vec<Observation>> {
         let mut collected = BTreeMap::new();
-        self.collect_each(sites, |peer, observations| {
+        self.collect_each(sites, |peer, observations, _| {
             collected.insert(peer, observations);
         })
         .await;
         collected
     }
 
-    /// Hand each site's observations to `publish` as its poll completes.
+    /// Hand each site's observations to `publish` as its poll completes, with how
+    /// many of its rows were dropped for an implausible age.
     pub async fn collect_each<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
     where
-        Publish: FnMut(String, Vec<Observation>),
+        Publish: FnMut(String, Vec<Observation>, usize),
     {
         let collect_query = self
             .collect
@@ -1177,21 +1249,21 @@ impl PollPeers {
             .collect::<Vec<_>>()
             .join("&");
 
-        let fetches = peer_urls(sites, &collect_query)
-            .into_iter()
-            .map(|(peer, url, pins)| async move {
-                let (body, date) = self.poll_one(&peer, &url, &pins).await?;
-                let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
-                let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
-                reexpress_peer_ages(&mut observations, date, now_ms);
-                Some((peer, observations))
-            });
+        let targets = peer_urls(sites, &collect_query);
+        self.retain_transports(&targets);
+        let fetches = targets.into_iter().map(|(peer, url, pins)| async move {
+            let (body, date) = self.poll_one(&peer, &url, &pins).await?;
+            // Ages first, so a row dropped for its age never takes a provider slot.
+            let (aged, rejected) = reexpress_peer_ages(stamp_origin(parse(&body), &peer), date, &peer);
+            let observations = bound_peer(aged, &peer);
+            Some((peer, observations, rejected))
+        });
 
         // A failed peer is absent, not empty, so silence stays distinct from nothing to report.
         let mut done = futures::stream::iter(fetches).buffer_unordered(self.concurrency.max(1));
         while let Some(result) = done.next().await {
-            if let Some((peer, observations)) = result {
-                publish(peer, observations);
+            if let Some((peer, observations, rejected)) = result {
+                publish(peer, observations, rejected);
             }
         }
     }
@@ -1225,12 +1297,12 @@ impl<'poll> PollGuard<'poll> {
     }
 
     /// Record a poll that ran to a conclusion.
-    fn finish(&mut self, outcome: PollOutcome, bytes: usize) {
+    fn finish(&mut self, outcome: RequestOutcome, bytes: usize) {
         self.record(outcome, bytes);
     }
 
     /// Record an outcome once and only once.
-    fn record(&mut self, outcome: PollOutcome, bytes: usize) {
+    fn record(&mut self, outcome: RequestOutcome, bytes: usize) {
         if self.recorded {
             return;
         }
@@ -1244,8 +1316,8 @@ impl<'poll> PollGuard<'poll> {
         );
         // Reachability is claimed only when the poll concluded: a cancelled
         // poll learned nothing, and marking it down would fake an outage.
-        if outcome != PollOutcome::Cancelled {
-            crate::metrics::set_peer_collection_up(self.peer, outcome == PollOutcome::Ok, SystemTime::now());
+        if outcome != RequestOutcome::Cancelled {
+            crate::metrics::set_peer_collection_up(self.peer, outcome == RequestOutcome::Ok, SystemTime::now());
         }
     }
 }
@@ -1253,7 +1325,7 @@ impl<'poll> PollGuard<'poll> {
 impl Drop for PollGuard<'_> {
     fn drop(&mut self) {
         crate::metrics::peer_polls_in_flight(-1);
-        self.record(PollOutcome::Cancelled, 0);
+        self.record(RequestOutcome::Cancelled, 0);
     }
 }
 
@@ -1441,13 +1513,14 @@ pub fn is_peer_signal(metric: &str) -> bool {
     PEER_SIGNAL_NAMES.contains(&metric)
 }
 
-/// One target's contract series as exposition text, its oldest sample age, and
-/// the lines cut past [`MAX_RENDER_LINES_PER_TARGET`].
+/// One target's contract series, held for `held_for` and stamped from `wall`, as
+/// exposition text, its oldest sample age, and the lines cut past
+/// [`MAX_RENDER_LINES_PER_TARGET`].
 fn render_contract_block(
     samples: &[Observation],
     collect: &[String],
-    collected_at_ms: i64,
-    now_ms: i64,
+    held_for: Duration,
+    wall: SystemTime,
 ) -> (String, Duration, usize) {
     let mut block = String::new();
     let mut oldest = Duration::ZERO;
@@ -1461,43 +1534,72 @@ fn render_contract_block(
             cut = cut.saturating_add(1);
             continue;
         }
-        let stamp_ms = sample.timestamp_ms.unwrap_or(collected_at_ms);
-        render_sample(&mut block, sample, stamp_ms);
+        let age = held_for.saturating_add(sample.age);
+        render_sample(&mut block, sample, wall_millis(wall, age));
         block.push('\n');
         lines = lines.saturating_add(1);
-        let sample_age = Duration::from_millis(u64::try_from(now_ms.saturating_sub(stamp_ms)).unwrap_or(0));
-        oldest = oldest.max(sample_age);
+        oldest = oldest.max(age);
     }
     (block, oldest, cut)
 }
 
-/// The largest relayed-sample age accepted, one day.
-///
-/// A larger apparent age means the peer's clock is skewed or the timestamp is
-/// garbage. Such a sample is stamped fresh rather than trusted to be that old.
-const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+/// How far a relayed sample may be stamped past its peer's `Date` and still count
+/// as now. A peer writes its `Date` from the same clock reading as its stamps, at
+/// one-second resolution, so a fresh sample lands up to 999 ms ahead.
+const RELAY_AGE_TOLERANCE_MS: i64 = 1_000; // the Date header's resolution
 
-/// Re-express each relayed peer sample's age on this site's clock.
+/// The largest relayed-sample age accepted.
+///
+/// Older, or further ahead of the peer's `Date` than [`RELAY_AGE_TOLERANCE_MS`],
+/// means the peer's clock stepped or the stamp is garbage, so the row is dropped
+/// rather than refreshed into a value that reads as current.
+///
+/// The gateway's `grid-signals` holds its own copy of both bounds, and a test
+/// fails when the two differ.
+const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
+
+/// Carry each relayed peer sample's age into [`Observation::age`], dropping and
+/// counting as `skew` each row whose age is implausible. Returns the rows kept and
+/// how many were dropped.
 ///
 /// Age is the peer's `Date` minus the sample's own timestamp, both on the peer
-/// clock so no skew enters, then stamped as this site's `now` minus that age. A
-/// missing or out-of-range input falls back to `now`, never the peer's absolute
-/// clock, so a reader compares timestamps within one clock.
-fn reexpress_peer_ages(observations: &mut [Observation], date: Option<SystemTime>, now_ms: i64) {
+/// clock so no skew enters. The timestamp is then dropped: a render here stamps
+/// the sample from its own clock reading and this age, so no wall time of this
+/// site's is stored. A missing `Date` or stamp leaves the row aged from its
+/// collection here, never from the peer's absolute clock.
+fn reexpress_peer_ages(
+    observations: Vec<Observation>,
+    date: Option<SystemTime>,
+    peer: &str,
+) -> (Vec<Observation>, usize) {
     let date_ms = date
         .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
         .and_then(|since| i64::try_from(since.as_millis()).ok());
-    for observation in observations.iter_mut() {
-        observation.timestamp_ms = match (date_ms, observation.timestamp_ms) {
-            (Some(date_ms), Some(sample_ms)) => {
-                let age = date_ms.saturating_sub(sample_ms);
-                (0..=MAX_RELAY_AGE_MS)
-                    .contains(&age)
-                    .then(|| now_ms.saturating_sub(age))
-            },
-            _ => None,
+    let mut kept = Vec::with_capacity(observations.len());
+    let mut rejected = 0_usize;
+    for mut observation in observations {
+        let age = match (date_ms, observation.timestamp_ms.take()) {
+            (Some(date_ms), Some(stamp_ms)) => relay_age(date_ms, stamp_ms),
+            _ => Some(Duration::ZERO),
         };
+        if let Some(age) = age {
+            observation.age = age;
+            kept.push(observation);
+        } else {
+            crate::metrics::record_peer_signal_refused(peer, "skew");
+            rejected = rejected.saturating_add(1);
+        }
     }
+    (kept, rejected)
+}
+
+/// The age `stamp_ms` carries against its peer's `date_ms`, `None` when it is
+/// implausible. Ahead of the `Date` within [`RELAY_AGE_TOLERANCE_MS`] is now.
+fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
+    let age = date_ms.saturating_sub(stamp_ms);
+    (RELAY_AGE_TOLERANCE_MS.saturating_neg()..=MAX_RELAY_AGE_MS)
+        .contains(&age)
+        .then(|| Duration::from_millis(u64::try_from(age).unwrap_or(0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1618,7 @@ mod tests {
             labels: labels.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
             value: 1.0,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         assert!(
             !in_pool(&labelled(&[]), Some("qwen3")),
@@ -1542,6 +1645,7 @@ mod tests {
             ]),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         }
     }
 
@@ -1762,6 +1866,11 @@ mod tests {
 
     /// Serve `body` to the first request, returning the URL to dial.
     async fn serve_once(body: String) -> String {
+        serve_once_with(body, String::new()).await
+    }
+
+    /// Serve `body` under the extra header lines `headers` to the first request, returning the URL to dial.
+    async fn serve_once_with(body: String, headers: String) -> String {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -1769,10 +1878,20 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut request = [0_u8; 1024];
             drop(stream.read(&mut request).await);
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
             drop(stream.write_all(response.as_bytes()).await);
         });
         format!("http://{addr}{SIGNALS_PATH}")
+    }
+
+    /// The `Date` a peer answering at `date` sends, and that instant in epoch milliseconds.
+    fn dated(date: SystemTime) -> (String, i64) {
+        let date_ms =
+            i64::try_from(date.duration_since(UNIX_EPOCH).expect("after the epoch").as_millis()).expect("fits i64");
+        (format!("Date: {}\r\n", httpdate::fmt_http_date(date)), date_ms)
     }
 
     /// Through the real poll path: a row naming another site is refused and an unlabeled row is
@@ -1810,7 +1929,7 @@ mod tests {
         };
         let mut release_slow = Some(release_slow);
         let mut order = Vec::new();
-        let round = poll.collect_each(&sites, |peer, observations| {
+        let round = poll.collect_each(&sites, |peer, observations, _| {
             assert_eq!(observations.len(), 1, "{peer}");
             if let Some(release) = release_slow.take() {
                 release.send(()).unwrap_or(());
@@ -1968,31 +2087,163 @@ mod tests {
     }
 
     #[test]
-    fn reexpress_peer_ages_preserves_age_and_rejects_out_of_range() {
-        let obs = |ts: Option<i64>| Observation {
-            metric: "m".to_owned(),
-            labels: BTreeMap::new(),
-            value: 1.0,
-            timestamp_ms: ts,
-        };
-        let now_ms = 10_000_000_000_000;
+    #[expect(clippy::too_many_lines, reason = "one table of ages either side of each bound")]
+    fn reexpress_peer_ages_keeps_plausible_ages_and_drops_the_rest() {
         let date_ms = 5_000_000_000_000;
-        // Peer scraped 30s before its response Date. The age survives, re-expressed
-        // as this site's now minus 30s, not the peer's absolute 4_999_970_000_000.
-        let mut samples = vec![
-            obs(Some(date_ms - 30_000)),               // 30s old
-            obs(Some(date_ms + 1_000)),                // future on the peer clock: rejected
-            obs(Some(date_ms - MAX_RELAY_AGE_MS - 1)), // implausibly old: rejected
-            obs(None),                                 // no peer timestamp: dropped to fallback
+        let stamped = |stamp: Option<i64>| Observation {
+            timestamp_ms: stamp,
+            ..aged(Duration::ZERO)
+        };
+        let samples = vec![
+            stamped(Some(date_ms - 30_000)),
+            stamped(Some(date_ms + 1_000)),
+            stamped(Some(date_ms + 1_001)),
+            stamped(Some(date_ms - MAX_RELAY_AGE_MS)),
+            stamped(Some(date_ms - MAX_RELAY_AGE_MS - 1)),
+            stamped(None),
         ];
-        reexpress_peer_ages(
-            &mut samples,
-            Some(UNIX_EPOCH + Duration::from_millis(u64::try_from(date_ms).expect("positive"))),
-            now_ms,
+        let date = UNIX_EPOCH + Duration::from_millis(u64::try_from(date_ms).expect("positive"));
+        let (kept, rejected) = reexpress_peer_ages(samples, Some(date), "reexpress-bounds");
+        assert_eq!(
+            kept.iter().map(|o| (o.age, o.timestamp_ms)).collect::<Vec<_>>(),
+            [
+                (Duration::from_secs(30), None),
+                (Duration::ZERO, None),
+                (Duration::from_millis(86_400_000), None),
+                (Duration::ZERO, None)
+            ],
+            "30 s and a day keep their age, a second ahead reads as now, no stamp is aged from collection, \
+             and no peer stamp is kept to be rendered"
         );
-        let got: Vec<Option<i64>> = samples.iter().map(|o| o.timestamp_ms).collect();
-        // Age preserved on this clock. Future, out of range, and missing all fall back.
-        assert_eq!(got, vec![Some(now_ms - 30_000), None, None, None]);
+        assert_eq!(rejected, 2, "past a second ahead and past a day old are dropped");
+        assert!(
+            refused_metric("reexpress-bounds", "skew", 2),
+            "each drop is counted as skew"
+        );
+    }
+
+    #[test]
+    fn a_relayed_row_without_a_date_is_aged_from_its_collection() {
+        let undated = vec![Observation {
+            timestamp_ms: Some(1_000),
+            ..aged(Duration::ZERO)
+        }];
+        let (kept, rejected) = reexpress_peer_ages(undated, None, "undated");
+        assert_eq!(
+            (kept.first().map(|o| o.age), rejected),
+            (Some(Duration::ZERO), 0),
+            "without a Date there is no age to carry, and nothing to reject"
+        );
+    }
+
+    /// The gateway's signals crate, which applies the same relay-age bounds on the next hop.
+    const GATEWAY_SIGNALS: &str = include_str!("../../signals/src/signals.rs");
+
+    #[test]
+    fn the_relay_age_bounds_match_the_gateways() {
+        let declared = |name: &str| -> Option<i64> {
+            let declaration = format!("const {name}: i64 = ");
+            GATEWAY_SIGNALS
+                .lines()
+                .find_map(|line| line.split_once(declaration.as_str()))
+                .and_then(|(_, value)| value.split(';').next())
+                .and_then(|value| value.replace('_', "").parse().ok())
+        };
+        assert_eq!(
+            (declared("RELAY_AGE_TOLERANCE_MS"), declared("MAX_RELAY_AGE_MS")),
+            (Some(RELAY_AGE_TOLERANCE_MS), Some(MAX_RELAY_AGE_MS)),
+            "both hops keep and drop the same relayed ages"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_polled_row_with_an_implausible_age_is_dropped_and_counted() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let line = |provider: &str, stamp: i64| {
+            format!("inference_pool_average_queue_size{{grid_provider=\"{provider}\"}} 1 {stamp}\n")
+        };
+        let body = [
+            line("ahead-by-a-second", date_ms + 1_000),
+            line("ahead-past-a-second", date_ms + 1_001),
+            line("a-day-old", date_ms - MAX_RELAY_AGE_MS),
+            line("past-a-day-old", date_ms - MAX_RELAY_AGE_MS - 1),
+        ]
+        .concat();
+        let round = poll_one_peer("age-bounds", body, date).await;
+        let providers: Vec<&str> = round
+            .get("age-bounds")
+            .expect("the peer answered")
+            .iter()
+            .filter_map(|row| row.labels.get(PROVIDER_LABEL).map(String::as_str))
+            .collect();
+        assert_eq!(
+            providers,
+            ["ahead-by-a-second", "a-day-old"],
+            "an age under minus one second or over a day is dropped, not refreshed"
+        );
+        assert!(
+            refused_metric("age-bounds", "skew", 2),
+            "both drops are counted as skew"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_serving_implausible_ages_is_named_on_the_condition() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let mut sites = Vec::new();
+        for (peer, stamp) in [
+            ("ahead", date_ms + 1_001),
+            ("ancient", date_ms - MAX_RELAY_AGE_MS - 1),
+            ("clean", date_ms - 1_000),
+        ] {
+            let body = format!("inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {stamp}\n");
+            sites.push(dated_peer(peer, body, date.clone()).await);
+        }
+        let mut answered = BTreeMap::new();
+        one_attempt()
+            .collect_each(&sites, |peer, _, rejected| {
+                answered.insert(peer, rejected);
+            })
+            .await;
+        let mut ages = crate::peer_ages::PeerAges::default();
+        ages.observe(
+            &sites.iter().map(|site| site.name.clone()).collect::<Vec<_>>(),
+            &answered,
+        );
+        let condition = ages.condition(&[], "t0", Some(1)).expect("raised");
+        assert_eq!(condition.status, "False", "{condition:?}");
+        assert!(
+            condition.message.contains("from ahead, ancient:"),
+            "the peers stamping past their Date and a day behind it are named, the clean one is not: {}",
+            condition.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_dropped_for_its_age_takes_no_provider_slot() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let line = |provider: &str, stamp: i64| {
+            format!("inference_pool_average_queue_size{{grid_provider=\"{provider}\"}} 1 {stamp}\n")
+        };
+        let body: String = (0..MAX_PEER_PROVIDERS)
+            .map(|i| line(&format!("a{i:03}"), date_ms + 60_000))
+            .chain(std::iter::once(line("zz", date_ms)))
+            .collect();
+        let round = poll_one_peer("age-slots", body, date).await;
+        let kept: Vec<&str> = round
+            .get("age-slots")
+            .expect("the peer answered")
+            .iter()
+            .filter_map(|row| row.labels.get(PROVIDER_LABEL).map(String::as_str))
+            .collect();
+        assert_eq!(
+            kept,
+            ["zz"],
+            "the rows dropped for their age do not fill the provider cap first"
+        );
     }
 
     /// `n` lines of one contract series for `target`, under distinct labels.
@@ -2006,9 +2257,80 @@ mod tests {
                 ]),
                 value: 1.0,
                 timestamp_ms: None,
+                age: Duration::ZERO,
             })
             .collect();
         (target.to_owned(), samples)
+    }
+
+    /// One contract sample of provider `pool-a`, already `age` old when collected.
+    fn aged(age: Duration) -> Observation {
+        Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([(PROVIDER_LABEL.to_owned(), "pool-a".to_owned())]),
+            value: 1.0,
+            timestamp_ms: None,
+            age,
+        }
+    }
+
+    /// The trailing stamp of the first line of `body`.
+    fn stamp_of(body: &str) -> i64 {
+        body.lines()
+            .next()
+            .and_then(|line| line.rsplit_once(' '))
+            .and_then(|(_, stamp)| stamp.parse().ok())
+            .expect("a stamped line")
+    }
+
+    /// A `Date` header value as a reader takes it, epoch milliseconds.
+    fn read_date_ms(header: &str) -> i64 {
+        let date = httpdate::parse_http_date(header).expect("an HTTP date");
+        i64::try_from(date.duration_since(UNIX_EPOCH).expect("after the epoch").as_millis()).expect("fits i64")
+    }
+
+    /// A peers store holding one row that `east` served `age_ms` before its `Date`, through the poll path.
+    async fn relayed_through_a_poll(age_ms: i64) -> SignalStore {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let row = format!(
+            "inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {}\n",
+            date_ms - age_ms
+        );
+        let peers = SignalStore::new();
+        peers.refresh(poll_one_peer("east", row, date).await, Duration::from_secs(60));
+        peers
+    }
+
+    /// One round polling `site`, which answers `body` under the extra header lines `headers`.
+    async fn poll_one_peer(site: &str, body: String, headers: String) -> BTreeMap<String, Vec<Observation>> {
+        one_attempt().collect(&[dated_peer(site, body, headers).await]).await
+    }
+
+    /// A peer named `site` answering `body` once, under the extra header lines `headers`.
+    async fn dated_peer(site: &str, body: String, headers: String) -> PeerSite {
+        PeerSite {
+            name: site.to_owned(),
+            url: serve_once_with(body, headers).await,
+            pins: Vec::new(),
+        }
+    }
+
+    /// A poller that tries each peer once.
+    fn one_attempt() -> PollPeers {
+        PollPeers {
+            attempts: 1,
+            ..PollPeers::default()
+        }
+    }
+
+    /// Whether `grid_peer_signals_refused_total` reads `count` for `peer` and `reason`.
+    fn refused_metric(peer: &str, reason: &str, count: u64) -> bool {
+        String::from_utf8(crate::metrics::encode_metrics())
+            .expect("utf-8 metrics")
+            .contains(&format!(
+                r#"grid_peer_signals_refused_total{{peer="{peer}",reason="{reason}"}} {count}"#
+            ))
     }
 
     /// One unlabeled sample of `metric`.
@@ -2018,6 +2340,7 @@ mod tests {
             labels: BTreeMap::new(),
             value: 1.0,
             timestamp_ms: None,
+            age: Duration::ZERO,
         }
     }
 
@@ -2029,13 +2352,13 @@ mod tests {
             BTreeMap::from([("pool-a".to_owned(), samples)]),
             Duration::from_secs(60),
         );
-        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
         assert!(rendered.body.contains("inference_pool_ready_pods"), "{}", rendered.body);
         assert!(
             !rendered.body.contains("vendor_private_gauge"),
             "a non-contract series is not relayed"
         );
-        let (unrestricted, _) = store.render_unrestricted(None, &[]);
+        let (unrestricted, _) = store.render_unrestricted(None, &[], ClockReading::now());
         assert!(
             unrestricted.contains("vendor_private_gauge"),
             "the unbounded render still has it"
@@ -2048,7 +2371,7 @@ mod tests {
         let big = stocked("pool-big", MAX_RENDER_LINES_PER_TARGET + 10);
         let small = stocked("pool-small", 1);
         store.refresh(BTreeMap::from([big, small]), Duration::from_secs(60));
-        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
         let big_lines = rendered.body.lines().filter(|line| line.contains("pool-big")).count();
         assert_eq!(big_lines, MAX_RENDER_LINES_PER_TARGET, "cut at the cap");
         assert_eq!(rendered.lines_cut, 10);
@@ -2063,42 +2386,74 @@ mod tests {
             BTreeMap::from([stocked("pool-a", 20), stocked("pool-b", 20)]),
             Duration::from_secs(60),
         );
-        let one = store.render_bounded(Some("pool-a"), &[], MAX_RELAY_BYTES).body.len();
+        let one = store
+            .render_bounded(Some("pool-a"), &[], MAX_RELAY_BYTES, ClockReading::now())
+            .body
+            .len();
         // Room for one target and a bit: the second must go whole, not in part.
-        let rendered = store.render_bounded(None, &[], one + one / 2);
+        let rendered = store.render_bounded(None, &[], one + one / 2, ClockReading::now());
         assert_eq!(rendered.targets_dropped, 1, "{}", rendered.body);
         assert_eq!(rendered.body.len(), one, "the first target is intact");
         assert!(rendered.body.ends_with('\n') && rendered.body.lines().all(|line| line.contains("pool-a")));
-        let all = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        let all = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
         assert_eq!(all.targets_dropped, 0, "under the budget nothing is dropped");
     }
 
     #[test]
     fn a_relayed_sample_renders_its_own_age_not_the_relay_time() {
-        // A sample stamped one hour ago must render an hour old even though the
-        // store just cached it, so the peer's freshness survives the relay.
-        let hour_ago_ms = wall_millis(SystemTime::now(), Duration::from_secs(3600));
         let store = SignalStore::new();
         store.refresh(
-            BTreeMap::from([(
-                "pool-a".to_owned(),
-                vec![Observation {
-                    metric: "m".to_owned(),
-                    labels: BTreeMap::new(),
-                    value: 1.0,
-                    timestamp_ms: Some(hour_ago_ms),
-                }],
-            )]),
+            BTreeMap::from([("pool-a".to_owned(), vec![aged(Duration::from_secs(3600))])]),
             Duration::from_secs(60),
         );
-        let (body, oldest) = store.render_unrestricted(None, &[]);
+        let now = ClockReading::now();
+        let (body, oldest) = store.render_unrestricted(None, &[], now);
+        let hour_ago_ms = wall_millis(now.wall, Duration::from_secs(3600));
         assert!(
-            body.trim_end().ends_with(&hour_ago_ms.to_string()),
-            "renders the sample's own stamp: {body}"
+            (hour_ago_ms - 1_000..=hour_ago_ms).contains(&stamp_of(&body)),
+            "a sample an hour old when relayed renders an hour old, not at the relay time: {body}"
         );
         assert!(
-            oldest >= Duration::from_secs(3500),
+            oldest >= Duration::from_secs(3600),
             "Age reflects the sample age, not the relay: {oldest:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "one polled row rendered at three wall readings")]
+    async fn a_wall_step_between_poll_and_render_leaves_relayed_ages_alone() {
+        let peers = relayed_through_a_poll(30_000).await;
+        let later = Instant::now() + Duration::from_secs(5);
+        let wall = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let hour = Duration::from_secs(3600);
+        let mut seen = Vec::new();
+        for (label, stepped) in [("no step", wall), ("forward", wall + hour), ("backward", wall - hour)] {
+            let now = ClockReading {
+                instant: later,
+                wall: stepped,
+            };
+            let (rendered, oldest) = peers.render_unrestricted(None, &[], now);
+            let bounded = peers.render_bounded(None, &[], MAX_RELAY_BYTES, now);
+            let read_ms = read_date_ms(&httpdate::fmt_http_date(now.wall));
+            let age_ms = read_ms - stamp_of(&rendered);
+            assert_eq!(
+                read_ms - stamp_of(&bounded.body),
+                age_ms,
+                "{label}: the bounded render stamps the same"
+            );
+            assert!(
+                (0..=1).contains(&(age_ms - i64::try_from(oldest.as_millis()).expect("fits i64"))),
+                "{label}: Date minus the stamp is the age the render reports, {age_ms} ms against {oldest:?}"
+            );
+            seen.push(age_ms);
+        }
+        assert!(
+            seen.iter().all(|age| (35_000..36_000).contains(age)),
+            "Date minus each stamp is the peer's 30 s plus the 5 s held, whatever the wall reads: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|pair| pair.first() == pair.last()),
+            "a step of the wall clock moves the stamps and the Date together: {seen:?}"
         );
     }
 
@@ -2134,45 +2489,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_trust_failure_is_not_retried() {
-        // Retrying a certificate problem burns the budget a transient failure
-        // needs, and it will fail identically until somebody replaces a cert.
-        assert!(!PollOutcome::Tls.is_retryable());
-        assert!(!PollOutcome::Config.is_retryable());
-    }
-
-    #[test]
-    fn a_peer_declining_to_answer_is_not_retried() {
-        // A 403 is the scope rule working. Retrying it turns one misconfigured
-        // reader into a burst against a peer that already said no.
-        assert!(!PollOutcome::ClientError.is_retryable());
-    }
-
-    #[test]
-    fn transient_failures_are_retried() {
-        for outcome in [
-            PollOutcome::Timeout,
-            PollOutcome::Refused,
-            PollOutcome::Transport,
-            PollOutcome::ServerError,
-        ] {
-            assert!(outcome.is_retryable(), "{} is worth another attempt", outcome.as_str());
+    /// `status` as a scrape failure, for a table that reads in numbers.
+    fn non_ok(status: u16) -> MetricsScrapeError {
+        MetricsScrapeError::NonOkStatus {
+            status,
+            url: "https://peer/metrics".to_owned(),
         }
     }
 
     #[test]
+    fn a_throttled_peer_is_named_without_being_hit_again_this_round() {
+        // Three attempts at a 50ms base is not the schedule a 429 asked for.
+        assert_eq!(classify(&non_ok(429)), RequestOutcome::Throttled);
+        assert!(!classify(&non_ok(429)).is_retryable());
+        assert!(!classify(&non_ok(403)).is_retryable());
+    }
+
+    #[test]
+    fn a_success_status_carried_in_an_error_is_not_read_as_an_answer() {
+        // Marking the peer up here would publish a round that scraped nothing.
+        assert_eq!(classify(&non_ok(204)), RequestOutcome::Transport);
+    }
+
+    #[test]
     fn a_status_is_split_at_five_hundred() {
-        let client = classify(&MetricsScrapeError::NonOkStatus {
-            status: 403,
-            url: "https://peer/metrics".to_owned(),
-        });
-        let server = classify(&MetricsScrapeError::NonOkStatus {
-            status: 503,
-            url: "https://peer/metrics".to_owned(),
-        });
-        assert_eq!(client, PollOutcome::ClientError, "the peer answered and refused");
-        assert_eq!(server, PollOutcome::ServerError, "the peer is having a bad time");
+        let client = classify(&non_ok(403));
+        let server = classify(&non_ok(503));
+        assert_eq!(client, RequestOutcome::ClientError, "the peer answered and refused");
+        assert_eq!(server, RequestOutcome::ServerError, "the peer is having a bad time");
         assert!(!client.is_retryable() && server.is_retryable());
     }
 
@@ -2181,25 +2525,113 @@ mod tests {
         // Both arrive as transport errors and call for opposite responses, so
         // the chain is walked rather than the message matched.
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        assert_eq!(classify_transport(&refused), PollOutcome::Refused);
+        assert_eq!(classify_transport(&refused), RequestOutcome::Refused);
 
         #[cfg(not(feature = "fips"))]
         let tls_err = rustls::Error::DecryptError;
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
-        assert_eq!(classify_transport(&tls_err), PollOutcome::Tls);
+        assert_eq!(classify_transport(&tls_err), RequestOutcome::Tls);
+    }
+
+    /// Peer TLS material from a throwaway CA, for the config cache tests.
+    #[cfg(not(feature = "fips"))]
+    fn test_material() -> Arc<PeerTlsMaterial> {
+        let ca = certs::generate_ca("cache-ca").expect("a CA");
+        let leaf = certs::generate_site_cert(&ca, "local").expect("a leaf");
+        Arc::new(PeerTlsMaterial {
+            ca: ca.cert_pem.into_bytes(),
+            identity: Some(PeerClientIdentity {
+                cert: leaf.cert_pem.into_bytes(),
+                key: zeroize::Zeroizing::new(leaf.key_pem.into_bytes()),
+            }),
+        })
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_peer_transport_is_held_across_rounds_and_rebuilt_when_its_pins_change() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        let first = poll.peer_transport("east", &pins).expect("built");
+        let again = poll.peer_transport("east", &pins).expect("built");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "building twice parses the private key and reopens the connection"
+        );
+        assert_eq!(poll.held_transports(), 1);
+
+        // A rotation replaces the entry rather than adding one, and takes the
+        // old pool with it.
+        let rotated = vec!["b".repeat(64)];
+        let after = poll.peer_transport("east", &rotated).expect("built");
+        assert!(!Arc::ptr_eq(&first, &after), "rotated pins must not reuse the socket");
+        assert_eq!(poll.held_transports(), 1, "keyed by peer, not by pin set");
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_transport_past_its_age_is_rebuilt_so_the_leaf_is_checked_again() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        let first = poll.peer_transport("east", &pins).expect("built");
+
+        // Age the entry past the bound without waiting for it.
+        let aged = Instant::now()
+            .checked_sub(PEER_TRANSPORT_MAX_AGE + Duration::from_secs(1))
+            .expect("a time before the bound");
+        let mut held = poll.transports.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get_mut("east").expect("an entry").built = aged;
+        drop(held);
+
+        let after = poll.peer_transport("east", &pins).expect("built");
+        assert!(
+            !Arc::ptr_eq(&first, &after),
+            "an aged transport must be rebuilt, or a pooled connection is never verified again"
+        );
+        assert_eq!(
+            poll.held_transports(),
+            1,
+            "the rebuild replaces rather than accumulates"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_departed_peer_does_not_keep_its_config() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        drop(poll.peer_transport("east", &pins).expect("built"));
+        drop(poll.peer_transport("west", &pins).expect("built"));
+        assert_eq!(poll.held_transports(), 2);
+
+        poll.retain_transports(&[("east".to_owned(), String::new(), pins)]);
+        assert_eq!(poll.held_transports(), 1, "west left the grid and took its material");
     }
 
     #[test]
     fn outcome_labels_are_stable() {
         // Dashboards and alert rules are written against these strings, so a
         // rename is a break for anyone already watching.
-        assert_eq!(PollOutcome::Ok.as_str(), "ok");
-        assert_eq!(PollOutcome::Timeout.as_str(), "timeout");
-        assert_eq!(PollOutcome::Refused.as_str(), "refused");
-        assert_eq!(PollOutcome::Tls.as_str(), "tls");
-        assert_eq!(PollOutcome::ClientError.as_str(), "client_error");
-        assert_eq!(PollOutcome::ServerError.as_str(), "server_error");
+        assert_eq!(RequestOutcome::Ok.as_str(), "ok");
+        assert_eq!(RequestOutcome::Timeout.as_str(), "timeout");
+        assert_eq!(RequestOutcome::Refused.as_str(), "refused");
+        assert_eq!(RequestOutcome::Tls.as_str(), "tls");
+        assert_eq!(RequestOutcome::ClientError.as_str(), "client_error");
+        assert_eq!(RequestOutcome::ServerError.as_str(), "server_error");
+        assert_eq!(RequestOutcome::Throttled.as_str(), "throttled");
     }
 
     #[test]
@@ -2410,14 +2842,14 @@ mod tests {
         let store = restricted_store();
 
         let silver = identities.resolve_by_key(&"bb".repeat(32)).expect("site-b is declared");
-        let denied = store.render(None, &[], Some(&silver)).0;
+        let denied = store.render(None, &[], Some(&silver), ClockReading::now()).0;
         assert!(
             !denied.contains("secret-pool"),
             "site-b is denied the restricted pool: {denied}"
         );
 
         let matching = identities.resolve_by_key(&"cc".repeat(32)).expect("site-c is declared");
-        let served = store.render(None, &[], Some(&matching)).0;
+        let served = store.render(None, &[], Some(&matching), ClockReading::now()).0;
         assert!(served.contains("secret-pool"), "site-c is served it: {served}");
     }
 
@@ -2520,7 +2952,9 @@ mod tests {
     #[test]
     fn a_denied_target_is_never_rendered() {
         let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
-        let body = restricted_store().render(None, &[], Some(&silver)).0;
+        let body = restricted_store()
+            .render(None, &[], Some(&silver), ClockReading::now())
+            .0;
         assert!(
             !body.contains("secret-pool"),
             "a reader the policy denies is served nothing for that target: {body}"
@@ -2533,13 +2967,15 @@ mod tests {
 
     #[test]
     fn a_matching_reader_is_served_the_restricted_target() {
-        let body = restricted_store().render(None, &[], Some(&gold())).0;
+        let body = restricted_store()
+            .render(None, &[], Some(&gold()), ClockReading::now())
+            .0;
         assert!(body.contains("secret-pool"), "labels satisfy the selector: {body}");
     }
 
     #[test]
     fn an_unnamed_reader_is_denied_a_restricted_target() {
-        let body = restricted_store().render(None, &[], None).0;
+        let body = restricted_store().render(None, &[], None, ClockReading::now()).0;
         assert!(
             !body.contains("secret-pool"),
             "identity unknown fails closed rather than open: {body}"
@@ -2553,7 +2989,9 @@ mod tests {
     #[test]
     fn naming_a_denied_target_does_not_reach_it() {
         let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
-        let body = restricted_store().render(Some("secret-pool"), &[], Some(&silver)).0;
+        let body = restricted_store()
+            .render(Some("secret-pool"), &[], Some(&silver), ClockReading::now())
+            .0;
         assert_eq!(body, "", "a parameter cannot widen what the connection decided");
     }
 
@@ -2575,8 +3013,8 @@ mod tests {
         store.set_access(access);
 
         let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
-        let restricted = store.render(None, &[], Some(&silver)).0;
-        let full = store.render(None, &[], Some(&gold())).0;
+        let restricted = store.render(None, &[], Some(&silver), ClockReading::now()).0;
+        let full = store.render(None, &[], Some(&gold()), ClockReading::now()).0;
 
         assert!(
             restricted.contains("pool1"),
@@ -2600,7 +3038,9 @@ mod tests {
         // `collect[]` is chosen by the caller, so it narrows within what the
         // caller may see and can never name past the policy.
         let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
-        let body = restricted_store().render(None, &[QUEUE.to_owned()], Some(&silver)).0;
+        let body = restricted_store()
+            .render(None, &[QUEUE.to_owned()], Some(&silver), ClockReading::now())
+            .0;
         assert!(
             !body.contains("secret-pool"),
             "asking for the metric by name does not reach a denied provider: {body}"
@@ -2616,8 +3056,12 @@ mod tests {
         // Absent, not zeroed and not redacted. A reader cannot tell a denied
         // provider from one that does not exist or is not reporting.
         let silver = BTreeMap::from([("tier".to_owned(), "silver".to_owned())]);
-        let denied = restricted_store().render(None, &[], Some(&silver)).0;
-        let served = restricted_store().render(None, &[], Some(&gold())).0;
+        let denied = restricted_store()
+            .render(None, &[], Some(&silver), ClockReading::now())
+            .0;
+        let served = restricted_store()
+            .render(None, &[], Some(&gold()), ClockReading::now())
+            .0;
         let lines = |body: &str| body.lines().filter(|l| !l.is_empty()).count();
         assert_eq!(
             lines(&denied),
@@ -2640,7 +3084,7 @@ mod tests {
             vec![gold(), BTreeMap::from([("audit".to_owned(), "yes".to_owned())])],
         )]));
         assert_eq!(
-            store.render(None, &[], Some(&gold())).0,
+            store.render(None, &[], Some(&gold()), ClockReading::now()).0,
             "",
             "satisfying one selector is not satisfying both"
         );
@@ -2656,11 +3100,11 @@ mod tests {
             ]),
             Duration::from_secs(60),
         );
-        let (one, _) = store.render(Some("pool-a"), &[], None);
+        let (one, _) = store.render(Some("pool-a"), &[], None, ClockReading::now());
         assert!(one.contains(r#"grid_provider="pool-a""#), "the asked-for target: {one}");
         assert!(!one.contains(r#"grid_provider="pool-b""#), "and only that one: {one}");
         assert_eq!(
-            store.render(None, &[], None).0.lines().count(),
+            store.render(None, &[], None, ClockReading::now()).0.lines().count(),
             2,
             "no target returns every target"
         );
@@ -2674,12 +3118,20 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(
-            store.render(None, &[QUEUE.to_owned()], None).0.lines().count(),
+            store
+                .render(None, &[QUEUE.to_owned()], None, ClockReading::now())
+                .0
+                .lines()
+                .count(),
             1,
             "the named signal"
         );
         assert_eq!(
-            store.render(None, &["absent".to_owned()], None).0.lines().count(),
+            store
+                .render(None, &["absent".to_owned()], None, ClockReading::now())
+                .0
+                .lines()
+                .count(),
             0,
             "and nothing else"
         );
@@ -2692,7 +3144,7 @@ mod tests {
             BTreeMap::from([("pool-a".to_owned(), scraped())]),
             Duration::from_secs(60),
         );
-        let (_, age) = store.render(None, &[], None);
+        let (_, age) = store.render(None, &[], None, ClockReading::now());
         assert!(
             age < Duration::from_secs(1),
             "a value just collected is reported as new: {age:?}"
@@ -2703,7 +3155,11 @@ mod tests {
     fn a_target_nothing_refreshes_stops_being_served() {
         let store = SignalStore::new();
         store.refresh(BTreeMap::from([("pool-a".to_owned(), scraped())]), Duration::ZERO);
-        assert_eq!(store.render(None, &[], None).0, "", "absence is what says it is stale");
+        assert_eq!(
+            store.render(None, &[], None, ClockReading::now()).0,
+            "",
+            "absence is what says it is stale"
+        );
     }
 
     #[test]
