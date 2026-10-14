@@ -18,7 +18,7 @@ COPY . .
 # The gateway is its own workspace, and its prefetched .cargo/config.toml holds the git
 # source replacement. Cargo finds that file from the working directory, not from
 # --manifest-path, so the build has to run from here or the git dependency is unresolvable.
-WORKDIR /src/gateway
+WORKDIR /src/crates/gateway
 # --locked: under prefetch a build free to re-resolve can drift from what was fetched.
 # --ignore-rust-version: UBI ships 1.92, the manifests declare 1.96.
 RUN cargo build --release --locked --ignore-rust-version --bin grid-gateway \
