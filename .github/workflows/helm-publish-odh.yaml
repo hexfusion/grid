@@ -20,6 +20,7 @@ env:
 
 jobs:
   package:
+    if: github.repository == 'opendatahub-io/praxis-ai-grid-operator'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -120,7 +121,7 @@ jobs:
 
   publish:
     needs: package
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.repository == 'opendatahub-io/praxis-ai-grid-operator' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
