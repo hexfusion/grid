@@ -101,12 +101,77 @@ not part of this CRD.
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`,
-`mountReconciliationStatus[]`, `budgetStatus[]`
+`observedGeneration`, `phase`, `conditions[]`, `consumerConfigStatus[]`,
+`mountReconciliationStatus[]`, `budgetStatus[]`, `gatewayAgeReports[]`,
+`gatewayAgeReportOverflow`
+
+**Conditions**: `status.conditions` carries a `PeerTimeValid` condition,
+written by the operator's peer poller under its own field manager
+(`grid-operator-peer-signals`), never by `GridNetwork` reconciliation. `True`
+means no polled peer has a rejected timestamp; `False` means at least one does.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
+| `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
+
+A relayed age survives a clock step on every hop, so a step alone never makes
+this condition false: it points at a peer whose clock or stamping is wrong.
+Rejected rows are dropped and counted in
+`grid_peer_signals_refused_total{peer,reason="skew"}`. Only rejected rows become
+unavailable for provider measurement; valid rows from the same peer remain
+available. A peer that does not answer keeps its standing,
+a peer that leaves membership is dropped, and one clean answer restores its
+validity. The operator conservatively preserves an existing `False` condition
+after restarting until every currently polled peer has answered or left
+membership. Unavailable secure polling is not a clean round and does not
+establish recovery. The condition is written only when its status, its
+message or the generation changes, since each write starts a `GridNetwork`
+reconcile.
+
+Peer-age observation and status publication wait for the operator's existing
+membership-convergence gate, so an initial empty snapshot cannot erase a live
+rejection during restart. Signal collection continues while this gate is held.
+A round begun while held cannot publish even if convergence finishes during
+collection; the next round uses the converged membership.
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
 from other `GridNetwork`s are excluded from the count.
+
+### Gateway age evidence
+
+`conditions[]` is a map keyed by condition type. `GatewayAgesRejected` reports
+local gateway ingest rejection under its own status manager, independently of
+peer diagnostics and normal GridNetwork reconciliation. `True` means a fresh
+gateway process has unresolved rejected ages. `False` requires genuine newer
+clean evidence from every recorded rejecting process. `Unknown` means the
+remaining evidence is stale, predates the operator restart, or reporter
+capacity was exceeded. Conditions never change network phase or routing.
+
+`gatewayAgeReports[]` retains at most 128 records keyed by random process epoch:
+replica label, sequence, cumulative skew count, original report flag, effective
+rejection state, and receipt timestamp. Live freshness uses a five-minute
+monotonic receipt window. Expiration is evaluated when another report arrives;
+if reporting stops entirely, the last condition remains until a report arrives.
+After an operator restart, persisted rejected epochs have unknown freshness
+until that same epoch submits a strictly newer observation. Wall-clock changes
+and duplicate reports cannot establish recovery or renew freshness.
+
+A clean report from another replica or replacement process never clears an
+older rejected epoch. The listener identifies the site, not authoritative pod
+membership. Once an operator has independently verified that an old process
+retired, they may explicitly remove its `gatewayAgeReports` status entry.
+The next report recomputes the condition. Silence or a timeout is insufficient
+proof of retirement.
+
+Only clean bookkeeping may be evicted to admit a new process. When all 128
+entries hold unresolved evidence, the operator persists
+`gatewayAgeReportOverflow: true` and refuses new identities; existing processes
+can still report recovery. This bounded uncertainty survives recovery and
+restart. Clear it explicitly only after verifying reporter coverage. Inspect
+status with `kubectl get gridnetwork NAME -o yaml`; status edits require RBAC
+permission for the GridNetwork status subresource.
 
 `consumerConfigStatus[]` is populated for each gateway with
 `consumerConfig.enabled: true`, reporting the outcome of the most recent

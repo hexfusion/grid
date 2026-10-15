@@ -157,7 +157,7 @@ handshake, so a connect proves nothing.
 |---|---|
 | `unauthorized` pulling an image | A digest pin keeps the chart's `image.repository`. Set both. |
 | `mixed protocol is not supported for LoadBalancer` | One Service carrying UDP and TCP. Upgrade to a chart that splits signals out. |
-| CA bootstrap Job gives `401 Unauthorized` | Its ServiceAccount is gone, removed with the hook RBAC after a failed attempt. Uninstall, delete leftover `grid-ca-*`, `enrollment-serving-tls` and `grid-site-identity` Secrets in both namespaces, install again. |
+| CA bootstrap Job gives `401 Unauthorized` | On Helm 3.19 and later, an older chart can remove the bootstrap RBAC when the hook fails, so a Job retry loses its ServiceAccount. Upgrade to a chart that retains the RBAC, then retry with `helm upgrade`. |
 | A site never reaches `Available` | The hub is not accepting that site's NAT address on 6443 or 443. |
 | Signals poll but gossip never converges | The SWIM Service got a Classic load balancer, which carries no UDP. Check `platform: aws`. |
 | No member is ever discovered, and `GRID_SWIM_SEEDS` holds the NAT addresses | The seeds came from `peers`, or from a `swim.seeds` that names the NAT addresses, and neither listens. Set `grid.seeds` to the other sites' SWIM Service hostnames, and clear `swim.seeds` if it is set, since it wins over `grid.seeds` for `GRID_SWIM_SEEDS`. |
