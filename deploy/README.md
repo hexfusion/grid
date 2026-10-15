@@ -42,17 +42,24 @@ kubectl --dry-run=server create -k deploy/crds/
 
 ## Operator Installation
 
-The install manifests are generated from `charts/grid-operator`; do not hand-edit them.
-Each directory keeps the `values.yaml` that renders it.
+The base install manifests are generated from `charts/grid-operator`; do not
+hand-edit them. Each generated directory keeps the `values.yaml` that renders
+it. Cloud-specific Kustomize overlays reuse a generated base and patch its
+Services.
 
 - `operator/` is the platform base: the image set through `params.env`, the namespace left
   to the consumer, metrics TLS from the enrolled site identity, and no platform assumptions.
   A platform operator vendors this directory, or a flavor of it, and places it in its own
   namespace.
-- `overlays/<flavor>/` is a platform flavor of the base: the base values plus the flavor's
+- Generated `overlays/<flavor>/` directories use the base values plus the flavor's
   `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
   `overlays/openshift/` takes metrics TLS from the service CA and adds a NetworkPolicy that
-  admits the platform's monitoring namespaces. Add a flavor by adding a directory.
+  admits the platform's monitoring namespaces.
+- `overlays/openshift-aws/` reuses `overlays/openshift/` and adds the AWS NLB
+  annotation to the SWIM and signals Services, matching Helm's `platform: aws`.
+  The default AWS Classic Load Balancer rejects UDP, leaving SWIM without an
+  address and the operator unready. Platform consumers must select this overlay
+  on AWS and vendor both directories; it does not detect the cloud provider.
 - The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
   type for the Service it advertises and peer sites reach both through it. A cluster with
   no LoadBalancer provider leaves the operator waiting for an address and never ready. The
@@ -63,12 +70,16 @@ Each directory keeps the `values.yaml` that renders it.
   `default` namespace that the install qualification checks.
 
 ```bash
-# Regenerate after a chart change (writes deploy/operator and every deploy/overlays directory)
+# Regenerate after a chart change (writes the base and overlays with values.yaml)
 make generate-deploy
 
-# Check that the committed manifests match the chart (runs in CI)
+# Check generated manifests and rendered overlays (runs in CI)
 make deploy-check
 ```
+
+`deploy-check` requires Helm, yq v4, jq, and Kustomize. It verifies that the
+AWS overlay requests NLBs for the separate UDP SWIM and TCP signals Services
+and changes only those two annotations relative to the OpenShift base.
 
 ### Install Steps
 
@@ -92,6 +103,9 @@ kubectl apply -k deploy/operator/ -n grid-system
 
 # or OpenShift
 kubectl apply -k deploy/overlays/openshift/ -n grid-system
+
+# or OpenShift on AWS
+kubectl apply -k deploy/overlays/openshift-aws/ -n grid-system
 
 # or kind, which brings its own namespace
 kubectl apply -k deploy/overlays/kind/
