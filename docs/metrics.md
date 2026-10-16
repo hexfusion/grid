@@ -9,8 +9,21 @@ components expose Prometheus endpoints and they answer different questions.
 | `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS only | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
 | `/metrics` on `OVERLAY_SYNC_HEALTH_ADDR`, default `0.0.0.0:9091` | Overlay-sync sidecar, when `overlay.sidecar.enabled` | Delivery of the serving overlay from its ConfigMap to the gateway |
 
-The gateway also serves the same series on the Praxis admin listener, which is
-reachable only from inside the pod.
+The `grid-gateway` operand built with Praxis 0.7.4 serves `/metrics`, `/healthy`,
+and `/ready` on `admin.metrics_address`. When upgrading from Praxis 0.7.3,
+move the probe listener from `admin.address` to `admin.metrics_address`:
+
+```yaml
+admin:
+  metrics_address: "127.0.0.1:9901"
+```
+
+Keep the listener address consistent with the deployment's probe commands.
+`admin.address` now serves administration endpoints; configure a different
+port if those are also needed. Chart defaults and operator-rendered configs
+must be qualified against the selected image before rolling out the new
+operand. The chart's separately released Praxis AI image has its own version
+and upgrade requirements.
 
 The operator exports each provider's resolved readings, not the raw engine
 series behind them. The series a gateway routes on travel over
