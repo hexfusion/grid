@@ -5,14 +5,14 @@ grid.praxis.fast/v1alpha1 and are cluster-scoped.
 
 ## Producers and consumers
 
-Solid arrows write spec. Dotted arrows read objects or generated configuration.
-The table below identifies status writers. Site discovery and reconciliation
-are roles within the same grid-operator process.
+Helm/GitOps applies administrator configuration. Site discovery and reconciliation
+are roles within the same grid-operator process. Bidirectional arrows show a
+controller reading an object and writing its status.
 
 ```mermaid
 flowchart LR
     subgraph Producers
-        admin["Administrator<br/>Helm / GitOps"]
+        installer["Helm client / GitOps controller"]
         publisher["Model-serving controller"]
         discovery["Grid operator<br/>site discovery"]
     end
@@ -30,29 +30,33 @@ flowchart LR
         enrollment["Enrollment service"]
     end
 
-    admin --> network & site & inference & tool & invite
-    publisher --> inference
-    discovery --> site
-    network & site & inference & tool -.-> operator
-    invite -.-> enrollment
+    installer -->|create / spec| network & site & inference & tool & invite
+    publisher -->|create / spec| inference
+    discovery -->|create / spec| site
+    network & site & inference & tool <-->|read / status| operator
+    invite <-->|read / status| enrollment
     operator ==>|generates| config["Routing configuration"]
     config -.-> gateway["Praxis gateway"]
 ```
 
 ## Object index
 
-| Object | Spec owner / writer | Status writer | Direct consumer |
+| Object | Created by | Spec writer | Status writer / direct consumer |
 | --- | --- | --- | --- |
-| [GridNetwork](grid-network.md) | Administrator | Grid operator | Grid operator |
-| [GridSite](grid-site.md) | Administrator or Grid discovery | Grid operator | Grid operator |
-| [InferenceProvider](inference-provider.md) | Administrator or model-serving controller | Grid operator | Grid operator |
-| [AgentToolProvider](agent-tool-provider.md) | Administrator | Grid operator | Grid operator |
-| [SiteInvite](site-invite.md) | Administrator | Enrollment service | Enrollment service |
+| [GridNetwork](grid-network.md) | Helm client or GitOps controller | Helm/GitOps | Grid operator |
+| [GridSite](grid-site.md) | Helm/GitOps for declared sites, Grid operator for discovered sites | Creator for that mode | Grid operator |
+| [InferenceProvider](inference-provider.md) | Helm/GitOps or model-serving controller | Publishing component | Grid operator |
+| [AgentToolProvider](agent-tool-provider.md) | Helm client or GitOps controller | Helm/GitOps | Grid operator |
+| [SiteInvite](site-invite.md) | Administrator API client or Helm/GitOps | Immutable after creation | Enrollment service |
 
 [AgentToAgentProvider](agent-to-agent-provider.md) is schema-only: it is absent
 from the generated CRD installation and has no runtime controller or consumer.
 
 ## Ownership rules
+
+The table names API writers. An administrator can also create resources directly
+through an API client. The operator chart can render GridNetwork, but the running
+Grid operator does not create it or populate missing TLS references.
 
 - **Owner** means the authority for the desired values, not necessarily a
   Kubernetes ownerReference. Helm and GitOps apply administrator intent.
