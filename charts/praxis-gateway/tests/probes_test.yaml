@@ -2,6 +2,44 @@ suite: health probes
 templates:
   - templates/deployment.yaml
 tests:
+  - it: follows the new metrics listener for rendered configs
+    set:
+      gatewayConfig:
+        render: true
+        localSite: hub
+        metricsAddress: "127.0.0.1:9912"
+        model: m
+        auth: {mode: none}
+        backends:
+          - cluster: a
+            endpoints: ["10.0.0.5:80"]
+            transport: {mode: plaintext}
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
+          value: http://127.0.0.1:9912/healthy
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.exec.command[4]
+          value: http://127.0.0.1:9912/healthy
+
+  - it: prefers the metrics listener over the administration listener in inline configs
+    set:
+      config:
+        inline: |
+          admin:
+            address: "127.0.0.1:9911"
+            metrics_address: "127.0.0.1:9912"
+          listeners:
+            - name: default
+              address: "0.0.0.0:8080"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
+          value: http://127.0.0.1:9912/ready
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.exec.command[4]
+          value: http://127.0.0.1:9912/healthy
+
   - it: probes the admin listener's ready and healthy endpoints when the default config enables it
     asserts:
       - equal:

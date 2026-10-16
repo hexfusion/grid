@@ -139,6 +139,11 @@
           "type": "boolean",
           "description": "Render praxis.yaml + policy.yaml from these values instead of a BYO ConfigMap."
         },
+        "metricsAddress": {
+          "type": "string",
+          "pattern": "^$|^127\\.0\\.0\\.1:[0-9]+$",
+          "description": "Loopback health/metrics listener for Praxis >= 0.7.4. Empty retains the legacy admin listener."
+        },
         "role": {
           "type": "string",
           "enum": [

@@ -20,10 +20,12 @@ admin:
 
 Keep the listener address consistent with the deployment's probe commands.
 `admin.address` now serves administration endpoints; configure a different
-port if those are also needed. Chart defaults and operator-rendered configs
-must be qualified against the selected image before rolling out the new
-operand. The chart's separately released Praxis AI image has its own version
-and upgrade requirements.
+port if those are also needed. For chart-rendered routing configuration, set
+`gatewayConfig.metricsAddress: "127.0.0.1:9901"`; the chart aligns its probes
+with that listener and also recognizes `admin.metrics_address` in inline
+configuration. The operator's generated consumer configurations use the new
+listener and require a compatible gateway image. The chart's default standalone
+Praxis AI image retains its legacy configuration until upgraded separately.
 
 The operator exports each provider's resolved readings, not the raw engine
 series behind them. The series a gateway routes on travel over

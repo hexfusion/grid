@@ -224,7 +224,12 @@ renewal_args() {
 }
 
 # images <component>: this run's image for a chart, into IMG.
-images() { IMG=(--set-string "image.repository=$IMAGE_PREFIX$1" --set-string "image.tag=$IMAGE_TAG"); }
+images() {
+  IMG=(--set-string "image.repository=$IMAGE_PREFIX$1" --set-string "image.tag=$IMAGE_TAG")
+  if [[ $1 == gateway ]]; then
+    IMG+=(--set-string gatewayConfig.metricsAddress=127.0.0.1:9901)
+  fi
+}
 
 # lb_curl: curl to a LoadBalancer address, through NET_PREFIX when set.
 lb_curl() {

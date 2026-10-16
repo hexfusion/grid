@@ -107,6 +107,25 @@ mod tests {
     }
 
     #[test]
+    fn the_metrics_listener_render_loads() {
+        let Some(yaml) = render(&[
+            "--set=gatewayConfig.metricsAddress=127.0.0.1:9912",
+            "--set=gatewayConfig.backends[0].cluster=site-a",
+            "--set=gatewayConfig.backends[0].transport.mode=plaintext",
+            "--set=gatewayConfig.backends[0].endpoints[0]=10.0.0.5:8000",
+        ]) else {
+            return;
+        };
+        load(&yaml).expect("the metrics listener render loads");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("rendered config");
+        assert_eq!(config["admin"]["metrics_address"], "127.0.0.1:9912");
+        assert!(
+            config["admin"].get("address").is_none(),
+            "probes use the metrics listener"
+        );
+    }
+
+    #[test]
     fn every_default_render_loads() {
         for (name, values) in CASES {
             let Some(yaml) = render(values) else { return };

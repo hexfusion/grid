@@ -548,7 +548,7 @@ nothing. Emits "true" or nothing.
 Admin listener address the chart rendered itself.
 */}}
 {{- define "praxis-gateway.renderedAdminAddress" -}}
-127.0.0.1:9901
+{{- .Values.gatewayConfig.metricsAddress | default "127.0.0.1:9901" -}}
 {{- end }}
 
 {{/*
@@ -561,7 +561,8 @@ config, else config.inline. An existingConfigMap is opaque, so it yields nothing
 {{- if $v.gatewayConfig.render -}}
 {{- $addr = include "praxis-gateway.renderedAdminAddress" . -}}
 {{- else if not ($v.config).existingConfigMap -}}
-{{- $addr = (((fromYaml (($v.config).inline | default "")).admin | default dict).address | default "") | toString -}}
+{{- $admin := ((fromYaml (($v.config).inline | default "")).admin | default dict) -}}
+{{- $addr = ($admin.metrics_address | default $admin.address | default "") | toString -}}
 {{- end -}}
 {{- if regexMatch "^(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0):[0-9]+$" $addr -}}
 {{- printf "127.0.0.1:%s" (regexReplaceAll "^.*:" $addr "") -}}

@@ -163,6 +163,10 @@ gatewayConfig:
   # when config.existingConfigMap is empty and backends, role provider, or gridServing is set.
   # Changing the rendered config rolls the pods.
   render: false
+  # -- Loopback health/metrics listener for Praxis >= 0.7.4. Set to
+  # 127.0.0.1:9901 when using the updated grid-gateway operand. Empty keeps the
+  # legacy admin.address listener for older Praxis AI images.
+  metricsAddress: ""
   # -- Opt in to OTLP tracing in the generated praxis.yaml. Requires
   # image.flavor: grid-gateway, whose Grid image build includes the Praxis OTLP
   # exporter and Praxis AI routing-span features. Credentials belong in env as

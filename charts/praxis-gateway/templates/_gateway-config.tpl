@@ -44,7 +44,11 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
       {{- end }}
     {{- end }}
     admin:
+      {{- if $cfg.metricsAddress }}
+      metrics_address: {{ $cfg.metricsAddress | quote }}
+      {{- else }}
       address: {{ include "praxis-gateway.renderedAdminAddress" . | quote }}
+      {{- end }}
     listeners:
       - name: gateway
         address: "0.0.0.0:{{ .Values.port.containerPort }}"
