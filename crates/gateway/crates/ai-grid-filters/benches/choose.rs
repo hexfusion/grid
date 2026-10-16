@@ -127,6 +127,7 @@ fn context(request: &Request) -> HttpFilterContext<'_> {
         filter_results: HashMap::new(),
         filter_state: HashMap::new(),
         health_registry: None,
+        hedge_policy: None,
         id_generator: &IDS,
         kv_stores: None,
         session_stores: None,
