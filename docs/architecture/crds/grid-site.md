@@ -6,8 +6,9 @@ Describes a site's network membership, gateway endpoint, and trust policy.
 
 | Responsibility | Component |
 | --- | --- |
-| Created by | Administrator, or Grid operator when site discovery is enabled |
-| Spec owner / writer | Administrator (declared sites) or Grid discovery (generated sites) |
+| Created by | Helm/GitOps for declared sites. Grid operator for automatically discovered sites |
+| Spec owner | Administrator (declared sites) or Grid discovery (generated sites) |
+| Spec writer | Helm/GitOps for declared sites. Grid discovery for generated fields |
 | Status writer | Grid operator network and site controllers |
 | Direct consumers | Grid operator site probes, network routing, and provider selection |
 | Derived consumers | Praxis gateway reads generated peer routing configuration |

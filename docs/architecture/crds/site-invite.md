@@ -6,8 +6,9 @@ Declares a time-limited invitation for a site to enroll with a signer.
 
 | Responsibility | Component |
 | --- | --- |
-| Created by | Administrator on the signer cluster |
-| Spec owner / writer | Administrator. Spec is immutable after creation |
+| Created by | Administrator API client or Helm/GitOps on the signer cluster |
+| Spec owner | Administrator. Spec is immutable after creation |
+| Spec writer | None after creation. Spec is immutable |
 | Status writer | Enrollment service's SiteInvite controller |
 | Direct consumers | Enrollment service and administrator delivering the invitation |
 | Derived consumers | Joining operator consumes the delivered token Secret and CA bundle |

@@ -6,8 +6,9 @@ Advertises an MCP endpoint and its available tools to the network.
 
 | Responsibility | Component |
 | --- | --- |
-| Created by | Administrator through Helm, GitOps, or the Kubernetes API |
-| Spec owner / writer | Administrator |
+| Created by | Helm client, GitOps controller, or administrator API client |
+| Spec owner | Administrator |
+| Spec writer | Helm/GitOps or administrator API client |
 | Status writer | Grid operator tool-provider controller |
 | Direct consumers | Grid operator MCP discovery and network capability publication |
 | Derived consumers | Peer operators and gateways consume published capability and routing state |

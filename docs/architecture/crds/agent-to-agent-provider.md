@@ -7,7 +7,8 @@ Defines an A2A provider schema. Runtime support is not implemented.
 | Responsibility | Component |
 | --- | --- |
 | Created by | None. Excluded from generated CRDs |
-| Spec owner / writer | None implemented. Schema describes administrator intent |
+| Spec owner | None implemented. Schema describes administrator intent |
+| Spec writer | None implemented |
 | Status writer | None implemented |
 | Direct consumers | None implemented |
 | Derived consumers | None implemented |
