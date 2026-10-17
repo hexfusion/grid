@@ -211,6 +211,17 @@ for dir in deploy/overlays/*/ deploy/overlays/*/*/; do
   FLAVORS+=("$flavor")
 done
 
+# A directory under the base or a flavor that is not a cloud would ship unchecked.
+for dir in deploy/operator/*/ deploy/overlays/*/*/; do
+  [ -d "$dir" ] || continue
+  dir="${dir%/}"
+  case "$dir" in deploy/overlays/kind/*) continue ;; esac
+  if [ ! -f "$dir/values.yaml" ]; then
+    echo "error: $dir has no values.yaml; a cloud under a flavor needs one" >&2
+    exit 1
+  fi
+done
+
 # The kind overlay: plain, with its own Namespace so kubectl apply -k works bare.
 APP_VERSION="$(yq '.appVersion' "$CHART/Chart.yaml")"
 KIND="$TMP_DIR/kind"

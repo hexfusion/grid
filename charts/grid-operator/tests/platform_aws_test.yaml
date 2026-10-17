@@ -6,7 +6,7 @@ release:
   name: grid
   namespace: grid-system
 # The objects a platform install creates on AWS: the platform base, the OpenShift flavor,
-# and platform aws.
+# and platform aws, the values deploy/overlays/openshift/aws renders from.
 values:
   - ../../../deploy/operator/values.yaml
   - ../../../deploy/overlays/openshift/values.yaml
@@ -33,10 +33,14 @@ tests:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
           value: "true"
 
-  - it: spreads SWIM across zones so a peer is never pinned to a zone with no target
-    template: templates/service-swim.yaml
+  - it: spreads SWIM and signals across zones so a peer never reaches a zone with no target
     asserts:
-      - equal:
+      - template: templates/service-signals.yaml
+        equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"]
+          value: "true"
+      - template: templates/service-swim.yaml
+        equal:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"]
           value: "true"
 
@@ -74,21 +78,21 @@ tests:
       loadBalancerScope: external
     asserts:
       - template: templates/service-swim.yaml
-        notExists:
+        equal:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
+          value: "false"
       - template: templates/service-signals.yaml
-        notExists:
+        equal:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
+          value: "false"
       - template: templates/service-swim.yaml
         equal:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
           value: nlb
-
-  - it: leaves cross-zone off the signals load balancer, whose hostname peers resolve per connection
-    template: templates/service-signals.yaml
-    asserts:
-      - notExists:
-          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"]
+      - template: templates/service-signals.yaml
+        equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
+          value: nlb
 
   - it: lets a Service's own annotation override the platform's
     set:
@@ -104,6 +108,14 @@ tests:
     set:
       platform: ""
     asserts:
+      - template: templates/service-swim.yaml
+        equal:
+          path: spec.type
+          value: LoadBalancer
+      - template: templates/service-signals.yaml
+        equal:
+          path: spec.type
+          value: LoadBalancer
       - template: templates/service-swim.yaml
         notExists:
           path: metadata.annotations

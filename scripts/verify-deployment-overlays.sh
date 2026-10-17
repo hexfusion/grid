@@ -33,9 +33,7 @@ jq -S 'map(
     (.metadata.name == "grid-operator-swim" or .metadata.name == "grid-operator-signals")
   then .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"] = "nlb"
     | .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"] = "true"
-    | if .metadata.name == "grid-operator-swim"
-      then .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"] = "true"
-      else . end
+    | .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"] = "true"
   else . end
 )' "$WORK/base.json" > "$WORK/expected.json"
 if ! diff -u "$WORK/expected.json" "$WORK/aws.json"; then
@@ -43,4 +41,4 @@ if ! diff -u "$WORK/expected.json" "$WORK/aws.json"; then
   exit 1
 fi
 
-echo "PASS: AWS Services request internal NLBs with separate UDP/TCP ports, cross-zone on SWIM; all other configuration is inherited"
+echo "PASS: AWS Services request internal NLBs with separate UDP/TCP ports, cross-zone on both; all other configuration is inherited"

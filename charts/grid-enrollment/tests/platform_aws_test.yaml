@@ -28,8 +28,9 @@ tests:
     set:
       loadBalancerScope: external
     asserts:
-      - notExists:
+      - equal:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
+          value: "false"
       - equal:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
           value: nlb
