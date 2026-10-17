@@ -6,7 +6,7 @@ metadata:
   name: {{ include "grid-operator.fullname" . }}-swim
   labels:
     {{- include "grid-operator.labels" . | nindent 4 }}
-  {{- $ann := include "grid-operator.serviceAnnotations" (dict "root" . "own" .Values.swim.service.annotations) }}
+  {{- $ann := include "grid-operator.serviceAnnotations" (dict "root" . "own" .Values.swim.service.annotations "swim" true) }}
   {{- if $ann }}
   annotations:
     {{- $ann | nindent 4 }}

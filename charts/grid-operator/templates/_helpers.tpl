@@ -202,6 +202,13 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- $platform := dict -}}
 {{- if eq (.root.Values.platform | default "") "aws" -}}
 {{- $platform = dict "service.beta.kubernetes.io/aws-load-balancer-type" "nlb" -}}
+{{- if eq (.root.Values.loadBalancerScope | default "internal") "internal" -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/aws-load-balancer-internal" "true" -}}
+{{- end -}}
+{{- /* SWIM advertises one resolved NLB address: without cross-zone it can be a zone with no target. */ -}}
+{{- if .swim -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled" "true" -}}
+{{- end -}}
 {{- end -}}
 {{- $merged := merge (deepCopy $own) $platform -}}
 {{- if $merged }}
