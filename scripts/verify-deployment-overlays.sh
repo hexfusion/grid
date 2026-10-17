@@ -11,7 +11,7 @@ render() {
 }
 
 render deploy/overlays/openshift > "$WORK/base.json"
-render deploy/overlays/openshift-aws > "$WORK/aws.json"
+render deploy/overlays/openshift/aws > "$WORK/aws.json"
 
 for service in "grid-operator-swim UDP" "grid-operator-signals TCP"; do
   read -r name protocol <<< "$service"
@@ -19,9 +19,10 @@ for service in "grid-operator-swim UDP" "grid-operator-signals TCP"; do
     .[] | select(.kind == "Service" and .metadata.name == $name) |
     .spec.type == "LoadBalancer" and
     .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"] == "nlb" and
+    .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"] == "true" and
     (.spec.ports | length) == 1 and .spec.ports[0].protocol == $protocol
   ' "$WORK/aws.json" > /dev/null; then
-    echo "FAIL: $name must request an NLB with one $protocol port" >&2
+    echo "FAIL: $name must request an internal NLB with one $protocol port" >&2
     exit 1
   fi
 done
@@ -31,11 +32,15 @@ jq -S 'map(
   if .kind == "Service" and
     (.metadata.name == "grid-operator-swim" or .metadata.name == "grid-operator-signals")
   then .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"] = "nlb"
+    | .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"] = "true"
+    | if .metadata.name == "grid-operator-swim"
+      then .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"] = "true"
+      else . end
   else . end
 )' "$WORK/base.json" > "$WORK/expected.json"
 if ! diff -u "$WORK/expected.json" "$WORK/aws.json"; then
-  echo "FAIL: the AWS overlay must change only the two NLB annotations" >&2
+  echo "FAIL: the AWS overlay must change only the NLB annotations on the two Services" >&2
   exit 1
 fi
 
-echo "PASS: AWS Services request NLBs with separate UDP/TCP ports; all other configuration is inherited"
+echo "PASS: AWS Services request internal NLBs with separate UDP/TCP ports, cross-zone on SWIM; all other configuration is inherited"

@@ -1,0 +1,3 @@
+# OpenShift on AWS: a delta on deploy/overlays/openshift/values.yaml. Internal NLBs for SWIM
+# and signals, since the default Classic Load Balancer carries no UDP.
+platform: aws
