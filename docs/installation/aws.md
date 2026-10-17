@@ -35,7 +35,7 @@ turns a Classic load balancer into an NLB, keeping the old one but no longer upd
 Delete the Service and let the release recreate it, which gives it a new address.
 
 A platform install of `deploy/overlays/openshift` needs no setting: that render carries the
-AWS annotations, which other clouds ignore.
+AWS annotations, which only the AWS cloud provider reads.
 
 ## Before you start
 
@@ -210,11 +210,19 @@ On every cluster, `SEEDS` must list the other sites' SWIM Service endpoints and
 and can report `Active`, so the phase alone does not prove the second pass
 finished.
 
-Each load balancer's scheme, `internal` unless the scope is `external`:
+Each Network Load Balancer's scheme, `internal` unless the scope is `external`:
 
 ```bash
 aws elbv2 describe-load-balancers \
   --query 'LoadBalancers[?Type==`network`].[LoadBalancerName,Scheme,DNSName]' --output table
+```
+
+A Classic load balancer left from before `platform: aws` is listed separately, and should be
+gone once its Service is recreated:
+
+```bash
+aws elb describe-load-balancers \
+  --query 'LoadBalancerDescriptions[].[LoadBalancerName,Scheme,DNSName]' --output table
 ```
 
 Then send a datagram to 7946/UDP and open 9091/TCP between every pair, from a host in the

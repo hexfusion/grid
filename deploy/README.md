@@ -57,8 +57,8 @@ Services.
   admits the platform's monitoring namespaces.
 - `overlays/openshift/` also sets `platform: aws`: internal NLBs for the SWIM and signals
   Services, with cross-zone load balancing. The default AWS Classic Load Balancer rejects
-  UDP, leaving SWIM without an address and the operator unready. Other clouds ignore the
-  AWS annotations, so the same render serves every OpenShift install.
+  UDP, leaving SWIM without an address and the operator unready. Only the AWS cloud
+  provider reads the `aws-` annotations, so the same render serves every OpenShift install.
 - The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
   type for the Service it advertises and peer sites reach both through it. A cluster with
   no LoadBalancer provider leaves the operator waiting for an address and never ready. The
@@ -77,8 +77,8 @@ make deploy-check
 ```
 
 `deploy-check` requires Helm, yq v4, jq, and Kustomize. It verifies that the
-AWS overlay requests NLBs for the separate UDP SWIM and TCP signals Services
-and changes only those two annotations relative to the OpenShift base.
+generated directories match the chart, and that the OpenShift render requests
+internal cross-zone NLBs for the separate UDP SWIM and TCP signals Services.
 
 ### Install Steps
 
