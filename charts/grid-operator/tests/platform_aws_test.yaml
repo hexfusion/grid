@@ -5,13 +5,11 @@ templates:
 release:
   name: grid
   namespace: grid-system
-# The objects a platform install creates on AWS: the platform base, the OpenShift flavor,
-# and platform aws, the values deploy/overlays/openshift/aws renders from.
+# The objects a platform install creates: the platform base and the OpenShift flavor, which
+# sets platform aws.
 values:
   - ../../../deploy/operator/values.yaml
   - ../../../deploy/overlays/openshift/values.yaml
-set:
-  platform: aws
 tests:
   - it: exposes SWIM on an internal network load balancer that carries UDP
     template: templates/service-swim.yaml

@@ -34,8 +34,8 @@ the cloud provider ignores a `loadBalancerScope` change and refuses a `platform`
 turns a Classic load balancer into an NLB, keeping the old one but no longer updating it.
 Delete the Service and let the release recreate it, which gives it a new address.
 
-A platform operator that vendors `deploy/overlays/openshift` applies
-`deploy/overlays/openshift/aws` on AWS: the same render with `platform: aws`.
+A platform install of `deploy/overlays/openshift` needs no setting: that render carries the
+AWS annotations, which other clouds ignore.
 
 ## Before you start
 

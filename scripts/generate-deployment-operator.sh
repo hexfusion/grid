@@ -7,9 +7,6 @@
 #   deploy/overlays/<flavor>   a platform flavor of the base, rendered from the base
 #                              values plus the flavor's values.yaml as a delta, with the
 #                              API versions in its optional api-versions file
-#   deploy/overlays/<flavor>/<cloud>
-#                              a cloud under a flavor, a delta on the flavor's values
-#                              with the flavor's API versions plus its own
 #   deploy/overlays/kind       the standalone install xtask applies to a kind cluster,
 #                              rendered from its own values.yaml alone
 # With --check, writes nothing and fails if the committed files differ from what the
@@ -184,42 +181,18 @@ EOF
 BASE="$TMP_DIR/operator"
 render_base "$BASE" deploy/operator/values.yaml --
 
-# api_versions_of <dir>: the API versions in its optional api-versions file.
-api_versions_of() {
-  [ -f "$1/api-versions" ] || return 0
-  grep -v '^\s*#' "$1/api-versions" | grep -v '^\s*$' || true
-}
-
-# Every flavor, and every cloud under one: the base values plus each level's delta.
+# Every flavor: the base values plus the flavor's delta, with its API versions.
 FLAVORS=()
-for dir in deploy/overlays/*/ deploy/overlays/*/*/; do
-  dir="${dir%/}"
-  flavor="${dir#deploy/overlays/}"
-  case "$flavor" in kind | kind/*) continue ;; esac
+for dir in deploy/overlays/*/; do
+  flavor="$(basename "$dir")"
+  [ "$flavor" = kind ] && continue
   [ -f "$dir/values.yaml" ] || continue
-  values=(deploy/operator/values.yaml)
   api_versions=()
-  parent="$(dirname "$dir")"
-  if [ "$parent" != deploy/overlays ]; then
-    [ -f "$parent/values.yaml" ] || { echo "error: $dir has no parent flavor values" >&2; exit 1; }
-    values+=("$parent/values.yaml")
-    mapfile -t -O 0 api_versions < <(api_versions_of "$parent")
+  if [ -f "$dir/api-versions" ]; then
+    mapfile -t api_versions < <(grep -v '^\s*#' "$dir/api-versions" | grep -v '^\s*$')
   fi
-  values+=("$dir/values.yaml")
-  mapfile -t -O "${#api_versions[@]}" api_versions < <(api_versions_of "$dir")
-  render_base "$TMP_DIR/$flavor" "${values[@]}" -- "${api_versions[@]}"
+  render_base "$TMP_DIR/$flavor" deploy/operator/values.yaml "$dir/values.yaml" -- "${api_versions[@]}"
   FLAVORS+=("$flavor")
-done
-
-# A directory under the base or a flavor that is not a cloud would ship unchecked.
-for dir in deploy/operator/*/ deploy/overlays/*/*/; do
-  [ -d "$dir" ] || continue
-  dir="${dir%/}"
-  case "$dir" in deploy/overlays/kind/*) continue ;; esac
-  if [ ! -f "$dir/values.yaml" ]; then
-    echo "error: $dir has no values.yaml; a cloud under a flavor needs one" >&2
-    exit 1
-  fi
 done
 
 # The kind overlay: plain, with its own Namespace so kubectl apply -k works bare.
@@ -259,8 +232,6 @@ sync_dir() {
   local f base
   for f in "$dst"/*; do
     [ -e "$f" ] || continue
-    # A subdirectory is a cloud flavor, synced on its own.
-    [ -d "$f" ] && continue
     base="$(basename "$f")"
     case " ${KEEP_FILES[*]} " in *" $base "*) continue ;; esac
     if [ ! -e "$src/$base" ]; then
@@ -272,7 +243,6 @@ sync_dir() {
     fi
   done
   for f in "$src"/*; do
-    [ -d "$f" ] && continue
     base="$(basename "$f")"
     if $CHECK; then
       if ! cmp -s "$f" "$dst/$base"; then

@@ -2,16 +2,9 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
 
-render() {
-  kustomize build "$1" | yq eval-all -o=json '[.]' | \
-    jq -S 'sort_by(.apiVersion, .kind, .metadata.namespace, .metadata.name)'
-}
-
-render deploy/overlays/openshift > "$WORK/base.json"
-render deploy/overlays/openshift/aws > "$WORK/aws.json"
+# The OpenShift flavor carries the AWS annotations, which other clouds ignore.
+rendered=$(kustomize build deploy/overlays/openshift | yq eval-all -o=json '[.]')
 
 for service in "grid-operator-swim UDP" "grid-operator-signals TCP"; do
   read -r name protocol <<< "$service"
@@ -20,25 +13,12 @@ for service in "grid-operator-swim UDP" "grid-operator-signals TCP"; do
     .spec.type == "LoadBalancer" and
     .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"] == "nlb" and
     .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"] == "true" and
+    .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"] == "true" and
     (.spec.ports | length) == 1 and .spec.ports[0].protocol == $protocol
-  ' "$WORK/aws.json" > /dev/null; then
-    echo "FAIL: $name must request an internal NLB with one $protocol port" >&2
+  ' <<< "$rendered" > /dev/null; then
+    echo "FAIL: $name must request an internal cross-zone NLB with one $protocol port" >&2
     exit 1
   fi
 done
 
-# Comparing every object also protects the inherited TLS, RBAC, and network policy.
-jq -S 'map(
-  if .kind == "Service" and
-    (.metadata.name == "grid-operator-swim" or .metadata.name == "grid-operator-signals")
-  then .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"] = "nlb"
-    | .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"] = "true"
-    | .metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled"] = "true"
-  else . end
-)' "$WORK/base.json" > "$WORK/expected.json"
-if ! diff -u "$WORK/expected.json" "$WORK/aws.json"; then
-  echo "FAIL: the AWS overlay must change only the NLB annotations on the two Services" >&2
-  exit 1
-fi
-
-echo "PASS: AWS Services request internal NLBs with separate UDP/TCP ports, cross-zone on both; all other configuration is inherited"
+echo "PASS: OpenShift Services request internal cross-zone NLBs with separate UDP/TCP ports"

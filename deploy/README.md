@@ -55,13 +55,10 @@ Services.
   `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
   `overlays/openshift/` takes metrics TLS from the service CA and adds a NetworkPolicy that
   admits the platform's monitoring namespaces.
-- A cloud under a flavor, such as `overlays/openshift/aws/`, is generated the same way
-  with its own `values.yaml` as a delta on the flavor's, and the flavor's API versions.
-  `overlays/openshift/aws/` sets `platform: aws`: internal NLBs for the SWIM and signals
-  Services, and cross-zone load balancing on SWIM. The default AWS Classic Load Balancer
-  rejects UDP, leaving SWIM without an address and the operator unready. Vendoring
-  `overlays/openshift/` brings its clouds along; the platform consumer selects the cloud's
-  directory, since the render does not detect the cloud provider.
+- `overlays/openshift/` also sets `platform: aws`: internal NLBs for the SWIM and signals
+  Services, with cross-zone load balancing. The default AWS Classic Load Balancer rejects
+  UDP, leaving SWIM without an address and the operator unready. Other clouds ignore the
+  AWS annotations, so the same render serves every OpenShift install.
 - The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
   type for the Service it advertises and peer sites reach both through it. A cluster with
   no LoadBalancer provider leaves the operator waiting for an address and never ready. The
@@ -105,9 +102,6 @@ kubectl apply -k deploy/operator/ -n grid-system
 
 # or OpenShift
 kubectl apply -k deploy/overlays/openshift/ -n grid-system
-
-# or OpenShift on AWS
-kubectl apply -k deploy/overlays/openshift/aws/ -n grid-system
 
 # or kind, which brings its own namespace
 kubectl apply -k deploy/overlays/kind/
