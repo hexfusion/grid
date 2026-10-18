@@ -45,7 +45,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | [GridNetwork](grid-network.md) | Helm client or GitOps controller | Helm/GitOps | Grid operator |
 | [GridSite](grid-site.md) | Helm/GitOps for declared sites, Grid operator for discovered sites | Creator for that mode | Grid operator |
-| [InferenceProvider](inference-provider.md) | Helm/GitOps or model-serving controller | Publishing component | Grid operator |
+| [InferenceProvider](inference-provider.md) | Helm/GitOps or an external controller | Publishing component | Grid operator |
 | [AgentToolProvider](agent-tool-provider.md) | Helm client or GitOps controller | Helm/GitOps | Grid operator |
 | [SiteInvite](site-invite.md) | Administrator API client or Helm/GitOps | Immutable after creation | Enrollment service |
 
