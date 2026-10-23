@@ -44,6 +44,12 @@ filter_chains:
               - "203.0.113.20:8443"
             connection_timeout_ms: 2000
             total_connection_timeout_ms: 4000
+            read_timeout_ms: 120000
+            write_timeout_ms: 30000
+            retry_policy:
+              max_retries: 1
+              retriable_conditions: [connect_failure]
+              allow_non_idempotent: true
             health_check:
               type: tcp
               interval_ms: 3000
@@ -77,6 +83,12 @@ clusters:
               - "203.0.113.20:8443"
             connection_timeout_ms: 2000
             total_connection_timeout_ms: 4000
+            read_timeout_ms: 120000
+            write_timeout_ms: 30000
+            retry_policy:
+              max_retries: 1
+              retriable_conditions: [connect_failure]
+              allow_non_idempotent: true
             health_check:
               type: tcp
               interval_ms: 3000

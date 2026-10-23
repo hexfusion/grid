@@ -557,6 +557,16 @@ struct GridSiteRouteRender;
 const PEER_CONNECT_TIMEOUT_MS: u32 = 2_000;
 /// How long another site's gateway may take to accept a connection over TLS, milliseconds.
 const PEER_TOTAL_CONNECT_TIMEOUT_MS: u32 = 4_000;
+/// How long one read from another site's gateway may take, milliseconds. Praxis applies it
+/// per read, so a stream survives as long as chunks keep coming; the first token is the
+/// longest gap, and a wedged peer holds a stream no longer than this.
+const PEER_READ_TIMEOUT_MS: u32 = 120_000;
+/// How long one write to another site's gateway may take, milliseconds: a prompt body a
+/// stalled peer never reads.
+const PEER_WRITE_TIMEOUT_MS: u32 = 30_000;
+/// Retries after a connect failure, each on another endpoint: a partitioned address costs
+/// one more connect, not three on the same one.
+const PEER_CONNECT_RETRIES: u32 = 1;
 /// Probe period for another site's gateway, which takes too little traffic for passive checks alone.
 const PEER_PROBE_INTERVAL_MS: u32 = 3_000;
 /// Probe period for a local backend.
@@ -580,16 +590,20 @@ impl RouterRender for GridSiteRouteRender {
         ))
     }
 
-    /// Bounded connects for another site's gateway, and a probe that `grid_site_route` demotes on.
+    /// Bounded connects, reads and retries for another site's gateway, and a probe that
+    /// `grid_site_route` demotes on.
     ///
-    /// The probe is tcp for every transport: the operator does not know a backend's health
-    /// path, and passive checks still mark an endpoint that fails requests.
+    /// The probe is tcp for every transport. Praxis's http probe is plaintext, so it cannot
+    /// reach a mutual TLS peer, and the passive thresholds live in the same block. Behind a
+    /// router or load balancer the tcp probe proves only that the address answers; a peer
+    /// that accepts and stalls is demoted by the passive checks once its requests fail
+    /// within the read bound, and ordered last by its silence on the signals poll.
     fn probe(endpoint: &ClusterEndpointConfig) -> Option<String> {
         let peer = endpoint
             .transport
             .as_ref()
             .is_some_and(|transport| transport.mode == TransportMode::MutualTls);
-        let timeouts = if peer { peer_connect_limits() } else { String::new() };
+        let timeouts = if peer { peer_limits() } else { String::new() };
         Some(format!(
             concat!(
                 "{timeouts}",
@@ -1544,15 +1558,31 @@ fn render_cluster_entry(
     }
 }
 
-/// The connect limits for another site's gateway, so a partitioned site fails fast.
-fn peer_connect_limits() -> String {
+/// The limits for another site's gateway: a partitioned site fails within the connect
+/// bounds and one retry elsewhere, a hung one within the read bound.
+///
+/// The retry policy is configured, so praxis reselects the endpoint on the retry, and it
+/// allows the non-idempotent chat POST because a connect failure sent nothing. Praxis's
+/// body replay limit stays, so a prompt past it fails over without a retry. No
+/// `per_try_timeout_ms`: praxis applies it to the connect, read and write timeouts alike,
+/// which would either cut a slow first token or undo the fast connect bound.
+fn peer_limits() -> String {
     format!(
         concat!(
             "\n            connection_timeout_ms: {connect}",
             "\n            total_connection_timeout_ms: {total}",
+            "\n            read_timeout_ms: {read}",
+            "\n            write_timeout_ms: {write}",
+            "\n            retry_policy:",
+            "\n              max_retries: {retries}",
+            "\n              retriable_conditions: [connect_failure]",
+            "\n              allow_non_idempotent: true",
         ),
         connect = PEER_CONNECT_TIMEOUT_MS,
         total = PEER_TOTAL_CONNECT_TIMEOUT_MS,
+        read = PEER_READ_TIMEOUT_MS,
+        write = PEER_WRITE_TIMEOUT_MS,
+        retries = PEER_CONNECT_RETRIES,
     )
 }
 
@@ -1801,13 +1831,35 @@ mod tests {
         assert_eq!(
             remote["connection_timeout_ms"].as_u64(),
             Some(2000),
-            "a partitioned site fails fast"
+            "a partitioned site fails within the connect bound"
         );
         assert_eq!(remote["total_connection_timeout_ms"].as_u64(), Some(4000));
-        assert!(
-            doc["clusters"][0].get("connection_timeout_ms").is_none(),
-            "local keeps praxis's own"
+        assert_eq!(
+            remote["read_timeout_ms"].as_u64(),
+            Some(120_000),
+            "a hung site fails within the read bound"
         );
+        assert_eq!(remote["write_timeout_ms"].as_u64(), Some(30_000));
+        let retry = &remote["retry_policy"];
+        assert_eq!(retry["max_retries"].as_u64(), Some(1), "one retry, on another endpoint");
+        assert_eq!(
+            retry["retriable_conditions"].as_sequence().map(Vec::len),
+            Some(1),
+            "a connect failure alone retries"
+        );
+        assert_eq!(retry["retriable_conditions"][0].as_str(), Some("connect_failure"));
+        assert_eq!(
+            retry["allow_non_idempotent"].as_bool(),
+            Some(true),
+            "the chat POST retries: a connect failure sent nothing"
+        );
+        assert!(
+            retry.get("per_try_timeout_ms").is_none(),
+            "a per-try timeout would override the read bound"
+        );
+        for key in ["connection_timeout_ms", "read_timeout_ms", "retry_policy"] {
+            assert!(doc["clusters"][0].get(key).is_none(), "local keeps praxis's own {key}");
+        }
         assert!(
             !yaml.contains("intelligent_route") && !yaml.contains("overlay_file"),
             "a site-route render carries no intelligent_route or its overlay"
