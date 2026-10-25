@@ -114,7 +114,7 @@ async fn main() {
 
     // Probes answer during enrollment and the LoadBalancer wait, except under site identity TLS, which waits for
     // enrollment.
-    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = Arc::new(Readiness::default());
     let metrics_tls = match operator::metrics_tls::MetricsTls::from_args(
         config.metrics.cert.clone(),
         config.metrics.key.clone(),
@@ -132,7 +132,7 @@ async fn main() {
     // Watched before enrolling, because enrolling retries a retryable failure
     // for as long as it keeps failing and must still answer a SIGTERM.
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
-    tokio::spawn(watch_for_termination(trigger));
+    tokio::spawn(watch_for_termination(trigger, Arc::clone(&ready)));
 
     if config.enrollment.enabled {
         let enrolled = tokio::select! {
@@ -400,7 +400,7 @@ async fn start_swim(
     client: Client,
     cli: Cli,
     ctx: Arc<OperatorCtx>,
-    ready: Arc<std::sync::atomic::AtomicBool>,
+    ready: Arc<Readiness>,
     started: tokio::sync::watch::Sender<SwimStage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let swim = Box::pin(maybe_start_swim(&client, &cli, ctx.signal_mode()))
@@ -418,7 +418,7 @@ async fn start_swim(
         ctx.release_membership();
     }
     started.send_replace(SwimStage::Settled(swim));
-    ready.store(true, std::sync::atomic::Ordering::Release);
+    ready.mark_started();
     Ok(())
 }
 
@@ -1479,7 +1479,7 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
 
 /// Serve Prometheus metrics and health endpoints.
 async fn run_metrics_server(
-    ready: Arc<std::sync::atomic::AtomicBool>,
+    ready: Arc<Readiness>,
     tls: Option<operator::metrics_tls::MetricsTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("GRID_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_owned());
@@ -1488,7 +1488,7 @@ async fn run_metrics_server(
         .route("/healthz", axum::routing::get(health_handler))
         .route(
             "/readyz",
-            axum::routing::get(move || std::future::ready(readiness(&ready))),
+            axum::routing::get(move || std::future::ready(ready.status())),
         );
     if let Some(tls) = tls {
         return operator::metrics_tls::serve_metrics_tls(&addr, app, tls, METRICS_TLS_RELOAD).await;
@@ -1517,12 +1517,35 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
-/// Not ready until enrollment and SWIM startup, including any `LoadBalancer` wait, have finished.
-fn readiness(ready: &std::sync::atomic::AtomicBool) -> (http::StatusCode, &'static str) {
-    if ready.load(std::sync::atomic::Ordering::Acquire) {
-        (http::StatusCode::OK, "ok")
-    } else {
-        (http::StatusCode::SERVICE_UNAVAILABLE, "starting")
+/// Whether `/readyz` answers ready.
+#[derive(Debug, Default)]
+struct Readiness {
+    /// Enrollment and SWIM startup, including any `LoadBalancer` wait, have finished.
+    started: std::sync::atomic::AtomicBool,
+    /// A termination signal arrived; never cleared, so a late start cannot undo it.
+    stopping: std::sync::atomic::AtomicBool,
+}
+
+impl Readiness {
+    /// Startup finished.
+    fn mark_started(&self) {
+        self.started.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Standing down: not ready from now on, whatever startup does next.
+    fn mark_stopping(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The `/readyz` answer.
+    fn status(&self) -> (http::StatusCode, &'static str) {
+        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            (http::StatusCode::SERVICE_UNAVAILABLE, "stopping")
+        } else if self.started.load(std::sync::atomic::Ordering::Acquire) {
+            (http::StatusCode::OK, "ok")
+        } else {
+            (http::StatusCode::SERVICE_UNAVAILABLE, "starting")
+        }
     }
 }
 
@@ -1544,9 +1567,15 @@ fn readiness(ready: &std::sync::atomic::AtomicBool) -> (http::StatusCode, &'stat
 const SIGNALS_TLS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Trigger cooperative shutdown on the first termination signal.
-async fn watch_for_termination(trigger: operator::shutdown::Trigger) {
+async fn watch_for_termination(trigger: operator::shutdown::Trigger, ready: Arc<Readiness>) {
     let signal = first_termination_signal().await;
     tracing::info!(signal, "standing down");
+    begin_stand_down(&trigger, &ready);
+}
+
+/// Answer not ready first, so nothing new is routed here, then ask every worker to stop.
+fn begin_stand_down(trigger: &operator::shutdown::Trigger, ready: &Readiness) {
+    ready.mark_stopping();
     trigger.trigger();
 }
 
@@ -1805,7 +1834,9 @@ async fn serve_signals_tls(
         let accepted = tokio::select! {
             biased;
             () = shutdown.triggered() => {
-                // Stop accepting, then let what is already answering finish.
+                // Close the socket, so a new connection is refused at once rather than left in
+                // the backlog until its client times out, then let open connections finish.
+                drop(listener);
                 drain_connections(&admission.slots).await;
                 return Ok(());
             },
@@ -3883,7 +3914,7 @@ mod tests {
         );
         started.send_replace(SwimStage::Settled(None));
         assert!(settled.await.is_none(), "settled without SWIM");
-        assert!(readiness(&std::sync::atomic::AtomicBool::new(false)).0 == http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(Readiness::default().status().0 == http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -4428,6 +4459,73 @@ mod tests {
             idle.elapsed() < SHUTDOWN_GRACE,
             "with nothing open the drain must not wait out the grace"
         );
+    }
+
+    /// Stand-down answers not ready before any worker sees the signal, and a startup that
+    /// finishes later cannot make it ready again.
+    #[tokio::test]
+    async fn stand_down_answers_not_ready_before_workers_stop() {
+        let ready = Arc::new(Readiness::default());
+        ready.mark_started();
+        assert_eq!(ready.status().0, http::StatusCode::OK);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let observed = Arc::clone(&ready);
+        let worker = tokio::spawn(async move {
+            shutdown.triggered().await;
+            observed.status()
+        });
+        begin_stand_down(&trigger, &ready);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("the worker saw the signal")
+            .expect("worker task");
+        assert_eq!(seen, (http::StatusCode::SERVICE_UNAVAILABLE, "stopping"));
+        ready.mark_started();
+        assert_eq!(
+            ready.status().0,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "stays stopping"
+        );
+    }
+
+    /// While an answer still holds the drain open, a new connection is refused at once rather
+    /// than left in the backlog.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn the_drain_refuses_new_connections_at_once() {
+        let mesh = Mesh::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let addr = listener.local_addr().expect("fixture");
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let admission = Admission::new(8);
+        // Stands in for a connection mid-answer, which holds the drain.
+        let answering = Arc::clone(&admission.slots).acquire_owned().await.expect("slot");
+        let server = tokio::spawn(serve_signals_tls(
+            listener,
+            serving_for(&mesh),
+            admission,
+            std::future::pending(),
+            shutdown,
+        ));
+        let mut polling = mesh.connect(addr).await;
+        assert!(get(&mut polling).await.starts_with(b"HTTP/1.1 200"), "serves before");
+
+        trigger.trigger();
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while tokio::net::TcpStream::connect(addr).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(refused.is_ok(), "a new connection is refused within 2s of the signal");
+        assert!(!server.is_finished(), "refused while an answer still holds the drain");
+
+        drop(answering);
+        tokio::time::timeout(SHUTDOWN_GRACE, server)
+            .await
+            .expect("the drain ends once the answer does")
+            .expect("server task")
+            .expect("the listener stands down cleanly");
     }
 
     /// The signal closes the listener, where before only SIGKILL did.
