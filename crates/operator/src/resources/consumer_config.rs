@@ -777,7 +777,10 @@ fn consumer_chain_head(listener_port: u16) -> String {
 }
 
 /// The admin listener and shutdown bound every generated config closes with.
-const ADMIN_TRAILER: &str = "\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n";
+///
+/// The drain is Praxis's own default, 30 s, which the praxis-gateway chart's default grace
+/// (30 s plus its preStop delay) is sized for, so a long streamed answer is not cut short.
+const ADMIN_TRAILER: &str = "\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 30\n";
 
 /// A gateway config that starts and answers 503, for a pod whose generated config is not
 /// written yet.

@@ -99,4 +99,4 @@ clusters:
               passive_healthy_threshold: 2
 admin:
   metrics_address: "127.0.0.1:9901"
-shutdown_timeout_secs: 5
+shutdown_timeout_secs: 30

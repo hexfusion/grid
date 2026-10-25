@@ -560,7 +560,8 @@ shutdownDelaySeconds: 5
 # -- Seconds Kubernetes gives a terminating pod before killing it. Empty: 30 plus
 # shutdownDelaySeconds, so Praxis still gets its default 30 seconds
 # (shutdown_timeout_secs) to drain in-flight requests after the delay. Raise it if your
-# Praxis config sets a longer shutdown_timeout_secs. Must exceed shutdownDelaySeconds.
+# Praxis config sets a longer shutdown_timeout_secs. Must exceed shutdownDelaySeconds,
+# and with praxisConfig.source operator, whose config drains for 30, cover 30 plus it.
 terminationGracePeriodSeconds: null
 
 # -- Container resource requests and limits.

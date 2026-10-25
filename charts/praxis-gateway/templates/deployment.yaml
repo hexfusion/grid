@@ -64,6 +64,9 @@ spec:
       {{- $grace = add 30 $delay }}
       {{- else if le (int $grace) $delay }}
       {{- fail "terminationGracePeriodSeconds must be longer than shutdownDelaySeconds, or the pod is killed before Praxis can drain" }}
+      {{- else if and (eq .Values.praxisConfig.source "operator") (lt (int $grace) (add 30 $delay)) }}
+      {{- /* The operator renders shutdown_timeout_secs: 30, which runs after the preStop delay. */}}
+      {{- fail (printf "terminationGracePeriodSeconds must be at least %d: the operator-generated config drains for 30 seconds after the %d second shutdownDelaySeconds" (add 30 $delay) $delay) }}
       {{- end }}
       terminationGracePeriodSeconds: {{ $grace }}
       {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}

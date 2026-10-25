@@ -15,4 +15,4 @@ filter_chains:
         body: '{"error":{"message":"the gateway is starting","type":"service_unavailable"}}'
 admin:
   metrics_address: "127.0.0.1:9901"
-shutdown_timeout_secs: 5
+shutdown_timeout_secs: 30

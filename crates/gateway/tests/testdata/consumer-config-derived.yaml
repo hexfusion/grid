@@ -44,4 +44,4 @@ filter_chains:
               - "model-b.models.svc"
 admin:
   metrics_address: "127.0.0.1:9901"
-shutdown_timeout_secs: 5
+shutdown_timeout_secs: 30

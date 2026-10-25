@@ -49,3 +49,28 @@ tests:
       shutdownDelaySeconds: 40
     asserts:
       - failedTemplate: {}
+
+  - it: gives an operator-generated config its 30 second drain after the delay
+    set:
+      praxisConfig.source: operator
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 35
+
+  - it: rejects a grace period shorter than the operator-generated drain
+    set:
+      praxisConfig.source: operator
+      terminationGracePeriodSeconds: 20
+    asserts:
+      - failedTemplate:
+          errorPattern: terminationGracePeriodSeconds must be at least 35
+
+  - it: takes a grace period that covers the operator-generated drain
+    set:
+      praxisConfig.source: operator
+      terminationGracePeriodSeconds: 35
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 35

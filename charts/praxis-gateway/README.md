@@ -347,7 +347,7 @@ Praxis AI image; these values may advance independently.
 | `health.liveness` | object | admin `/healthy`, else TCP on the listener port | Liveness probe, chosen the same way against `/healthy`. Set to null to disable. |
 | `health.adminProbeCommand` | list | `[]` | Command for the admin-listener probe; the URL is appended. Empty runs `/bin/sh` with `curl` or `wget`. |
 | `shutdownDelaySeconds` | int | `5` | Seconds a terminating pod keeps serving before Praxis gets SIGTERM, so Service endpoints drop it first and rollouts do not refuse requests. Runs the image's `sleep` as a preStop hook. `0` disables it, which an image without `sleep` (distroless or scratch) needs. |
-| `terminationGracePeriodSeconds` | int | `null` | Seconds Kubernetes gives a terminating pod before killing it. Empty means 30 plus `shutdownDelaySeconds`, so Praxis keeps its default 30 second drain after the delay. Raise it for a longer Praxis `shutdown_timeout_secs`. Must exceed `shutdownDelaySeconds`. |
+| `terminationGracePeriodSeconds` | int | `null` | Seconds Kubernetes gives a terminating pod before killing it. Empty means 30 plus `shutdownDelaySeconds`, so Praxis keeps its default 30 second drain after the delay. Raise it for a longer Praxis `shutdown_timeout_secs`. Must exceed `shutdownDelaySeconds`, and with `praxisConfig.source` operator, whose generated config drains for 30 seconds, must be at least 30 plus `shutdownDelaySeconds`. |
 | `resources` | object | `{}` | Container resource requests and limits. |
 | `nodeSelector` | object | `{}` | Node selector. |
 | `affinity` | object | `{}` | Pod affinity rules. |
