@@ -1545,11 +1545,11 @@ fn render_cluster_entry(
 }
 
 /// The limits for another site's gateway: a partitioned site fails within the connect
-/// bounds and one retry elsewhere, a hung one within the read bound.
+/// bounds and one retry, a hung one within the read bound.
 ///
-/// The retry policy is configured, so praxis reselects the endpoint on the retry, and it
-/// allows the non-idempotent chat POST because a connect failure sent nothing. Praxis's
-/// body replay limit stays, so a prompt past it fails over without a retry. No
+/// The cluster has one endpoint, so the retry is a second connect to the same address. It
+/// allows the non-idempotent chat POST only on `connect_failure`, which sent nothing (RFC 9110
+/// section 9.2.2). Praxis's body replay limit stays, so a prompt past it is not retried. No
 /// `per_try_timeout_ms`: praxis applies it to the connect, read and write timeouts alike,
 /// which would either cut a slow first token or undo the fast connect bound.
 fn peer_limits() -> String {
@@ -1828,7 +1828,7 @@ mod tests {
         );
         assert_eq!(remote["write_timeout_ms"].as_u64(), Some(30_000));
         let retry = &remote["retry_policy"];
-        assert_eq!(retry["max_retries"].as_u64(), Some(1), "one retry, on another endpoint");
+        assert_eq!(retry["max_retries"].as_u64(), Some(1), "one retry, to the same address");
         assert_eq!(
             retry["retriable_conditions"].as_sequence().map(Vec::len),
             Some(1),
@@ -1838,7 +1838,7 @@ mod tests {
         assert_eq!(
             retry["allow_non_idempotent"].as_bool(),
             Some(true),
-            "the chat POST retries: a connect failure sent nothing"
+            "the chat POST retries only on a connect failure, which sent nothing (RFC 9110 9.2.2)"
         );
         assert!(
             retry.get("per_try_timeout_ms").is_none(),

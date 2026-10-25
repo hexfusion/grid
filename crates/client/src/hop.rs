@@ -15,8 +15,9 @@ pub struct HopPolicy {
     pub read: Duration,
     /// Longest wait for one write: a prompt body a stalled peer never reads.
     pub write: Duration,
-    /// Retries after a connect failure, each on another endpoint. Safe for a non-idempotent
-    /// request, because a failed connect sent nothing.
+    /// Retries after a connect failure, to the same address: a peer cluster has one endpoint.
+    /// Safe for a non-idempotent request because a failed connect sent nothing, which RFC 9110
+    /// section 9.2.2 permits; no other failure retries.
     pub connect_retries: u32,
 }
 
