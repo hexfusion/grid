@@ -19,6 +19,7 @@ compile_error!("features `rcgen` and `fips` are mutually exclusive");
 #[cfg(all(feature = "reqwest-client", not(any(feature = "rcgen", feature = "fips"))))]
 compile_error!("`reqwest-client` needs one of `rcgen` or `fips` to pick a TLS backend");
 
+mod hop;
 #[cfg(feature = "peer-scraper")]
 mod mtls;
 #[cfg(feature = "peer-scraper")]
@@ -34,6 +35,7 @@ mod feedback;
 
 #[cfg(feature = "peer-scraper")]
 pub use feedback::Reporter;
+pub use hop::HopPolicy;
 #[cfg(feature = "peer-scraper")]
 pub use mtls::{MtlsError, PeerScraper};
 #[cfg(feature = "peer-scraper")]

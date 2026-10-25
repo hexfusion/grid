@@ -553,20 +553,6 @@ impl RouterRender for IntelligentRouteRender {
 /// Renders `grid_site_route` over the serving config, routable to every cluster the pipeline dials.
 struct GridSiteRouteRender;
 
-/// How long another site's gateway may take to accept a connection, milliseconds.
-const PEER_CONNECT_TIMEOUT_MS: u32 = 2_000;
-/// How long another site's gateway may take to accept a connection over TLS, milliseconds.
-const PEER_TOTAL_CONNECT_TIMEOUT_MS: u32 = 4_000;
-/// How long one read from another site's gateway may take, milliseconds. Praxis applies it
-/// per read, so a stream survives as long as chunks keep coming; the first token is the
-/// longest gap, and a wedged peer holds a stream no longer than this.
-const PEER_READ_TIMEOUT_MS: u32 = 120_000;
-/// How long one write to another site's gateway may take, milliseconds: a prompt body a
-/// stalled peer never reads.
-const PEER_WRITE_TIMEOUT_MS: u32 = 30_000;
-/// Retries after a connect failure, each on another endpoint: a partitioned address costs
-/// one more connect, not three on the same one.
-const PEER_CONNECT_RETRIES: u32 = 1;
 /// Probe period for another site's gateway, which takes too little traffic for passive checks alone.
 const PEER_PROBE_INTERVAL_MS: u32 = 3_000;
 /// Probe period for a local backend.
@@ -1567,6 +1553,7 @@ fn render_cluster_entry(
 /// `per_try_timeout_ms`: praxis applies it to the connect, read and write timeouts alike,
 /// which would either cut a slow first token or undo the fast connect bound.
 fn peer_limits() -> String {
+    const HOP: grid_client::HopPolicy = grid_client::HopPolicy::PEER;
     format!(
         concat!(
             "\n            connection_timeout_ms: {connect}",
@@ -1578,11 +1565,11 @@ fn peer_limits() -> String {
             "\n              retriable_conditions: [connect_failure]",
             "\n              allow_non_idempotent: true",
         ),
-        connect = PEER_CONNECT_TIMEOUT_MS,
-        total = PEER_TOTAL_CONNECT_TIMEOUT_MS,
-        read = PEER_READ_TIMEOUT_MS,
-        write = PEER_WRITE_TIMEOUT_MS,
-        retries = PEER_CONNECT_RETRIES,
+        connect = HOP.connect.as_millis(),
+        total = HOP.total_connect.as_millis(),
+        read = HOP.read.as_millis(),
+        write = HOP.write.as_millis(),
+        retries = HOP.connect_retries,
     )
 }
 
