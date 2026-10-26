@@ -3,10 +3,11 @@
 # runs the examples/helm/hub-site README commands, with test-only overrides, and asserts
 # enrollment, membership, serving, peer trust, and log health per trust mode.
 #
-# Usage: e2e-hub-site.sh [all|up|test|down]   (default all)
+# Usage: e2e-hub-site.sh [all|up|test|down|selftest]   (default all)
 #   up     build and load the images, create the clusters, apply the topology stacks
 #   test   per mode in MODES: reset the grid namespace, install, assert
 #   down   delete the clusters
+#   selftest  check the HA verdicts against synthetic monitor logs, no cluster
 #
 # Env:
 #   MODES               peer trust modes to test (default "pin spiffe")
@@ -27,10 +28,19 @@
 #                       then polls signals and asserts renewal, a fork, and re-enrollment
 #   NET_PREFIX          command prefix for calls to LoadBalancer addresses, e.g. under
 #                       rootless podman: podman unshare --rootless-netns
+#   TOPOLOGY            topology under tests/e2e/topologies (default grid-hub-site, or
+#                       grid-hub-site-ha under HA=1)
+#   HA=1                run the HA fault scenarios: steady load through the hub gateway's
+#                       LoadBalancer while the gateway and the operator are restarted,
+#                       deleted and drained. Needs a hub with two worker nodes.
+#   HA_GATEWAY_REPLICAS  hub gateway replicas under HA=1 (default 2)
+#   HA_OPERATOR_REPLICAS operator replicas under HA=1 (default 1; more is schema-refused)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TOPO="$ROOT/tests/e2e/topologies/grid-hub-site"
+# The HA leg needs worker nodes on the hub, so it has a topology of its own.
+TOPOLOGY=${TOPOLOGY:-$([[ ${HA:-0} == 1 ]] && echo grid-hub-site-ha || echo grid-hub-site)}
+TOPO="$ROOT/tests/e2e/topologies/$TOPOLOGY"
 MODES=${MODES:-pin spiffe}
 HUB_ROUTER=${HUB_ROUTER:-render}
 IMAGE_PREFIX=${IMAGE_PREFIX:-localhost/grid-}
@@ -38,7 +48,10 @@ IMAGE_TAG=${IMAGE_TAG:-e2e}
 CONTAINER_TOOL=${CONTAINER_TOOL:-docker}
 ARTIFACTS=${ARTIFACTS:-/tmp/grid-hub-site-e2e}
 TIMEOUT=${TIMEOUT:-180}
-PREFIX=grid-hub-site
+HA=${HA:-0}
+HA_GATEWAY_REPLICAS=${HA_GATEWAY_REPLICAS:-2}
+HA_OPERATOR_REPLICAS=${HA_OPERATOR_REPLICAS:-1}
+PREFIX=$TOPOLOGY
 HUB_CTX=kind-$PREFIX-hub
 SITE_CTX=kind-$PREFIX-site
 NS=grid
@@ -56,6 +69,9 @@ PF_PID=""
 WATCH_PID=""
 MTLS_PID=""
 HUBPATH_PID=""
+FRONTDOOR_PID=""
+CATALOG_PID=""
+DRAIN_PID=""
 FAILED=0
 # Start of the deliberate-refusal checks; assert_health allows gateway handshake rejections after it.
 REFUSALS_FROM=""
@@ -180,6 +196,9 @@ plan_addresses() {
   HUB_SWIM_IP=$(ip_add "$hub" 2)
   # Signals have their own Service, so their own address from each pool.
   HUB_SIG_IP=$(ip_add "$hub" 3)
+  # The HA leg puts the hub gateway behind a LoadBalancer of its own; reserved either way,
+  # so the address map does not change shape between legs.
+  HUB_GW_IP=$(ip_add "$hub" 4)
   SITE_SWIM_IP=$(ip_add "$site" 1)
   SITE_GW_IP=$(ip_add "$site" 2)
   SITE_SIG_IP=$(ip_add "$site" 3)
@@ -189,11 +208,11 @@ plan_addresses() {
   # Two Services asking MetalLB for one address leaves the loser pending forever,
   # which surfaces as an unrelated deployment never going ready.
   local planned
-  planned=$(printf '%s\n' "$ENROLL_IP" "$HUB_SWIM_IP" "$HUB_SIG_IP" \
+  planned=$(printf '%s\n' "$ENROLL_IP" "$HUB_SWIM_IP" "$HUB_SIG_IP" "$HUB_GW_IP" \
     "$SITE_SWIM_IP" "$SITE_SIG_IP" "$SITE_GW_IP" "$MODEL_LB_IP")
-  [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 7 ]] \
+  [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 8 ]] \
     || die "planned addresses are not distinct: $(printf '%s ' "$planned")"
-  log "enrollment $ENROLL_IP, hub SWIM $HUB_SWIM_IP, hub signals $HUB_SIG_IP"
+  log "enrollment $ENROLL_IP, hub SWIM $HUB_SWIM_IP, hub signals $HUB_SIG_IP, hub gateway $HUB_GW_IP"
   log "site SWIM $SITE_SWIM_IP, site signals $SITE_SIG_IP, site gateway $SITE_GW_IP"
 }
 
@@ -223,6 +242,12 @@ renewal_args() {
       --set "enrollment.enrollmentAdmins.subjects[0].kind=ServiceAccount"
       --set "enrollment.enrollmentAdmins.subjects[0].name=grid-admin"
       --set "enrollment.enrollmentAdmins.subjects[0].namespace=$ENS")
+  fi
+  # The HA leg serves signals, so an observer's read can be asserted, and leaves membership
+  # on whatever the trust mode already uses.
+  if ha && ! renews && ! site_route && [[ $1 == grid-operator ]]; then
+    RA=(--set signals.enabled=true)
+    return 0
   fi
   renews || site_route || return 0
   case $1 in
@@ -396,19 +421,21 @@ install_hub() {
   site_route && site_route_providers vcr hub-local
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "install hub grid-site"
   images gateway
+  ha_gateway_args
   if site_route; then
     helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
       --set fullnameOverride=grid-gateway --set praxisConfig.source=operator --set image.flavor=grid-gateway \
       --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
       --set praxisConfig.operator.gridServing.enabled=true --set mountReconciliation.enabled=true \
       --set mountReconciliation.network=grid --set mountReconciliation.gatewayRef=grid-gateway \
-      --set "mountReconciliation.operator.namespace=$NS" "${IMG[@]}" || die "install hub grid-gateway"
+      --set "mountReconciliation.operator.namespace=$NS" "${IMG[@]}" "${GA[@]}" || die "install hub grid-gateway"
   else
     helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
       --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
       --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
       --set praxisConfig.render.model="$MODEL" --set praxisConfig.render.auth.mode=none \
-      --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" || die "install hub grid-gateway"
+      --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" "${GA[@]}" \
+      || die "install hub grid-gateway"
   fi
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
     || die "hub not enrolled"
@@ -789,6 +816,436 @@ assert_health() {
 }
 
 # ---------------------------------------------------------------------------
+# High availability
+# ---------------------------------------------------------------------------
+#
+# Faults go in while load runs, and the question is only ever what the front
+# door answered. The front door is the hub gateway's LoadBalancer, not a
+# port-forward: a port-forward resolves to one pod and keeps that tunnel, so it
+# cannot see a replica swap at all.
+
+# ha: this leg runs the fault scenarios.
+ha() { [[ ${HA:-0} == 1 ]]; }
+
+skip() { printf 'SKIP [%s] %s\n' "$MODE" "$*"; }
+
+# measure <scenario> <name> <value>: a recorded value. Targets live in GRID-HA.md; nothing
+# here asserts one until they do.
+measure() {
+  mkdir -p "$ARTIFACTS/$MODE"
+  printf 'MEASURE [%s] %s %s=%s\n' "$MODE" "$1" "$2" "$3"
+  printf '%s\t%s\t%s\t%s\n' "$MODE" "$1" "$2" "$3" >>"$ARTIFACTS/$MODE/ha-measures.tsv"
+}
+
+# ha_gateway_args: the HA shape for the hub gateway. The spread is strict on purpose: with
+# both replicas on one node the drain scenario proves nothing.
+ha_gateway_args() {
+  GA=()
+  ha || return 0
+  # The chart refuses auth.mode none on a LoadBalancer; this leg takes its escape hatch
+  # because the subject is availability, and the address lives on the kind network only.
+  GA=(--set "replicaCount=$HA_GATEWAY_REPLICAS" --set service.type=LoadBalancer
+    --set "service.loadBalancerIP=$HUB_GW_IP"
+    --set praxisConfig.render.auth.allowUnauthenticatedExposure=true
+    --set "topologySpreadConstraints[0].maxSkew=1"
+    --set "topologySpreadConstraints[0].topologyKey=kubernetes.io/hostname"
+    --set "topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule"
+    --set "topologySpreadConstraints[0].labelSelector.matchLabels.app\.kubernetes\.io/instance=grid-gateway")
+}
+
+# front_door <out prefix>: one chat completion through the hub gateway Service. Prints
+# "<code> <provider site>", 000 for a call that never got a response.
+front_door() {
+  local out=$1 code site
+  code=$(chat_body | lb_curl -sS -o "$out.body" -D "$out.hdr" -w '%{http_code}' --max-time 10 \
+    -H 'Content-Type: application/json' -d @- "http://$HUB_GW_IP:8080/v1/chat/completions" 2>/dev/null) || true
+  site=$(grep -i '^x-grid-provider-site:' "$out.hdr" 2>/dev/null | head -1 | cut -d: -f2- | tr -d ' \r')
+  printf '%s %s\n' "${code:-000}" "${site:--}"
+}
+
+front_door_ok() { [[ $(front_door "$WORK/fd-probe") == "200 $SITE" ]]; }
+
+# watch_front_door: one call a second, recorded whatever it answers. No retry: a retried call
+# averages away the outage this leg exists to measure.
+watch_front_door() {
+  trap 'exit 0' TERM
+  while :; do
+    printf '%s %s\n' "$(date -u +%s)" "$(front_door "$WORK/frontdoor")" >>"$WORK/frontdoor.log"
+    sleep 1
+  done
+}
+
+start_front_door() {
+  : >"$WORK/frontdoor.log"
+  eventually "the hub gateway answers on its LoadBalancer $HUB_GW_IP" front_door_ok || return 1
+  watch_front_door &
+  FRONTDOOR_PID=$!
+}
+
+stop_front_door() {
+  [[ -z $FRONTDOOR_PID ]] || kill "$FRONTDOOR_PID" 2>/dev/null || true
+  FRONTDOOR_PID=""
+}
+
+# front_door_result <label> <from epoch> <strict|lenient>: no 5xx and nothing served from
+# outside the site. strict also means no call failed to connect; lenient records those
+# instead, because MetalLB re-announces a drained node's address and kind cannot avoid it.
+front_door_result() {
+  local label=$1 from=$2 how=$3 calls bad connect
+  calls=$(awk -v f="$from" '$1 + 0 >= f' "$WORK/frontdoor.log" | wc -l)
+  bad=$(awk -v f="$from" -v s="$SITE" '$1 + 0 >= f && (($2 >= 500 && $2 < 600) || ($2 == "200" && $3 != s))' \
+    "$WORK/frontdoor.log")
+  connect=$(awk -v f="$from" '$1 + 0 >= f && $2 == "000"' "$WORK/frontdoor.log" | wc -l)
+  if ((calls == 0)); then
+    fail "$label: the front door monitor recorded no calls"
+  elif [[ -n $bad ]]; then
+    fail "$label: $(grep -c . <<<"$bad") of $calls front door calls were 5xx or served from elsewhere"
+    head -5 <<<"$bad"
+  else
+    pass "$label: $calls front door calls, no 5xx and none served from outside $SITE"
+  fi
+  if [[ $how == strict ]]; then
+    if ((connect == 0)); then
+      pass "$label: every front door call connected"
+    else
+      fail "$label: $connect of $calls front door calls never connected"
+    fi
+  else
+    measure "$label" connect_failures "$connect"
+  fi
+}
+
+# measure_ttr <label> <name> <from epoch> <code|draw>: seconds from the fault to the first
+# good call after the last bad one, 0 when the fault produced none.
+measure_ttr() {
+  local v
+  v=$(awk -v f="$3" -v s="$SITE" -v want="$4" '
+    $1 + 0 < f { next }
+    { bad = ($2 != "200") || (want == "draw" && $3 != s)
+      if (bad) { last = $1; rec = "" } else if (last != "" && rec == "") { rec = $1 } }
+    END { if (last == "") print 0; else if (rec == "") print "unrecovered"; else print rec - f }
+  ' "$WORK/frontdoor.log")
+  measure "$1" "$2" "$v"
+}
+
+# watch_drain <context> <pod> <service>: every 200ms, whether that pod is still a ready
+# endpoint of the Service and whether its containers are still running. The pair is the drain
+# order: readiness has to go first, or traffic lands on a socket already closing.
+watch_drain() {
+  local ctx=$1 pod=$2 svc=$3 ip=$4 ready running
+  trap 'exit 0' TERM
+  while :; do
+    ready=$(k "$ctx" get endpointslices -l "kubernetes.io/service-name=$svc" -o json 2>/dev/null \
+      | jq -r --arg ip "$ip" '[.items[].endpoints[]? | select((.addresses // []) | index($ip))
+          | (.conditions.ready // true)] | if length == 0 then "gone" elif any then "true" else "false" end') || ready=gone
+    if running=$(k "$ctx" get pod "$pod" -o jsonpath='{.status.containerStatuses[*].state.running.startedAt}' 2>/dev/null); then
+      [[ -n $running ]] && running=true || running=false
+    else
+      running=gone
+    fi
+    printf '%s %s %s\n' "$(date -u +%s)" "${ready:-gone}" "$running" >>"$WORK/drain.log"
+    sleep 0.2
+  done
+}
+
+# start_drain_watch <context> <pod> <service>
+start_drain_watch() {
+  local ip
+  ip=$(k "$1" get pod "$2" -o jsonpath='{.status.podIP}') || { fail "no address for pod $2"; return 1; }
+  : >"$WORK/drain.log"
+  watch_drain "$1" "$2" "$3" "$ip" &
+  DRAIN_PID=$!
+}
+
+stop_drain_watch() {
+  [[ -z $DRAIN_PID ]] || kill "$DRAIN_PID" 2>/dev/null || true
+  DRAIN_PID=""
+}
+
+# drain_order_samples: samples where the pod had left the ready endpoints but was still running.
+drain_order_samples() { awk '($2 == "false" || $2 == "gone") && $3 == "true"' "$WORK/drain.log" | grep -c . || true; }
+
+# late_endpoint_samples: samples where the pod was still a ready endpoint after it stopped.
+late_endpoint_samples() { awk '$2 == "true" && ($3 == "false" || $3 == "gone")' "$WORK/drain.log" | grep -c . || true; }
+
+# assert_drain_order <label>: readiness left the Service while the container still ran, and the
+# pod was never a ready endpoint after it stopped.
+assert_drain_order() {
+  local early late
+  early=$(drain_order_samples)
+  late=$(late_endpoint_samples)
+  # A late ready endpoint is the defect; an unobserved window is only an unobserved window.
+  if ((late > 0)); then
+    fail "$1: the pod was a ready endpoint after its container stopped ($late samples)"
+  elif ((early == 0)); then
+    fail "$1: never saw the pod leave the Service's ready endpoints with its container still running"
+  else
+    pass "$1: the pod left the Service's ready endpoints while it still ran ($early samples)"
+  fi
+}
+
+# gateway_pod: the oldest gateway pod, so a scenario hits one that was already serving.
+gateway_pod() {
+  k "$HUB_CTX" get pods -l app.kubernetes.io/instance=grid-gateway \
+    --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[0].metadata.name}'
+}
+
+operator_pod() {
+  k "$HUB_CTX" get pods -l app.kubernetes.io/instance=grid-operator -o jsonpath='{.items[0].metadata.name}'
+}
+
+# ready_replicas <deployment>
+ready_replicas() {
+  local n
+  n=$(k "$HUB_CTX" get deployment "$1" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+  printf '%s' "${n:-0}"
+}
+
+gateway_ready_at_least() { (($(ready_replicas grid-gateway) >= $1)); }
+
+# catalog_served: the hub's signals rollup, which an observer reads through the Service.
+# Prints "<code> <provider series>".
+catalog_served() {
+  local out="$WORK/catalog" code n
+  code=$(lb_curl -sS -o "$out.body" -w '%{http_code}' --max-time 5 \
+    --resolve "hub.grid.internal:9091:$HUB_SIG_IP" --cacert "$WORK/id/ca.crt" \
+    --cert "$WORK/id/hub.crt" --key "$WORK/id/hub.key" \
+    "https://hub.grid.internal:9091/v1/site/signals" 2>/dev/null) || true
+  n=$(grep -c 'grid_provider="' "$out.body" 2>/dev/null) || n=0
+  printf '%s %s\n' "${code:-000}" "$n"
+}
+
+# watch_catalog: twice a second, what an observer reading the signals Service gets. A pod that
+# is a ready endpoint before it has published anything answers 200 with no provider series,
+# which drops this site from the reader's draw.
+watch_catalog() {
+  trap 'exit 0' TERM
+  while :; do
+    printf '%s %s\n' "$(date -u +%s)" "$(catalog_served)" >>"$WORK/catalog.log"
+    sleep 0.5
+  done
+}
+
+start_catalog_watch() {
+  : >"$WORK/catalog.log"
+  watch_catalog &
+  CATALOG_PID=$!
+}
+
+stop_catalog_watch() {
+  [[ -z $CATALOG_PID ]] || kill "$CATALOG_PID" 2>/dev/null || true
+  CATALOG_PID=""
+}
+
+# assert_catalog <label> <from epoch>: no observer read a 200 carrying zero providers. On main
+# signals_handler always answers 200 from whatever is published, so a pod that has not published
+# yet serves an empty catalog; 6a53a02c answers 503 until the first publish and is not on main.
+assert_catalog() {
+  local reads empty unreachable
+  reads=$(awk -v f="$2" '$1 + 0 >= f' "$WORK/catalog.log" | grep -c . || true)
+  empty=$(awk -v f="$2" '$1 + 0 >= f && $2 == "200" && $3 + 0 == 0' "$WORK/catalog.log" | grep -c . || true)
+  unreachable=$(awk -v f="$2" '$1 + 0 >= f && $2 == "000"' "$WORK/catalog.log" | grep -c . || true)
+  # The signals Service is externalTrafficPolicy Local, so while no operator pod is a ready
+  # endpoint MetalLB withdraws the address and the read cannot connect. Recorded, because a
+  # pass over nothing but unreachable reads has exercised nothing.
+  measure "$1" catalog_reads "$reads"
+  measure "$1" catalog_unreachable_reads "$unreachable"
+  if ((reads == 0)); then
+    fail "$1: the catalog monitor recorded no reads"
+  elif ((empty == 0)); then
+    pass "$1: $reads observer reads, none a 200 with an empty provider catalog"
+  else
+    fail "$1: $empty of $reads observer reads were 200 with no providers"
+  fi
+}
+
+# ha_scenario <name> <function>: inject, settle, then account for the front door.
+ha_scenario() {
+  local name=$1 fn=$2 strict=${3:-strict} from
+  from=$(date -u +%s)
+  log "[$MODE] HA scenario: $name"
+  "$fn" || fail "$name: injecting the fault failed"
+  eventually "$name: the gateway is rolled out again" rolled_out || true
+  eventually "$name: the front door serves $SITE again" front_door_ok || true
+  front_door_result "$name" "$from" "$strict"
+  measure_ttr "$name" ttr_front_door_seconds "$from" code
+  measure_ttr "$name" ttr_in_draw_seconds "$from" draw
+}
+
+# Scenario 1: a rolling restart of the gateway.
+ha_gateway_rollout() {
+  local pod
+  pod=$(gateway_pod) || return 1
+  start_drain_watch "$HUB_CTX" "$pod" grid-gateway
+  k "$HUB_CTX" rollout restart deployment/grid-gateway >/dev/null || return 1
+  k "$HUB_CTX" rollout status deployment/grid-gateway --timeout="${TIMEOUT}s" >/dev/null || true
+  stop_drain_watch
+  assert_drain_order "gateway rolling restart"
+}
+
+# Scenario 2: one gateway pod deleted.
+ha_gateway_pod_deleted() {
+  local pod
+  pod=$(gateway_pod) || return 1
+  start_drain_watch "$HUB_CTX" "$pod" grid-gateway
+  k "$HUB_CTX" delete pod "$pod" --wait=false >/dev/null || return 1
+  eventually "gateway pod deleted: $HA_GATEWAY_REPLICAS replicas ready again" \
+    gateway_ready_at_least "$HA_GATEWAY_REPLICAS" || true
+  stop_drain_watch
+  assert_drain_order "gateway pod deleted"
+}
+
+# Scenario 3: the operator restarts. Not a rolling restart: the chart's strategy is Recreate,
+# one SWIM identity per site, so the old pod goes before the new one starts.
+ha_operator_restart() {
+  local pod from
+  pod=$(operator_pod) || return 1
+  from=$(date -u +%s)
+  start_drain_watch "$HUB_CTX" "$pod" grid-operator-signals
+  k "$HUB_CTX" rollout restart deployment/grid-operator >/dev/null || return 1
+  k "$HUB_CTX" rollout status deployment/grid-operator --timeout="${TIMEOUT}s" >/dev/null || true
+  stop_drain_watch
+  # Recorded, not asserted: the operator chart has no preStop hook, so the window between the
+  # probe failing and kube-proxy dropping the endpoint can be shorter than one sample.
+  measure "operator restart" drain_order_samples "$(drain_order_samples)"
+  measure "operator restart" late_endpoint_samples "$(late_endpoint_samples)"
+  assert_catalog "operator restart" "$from"
+  skip "operator restart: no overlap between the old and new pod (strategy is Recreate)"
+}
+
+# Scenario 4: kill the operator leader. No Lease exists yet, so there is no leader to kill.
+ha_leader_kill() {
+  skip "operator leader handover: no leader election in the operator, so no Lease to delete"
+  measure "operator leader kill" ttr_leader_write_seconds skipped
+}
+
+# Scenario 5: cordon and drain the node running a gateway replica.
+ha_node_drain() {
+  local pod node
+  pod=$(gateway_pod) || return 1
+  node=$(k "$HUB_CTX" get pod "$pod" -o jsonpath='{.spec.nodeName}') || return 1
+  if [[ $(kubectl --context "$HUB_CTX" get nodes -o json | jq '[.items[] | select(.spec.taints // [] | any(.key == "node-role.kubernetes.io/control-plane") | not)] | length') -lt 2 ]]; then
+    skip "node drain: the hub has one schedulable node, so draining it takes the whole site"
+    return 0
+  fi
+  log "[$MODE] draining $node, which runs $pod"
+  kubectl --context "$HUB_CTX" drain "$node" --ignore-daemonsets --delete-emptydir-data \
+    --timeout=120s >/dev/null || return 1
+  eventually "node drain: a ready gateway replica remains" gateway_ready_at_least 1 || true
+  # The strict spread refuses to put the evicted replica on the surviving node, so the
+  # Deployment runs short until the node returns. No chart ships a PodDisruptionBudget.
+  measure "node drain" ready_replicas_while_drained "$(ready_replicas grid-gateway)"
+  kubectl --context "$HUB_CTX" uncordon "$node" >/dev/null || return 1
+  eventually "node drain: the gateway returns to $HA_GATEWAY_REPLICAS ready replicas" \
+    gateway_ready_at_least "$HA_GATEWAY_REPLICAS" || true
+}
+
+# ha_operator_replicas_blocked: the operator cannot run two replicas yet, and this proves the
+# first of the three reasons rather than asserting an absence, so the skip cannot go stale.
+ha_operator_replicas_blocked() {
+  if helm template grid-operator "$ROOT/charts/grid-operator" --set replicaCount=2 >/dev/null 2>&1; then
+    fail "the operator chart now accepts replicaCount=2: enable the operator HA scenarios"
+  else
+    skip "operator at $HA_OPERATOR_REPLICAS replica: the chart schema pins replicaCount to 1, the strategy is Recreate, and there is no leader election"
+  fi
+}
+
+# assert_ha: runs after assert_serving, which wrote the identity files the catalog read uses.
+assert_ha() {
+  ha || return 0
+  eventually "the hub gateway runs $HA_GATEWAY_REPLICAS ready replicas" \
+    gateway_ready_at_least "$HA_GATEWAY_REPLICAS" || return 0
+  ha_operator_replicas_blocked
+  start_front_door || { fail "the front door monitor never got a first good call"; return 0; }
+  start_catalog_watch
+  ha_scenario "gateway rolling restart" ha_gateway_rollout
+  ha_scenario "gateway pod deleted" ha_gateway_pod_deleted
+  ha_scenario "operator restart" ha_operator_restart
+  ha_scenario "node drain" ha_node_drain lenient
+  ha_leader_kill
+  stop_catalog_watch
+  stop_front_door
+}
+
+# ---------------------------------------------------------------------------
+# Self test
+# ---------------------------------------------------------------------------
+#
+# The HA verdicts are awk over monitor logs, so they are checked against
+# synthetic logs with no cluster. Run by the HA leg before the e2e.
+
+# want <label> <expected> <got>
+want() {
+  if [[ $2 == "$3" ]]; then
+    pass "selftest $1: $3"
+  else
+    fail "selftest $1: want $2, got $3"
+  fi
+}
+
+# refutes <label> <command...>: the assertion under test has to fail here.
+refutes() {
+  local label=$1 before=$FAILED
+  shift
+  FAILED=0
+  "$@" >/dev/null
+  if ((FAILED)); then
+    FAILED=$before
+    pass "selftest $label: refused"
+  else
+    FAILED=$before
+    fail "selftest $label: accepted what it must refuse"
+  fi
+}
+
+ttr_of() { measure_ttr selftest t "$1" "$2" | tail -1 | cut -d= -f2; }
+
+cmd_selftest() {
+  MODE=selftest
+  WORK=$(mktemp -d)
+  ARTIFACTS=$WORK/artifacts
+  SITE="site-a"
+
+  printf '%s\n' "100 200 site-a" "101 200 site-a" "102 200 site-a" >"$WORK/frontdoor.log"
+  want "no fault, no recovery time" 0 "$(ttr_of 100 code)"
+  front_door_result "selftest clean window" 100 strict
+
+  printf '%s\n' "100 200 site-a" "101 503 -" "102 503 -" "103 200 site-a" >"$WORK/frontdoor.log"
+  want "recovery time spans the outage" 3 "$(ttr_of 100 code)"
+  refutes "a 5xx window" front_door_result "selftest outage" 100 strict
+
+  printf '%s\n' "100 200 site-a" "101 000 -" "102 200 site-a" >"$WORK/frontdoor.log"
+  refutes "a call that never connected" front_door_result "selftest connects" 100 strict
+  front_door_result "selftest connects recorded" 100 lenient
+
+  printf '%s\n' "100 200 hub" "101 200 site-a" >"$WORK/frontdoor.log"
+  want "the front door was up throughout" 0 "$(ttr_of 100 code)"
+  want "the site came back into the draw" 1 "$(ttr_of 100 draw)"
+
+  printf '%s\n' "100 503 -" "101 503 -" >"$WORK/frontdoor.log"
+  want "an outage that never recovered" unrecovered "$(ttr_of 100 code)"
+
+  printf '%s\n' "100 true true" "101 false true" "102 gone gone" >"$WORK/drain.log"
+  assert_drain_order "selftest drain order"
+  printf '%s\n' "100 true true" "101 true false" "102 gone gone" >"$WORK/drain.log"
+  refutes "a ready endpoint that outlived its container" assert_drain_order "selftest late endpoint"
+  : >"$WORK/drain.log"
+  refutes "a drain nobody watched" assert_drain_order "selftest unobserved drain"
+
+  printf '%s\n' "100 503 0" "101 000 0" "102 200 3" >"$WORK/catalog.log"
+  assert_catalog "selftest catalog" 100
+  printf '%s\n' "100 200 0" "101 200 3" >"$WORK/catalog.log"
+  refutes "a 200 carrying no providers" assert_catalog "selftest empty catalog" 100
+
+  rm -rf "$WORK"
+  if ((FAILED)); then
+    printf 'RESULT: FAIL (selftest)\n'
+    return 1
+  fi
+  printf 'RESULT: PASS (selftest)\n'
+}
+
+# ---------------------------------------------------------------------------
 # Certificate rotation
 # ---------------------------------------------------------------------------
 
@@ -877,12 +1334,15 @@ watch_hub_path() {
 
 stop_monitors() {
   local pid
-  for pid in "$WATCH_PID" "$MTLS_PID" "$HUBPATH_PID"; do
+  for pid in "$WATCH_PID" "$MTLS_PID" "$HUBPATH_PID" "$FRONTDOOR_PID" "$CATALOG_PID" "$DRAIN_PID"; do
     [[ -z $pid ]] || kill "$pid" 2>/dev/null || true
   done
   WATCH_PID=""
   MTLS_PID=""
   HUBPATH_PID=""
+  FRONTDOOR_PID=""
+  CATALOG_PID=""
+  DRAIN_PID=""
 }
 
 # monitor_result <log> <label>: every call answered 200 within its tries.
@@ -1172,6 +1632,7 @@ cmd_test() {
     start_renewal_watch
     assert_membership
     assert_serving
+    assert_ha
     assert_site_route
     assert_pin_no_renewal
     assert_renewal
@@ -1190,6 +1651,7 @@ case ${1:-all} in
     CREATED=0
     ;;
   test) cmd_test ;;
+  selftest) cmd_selftest ;;
   down) cmd_down ;;
   all)
     cmd_up
