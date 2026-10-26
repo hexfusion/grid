@@ -195,8 +195,8 @@ pub struct OperatorCtx {
 
     /// How this site learns its members.
     membership: crate::cli::Membership,
-    /// Whether the install declares a signals listener, which only the poll transport runs.
-    signals_declared: bool,
+    /// What the declared signals listener's task reports, `None` when the install declares none.
+    signals_listener: Option<crate::signals_listener::Report>,
 
     /// The last value logged per state, so a pass logs at INFO only what changed.
     pub(crate) logged: ChangeLog,
@@ -394,7 +394,7 @@ impl OperatorCtx {
             mode_restart: None,
             site_name: None,
             membership: crate::cli::Membership::Swim,
-            signals_declared: false,
+            signals_listener: None,
             logged: ChangeLog::default(),
             started: Instant::now(),
         }
@@ -557,10 +557,11 @@ impl OperatorCtx {
         self
     }
 
-    /// Whether the install declares a signals listener, which the `SignalsListener` condition reports on.
+    /// The declared signals listener's report, which the `SignalsListener` condition reads;
+    /// `None` when the install declares none.
     #[must_use]
-    pub const fn with_signals_declared(mut self, declared: bool) -> Self {
-        self.signals_declared = declared;
+    pub fn with_signals_listener(mut self, report: Option<crate::signals_listener::Report>) -> Self {
+        self.signals_listener = report;
         self
     }
 
@@ -2007,8 +2008,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
-    let listener = crate::signals_listener::Listener::of(ctx.signals_declared, ctx.signal_mode);
-    Box::pin(apply_signals_listener_condition(client, &network, listener)).await;
+    let served = ctx.signals_listener.as_ref().map(|report| report.borrow().clone());
+    let listener = crate::signals_listener::Listener::of(served.as_ref(), ctx.signal_mode);
+    Box::pin(apply_signals_listener_condition(client, &network, listener.as_ref())).await;
     Box::pin(apply_rollup(client, &network)).await;
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
@@ -2121,7 +2123,7 @@ fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held
 async fn apply_signals_listener_condition(
     client: &Client,
     network: &GridNetwork,
-    listener: Option<crate::signals_listener::Listener>,
+    listener: Option<&crate::signals_listener::Listener>,
 ) {
     let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
         return;
