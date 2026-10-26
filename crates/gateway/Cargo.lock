@@ -3066,7 +3066,7 @@ dependencies = [
 [[package]]
 name = "praxis-ai-apis"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+source = "git+https://github.com/praxis-proxy/ai.git?rev=c39f7198932d408b12f35cd57a2457067e67d0cf#c39f7198932d408b12f35cd57a2457067e67d0cf"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3098,7 +3098,7 @@ dependencies = [
 [[package]]
 name = "praxis-ai-filters"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+source = "git+https://github.com/praxis-proxy/ai.git?rev=c39f7198932d408b12f35cd57a2457067e67d0cf#c39f7198932d408b12f35cd57a2457067e67d0cf"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3129,7 +3129,7 @@ dependencies = [
 [[package]]
 name = "praxis-ai-store"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+source = "git+https://github.com/praxis-proxy/ai.git?rev=c39f7198932d408b12f35cd57a2457067e67d0cf#c39f7198932d408b12f35cd57a2457067e67d0cf"
 dependencies = [
  "async-trait",
  "dashmap",
