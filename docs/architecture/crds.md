@@ -299,21 +299,6 @@ until every site names one source.
 | `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
 | `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
 
-A `SignalsListener` condition, under its own field manager
-(`grid-operator-signals-listener`), reports whether the signals listener the
-install declares serves. The operator runs it only under the poll transport, and
-under poll the condition reads what the listener task reports, not what is
-configured: `True` only once it is bound. Once the install declares no listener,
-the operator removes the condition it wrote.
-
-| Status | Reason | When |
-|---|---|---|
-| `False` | `GossipTransport` | The signals Service is rendered but the signal transport is gossip, so nothing listens on it. Set the GridNetwork's `signalTransport` to `poll`, or turn signals off. |
-| `False` | `Starting` | The transport is poll and the listener has not bound yet. |
-| `False` | `TLSMaterialUnavailable` | This site's TLS material is unavailable, so the listener serves nothing; it retries every 30 s. |
-| `False` | `BindFailed` | The listener could not bind its address; the message carries the error. It retries every 30 s. |
-| `True` | `SignalsListener` | The transport is poll and the listener is bound and serving. |
-
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
 Rejected rows are dropped and counted in
@@ -333,6 +318,21 @@ membership-convergence gate, so an initial empty snapshot cannot erase a live
 rejection during restart. Signal collection continues while this gate is held.
 A round begun while held cannot publish even if convergence finishes during
 collection; the next round uses the converged membership.
+
+A `SignalsListener` condition, under its own field manager
+(`grid-operator-signals-listener`), reports whether the signals listener the
+install declares serves. The operator runs it only under the poll transport, and
+under poll the condition reads what the listener task reports, not what is
+configured: `True` only once it is bound. Once the install declares no listener,
+the operator removes the condition it wrote.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `GossipTransport` | The signals Service is rendered but the signal transport is gossip, so nothing listens on it. Set the GridNetwork's `signalTransport` to `poll`, or turn signals off. |
+| `False` | `Starting` | The transport is poll and the listener has not bound yet. |
+| `False` | `TLSMaterialUnavailable` | This site's TLS material is unavailable, so the listener serves nothing; it retries every 30 s. |
+| `False` | `BindFailed` | The listener could not bind its address; the message carries the error. It retries every 30 s. |
+| `True` | `SignalsListener` | The transport is poll and the listener is bound and serving. |
 
 `remoteProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
