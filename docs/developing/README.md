@@ -1,36 +1,35 @@
 # Developing Grid
 
-Run a two-site grid on a laptop with kind: a hub and a site cluster, SPIFFE peer
-trust, polled signals, and the operator's generated `grid_site_route` config.
-CI runs the same script on every pull request.
+Run a two-site grid on a laptop with kind: a hub and a site cluster with SPIFFE
+peer trust and polled signals. CI runs the same script on every pull request.
 
-## Prerequisites
+## Dependencies
 
-- Docker or Podman, kind, kubectl, Helm, Git
-- The Rust toolchain from `rust-toolchain.toml`, used to build the images and
-  [Forge](forge.md)
-- About 4 vCPU and 16 GB of memory
+- Linux with Docker (macOS is not verified: images are linux/amd64 and kind
+  LoadBalancer addresses are not reachable from the host)
+- [kind](https://kind.sigs.k8s.io) v0.32.0, kubectl, [Helm](https://helm.sh) v3.17.3, Git
+- Rust from `rust-toolchain.toml`, used to install [Forge](forge.md)
+- 4 vCPU, 16 GB memory, 20 GB disk
 
 ## Bring it up
 
 ```bash
 git clone https://github.com/praxis-proxy/grid && cd grid
 ./scripts/forge.sh install
-MODES=spiffe HUB_ROUTER=operator KEEP=1 scripts/e2e-hub-site.sh all
+
+# Use published images for this commit instead of building them
+export SKIP_BUILD=1 IMAGE_PREFIX=ghcr.io/praxis-proxy/grid- IMAGE_TAG=sha-$(git rev-parse HEAD | cut -c1-7)
+for i in operator gateway enrollment; do docker pull "$IMAGE_PREFIX$i:$IMAGE_TAG"; done
+
+# Create the hub and site clusters
+./scripts/e2e-hub-site.sh up
+
+# Install with SPIFFE trust (MODES=spiffe) and polled signals with
+# operator-generated routing (HUB_ROUTER=operator); leaves the grid running
+MODES=spiffe HUB_ROUTER=operator ./scripts/e2e-hub-site.sh test
 ```
 
-With rootless Podman:
-
-```bash
-CONTAINER_TOOL=podman \
-KIND_CREATE_PREFIX="systemd-run --scope --user -p Delegate=yes" \
-NET_PREFIX="podman unshare --rootless-netns" \
-MODES=spiffe HUB_ROUTER=operator KEEP=1 scripts/e2e-hub-site.sh all
-```
-
-`all` builds the images, creates the clusters, installs both sites, and runs the
-assertions. Run `up` and then `test` to split the steps. `SKIP_BUILD=1` reuses
-images you already built.
+To build the images yourself, unset `SKIP_BUILD`, `IMAGE_PREFIX` and `IMAGE_TAG`.
 
 ## Look around
 
@@ -42,15 +41,13 @@ kubectl --context kind-grid-hub-site-site -n grid get gridsites
 ## Tear down
 
 ```bash
-scripts/e2e-hub-site.sh down
+./scripts/e2e-hub-site.sh down
 ```
 
 ## Notes
 
-- The Helm commands behind the script are in
+- The Helm commands the script runs are in
   [examples/helm/hub-site](../../examples/helm/hub-site/README.md).
-- On macOS, kind LoadBalancer addresses are not reachable from the host without
-  extra setup.
 - Membership on `main` still uses SWIM. Declared membership with SWIM off is in
   progress.
 
