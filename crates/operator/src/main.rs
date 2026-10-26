@@ -319,6 +319,7 @@ async fn main() {
             .with_mode_restart(mode_restart)
             .with_site_name(config.swim.site_name.clone())
             .with_membership(config.grid.membership)
+            .with_signals_declared(config.signals.local_addr().is_some())
             .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
     );

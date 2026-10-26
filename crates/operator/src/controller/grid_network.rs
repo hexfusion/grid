@@ -195,6 +195,8 @@ pub struct OperatorCtx {
 
     /// How this site learns its members.
     membership: crate::cli::Membership,
+    /// Whether the install declares a signals listener, which only the poll transport runs.
+    signals_declared: bool,
 
     /// The last value logged per state, so a pass logs at INFO only what changed.
     pub(crate) logged: ChangeLog,
@@ -392,6 +394,7 @@ impl OperatorCtx {
             mode_restart: None,
             site_name: None,
             membership: crate::cli::Membership::Swim,
+            signals_declared: false,
             logged: ChangeLog::default(),
             started: Instant::now(),
         }
@@ -551,6 +554,13 @@ impl OperatorCtx {
                 false
             },
         });
+        self
+    }
+
+    /// Whether the install declares a signals listener, which the `SignalsListener` condition reports on.
+    #[must_use]
+    pub const fn with_signals_declared(mut self, declared: bool) -> Self {
+        self.signals_declared = declared;
         self
     }
 
@@ -1997,6 +2007,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
+    if let Some(listener) = crate::signals_listener::Listener::of(ctx.signals_declared, ctx.signal_mode) {
+        Box::pin(apply_signals_listener_condition(client, &network, listener)).await;
+    }
     Box::pin(apply_rollup(client, &network)).await;
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
@@ -2103,6 +2116,26 @@ pub async fn apply_rollup(client: &Client, network: &GridNetwork) {
 /// The condition of `type_` in `held`.
 fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held Condition> {
     held.iter().find(|condition| condition.type_ == type_)
+}
+
+/// Write the `SignalsListener` condition when it changed.
+async fn apply_signals_listener_condition(
+    client: &Client,
+    network: &GridNetwork,
+    listener: crate::signals_listener::Listener,
+) {
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return;
+    };
+    let Some((name, patch)) = crate::signals_listener::patch(network, listener, &now) else {
+        return;
+    };
+    let params = PatchParams::apply(crate::signals_listener::FIELD_MANAGER).force();
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        Ok(_) => tracing::info!(?listener, network = name, "signals listener condition written"),
+        Err(error) => tracing::warn!(%error, "signals listener condition not written; retrying next reconcile"),
+    }
 }
 
 /// Advance the explicitly configured local [`GridSite`] into discovery.

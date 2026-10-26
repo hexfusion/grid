@@ -299,6 +299,16 @@ until every site names one source.
 | `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
 | `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
 
+A `SignalsListener` condition, under its own field manager
+(`grid-operator-signals-listener`), reports whether the signals listener the
+install declares runs. The operator runs it only under the poll transport. It
+is written only when the install declares a listener.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `SignalsListenerAbsent` | The signals Service is rendered but the signal transport is gossip, so nothing listens on it. Set the GridNetwork's `signalTransport` to `poll`, or turn signals off. |
+| `True` | `SignalsListenerServing` | The transport is poll and the listener runs. |
+
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
 Rejected rows are dropped and counted in
