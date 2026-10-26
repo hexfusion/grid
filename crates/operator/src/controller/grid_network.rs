@@ -2007,9 +2007,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
-    if let Some(listener) = crate::signals_listener::Listener::of(ctx.signals_declared, ctx.signal_mode) {
-        Box::pin(apply_signals_listener_condition(client, &network, listener)).await;
-    }
+    let listener = crate::signals_listener::Listener::of(ctx.signals_declared, ctx.signal_mode);
+    Box::pin(apply_signals_listener_condition(client, &network, listener)).await;
     Box::pin(apply_rollup(client, &network)).await;
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
@@ -2118,11 +2117,11 @@ fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held
     held.iter().find(|condition| condition.type_ == type_)
 }
 
-/// Write the `SignalsListener` condition when it changed.
+/// Write the `SignalsListener` condition when it changed, removing it once none is declared.
 async fn apply_signals_listener_condition(
     client: &Client,
     network: &GridNetwork,
-    listener: crate::signals_listener::Listener,
+    listener: Option<crate::signals_listener::Listener>,
 ) {
     let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
         return;

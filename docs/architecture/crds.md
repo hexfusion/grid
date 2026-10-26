@@ -301,8 +301,8 @@ until every site names one source.
 
 A `SignalsListener` condition, under its own field manager
 (`grid-operator-signals-listener`), reports whether the signals listener the
-install declares runs. The operator runs it only under the poll transport. It
-is written only when the install declares a listener.
+install declares runs. The operator runs it only under the poll transport. Once
+the install declares no listener, the operator removes the condition it wrote.
 
 | Status | Reason | When |
 |---|---|---|

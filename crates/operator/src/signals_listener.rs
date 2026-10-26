@@ -59,15 +59,20 @@ impl Listener {
     }
 }
 
+/// The `SignalsListener` condition the live status holds.
+fn held(network: &GridNetwork) -> Option<&Condition> {
+    network
+        .status
+        .as_ref()
+        .and_then(|live| live.conditions.iter().find(|held| held.type_ == SIGNALS_LISTENER))
+}
+
 /// The condition for `listener`, or `None` when the live status already says it.
 #[must_use]
 pub fn condition(network: &GridNetwork, listener: Listener, now_rfc3339: &str) -> Option<Condition> {
     let (state, reason, message) = listener.verdict();
     let generation = network.metadata.generation;
-    let held = network
-        .status
-        .as_ref()
-        .and_then(|live| live.conditions.iter().find(|held| held.type_ == SIGNALS_LISTENER));
+    let held = held(network);
     if held.is_some_and(|held| {
         held.status == state
             && held.reason == reason
@@ -89,22 +94,31 @@ pub fn condition(network: &GridNetwork, listener: Listener, now_rfc3339: &str) -
     })
 }
 
-/// The status patch carrying the condition, or `None` when the live status already says it.
+/// The status patch for `listener`, or `None` when the live status already says it.
+///
+/// With no listener declared the patch carries no condition: conditions merge by type, so
+/// applying none under [`FIELD_MANAGER`] removes only the one it wrote, and nothing is
+/// written while none is held.
 #[must_use]
 pub fn patch<'network>(
     network: &'network GridNetwork,
-    listener: Listener,
+    listener: Option<Listener>,
     now_rfc3339: &str,
 ) -> Option<(&'network str, Value)> {
     let name = network.metadata.name.as_deref()?;
-    let condition = condition(network, listener, now_rfc3339)?;
+    let conditions = if let Some(listener) = listener {
+        vec![condition(network, listener, now_rfc3339)?]
+    } else {
+        held(network)?;
+        Vec::new()
+    };
     Some((
         name,
         serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridNetwork",
             "metadata": { "name": name },
-            "status": { "conditions": [condition] }
+            "status": { "conditions": conditions }
         }),
     ))
 }
@@ -159,5 +173,23 @@ mod tests {
         assert!(condition(&live, Listener::Absent, "t1").is_none(), "already says it");
         let flipped = condition(&live, Listener::Serving, "t1").expect("flipped");
         assert_eq!(flipped.last_transition_time, "t1");
+    }
+
+    #[test]
+    fn a_held_condition_is_removed_once_no_listener_is_declared() {
+        let mut live = network();
+        assert!(patch(&live, None, "t0").is_none(), "nothing held, nothing written");
+        let written = condition(&live, Listener::Serving, "t0").expect("written");
+        live.status = Some(GridNetworkStatus {
+            conditions: vec![written],
+            ..GridNetworkStatus::default()
+        });
+        let (name, cleared) = patch(&live, None, "t1").expect("the stale condition is removed");
+        assert_eq!(name, "grid");
+        assert_eq!(
+            cleared.pointer("/status/conditions"),
+            Some(&serde_json::json!([])),
+            "an empty condition set under the field manager removes what it wrote"
+        );
     }
 }
