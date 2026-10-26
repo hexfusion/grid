@@ -13,11 +13,11 @@ use crate::crd::{
 /// The condition's type.
 pub const SIGNALS_LISTENER: &str = "SignalsListener";
 
-/// Reason while the declared listener serves.
-pub const SIGNALS_LISTENER_SERVING: &str = "SignalsListenerServing";
+/// Reason while the declared listener serves; a True reason names the type.
+pub const SIGNALS_LISTENER_SERVING: &str = SIGNALS_LISTENER;
 
-/// Reason while the install declares a listener the transport never starts.
-pub const SIGNALS_LISTENER_ABSENT: &str = "SignalsListenerAbsent";
+/// Reason while the install declares a listener the gossip transport never starts.
+pub const SIGNALS_LISTENER_ABSENT: &str = "GossipTransport";
 
 /// Server-side apply manager, apart from `GridNetwork` reconciliation.
 pub const FIELD_MANAGER: &str = "grid-operator-signals-listener";

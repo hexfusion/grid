@@ -306,8 +306,8 @@ is written only when the install declares a listener.
 
 | Status | Reason | When |
 |---|---|---|
-| `False` | `SignalsListenerAbsent` | The signals Service is rendered but the signal transport is gossip, so nothing listens on it. Set the GridNetwork's `signalTransport` to `poll`, or turn signals off. |
-| `True` | `SignalsListenerServing` | The transport is poll and the listener runs. |
+| `False` | `GossipTransport` | The signals Service is rendered but the signal transport is gossip, so nothing listens on it. Set the GridNetwork's `signalTransport` to `poll`, or turn signals off. |
+| `True` | `SignalsListener` | The transport is poll and the listener runs. |
 
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
