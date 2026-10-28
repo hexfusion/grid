@@ -900,6 +900,12 @@ mod tests {
         );
         assert_eq!(Unreachable::of(RequestOutcome::Timeout, None), Unreachable::Timeout);
         assert_eq!(
+            Unreachable::of(RequestOutcome::Config, None),
+            Unreachable::Config,
+            "a client this site cannot build reads a cause, not Unknown forever"
+        );
+        assert_eq!(Unreachable::Config.reason(), "ClientConfigInvalid");
+        assert_eq!(
             Unreachable::of(RequestOutcome::Deadline, None),
             Unreachable::RoundDeadline
         );

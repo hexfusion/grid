@@ -1548,6 +1548,8 @@ pub enum Unreachable {
     Refused,
     /// This site's round ran out before the peer could be polled in full.
     RoundDeadline,
+    /// This site could not build a client for the peer, so it was never dialled.
+    Config,
     /// Any other failure, by its outcome.
     Failed(RequestOutcome),
 }
@@ -1559,6 +1561,7 @@ impl Unreachable {
         match (outcome, status) {
             (_, Some(404)) => Self::NotFound,
             (RequestOutcome::Deadline, _) => Self::RoundDeadline,
+            (RequestOutcome::Config, _) => Self::Config,
             (RequestOutcome::Timeout, _) => Self::Timeout,
             (RequestOutcome::Tls, _) => Self::Tls,
             (RequestOutcome::Refused, _) => Self::Refused,
@@ -1575,6 +1578,7 @@ impl Unreachable {
             Self::Tls => "TLSRefused",
             Self::Refused => "ConnectionRefused",
             Self::RoundDeadline => "RoundDeadline",
+            Self::Config => "ClientConfigInvalid",
             Self::Failed(_) => "RequestFailed",
         }
     }
@@ -1587,6 +1591,10 @@ impl Unreachable {
             Self::Timeout => "timed out".to_owned(),
             Self::Tls => "TLS handshake or identity refused".to_owned(),
             Self::Refused => "connection refused".to_owned(),
+            Self::Config => {
+                "not dialled: this site cannot build a client for it from its pins or trust, see the operator log"
+                    .to_owned()
+            },
             Self::RoundDeadline => {
                 "not polled in full: this site's poll round ran out first, so lengthen the round or raise \
                  the dial concurrency"
@@ -1647,6 +1655,7 @@ impl PollPeers {
             Err(error) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
                 guard.finish(RequestOutcome::Config, 0);
+                self.failures.observe(peer, false, Unreachable::Config);
                 return None;
             },
         };
