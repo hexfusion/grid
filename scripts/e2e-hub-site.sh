@@ -10,7 +10,9 @@
 #   selftest  check the HA verdicts against synthetic monitor logs, no cluster
 #
 # Env:
-#   MODES               peer trust modes to test (default "pin spiffe")
+#   MODES               legs to run (default "pin spiffe"): the peer trust modes, and
+#                       local, which is spiffe trust under Local membership, with signals
+#                       polled where the GridSites say and no SWIM seed between the sites
 #   HUB_ROUTER          hub gateway config: render (default), or operator, which serves the
 #                       operator's generated gridSiteRoute config under poll signals
 #   IMAGE_PREFIX        image repository prefix (default localhost/grid-)
@@ -82,6 +84,7 @@ FAILED=0
 REFUSALS_FROM=""
 CREATED=0
 MODE=""
+TRUST=""
 
 cleanup() {
   [[ -z $PF_PID ]] || kill "$PF_PID" 2>/dev/null || true
@@ -238,8 +241,15 @@ renews() { [[ $MODE == spiffe && -n ${ROTATION_LIFETIME:-} ]]; }
 # site_route: the hub gateway serves the operator's generated gridSiteRoute config.
 site_route() { [[ $HUB_ROUTER == operator ]]; }
 
+# local_source: this leg runs Local membership, polling signals where the GridSites say, with
+# no SWIM seed between the sites.
+local_source() { [[ $MODE == local ]]; }
+
+# polls: this leg runs signals in poll.
+polls() { renews || local_source || site_route; }
+
 # renewal_args <chart>: a short lifetime and a grid-admin for the renewal leg, and signals
-# polling for it and the site route leg.
+# polling for it, the Local membership leg and the site route leg.
 renewal_args() {
   RA=()
   if renews && [[ $1 == grid-enrollment ]]; then
@@ -260,12 +270,14 @@ renewal_args() {
     esac
     return 0
   fi
-  renews || site_route || return 0
+  ! local_source || RA+=(--set grid.membership.source=Local)
+  ! local_source || [[ $1 != grid-operator ]] || RA+=(--set signals.service.type=LoadBalancer)
+  polls || return 0
   case $1 in
     # grid.signals starts the operator in poll before its GridNetwork exists; without grid.id
     # the chart turns the signals listener on only when asked.
-    grid-operator) RA=(--set grid.signals=poll --set signals.enabled=true) ;;
-    grid-site) RA=(--set gridNetwork.signalTransport.mode=poll) ;;
+    grid-operator) RA+=(--set grid.signals=poll --set signals.enabled=true) ;;
+    grid-site) RA+=(--set gridNetwork.signalTransport.mode=poll) ;;
   esac
 }
 
@@ -442,8 +454,11 @@ install_hub() {
   images operator
   renewal_args grid-operator
   ha_operator_args
+  # Local membership: the site's gateway and signals share one load balancer, so the hub dials the
+  # gateway host at the signals port, under <site>-signals.grid.internal, which the listener ignores.
+  ! local_source || RA+=(--set signals.peerEndpointPort=9091)
   helm_on "$HUB_CTX" "$NS" grid-operator grid-operator "${RA[@]}" "${OA[@]}" \
-    --set swim.siteName=hub --set enrollment.enabled=true --set grid.peerTrust="$MODE" \
+    --set swim.siteName=hub --set enrollment.enabled=true --set grid.peerTrust="$TRUST" \
     --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$HUB_SWIM_IP" \
     --set signals.service.loadBalancerIP="$HUB_SIG_IP" || die "install hub grid-operator"
@@ -455,7 +470,7 @@ install_hub() {
   renewal_args grid-site
   HUB_SITE_ARGS=("${RA[@]}" --set gridNetwork.gridId="$PREFIX-e2e" --set gridSite.name=hub
     --set "peers.$SITE.address=$SITE_GW_IP:8080"
-    --set gridNetwork.peerTrust.mode="$MODE" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
+    --set gridNetwork.peerTrust.mode="$TRUST" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
     --set "gridNetwork.consumerGateways[0].namespace=$NS" --set "gridNetwork.consumerGateways[0].siteName=hub")
   SR=()
   site_route && site_route_providers vcr hub-local
@@ -516,16 +531,27 @@ EOF
 }
 
 install_site() {
-  local trust
+  local trust seeds
   images operator
   renewal_args grid-operator
+  seeds=(--set "swim.seeds=$HUB_SWIM_IP:7946")
+  ! local_source || seeds=()
+  local sig_ip=$SITE_SIG_IP shared=()
+  # One load balancer per site: the signals Service shares the gateway's address. MetalLB
+  # shares an address between Local Services only with one selector, so it is Cluster, and
+  # every peer arrives from a node address, which needs the per-source cap raised.
+  if local_source; then
+    sig_ip=$SITE_GW_IP
+    shared=(--set-string 'signals.service.annotations.metallb\.universe\.tf/allow-shared-ip=grid-site'
+      --set signals.service.externalTrafficPolicy=Cluster --set signals.maxHandshakesPerSource=64)
+  fi
   helm_on "$SITE_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
-    --set "swim.siteName=$SITE" --set "swim.seeds=$HUB_SWIM_IP:7946" \
+    --set "swim.siteName=$SITE" "${seeds[@]}" \
     --set enrollment.enabled=true \
     --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
-    --set grid.peerTrust="$MODE" \
+    --set grid.peerTrust="$TRUST" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" \
-    --set signals.service.loadBalancerIP="$SITE_SIG_IP" || die "install site grid-operator"
+    --set signals.service.loadBalancerIP="$sig_ip" "${shared[@]}" || die "install site grid-operator"
   enrollment_forward || die "enrollment forward"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" grid-ca-bundle ca.crt || die "copy the site CA bundle"
   k "$SITE_CTX" label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true >/dev/null || die "opt the site CA bundle in"
@@ -540,16 +566,18 @@ install_site() {
   helm_on "$SITE_CTX" "$NS" grid-site grid-site "${RA[@]}" \
     --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" --set "peers.hub.digest=$HUB_DIGEST" \
     --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000" \
-    --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$MODE" || die "install site grid-site"
+    --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$TRUST" || die "install site grid-site"
   trust=(--set "praxisConfig.render.peerTrust.digest=$HUB_DIGEST")
-  [[ $MODE == pin ]] || trust=(--set praxisConfig.render.peerTrust.mode=spiffe
+  [[ $TRUST == pin ]] || trust=(--set praxisConfig.render.peerTrust.mode=spiffe
     --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub)
+  local gw_shared=()
+  ! local_source || gw_shared=(--set-string 'service.annotations.metallb\.universe\.tf/allow-shared-ip=grid-site')
   images gateway
   helm_on "$SITE_CTX" "$NS" grid-gateway praxis-gateway \
     --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set praxisConfig.render.role=provider \
     --set "grid.siteName=$SITE" --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca "${trust[@]}" \
     --set "praxisConfig.render.backends.local.endpoint=$MODEL_IP:8000" \
-    "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
+    "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" "${gw_shared[@]}" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
   eventually "$SITE GridNetwork reports Enrolled by the signer" site_reports_enrolled "$SITE_CTX" \
@@ -610,10 +638,30 @@ assert_membership() {
       fail "$name identity SPIFFE ID: $(spiffe_id_of "$ctx")"
     fi
   done
-  eventually "hub GridSite grid-$SITE Active (identity-verified probe)" site_phase_in "$HUB_CTX" "grid-$SITE" Active || true
-  # The hub gateway is ClusterIP, so the hub gossips no gateway address and stays Discovered on the site.
-  eventually "site GridSite grid-hub Discovered over SWIM" site_phase_in "$SITE_CTX" grid-hub Discovered || true
-  eventually "hub GridNetwork Active with >=1 connected site" network_active "$HUB_CTX" || true
+  # The chart names a peer as SWIM discovery does, <network>-<name>, except under Local membership.
+  local peer=grid-$SITE
+  ! local_source || peer=$SITE
+  eventually "hub GridSite $peer Active (identity-verified probe)" site_phase_in "$HUB_CTX" "$peer" Active || true
+  if local_source; then
+    # No SWIM between the sites: the hub reaches the site only where its GridSite says.
+    eventually "hub polled $SITE at its signals endpoint from its GridSite" polled "$HUB_CTX" 19090 || true
+    if [[ $(k "$HUB_CTX" get gridnetwork grid -o jsonpath='{.status.connectedSites}') == 0 ]]; then
+      pass "no site connected over SWIM, as the leg intends"
+    else
+      fail "SWIM connected the sites with no seed between them"
+    fi
+    for ctx in "$HUB_CTX" "$SITE_CTX"; do
+      if k "$ctx" get service grid-operator-swim >/dev/null 2>&1; then
+        fail "$ctx renders a SWIM Service under Local membership"
+      else
+        pass "$ctx runs no SWIM Service under Local membership"
+      fi
+    done
+  else
+    # The hub gateway is ClusterIP, so the hub gossips no gateway address and stays Discovered on the site.
+    eventually "site GridSite grid-hub Discovered over SWIM" site_phase_in "$SITE_CTX" grid-hub Discovered || true
+    eventually "hub GridNetwork Active with >=1 connected site" network_active "$HUB_CTX" || true
+  fi
   # Operator state only: the hub gateway routes on its static backends, not this overlay.
   eventually "operator renders the hub overlay with a remote candidate" overlay_distributed || true
 }
@@ -753,9 +801,9 @@ assert_serving() {
   fi
   # pin refuses an unpinned leaf in the filter, spiffe an unlisted ID in the handshake.
   code=$(chat_body | site_call "$WORK/rogue" /v1/chat/completions --cert "$d/rogue.crt" --key "$d/rogue.key" -d @-)
-  if [[ $MODE == pin && $code == 403 ]] && ! grep -qi '^x-grid-provider-site:' "$WORK/rogue.hdr"; then
+  if [[ $TRUST == pin && $code == 403 ]] && ! grep -qi '^x-grid-provider-site:' "$WORK/rogue.hdr"; then
     pass "enrolled identity the site does not pin: 403"
-  elif [[ $MODE == spiffe ]] && refused_handshake "$WORK/rogue" "$code" --cert "$d/rogue.crt" --key "$d/rogue.key"; then
+  elif [[ $TRUST == spiffe ]] && refused_handshake "$WORK/rogue" "$code" --cert "$d/rogue.crt" --key "$d/rogue.key"; then
     pass "enrolled identity outside spiffeIds: TLS alert, curl exit $(cat "$WORK/rogue.rc")"
   else
     fail "enrolled identity the site does not trust: HTTP $code, curl exit $(cat "$WORK/rogue.rc") ($(tr '\n' ' ' <"$WORK/rogue.err" | cut -c1-200))"
@@ -2082,13 +2130,13 @@ assert_rotation_declared() {
     declared=$(k "$ctx" get configmap grid-operator-config -o jsonpath='{.data.config\.yaml}' \
       | sed -n 's/^ *rotation: "\{0,1\}\([A-Za-z]*\)"\{0,1\}$/\1/p')
     want=""
-    [[ $MODE == pin ]] && want=Disabled
+    [[ $TRUST == pin ]] && want=Disabled
     if [[ $declared == "$want" ]]; then
       pass "$ctx: the operator config declares site.signerEndpoint.rotation '${declared:-default Enabled}'"
     else
       fail "$ctx: the operator config declares site.signerEndpoint.rotation '$declared', want '$want'"
     fi
-    if [[ $MODE == pin ]]; then
+    if [[ $TRUST == pin ]]; then
       eventually "$ctx: GridNetwork reports RotationOnSchedule True with rotation Disabled under pin" \
         rotation_reads "$ctx" True/RotationOnSchedule || true
       eventually "$ctx: GridNetwork is Accepted with rotation Disabled under pin" accepted_reads "$ctx" True/Accepted || true
@@ -2102,7 +2150,7 @@ assert_rotation_declared() {
 cmd_test() {
   local m tool
   for m in $MODES; do
-    case $m in pin | spiffe) ;; *) die "MODES entry $m is not pin or spiffe" ;; esac
+    case $m in pin | spiffe | local) ;; *) die "MODES entry $m is not pin, spiffe or local" ;; esac
   done
   case $HUB_ROUTER in render | operator) ;; *) die "HUB_ROUTER $HUB_ROUTER is not render or operator" ;; esac
   for tool in kubectl helm jq openssl curl; do
@@ -2124,6 +2172,8 @@ cmd_test() {
     eventually "the site model answers on $MODEL_LB_IP" model_lb_ready || die "no address for the hub-local model"
   fi
   for MODE in $MODES; do
+    TRUST=$MODE
+    ! local_source || TRUST=spiffe
     REFUSALS_FROM=""
     log "[$MODE] resetting the $NS namespace on both clusters"
     rm -rf "${ARTIFACTS:?}/$MODE"
