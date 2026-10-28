@@ -276,18 +276,26 @@ jobs:
           rm /tmp/kind
           kind version
 
-      - name: Download operator image
+      # Every image the kind path installs, as the hub-site legs download them. The operator
+      # alone was not enough: the enrollment chart then installed its published default, which
+      # on a release branch is a tag that does not exist yet, so its pods waited out a pull
+      # that could not succeed and the job hung on helm test.
+      - name: Download images
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: image-operator
+          pattern: image-*
           path: /tmp/images
+          merge-multiple: true
 
-      - name: Load operator image
-        run: docker load -i /tmp/images/grid-operator.tar
+      - name: Load images
+        run: |
+          for name in operator enrollment; do
+            docker load -i "/tmp/images/grid-${name}.tar"
+          done
 
       - name: Run Kind lifecycle tests
         run: |
-          KIND=1 GRID_OPERATOR_CI_TAG=ci ./scripts/verify-helm-chart.sh
+          KIND=1 GRID_IMAGE_TAG=ci ./scripts/verify-helm-chart.sh
 
       - name: Upload test logs
         if: always()
