@@ -103,6 +103,7 @@ relays every site's readings to its own gateway.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `grid_site_identity_expiry_timestamp_seconds` | gauge | | When the site identity certificate expires. |
+| `grid_swim_unavailable` | gauge | | 1 while SWIM is configured on this site but not running; the `GridNetwork` `Swim` condition reads `False` with the cause. |
 | `grid_site_identity_rotations_total` | counter | `result` | Site identity rotation attempts. |
 | `grid_swim_key_pending` | gauge | | 1 while SWIM holds traffic for its key. |
 | `grid_operator_config_ignored_sections` | gauge | | Top-level sections of the operator config that this operator does not read and ignores. |

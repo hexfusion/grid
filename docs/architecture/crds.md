@@ -218,6 +218,67 @@ means no polled peer has a rejected timestamp; `False` means at least one does.
 | `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
 | `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
 
+Under Local membership the poller also writes two counts, each under its own field
+manager. Which peers, and why, is on each peer's `GridSite`, as described in
+[Peer conditions under Local membership](#peer-conditions-under-local-membership).
+
+`PeerSignalsReachable` (`grid-operator-peer-reach`) counts the peers whose signals
+endpoint did not answer, or that have none. A peer not yet checked is not counted.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `NoPeersReachable` | No checked peer's signals endpoint answered. The message reads, for example, `3 of 3 peers unreachable`. |
+| `False` | `SomePeersUnreachable` | Some checked peers' signals endpoints did not answer. The message reads, for example, `2 of 5 peers unreachable`. |
+| `True` | `PeerSignalsReachable` | Every polled peer's signals endpoint answered. |
+
+`PeerCatalogsAccepted` (`grid-operator-peer-catalogs`) counts the peers whose catalog,
+or part of it, was refused, out of the peers whose catalog is held.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `SomeCatalogsRefused` | Some peers' catalogs were refused. The message reads, for example, `1 of 5 peers' catalogs refused`. |
+| `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
+
+A `Swim` condition, under its own field manager (`grid-operator-swim`), reads `True`
+with reason `Swim` while SWIM runs, and `False` when it is configured but cannot start,
+with a reason naming the cause and the detail in the message. The operator
+keeps running without membership gossip, rather than exiting into a restart loop. It
+restarts itself once a late advertise address appears, and 300 s after a failure that
+may clear on another try: `AdvertiseAddressUnresolved`, `RevisionLeaseFailed` or
+`StartFailed`. A setting that is wrong waits for a rollout that fixes it. Under Local
+membership the operator removes the condition, since SWIM never runs there.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `AdvertiseAddressPending` | No advertise address within 180 s; the operator restarts once one appears. |
+| `False` | `AdvertiseAddressUnresolved` | The advertise address could not be resolved; retried after 300 s. |
+| `False` | `AdvertiseAddressUnspecified` | The address to advertise is unspecified; set `GRID_SWIM_ADVERTISE_ADDR`. |
+| `False` | `BindAddressInvalid` | `GRID_SWIM_BIND_ADDR` is not a socket address. |
+| `False` | `KeyInvalid` | `GRID_SWIM_ENCRYPT_KEY` does not parse. |
+| `False` | `RevisionLeaseFailed` | The signal revision lease could not be reserved; retried after 300 s. |
+| `False` | `StartFailed` | The runtime failed to start, binding its socket included; retried after 300 s. |
+| `True` | `Swim` | SWIM runs. |
+
+**Membership source:** the chart value `grid.membership.source`, the operator's
+`GRID_MEMBERSHIP_SOURCE`, says where a site learns its members. It is install
+configuration, not a `GridNetwork` field. `Swim`, the default, discovers members by SWIM
+gossip. `Local` means this site's configuration lists its peers as `GridSite` objects.
+Local needs poll signals: an unset transport starts in poll, and gossip fails the render
+and the operator's startup. Both are supported peer options.
+
+A `PeerMembership` condition, under its own field manager
+(`grid-operator-peer-membership`), compares the `X-Grid-Membership` header each
+polled peer answers with against this site's `GRID_MEMBERSHIP_SOURCE`. A peer that sends
+no header is an older release and is judged by nothing. A grid that mixes sources is
+not supported: polling goes on so the direction that works still routes, but a
+Swim site never reads a Local site's catalog, and the condition stays False
+until every site names one source.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
+| `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
+
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
 Rejected rows are dropped and counted in
@@ -572,7 +633,7 @@ spec:
     address: egress.cluster-b.example.com:8443
     tls:
       mode: Mutual
-      serverName: egress.cluster-b.example.com
+      serverName: cluster-b.grid.internal
   trust:
     canonicalFingerprints:
       - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -664,7 +725,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 |---|---|---|
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
-| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
+| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered, or from Pending for a declared site with both endpoints; performs identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
@@ -676,6 +737,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
+| `EndpointsDeclared` | Connecting | Declared site names a dialable gateway endpoint, which also gives its signals endpoint; advancing without discovery |
 | `GatewayAddressMissing` | Discovered, Connecting, or Unreachable | No gateway address known (see `GRID_GATEWAY_ADDRESS`), or a previously probed site lost it |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
@@ -695,6 +757,9 @@ A discovered SWIM peer is not automatically authorized for routing.
 - Pending → Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
   peer is first observed as Alive (requires `grid.praxis.fast/auto-discover-sites: "true"`
   label on the `GridNetwork`).
+- Pending → Connecting: the `GridSite` controller advances a declared site (one without
+  the `grid.praxis.fast/auto-discovered` label) that sets a dialable
+  `spec.gatewayEndpoint.address`, so it does not wait on SWIM.
 - Discovered → Connecting: the `GridSite` controller advances automatically when
   `spec.gatewayEndpoint.address` is non-empty. For auto-discovered sites, the egress address comes from
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
@@ -742,6 +807,24 @@ structural check passed.  It does **not** mean:
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
 
+**Signals endpoint:** under Local membership a site serves its signals by default at its
+gateway endpoint's host, under the TLS server name `<site>-signals.grid.internal`, where `<site>` is
+the GridSite name. The port is the gateway's own, for a site whose one router selects the
+signals listener by server name, such as an OpenShift passthrough Route. The operator flag
+`GRID_SIGNALS_PEER_ENDPOINT_PORT` (chart `signals.peerEndpointPort`) sets one port for the
+grid instead, for sites whose one load balancer carries both. A site whose signals sit
+elsewhere sets the optional `spec.signalsEndpoint`, and each field it sets replaces the
+derived one. Loopback, link-local, and cloud metadata hosts are not dialled.
+
+**`spec.signalsEndpoint` fields**, all optional:
+
+| Field | Meaning |
+|---|---|
+| `address` | Signals listener `host:port`. Absent, the gateway endpoint's host |
+| `serverName` | TLS server name sent to the listener. Absent, `<site>-signals.grid.internal` |
+| `port` | Port, replacing the address's. Absent, the address's port, or for an address taken from the gateway endpoint the operator's signals port setting or the gateway's | The poller verifies the peer by pin or SPIFFE ID, so the
+server name need not appear in the peer's certificate.
+
 **`spec.gatewayEndpoint.tls` fields:**
 
 | Field | Meaning |
@@ -787,6 +870,44 @@ and its mTLS gateway probe (`spec.gatewayEndpoint` + `spec.trust`) apply to reac
 
 See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
 
+### Peer conditions under Local membership
+
+Under Local membership the lease holder writes two conditions on each peer's
+`GridSite`, each under its own field manager. They are this site's view of the peer.
+Neither gates the phase or `Available`. A `False` one raises the peer's `Degraded`,
+`SignalsReachable` first, then `CatalogAccepted`. `Degraded` copies its reason, and its
+message names the condition. The GridSite controller writes `Degraded` on the reconcile
+that the poller's write triggers.
+
+`SignalsReachable` (`grid-operator-peer-reach`) says whether the peer's signals endpoint
+answered the last poll. The message carries the polled address and the detail.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `SignalsReachable` | The peer's signals endpoint answered. |
+| `Unknown` | `AwaitingFirstCheck` | The peer has not yet answered or failed a poll. |
+| `False` | `NotFound` | It answered 404: check its signals endpoint and port. |
+| `False` | `Timeout` | It did not answer in time. |
+| `False` | `TLSRefused` | The TLS handshake or the peer's identity was refused. |
+| `False` | `ConnectionRefused` | The connection was refused or never established. |
+| `False` | `RequestFailed` | Any other failure, named in the message. |
+| `False` | `NoSignalsEndpoint` | The peer has no signals endpoint to poll: set `spec.signalsEndpoint`, or a dialable `spec.gatewayEndpoint`. |
+
+`CatalogAccepted` (`grid-operator-peer-catalogs`) says whether the peer's catalog was
+accepted in the last rendering. It is written once a catalog is held.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `CatalogAccepted` | The peer's catalog is accepted, in full or up to what it may contribute. Each declared peer is owed the overlay's 1024-candidate ceiling divided by the peers, one candidate per model; what is left once every peer has its share goes to the peers over theirs in the order their catalogs first arrived. A peer is never refused for its size: past what it may contribute, the rest of its catalog waits, models in name order, and the message counts how many of its candidates wait and names who took the rest. The message also names what the peer holds that another peer also names, and the peers it leaves short by taking the remainder. |
+| `False` | `OwnCluster` | A record names one of this site's own clusters. |
+| `False` | `HopClaimed` | A record names a cluster bound to another site's gateway hop. The message names that site. |
+| `False` | `ClusterClaimed` | A record names a cluster another peer holds by declaration: the cluster is bound to that peer's gateway hop, or carries that peer's name. The message names the holder. |
+| `False` | `ClusterContested` | A record names a cluster another peer also names, and nothing declares whose it is, so no peer routes it until the names differ. The message names the other peers. |
+
+A peer that leaves the Local peer set loses both conditions on the next round, and an
+operator that starts under Swim removes them once. Either way the peer's `Degraded`
+returns to `False` on its next reconcile.
+
 Example status (Mutual TLS verified):
 
 ```yaml
@@ -822,7 +943,9 @@ status:
 ### Status conditions
 
 The operator writes `Connected` and the roll-up beside the phase, which stays for
-v1alpha1 readers. On a peer, `Connected` is the only gate.
+v1alpha1 readers. On a peer, `Connected` is the only gate. Under Local membership, a
+`False` `SignalsReachable` or `CatalogAccepted` raises `Degraded`, as
+[Peer conditions under Local membership](#peer-conditions-under-local-membership) lists.
 
 A peer's `GridSite` is a local object, and its conditions record what this site
 observes of that peer. Status is never shared between sites, so two sites can

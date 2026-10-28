@@ -86,7 +86,7 @@ An invite expires after a day by default, and an unredeemed one stays in place. 
 
 - grid-enrollment: `host` joins the serving cert names, is the default Route host, and makes the enrollment Service a LoadBalancer when no Route renders. An invite's `network` defaults to `grid`.
 - grid-operator with `enrollment.enabled`: the operator config `grid-operator-config` names the site, its signer and its invite. The site name follows `swim.siteName`, the URL is the in-cluster grid-enrollment Service, the CA bundle is Secret `grid-ca-bundle`, the token is `grid-invite-<site>`, the SWIM Service is a LoadBalancer, the gateway Service is `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
-- grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`.
+- grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`. A peer's GridSite is `<network>-<name>` under swim membership, the name SWIM discovery gives it, and `<name>` under declared.
 - praxis-gateway: it renders its own config without a BYO ConfigMap. Set `gridIdentity.tlsSecretName` to `grid-site-identity` and `gridIdentity.caSecretName` to `grid-ca` for mTLS. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
 
 ## Credential Delivery
@@ -105,7 +105,9 @@ In a fleet, deliver the three Secrets over one protected channel:
 
 The grid-site `gridNetwork.peerTrust.mode` is the source of truth for the grid. Each provider gateway's `praxisConfig.render.peerTrust.mode` must match it.
 
-Each operator routes to a peer only once a probe of its gateway, at the peer `address`, finds a leaf that matches the peer `digest`, which makes the peer Active. Declare a peer before it joins, since the operator creates a GridSite for any peer it meets and Helm does not adopt it. To rotate a pin, set `nextDigest` to the new digest, then move it to `digest` once the peer is Active.
+Each operator routes to a peer only once a probe of its gateway, at the peer `address`, finds a leaf that matches the peer `digest`, which makes the peer Active. A listed peer's `digest` is the pin the signals poller uses. With `address` set, the site's signals are polled at the same host under `<name>-signals.grid.internal`, without waiting on gossip, so each site puts its gateway and signals behind one router or one load balancer. To rotate a pin, set `nextDigest` to the new digest, then move it to `digest` once the peer is Active.
+
+`grid.membership.source` picks where a site learns its peers. `Swim`, the default, discovers them over SWIM. `Local` means this site's configuration lists its peers, and runs no SWIM: set `--set grid.membership.source=Local` on grid-enrollment, grid-operator and grid-site alike, and the charts derive poll signals, no SWIM Service, port, seeds or key, and refuse any value that contradicts it.
 
 `peerTrust.mode` picks how the signals listener and the provider gateway admit peers. In `pin` mode, the default, they admit the pinned digests. In `spiffe` mode, add `--set gridNetwork.peerTrust.mode=spiffe` to both grid-site commands, and on the site gateway replace the digest with `--set praxisConfig.render.peerTrust.mode=spiffe --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub`. It needs the grid-gateway image built with the praxis `spiffe` feature, which praxis marks experimental.
 

@@ -459,6 +459,7 @@ unrelated address.
 | `GRID_SWIM_ADVERTISE_FALLBACK` | Marks a `GRID_SWIM_ADVERTISE_ADDR` equal to it as the Pod IP default. The operator then builds the Pod IP endpoint itself, bracketing IPv6, or discovers the LoadBalancer address when `GRID_SWIM_SERVICE_NAME` names a Service. An older operator ignores it and advertises the Pod IP |
 | `GRID_SWIM_REQUIRE_KEY` | Hold all SWIM traffic until the `GridNetwork` key loads or the network declares none. Defaults to `true`. With `false`, SWIM is plaintext while no network exists |
 | `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
+| `GRID_SITE_NAME` | The same, for an install under Local membership (`grid.membership.source` Local), which runs no SWIM; the chart sets it in place of `GRID_SWIM_SITE_NAME` |
 | `GRID_SWIM_SEEDS` | Comma-separated SWIM seed endpoints; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` |
 | `GRID_SIGNALS_ADDR` | Signals listener address. Defaults to `[::]:9091`, or `0.0.0.0:9091` on a host without IPv6 |
 | `GRID_SIGNALS_ADVERTISE_ADDR` | Signals endpoint gossiped to peers, as `ip:port`, `[ipv6]:port`, or `hostname:port`. Without it, a site advertising the SWIM LoadBalancer gossips that address on the Service port named `signals`, and any other site gossips none. A LoadBalancer site needs one of the two, and the Service port needs a LoadBalancer that serves UDP and TCP on one Service |
@@ -479,10 +480,15 @@ unrelated address.
 Gateway port discovery reads only the gateway Service's `spec.ports`; Pod health
 probes and metrics endpoints are not used for this selection.
 
-The signals listener caps handshakes per client source address. Behind a
-LoadBalancer, set `externalTrafficPolicy: Local` on the Service that carries
-the signals port. With `Cluster`, node SNAT gives many clients one source
-address, and they share its cap.
+The signals listener caps pending handshakes per client source address, eight by
+default, and gives each 2 seconds to finish before a client certificate proves
+who it is. At the cap the oldest pending handshake is cut, not the newest
+refused, so one slow or stalled handshake cannot shut a source's other peers
+out. The supported shape is a network load balancer whose Service carries
+`externalTrafficPolicy: Local`, so each peer arrives from its own address. With
+`Cluster`, node SNAT gives many clients one source address and they share its
+cap. Behind an OpenShift Route every peer arrives from the router's address,
+so raise `signals.maxHandshakesPerSource` to at least the number of peers.
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses
@@ -1152,6 +1158,7 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.sta
 |---|---|---|
 | (new) | Pending | Resource created |
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
+| Pending | Connecting | `GridSite` controller: declared site sets a dialable `spec.gatewayEndpoint.address` |
 | Discovered | Connecting | `GridSite` controller: `spec.gatewayEndpoint.address` non-empty |
 | Connecting | Active | `GridSite` controller: configured Mutual TLS identity probe succeeds |
 | Active | Connecting | TLS identity or trust verification fails, or the endpoint is changed to plaintext |
