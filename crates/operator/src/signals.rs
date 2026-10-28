@@ -415,34 +415,26 @@ pub struct PeerCatchUp {
 }
 
 impl CatchUp {
-    /// Record a round over `polled`; a peer not in it is no longer polled.
-    pub fn record<Answered: Fn(&str) -> bool, Held: Fn(&str) -> bool>(
+    /// Record a round over `polled`, each peer's `unanswered` rounds as the poller counts
+    /// them; a peer not in it is no longer polled.
+    pub fn record<Unanswered: Fn(&str) -> u32, Held: Fn(&str) -> bool>(
         &self,
         polled: &[String],
-        answered: Answered,
+        unanswered: Unanswered,
         held: Held,
     ) {
         let Ok(mut standing) = self.0.write() else {
             return;
         };
-        let previous = standing.take().unwrap_or_default();
         *standing = Some(
             polled
                 .iter()
                 .map(|peer| {
-                    let before = previous.get(peer).copied().unwrap_or_default();
-                    let unanswered = if answered(peer) {
-                        0
-                    } else {
-                        before.unanswered.saturating_add(1)
+                    let peer_standing = PeerCatchUp {
+                        held: held(peer),
+                        unanswered: unanswered(peer),
                     };
-                    (
-                        peer.clone(),
-                        PeerCatchUp {
-                            held: held(peer),
-                            unanswered,
-                        },
-                    )
+                    (peer.clone(), peer_standing)
                 })
                 .collect(),
         );
@@ -2484,16 +2476,15 @@ mod tests {
         let catch_up = CatchUp::default();
         assert!(!catch_up.caught_up(3), "not before the first round");
         let polled = ["east".to_owned(), "west".to_owned()];
-        catch_up.record(&polled, |_| true, |site| site == "east");
+        catch_up.record(&polled, |_| 0, |site| site == "east");
         assert!(!catch_up.caught_up(3), "west answered, but its catalog is not held yet");
-        catch_up.record(&polled, |site| site == "east", |site| site == "east");
-        catch_up.record(&polled, |site| site == "east", |site| site == "east");
+        catch_up.record(&polled, |site| u32::from(site == "west") * 2, |site| site == "east");
         assert!(!catch_up.caught_up(3), "west silent for two rounds");
-        catch_up.record(&polled, |site| site == "east", |site| site == "east");
+        catch_up.record(&polled, |site| u32::from(site == "west") * 3, |site| site == "east");
         assert!(catch_up.caught_up(3), "west silent for three rounds is not waited on");
-        catch_up.record(&polled, |_| true, |site| site == "east");
+        catch_up.record(&polled, |_| 0, |site| site == "east");
         assert!(!catch_up.caught_up(3), "an answer resets the count");
-        catch_up.record(&[], |_| true, |_| true);
+        catch_up.record(&[], |_| 0, |_| true);
         assert!(catch_up.caught_up(3), "a site with no peers has nothing to wait for");
     }
 

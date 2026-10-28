@@ -3837,15 +3837,16 @@ impl PeerPoller {
             .peer_providers()
             .retain_sites(|site| polled.iter().any(|polled| polled == site));
         operator::metrics::retain_peers(|site| polled.iter().any(|polled| polled == site));
-        self.ctx
-            .peer_catch_up()
-            .record(&polled, |site| answered.contains_key(site), |site| catalogs.holds(site));
-        self.ctx.peer_rounds().record(&polled, SystemTime::now());
         self.misses.record(
             &polled,
             |site| answered.contains_key(site),
             |site| source.failures.of(site) == Some(operator::signals::Unreachable::RoundDeadline),
         );
+        // Caught up counts the same misses the verdicts do, so one counter answers both.
+        self.ctx
+            .peer_catch_up()
+            .record(&polled, |site| self.misses.of(site), |site| catalogs.holds(site));
+        self.ctx.peer_rounds().record(&polled, SystemTime::now());
         self.unanswered = polled
             .iter()
             .filter(|site| !answered.contains_key(*site))
