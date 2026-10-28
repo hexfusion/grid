@@ -2274,13 +2274,23 @@ async fn run_signals_server(
         .await
         .and_then(|handle| handle.signals_address().map(str::to_owned));
     let app = signals_app(listener.published.clone());
+    // One admission for the listener's life, so a rebind on new material keeps its caps over
+    // the connections still open, and the final drain waits for all of them.
+    let admission = Admission::new(
+        listener.max_per_peer,
+        listener.max_per_source,
+        listener.peer_identities.clone(),
+    );
 
     // The opt-in listener rebinds on every material change, so a transient
     // bind blip (a socket in TIME_WAIT across a rebind) must not be fatal to
     // reconcile and the metrics server through `try_join!`: a serve error logs
     // and retries rather than propagating.
     while !shutdown.is_triggered() {
-        match listener.serve_once(&app, advertised.as_deref(), shutdown.clone()).await {
+        match listener
+            .serve_once((&app, &admission), advertised.as_deref(), shutdown.clone())
+            .await
+        {
             Ok(()) if !shutdown.is_triggered() => {
                 tracing::info!("signals TLS material changed; serving again");
             },
@@ -2298,7 +2308,7 @@ impl SignalsListener {
     /// Serve until this site's TLS material changes, or wait while it is unavailable.
     async fn serve_once(
         &self,
-        app: &axum::Router,
+        (app, admission): (&axum::Router, &Admission),
         advertised: Option<&str>,
         shutdown: operator::shutdown::Shutdown,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2318,14 +2328,13 @@ impl SignalsListener {
             .local_addr()
             .map_or_else(|_| "unknown".to_owned(), |a| a.to_string());
         tracing::info!(addr = %bound, advertised = ?advertised, tls = true, "signals server serving; peers poll the advertised endpoint");
-        let admission = Admission::new(self.max_per_peer, self.max_per_source, self.peer_identities.clone());
         let changed = material_changed(self.client.clone(), own);
         let serving = Serving {
             tls,
             app: app.clone(),
             identity,
         };
-        serve_signals_tls(listener, serving, admission, changed, shutdown).await
+        serve_signals_tls(listener, serving, admission.clone(), changed, shutdown).await
     }
 }
 
@@ -2425,7 +2434,7 @@ struct Serving {
 async fn serve_signals_tls(
     listener: tokio::net::TcpListener,
     serving: Serving,
-    mut admission: Admission,
+    admission: Admission,
     changed: impl Future<Output = ()> + Send,
     shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2437,7 +2446,7 @@ async fn serve_signals_tls(
                 // Close the socket, so a new connection is refused at once rather than left in
                 // the backlog until its client times out, then let open connections finish.
                 drop(listener);
-                drain_connections(&admission.slots, admission.capacity).await;
+                drain_connections(&admission.slots, admission.capacity()).await;
                 return Ok(());
             },
             () = &mut changed => return Ok(()),
@@ -2540,12 +2549,13 @@ async fn accepted_or_backoff(
     }
 }
 
-/// The connection caps one listener enforces.
+/// The connection caps one listener enforces, across every rebind: a clone shares them.
+#[derive(Clone)]
 struct Admission {
     /// Every open connection.
     slots: Arc<tokio::sync::Semaphore>,
     /// The permits [`Self::slots`] was given.
-    capacity: usize,
+    capacity: Arc<std::sync::atomic::AtomicUsize>,
     /// Handshakes in progress, across every source.
     handshakes: Arc<tokio::sync::Semaphore>,
     /// Handshakes in progress, per source.
@@ -2569,9 +2579,9 @@ impl Admission {
     /// handshakes per source address, and room for every one of `members`.
     fn new(max_per_peer: usize, max_per_source: usize, members: operator::signals::PeerIdentities) -> Self {
         let share = SIGNALS_MAX_HANDSHAKES / 2;
-        let mut admission = Self {
+        let admission = Self {
             slots: Arc::new(tokio::sync::Semaphore::new(SIGNALS_MAX_CONNECTIONS)),
-            capacity: SIGNALS_MAX_CONNECTIONS,
+            capacity: Arc::new(std::sync::atomic::AtomicUsize::new(SIGNALS_MAX_CONNECTIONS)),
             handshakes: Arc::new(tokio::sync::Semaphore::new(SIGNALS_MAX_HANDSHAKES)),
             sources: SourceSlots::new(
                 max_per_source.min(share),
@@ -2587,7 +2597,7 @@ impl Admission {
             warned: Arc::default(),
         };
         admission.size_for_members();
-        operator::metrics::set_signals_connection_cap(admission.capacity);
+        operator::metrics::set_signals_connection_cap(admission.capacity());
         operator::metrics::set_signals_admission(operator::metrics::AdmissionHandles {
             slots: Arc::clone(&admission.slots),
             handshakes: Arc::clone(&admission.handshakes),
@@ -2598,19 +2608,25 @@ impl Admission {
         admission
     }
 
+    /// The permits every open connection shares.
+    fn capacity(&self) -> usize {
+        self.capacity.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Grow the caps to fit every declared member, never shrinking them under a held slot.
-    fn size_for_members(&mut self) {
+    fn size_for_members(&self) {
         let wanted = self
             .members
             .count()
             .saturating_mul(self.per_peer)
             .saturating_add(SIGNALS_LOCAL_RESERVE + SIGNALS_MAX_HANDSHAKES)
             .clamp(SIGNALS_MAX_CONNECTIONS, SIGNALS_CONNECTIONS_CEILING);
-        let grow = wanted.saturating_sub(self.capacity);
+        // One grower wins each step, so the permits added match the capacity recorded.
+        let held = self.capacity.fetch_max(wanted, std::sync::atomic::Ordering::AcqRel);
+        let grow = wanted.saturating_sub(held);
         if grow > 0 {
             self.slots.add_permits(grow);
             self.peers.total.add_permits(grow);
-            self.capacity = wanted;
             operator::metrics::set_signals_connection_cap(wanted);
             tracing::info!(cap = wanted, "signals connection cap grown for the declared members");
         }
@@ -2618,7 +2634,7 @@ impl Admission {
 
     /// A connection slot, a handshake turn and a source slot for `remote`, or `None` to shed it.
     fn admit(
-        &mut self,
+        &self,
         remote: SocketAddr,
     ) -> Option<(
         tokio::sync::OwnedSemaphorePermit,
@@ -5324,10 +5340,18 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "floor, growth, no shrink and ceiling on one admission"
+    )]
     fn the_connection_cap_grows_with_the_declared_members_up_to_its_ceiling() {
         let members = operator::signals::PeerIdentities::new();
-        let mut admission = Admission::new(4, 8, members.clone());
-        assert_eq!(admission.capacity, SIGNALS_MAX_CONNECTIONS, "the floor with no members");
+        let admission = Admission::new(4, 8, members.clone());
+        assert_eq!(
+            admission.capacity(),
+            SIGNALS_MAX_CONNECTIONS,
+            "the floor with no members"
+        );
         let declare = |count: usize| {
             members.set(
                 (0..count)
@@ -5338,7 +5362,7 @@ mod tests {
         declare(100);
         let held = admission.admit(([127, 0, 0, 1], 1).into()).expect("admitted");
         let wanted = 100 * 4 + SIGNALS_LOCAL_RESERVE + SIGNALS_MAX_HANDSHAKES;
-        assert_eq!(admission.capacity, wanted, "every member's share fits");
+        assert_eq!(admission.capacity(), wanted, "every member's share fits");
         assert_eq!(
             admission.peers.total.available_permits(),
             wanted - SIGNALS_LOCAL_RESERVE - SIGNALS_MAX_HANDSHAKES,
@@ -5347,18 +5371,33 @@ mod tests {
         drop(held);
         declare(10);
         admission.size_for_members();
-        assert_eq!(admission.capacity, wanted, "never shrunk under a held slot");
+        assert_eq!(admission.capacity(), wanted, "never shrunk under a held slot");
         declare(10_000);
         admission.size_for_members();
         assert_eq!(
-            admission.capacity, SIGNALS_CONNECTIONS_CEILING,
+            admission.capacity(),
+            SIGNALS_CONNECTIONS_CEILING,
             "bounded by the ceiling"
         );
     }
 
     #[test]
+    fn a_rebind_on_new_material_keeps_the_caps_over_the_connections_still_open() {
+        let before = Admission::new(1, 8, operator::signals::PeerIdentities::new());
+        let held = before.peers.acquire("east").expect("the peer's one slot");
+        let after = before.clone();
+        assert!(
+            after.peers.acquire("east").is_none(),
+            "the rebound listener counts the connection the old one left open"
+        );
+        drop(held);
+        assert!(after.peers.acquire("east").is_some(), "and frees it when that closes");
+        assert_eq!(after.capacity(), before.capacity());
+    }
+
+    #[test]
     fn handshakes_never_take_the_slots_authenticated_connections_need() {
-        let mut admission = Admission::new(4, 64, operator::signals::PeerIdentities::new());
+        let admission = Admission::new(4, 64, operator::signals::PeerIdentities::new());
         let held: Vec<_> = (0..=u8::MAX)
             .filter_map(|n| admission.admit(([10, 0, 1, n], 1).into()))
             .collect();
