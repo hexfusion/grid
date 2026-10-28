@@ -2531,8 +2531,25 @@ const SIGNALS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Bound on a response write that makes no progress.
 const SIGNALS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Age at which an authenticated connection is closed after its current request.
-const SIGNALS_MAX_CONNECTION_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+/// Least age at which an authenticated connection is closed after its current request.
+const SIGNALS_MAX_CONNECTION_AGE: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// How far past [`SIGNALS_MAX_CONNECTION_AGE`] a connection's age is spread.
+const SIGNALS_CONNECTION_AGE_SPREAD: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One connection's age, between 4 and 6 minutes from `seed`, so connections a restart or a
+/// reroute opened together do not close and reconnect together.
+fn connection_age(seed: u64) -> std::time::Duration {
+    let spread = u64::try_from(SIGNALS_CONNECTION_AGE_SPREAD.as_millis()).unwrap_or(u64::MAX);
+    SIGNALS_MAX_CONNECTION_AGE + std::time::Duration::from_millis(seed % spread.saturating_add(1))
+}
+
+/// A seed for [`connection_age`] that differs from one connection to the next.
+fn connection_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| u64::from(since.subsec_nanos()))
+}
 
 /// The accepted connection, or `None` after pausing on a failed accept.
 async fn accepted_or_backoff(
@@ -3014,7 +3031,8 @@ async fn serve_http(
         .header_read_timeout(SIGNALS_HEADER_READ_TIMEOUT)
         .keep_alive(keep_alive)
         .serve_connection(io, service);
-    if let Err(error) = Box::pin(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE, shutdown)).await {
+    let age = connection_age(connection_seed());
+    if let Err(error) = Box::pin(serve_until_aged(connection, age, shutdown)).await {
         tracing::debug!(%remote, %error, "signals connection ended");
     }
 }
@@ -5390,6 +5408,17 @@ mod tests {
             SIGNALS_CONNECTIONS_CEILING,
             "bounded by the ceiling"
         );
+    }
+
+    #[test]
+    fn a_connections_age_is_spread_between_four_and_six_minutes() {
+        let minutes = |minutes: u64| std::time::Duration::from_secs(minutes * 60);
+        assert_eq!(connection_age(0), minutes(4));
+        assert_eq!(connection_age(120_000), minutes(6), "the spread reaches six minutes");
+        assert_eq!(connection_age(120_001), minutes(4), "and wraps, never past it");
+        let ages: BTreeSet<_> = (0..1_000_u64).map(|n| connection_age(n * 7_919)).collect();
+        assert!(ages.len() > 100, "seeds spread the ages: {}", ages.len());
+        assert!(ages.iter().all(|age| (minutes(4)..=minutes(6)).contains(age)));
     }
 
     #[test]

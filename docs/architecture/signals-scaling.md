@@ -1,6 +1,6 @@
 # Scaling the signals listener
 
-Each site keeps one pooled connection to each peer and polls it every 5 seconds. The listener closes a connection after 5 minutes and the peer reconnects, so a grid of N sites puts about N - 1 connections on each listener. An idle connection costs some tens of kilobytes and one file descriptor.
+Each site keeps one pooled connection to each peer and polls it every 5 seconds. The listener closes a connection after 4 to 6 minutes, spread so connections opened together do not reconnect together, and the peer reconnects, so a grid of N sites puts about N - 1 connections on each listener. An idle connection costs some tens of kilobytes and one file descriptor.
 
 ## Bounds
 
