@@ -3706,12 +3706,14 @@ impl PeerPoller {
             without_endpoint.iter().map(String::as_str),
         );
         let skipped = reach.skipped();
-        let reach = reach.held_over(&self.reach, &self.misses);
+        let generations = self.ctx.peer_identities().generations();
+        let reach = reach.held_over(&self.reach, &self.misses).read_at(generations.clone());
         let held = self.ctx.peer_providers();
         let catalogs = PeerReach::catalogs(
             polled.iter().map(String::as_str).filter(|site| held.holds(site)),
             &held.verdicts(),
-        );
+        )
+        .read_at(generations);
         (reach, catalogs, skipped)
     }
 
@@ -4511,6 +4513,7 @@ mod tests {
             labels: gpu(),
             pins,
             signals: None,
+            generation: None,
         };
         let peers = operator::signals::PeerIdentities::new();
         peers.set(BTreeMap::from([
@@ -4764,6 +4767,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec![operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem))],
                     signals: None,
+                    generation: None,
                 },
             )]));
             SignalsIdentity {
@@ -5153,6 +5157,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    generation: None,
                 },
             )]));
             SignalsIdentity {
@@ -5636,6 +5641,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            generation: None,
         };
         let heard = operator::signals::LoadHeard::default();
         let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
@@ -5908,6 +5914,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["bb".to_owned()],
                     signals: None,
+                    generation: None,
                 },
             ),
             (
@@ -5916,6 +5923,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["aa".to_owned()],
                     signals: None,
+                    generation: None,
                 },
             ),
             (
@@ -5924,6 +5932,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    generation: None,
                 },
             ),
         ]));
@@ -5963,6 +5972,7 @@ mod tests {
                 endpoint: operator::signals::SignalsEndpoint::parse(address).expect("endpoint"),
                 server_name: server_name.map(str::to_owned),
             }),
+            generation: None,
         };
         let pinned = || vec!["aa".to_owned()];
         let identities = operator::signals::PeerIdentities::new();
@@ -6095,6 +6105,7 @@ mod tests {
                     server_name: None,
                 }
             }),
+            generation: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6146,6 +6157,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            generation: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6334,6 +6346,7 @@ mod tests {
                 labels: gpu(),
                 pins: Vec::new(),
                 signals: None,
+                generation: None,
             },
         )]));
         Serving {

@@ -561,6 +561,9 @@ pub struct PeerRecord {
 
     /// Where this peer serves its signals, derived from the local object's gateway endpoint.
     pub signals: Option<DeclaredSignals>,
+
+    /// The local object's generation when it was read, the spec a verdict on the peer saw.
+    pub generation: Option<i64>,
 }
 
 /// The server name `site`'s gateway is reached and verified under, the DNS name its leaf carries.
@@ -642,6 +645,19 @@ impl PeerIdentities {
     #[must_use]
     pub fn count(&self) -> usize {
         self.inner.read().map_or(0, |guard| guard.len())
+    }
+
+    /// Each held peer's generation when its local object was read.
+    #[must_use]
+    pub fn generations(&self) -> HashMap<String, i64> {
+        self.inner.read().map_or_else(
+            |_| HashMap::new(),
+            |held| {
+                held.iter()
+                    .filter_map(|(site, record)| Some((site.clone(), record.generation?)))
+                    .collect()
+            },
+        )
     }
 
     /// Whether a record is held for `site`.
@@ -4130,6 +4146,7 @@ mod tests {
                 labels: gold(),
                 pins: Vec::new(),
                 signals: None,
+                generation: None,
             },
         )]));
         assert_eq!(
@@ -4149,6 +4166,7 @@ mod tests {
                 labels: gold(),
                 pins: vec!["ab".repeat(32)],
                 signals: None,
+                generation: None,
             },
         )]));
         assert_eq!(
@@ -4172,7 +4190,7 @@ mod tests {
                 PeerRecord {
                     labels: gold(),
                     pins: vec!["cc".repeat(32)],
-                    signals: None,
+                    ..PeerRecord::default()
                 },
             ),
             (
@@ -4180,7 +4198,7 @@ mod tests {
                 PeerRecord {
                     labels: BTreeMap::from([("tier".to_owned(), "silver".to_owned())]),
                     pins: vec!["bb".repeat(32)],
-                    signals: None,
+                    ..PeerRecord::default()
                 },
             ),
         ]));
@@ -4209,6 +4227,7 @@ mod tests {
                 labels: gold(),
                 pins: vec!["ab".repeat(32), "cd".repeat(32)],
                 signals: None,
+                generation: None,
             },
         )]));
         assert_eq!(identities.resolve_by_key(&"ab".repeat(32)), Some(gold()), "the old key");
@@ -4234,6 +4253,7 @@ mod tests {
                     labels: gold(),
                     pins: Vec::new(),
                     signals: None,
+                    generation: None,
                 },
             ),
             (
@@ -4242,6 +4262,7 @@ mod tests {
                     labels: gold(),
                     pins: vec!["cd".repeat(32)],
                     signals: None,
+                    generation: None,
                 },
             ),
         ]));
@@ -4291,6 +4312,7 @@ mod tests {
             labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
             pins: vec![canonical_fingerprint(&declared)],
             signals: None,
+            generation: None,
         };
         let identities = PeerIdentities::new();
         identities.set(BTreeMap::from([("peer".to_owned(), record)]));

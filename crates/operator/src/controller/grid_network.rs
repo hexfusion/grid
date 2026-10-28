@@ -1141,6 +1141,7 @@ fn peer_identities(
                 SignalsAt::Derived(signals_port) => declared_signals(site, &key, signals_port),
                 SignalsAt::Advertised => None,
             },
+            generation: site.metadata.generation,
         };
         let rank = (!record.pins.is_empty(), enrolled);
         if ranked.get(&key).is_none_or(|(held, _)| rank > *held) {
@@ -7596,6 +7597,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 pins: vec!["previous-pin".to_owned()],
                 signals: None,
+                generation: None,
             },
         )]));
         assert!(

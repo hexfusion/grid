@@ -173,6 +173,9 @@ pub struct PeerReach {
     kind: &'static Kind,
     /// Peer to what it was judged.
     peers: HashMap<String, Judged>,
+    /// Each peer's `GridSite` generation the round read its endpoint at, which its condition
+    /// says it observed.
+    generations: HashMap<String, i64>,
 }
 
 impl Default for PeerReach {
@@ -188,6 +191,7 @@ impl PeerReach {
         Self {
             kind,
             peers: HashMap::new(),
+            generations: HashMap::new(),
         }
     }
 
@@ -219,7 +223,11 @@ impl PeerReach {
         for peer in without_endpoint {
             peers.insert(peer.to_owned(), Judged::EgressOnly);
         }
-        Self { kind: &REACH, peers }
+        Self {
+            kind: &REACH,
+            peers,
+            generations: HashMap::new(),
+        }
     }
 
     /// This round's verdicts, with a peer `previous` judged reachable kept so until it has gone
@@ -249,6 +257,13 @@ impl PeerReach {
         self
     }
 
+    /// These verdicts, stamped with the `generations` each peer's endpoint was read at.
+    #[must_use]
+    pub fn read_at(mut self, generations: HashMap<String, i64>) -> Self {
+        self.generations = generations;
+        self
+    }
+
     /// How many peers this round had no time to poll, of how many it judged.
     #[must_use]
     pub fn skipped(&self) -> usize {
@@ -273,7 +288,11 @@ impl PeerReach {
                 (peer.to_owned(), judged)
             })
             .collect();
-        Self { kind: &CATALOGS, peers }
+        Self {
+            kind: &CATALOGS,
+            peers,
+            generations: HashMap::new(),
+        }
     }
 
     /// What the condition is.
@@ -347,7 +366,7 @@ impl PeerReach {
                 current,
                 (self.kind.site_type, status, reason, message),
                 now_rfc3339,
-                site.metadata.generation,
+                self.generations.get(name).copied(),
             )?],
             None if current.iter().any(|held| held.type_ == self.kind.site_type) => Vec::new(),
             None => return None,
@@ -401,9 +420,8 @@ pub fn patch<'network>(
     reach: &PeerReach,
     now_rfc3339: &str,
 ) -> Option<(&'network str, Value)> {
-    network_patch(network, |current| {
-        reach.condition(current, now_rfc3339, network.metadata.generation)
-    })
+    // Unstamped: the poller reads no GridNetwork spec, so it observes no generation of it.
+    network_patch(network, |current| reach.condition(current, now_rfc3339, None))
 }
 
 /// `PeerPollsComplete` after a round that had no time for `skipped` of its `judged` peers.
@@ -539,7 +557,8 @@ mod tests {
 
     #[test]
     fn each_peer_site_names_its_cause_and_where() {
-        let reach = mixed();
+        let read_at = ["up", "east", "west", "north", "south", "fresh"].map(|peer| (peer.to_owned(), 2));
+        let reach = mixed().read_at(read_at.into());
         for (peer, status, reason, said) in [
             ("up", "True", SIGNALS_REACHABLE, "answered"),
             ("east", "False", "NotFound", "https://east:9443: answered 404"),
@@ -555,7 +574,11 @@ mod tests {
                 "{peer}"
             );
             assert!(written.message.contains(said), "{peer}: {}", written.message);
-            assert_eq!(written.observed_generation, Some(3), "stamped from the GridSite");
+            assert_eq!(
+                written.observed_generation,
+                Some(2),
+                "the generation the endpoint was read at, not one an edit since made live"
+            );
         }
     }
 
