@@ -11,24 +11,27 @@ KIND_CLUSTER=""
 
 OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
 ENROLLMENT_IMAGE="ghcr.io/praxis-proxy/grid-enrollment"
-# Tag of the images this run installs, built from this checkout and loaded into kind. Empty
-# leaves the charts' own default, which is the published image for their appVersion: that
-# tests the last release rather than this code, and on a release branch the tag does not
-# exist yet, so every pod waits on a pull that cannot succeed.
-GRID_IMAGE_TAG="${GRID_IMAGE_TAG:-${GRID_OPERATOR_CI_TAG:-}}"
-OPERATOR_TAG="${GRID_IMAGE_TAG:-v0.1.5}"
-# An enrollment image named outright wins over the tag.
-ENROLL_IMAGE_REF="${ENROLL_IMAGE_REF:-${GRID_IMAGE_TAG:+${ENROLLMENT_IMAGE}:${GRID_IMAGE_TAG}}}"
-ENROLL_IMAGE_ARGS=()
-if [ -n "$ENROLL_IMAGE_REF" ]; then
-  # Never, not IfNotPresent: a missing local image then fails at once instead of waiting out
-  # a pull. The chart keeps the Postgres pullPolicy separate, so this reaches only the app.
-  ENROLL_IMAGE_ARGS=(
-    --set "image.repository=${ENROLL_IMAGE_REF%:*}"
-    --set "image.tag=${ENROLL_IMAGE_REF##*:}"
-    --set image.pullPolicy=Never
-  )
+# GRID_IMAGE_TAG: the tag of images built from this checkout, for every chart the kind path
+# installs. Empty leaves the charts' own default, which is the published image for their
+# appVersion: that tests the last release rather than this code, and on a release branch the
+# tag does not exist yet, so every pod waits on a pull that cannot succeed. An image this
+# names must be built here; a missing one fails rather than falling back to the published one.
+GRID_IMAGE_TAG="${GRID_IMAGE_TAG:-}"
+# GRID_OPERATOR_CI_TAG: the older knob, which names an operator tag and nothing else. It says
+# nothing about any other chart, so it never implies an enrollment image, and its tag may be
+# a registry one, so it never requires a local build.
+OPERATOR_TAG="${GRID_IMAGE_TAG:-${GRID_OPERATOR_CI_TAG:-v0.1.5}}"
+OPERATOR_PINNED=""
+if [ -n "$GRID_IMAGE_TAG" ] || [ -n "${GRID_OPERATOR_CI_TAG:-}" ]; then
+  OPERATOR_PINNED=1
 fi
+# An enrollment image named outright is used as given and may be a registry image. One
+# derived from GRID_IMAGE_TAG is built here.
+ENROLL_IMAGE_NAMED=""
+if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
+  ENROLL_IMAGE_NAMED=1
+fi
+ENROLL_IMAGE_REF="${ENROLL_IMAGE_REF:-${GRID_IMAGE_TAG:+${ENROLLMENT_IMAGE}:${GRID_IMAGE_TAG}}}"
 DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.7.0"
 
 # Helpers
@@ -1337,29 +1340,80 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     exit 1
   fi
 
-  # Load every image this run installs. A missing one is a failure, not a fallback: the
-  # fallback is the charts' published default, which is not the code under test.
-  if [ -n "$GRID_IMAGE_TAG" ]; then
-    for ref in "${OPERATOR_IMAGE}:${OPERATOR_TAG}" "$ENROLL_IMAGE_REF"; do
-      if command -v docker &>/dev/null && docker image inspect "$ref" &>/dev/null; then
-        if kind load docker-image "$ref" --name "$KIND_CLUSTER" >/dev/null 2>&1; then
-          pass "kind: loaded $ref"
-        else
-          fail "kind: could not load $ref"
-        fi
-      elif command -v podman &>/dev/null && podman image exists "$ref" 2>/dev/null; then
-        archive="$WORK/$(printf '%s' "$ref" | tr '/:' '--')-${KIND_CLUSTER}.tar"
-        if podman save "$ref" -o "$archive" 2>/dev/null \
-          && kind load image-archive "$archive" --name "$KIND_CLUSTER" >/dev/null 2>&1; then
-          pass "kind: loaded $ref"
-        else
-          fail "kind: could not load $ref"
-        fi
+  # kind_load <ref>: put a locally built image in the cluster. 0 loaded, 1 not built here,
+  # 2 built but the load failed.
+  kind_load() {
+    local ref="$1" archive
+    if command -v docker &>/dev/null && docker image inspect "$ref" &>/dev/null; then
+      kind load docker-image "$ref" --name "$KIND_CLUSTER" >/dev/null 2>&1 || return 2
+    elif command -v podman &>/dev/null && podman image exists "$ref" 2>/dev/null; then
+      archive="$WORK/$(printf '%s' "$ref" | tr '/:' '--')-${KIND_CLUSTER}.tar"
+      if ! { podman save "$ref" -o "$archive" >/dev/null 2>&1 \
+        && kind load image-archive "$archive" --name "$KIND_CLUSTER" >/dev/null 2>&1; }; then
         rm -f "$archive"
-      else
-        fail "kind: $ref is not built, so the charts would install a published image instead of this code"
+        return 2
       fi
-    done
+      rm -f "$archive"
+    else
+      return 1
+    fi
+    return 0
+  }
+
+  # in_cluster <ref> <required>: load <ref> when it is built here, and say whether the cluster
+  # now holds it, which is the only case where an install may pin pullPolicy=Never. A required
+  # image is one this run is meant to have built, so not finding it is a failure rather than a
+  # reason to let the cluster pull a published image that is not the code under test.
+  in_cluster() {
+    local ref="$1" required="$2" rc
+    kind_load "$ref"
+    rc=$?
+    case "$rc" in
+      0)
+        pass "kind: loaded $ref"
+        return 0
+        ;;
+      2)
+        fail "kind: could not load $ref"
+        return 1
+        ;;
+      *)
+        if [ -n "$required" ]; then
+          fail "kind: $ref is not built, so the charts would install a published image instead of this code"
+        else
+          pass "kind: $ref is not built here, so the cluster pulls it"
+        fi
+        return 1
+        ;;
+    esac
+  }
+
+  # Only a tag from GRID_IMAGE_TAG is required to be built here.
+  OPERATOR_LOCAL=""
+  if [ -n "$OPERATOR_PINNED" ] && in_cluster "${OPERATOR_IMAGE}:${OPERATOR_TAG}" "${GRID_IMAGE_TAG:+1}"; then
+    OPERATOR_LOCAL=1
+  fi
+  ENROLL_REQUIRED=""
+  if [ -n "$GRID_IMAGE_TAG" ] && [ -z "$ENROLL_IMAGE_NAMED" ]; then
+    ENROLL_REQUIRED=1
+  fi
+  ENROLL_LOCAL=""
+  if [ -n "$ENROLL_IMAGE_REF" ] && in_cluster "$ENROLL_IMAGE_REF" "$ENROLL_REQUIRED"; then
+    ENROLL_LOCAL=1
+  fi
+  ENROLL_IMAGE_ARGS=()
+  if [ -n "$ENROLL_IMAGE_REF" ]; then
+    ENROLL_IMAGE_ARGS=(
+      --set "image.repository=${ENROLL_IMAGE_REF%:*}"
+      --set "image.tag=${ENROLL_IMAGE_REF##*:}"
+    )
+    # Never only for an image the cluster already holds: a missing one then fails at once
+    # instead of waiting out a pull, which is the hang this guards. A registry image is left
+    # to the cluster's own policy, or it would never pull at all. The chart keeps the Postgres
+    # pullPolicy separate, so this reaches only the app image.
+    if [ -n "$ENROLL_LOCAL" ]; then
+      ENROLL_IMAGE_ARGS+=(--set image.pullPolicy=Never)
+    fi
   fi
 
   KCTX="kind-${KIND_CLUSTER}"
@@ -1375,8 +1429,11 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
 
   # Install the image loaded above rather than the chart's published default.
   OP_INSTALL_ARGS=()
-  if [ -n "$GRID_IMAGE_TAG" ]; then
-    OP_INSTALL_ARGS+=(--set "image.tag=${OPERATOR_TAG}" --set image.pullPolicy=Never)
+  if [ -n "$OPERATOR_PINNED" ]; then
+    OP_INSTALL_ARGS+=(--set "image.tag=${OPERATOR_TAG}")
+    if [ -n "$OPERATOR_LOCAL" ]; then
+      OP_INSTALL_ARGS+=(--set image.pullPolicy=Never)
+    fi
   fi
 
   # Grid operator lifecycle
