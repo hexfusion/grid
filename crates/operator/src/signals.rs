@@ -647,6 +647,17 @@ impl PeerIdentities {
         self.inner.read().map_or(0, |guard| guard.len())
     }
 
+    /// Whether this site names `site` under `trust`: by its pins under pin trust, else by its
+    /// record, so polling and judging agree on who is a peer.
+    #[must_use]
+    pub fn names(&self, trust: PeerTrustMode, site: &str) -> bool {
+        if trust == PeerTrustMode::Pin {
+            !self.refuses(site)
+        } else {
+            self.labels_for(site).is_some()
+        }
+    }
+
     /// Each held peer's generation when its local object was read.
     #[must_use]
     pub fn generations(&self) -> HashMap<String, i64> {
@@ -1870,6 +1881,11 @@ impl PollPeers {
             .join("&");
 
         let targets = peer_urls(sites, &collect_query);
+        // A site whose URL takes no query is never dialled: say why, as for an unusable client.
+        sites
+            .iter()
+            .filter(|site| !targets.iter().any(|target| target.peer == site.name))
+            .for_each(|site| self.failures.observe(&site.name, false, Unreachable::Config));
         self.retain_transports(&targets);
         let deadline = Instant::now() + self.round;
         let fetches = targets.into_iter().map(|target| async move {
@@ -4188,6 +4204,28 @@ mod tests {
             None,
             "a key nobody declared names nobody"
         );
+    }
+
+    #[test]
+    fn a_peer_is_named_under_pin_trust_only_by_its_pins_and_under_spiffe_by_its_record() {
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            (
+                "pinned".to_owned(),
+                PeerRecord {
+                    pins: vec!["cc".repeat(32)],
+                    ..PeerRecord::default()
+                },
+            ),
+            ("unpinned".to_owned(), PeerRecord::default()),
+        ]));
+        assert!(identities.names(PeerTrustMode::Pin, "pinned"));
+        assert!(
+            !identities.names(PeerTrustMode::Pin, "unpinned"),
+            "pin trust names no peer it cannot verify, so it is neither polled nor judged"
+        );
+        assert!(identities.names(PeerTrustMode::Spiffe, "unpinned"));
+        assert!(!identities.names(PeerTrustMode::Spiffe, "unknown"));
     }
 
     #[test]

@@ -3693,7 +3693,12 @@ impl PeerPoller {
         urls: &std::collections::HashMap<String, String>,
     ) -> (operator::peer_reach::PeerReach, operator::peer_reach::PeerReach, usize) {
         use operator::peer_reach::PeerReach;
-        let without_endpoint = self.ctx.peer_identities().without_endpoint(local_site);
+        let identities = self.ctx.peer_identities();
+        let without_endpoint: Vec<String> = identities
+            .without_endpoint(local_site)
+            .into_iter()
+            .filter(|site| identities.names(source.trust, site))
+            .collect();
         let reach = PeerReach::of(
             answered.keys().map(String::as_str),
             self.unanswered.iter().map(|peer| {
@@ -4175,11 +4180,7 @@ struct Targeting<'round> {
 impl Targeting<'_> {
     /// Whether `site` is one this site would name under its trust.
     fn named(&self, site: &str) -> bool {
-        if self.trust == operator::signals::PeerTrustMode::Pin {
-            !self.identities.refuses(site)
-        } else {
-            self.identities.labels_for(site).is_some()
-        }
+        self.identities.names(self.trust, site)
     }
 
     /// Peers this site would name, `None` when there is none to poll.
