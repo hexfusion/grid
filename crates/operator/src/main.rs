@@ -389,7 +389,7 @@ async fn main() {
                         peers: ctx.peers(),
                         rounds: ctx.peer_rounds(),
                         providers: ctx.local_providers(),
-                        membership: ctx.membership().as_str(),
+                        settings: ctx.own_settings(),
                         feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                     },
                     peer_identities: ctx.peer_identities(),
@@ -2227,8 +2227,8 @@ struct Published {
     rounds: operator::signals::PeerRounds,
     /// This site's providers, for peers building candidates.
     providers: operator::site_providers::LocalProviders,
-    /// This site's membership mode, named on every answer.
-    membership: &'static str,
+    /// This site's grid-wide settings, stated on every answer.
+    settings: operator::peer_settings::OwnSettings,
 }
 
 /// What the signals listener needs from startup.
@@ -3098,7 +3098,7 @@ const GRID_VERSION_HEADER: &str = "x-grid-version";
 
 /// Signals and feedback routes sharing the certificate-derived caller scope.
 fn signals_app(published: Published) -> axum::Router {
-    let membership = http::HeaderValue::from_static(published.membership);
+    let settings = published.settings.clone();
     axum::Router::new()
         .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
         .route(
@@ -3110,7 +3110,9 @@ fn signals_app(published: Published) -> axum::Router {
         .layer(axum::middleware::map_response(
             move |mut response: axum::response::Response| {
                 let headers = response.headers_mut();
-                headers.insert(operator::signals::MEMBERSHIP_HEADER, membership.clone());
+                if let Some(stated) = settings.header() {
+                    headers.insert(operator::peer_settings::SETTINGS_HEADER, stated);
+                }
                 headers.insert(GRID_VERSION_HEADER, http::HeaderValue::from_static(version::VERSION));
                 std::future::ready(response)
             },
@@ -3492,7 +3494,7 @@ async fn run_peer_poller(
         settings,
         shutdown,
         ages: operator::peer_ages::PeerAges::default(),
-        memberships: operator::peer_membership::PeerMemberships::default(),
+        peer_settings: operator::peer_settings::PeerSettings::default(),
         reach: operator::peer_reach::PeerReach::default(),
         misses: operator::peer_reach::Misses::default(),
         written: NetworkWritten::default(),
@@ -3532,7 +3534,7 @@ struct PeerPoller {
     /// Peers whose relayed ages the last rounds rejected, for the `GridNetwork` condition.
     ages: operator::peer_ages::PeerAges,
     /// Peers naming a different membership mode, for the `GridNetwork` condition.
-    memberships: operator::peer_membership::PeerMemberships,
+    peer_settings: operator::peer_settings::PeerSettings,
     /// Under Local membership, which peers' signals endpoints did not answer, as last written.
     reach: operator::peer_reach::PeerReach,
     /// Rounds in a row each peer went unanswered, which a reachable peer outlasts.
@@ -3760,7 +3762,7 @@ impl PeerPoller {
         source
             .collect_each(&sites, |peer, observations, rejected, stamp| {
                 answered.insert(peer.clone(), rejected);
-                modes.insert(peer.clone(), stamp.membership);
+                modes.insert(peer.clone(), stamp.settings);
                 versions.insert(peer.clone(), stamp.providers_version);
                 heard.record(&peer, &observations);
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
@@ -3823,12 +3825,12 @@ impl PeerPoller {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }
         if membership_ready {
-            let ours = self.ctx.membership().as_str();
-            self.memberships.observe(&polled, &modes, ours);
-            Box::pin(write_peer_memberships(
+            let ours = self.ctx.own_settings().current();
+            self.peer_settings.observe(&polled, &modes, &ours);
+            Box::pin(write_peer_settings(
                 &self.client,
-                &self.memberships,
-                ours,
+                &self.peer_settings,
+                &ours,
                 &self.shutdown,
             ))
             .await;
@@ -4135,39 +4137,22 @@ async fn apply_site_conditions(client: &Client, judged: &[operator::peer_reach::
     landed
 }
 
-/// Write the `PeerMembership` condition on the sole `GridNetwork` when it changed.
-async fn write_peer_memberships(
+/// Write the `PeerSettingsMatch` condition on the sole `GridNetwork` when it changed.
+async fn write_peer_settings(
     client: &Client,
-    memberships: &operator::peer_membership::PeerMemberships,
-    ours: &str,
+    peers: &operator::peer_settings::PeerSettings,
+    ours: &operator::peer_settings::Settings,
     shutdown: &operator::shutdown::Shutdown,
 ) {
-    let apply = async {
-        let Some(network) = Box::pin(sole_network(client)).await else {
-            return;
-        };
-        let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
-            return;
-        };
-        let Some((name, patch)) = operator::peer_membership::patch(&network, memberships, ours, &now) else {
-            return;
-        };
-        let api: Api<GridNetwork> = Api::all(client.clone());
-        let params = PatchParams::apply(operator::peer_membership::FIELD_MANAGER).force();
-        match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
-            Ok(_) if memberships.mismatched().is_empty() => {},
-            Ok(_) => tracing::warn!(peers = ?memberships.mismatched(), ours, "peers run a different membership mode"),
-            Err(error) => tracing::warn!(%error, "peer membership condition not written; retrying next round"),
-        }
-    };
-    tokio::select! {
-        biased;
-        () = shutdown.triggered() => {},
-        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, apply) => {
-            if result.is_err() {
-                tracing::warn!("peer membership condition write timed out; retrying next round");
-            }
-        },
+    let written = Box::pin(write_network_condition(
+        client,
+        operator::peer_settings::FIELD_MANAGER,
+        |network, now| operator::peer_settings::patch(network, peers, ours, now),
+        shutdown,
+    ))
+    .await;
+    if written && !peers.mismatched().is_empty() {
+        tracing::warn!(peers = ?peers.mismatched(), ours = %ours.header(), "peers state other grid-wide settings");
     }
 }
 
@@ -4320,7 +4305,7 @@ mod tests {
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
             providers: operator::site_providers::LocalProviders::default(),
-            membership: "Swim",
+            settings: operator::peer_settings::OwnSettings::new(Membership::Swim),
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
@@ -4888,7 +4873,7 @@ mod tests {
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
             providers: open_and_gold(),
-            membership: "Swim",
+            settings: operator::peer_settings::OwnSettings::new(Membership::Swim),
             feedback: operator::gateway_ages::GatewayFeedback::new(
                 stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0))),
                 operator::shutdown::Shutdown::never(),
@@ -5064,7 +5049,7 @@ mod tests {
     async fn a_peer_answer_names_its_membership_mode() {
         let mesh = Mesh::new();
         let mut published = serving_providers();
-        published.membership = "Local";
+        published.settings = operator::peer_settings::OwnSettings::new(Membership::Local);
         let app = signals_app(published);
         let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
         let (addr, server) = mesh.serve(mesh.west_is_pinned(), app, (&sources, &peers), 1).await;
@@ -5077,8 +5062,10 @@ mod tests {
             alias: None,
         };
         let mut named = None;
-        poll.collect_each(std::slice::from_ref(&east), |_, _, _, stamp| named = stamp.membership)
-            .await;
+        poll.collect_each(std::slice::from_ref(&east), |_, _, _, stamp| {
+            named = stamp.settings.and_then(|settings| settings.membership);
+        })
+        .await;
         assert_eq!(named.as_deref(), Some("Local"));
         drop(poll);
         server.await.expect("server task");
@@ -6810,7 +6797,7 @@ mod tests {
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
             providers: operator::site_providers::LocalProviders::default(),
-            membership: "Swim",
+            settings: operator::peer_settings::OwnSettings::new(Membership::Swim),
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
@@ -7164,7 +7151,7 @@ mod tests {
                 peers: operator::signals::SignalStore::new(),
                 rounds: operator::signals::PeerRounds::default(),
                 providers: operator::site_providers::LocalProviders::default(),
-                membership: "Swim",
+                settings: operator::peer_settings::OwnSettings::new(Membership::Swim),
                 feedback,
             })
         }

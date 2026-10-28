@@ -33,9 +33,6 @@ use crate::{
 /// certificate, never the path, so no second path can widen a caller's view.
 pub const SIGNALS_PATH: &str = "/v1/site/signals";
 
-/// Response header naming the serving site's membership source, `Swim` or `Local`.
-pub const MEMBERSHIP_HEADER: &str = "x-grid-membership";
-
 /// Label naming the site a sample was observed at.
 pub const SITE_LABEL: &str = "grid_site";
 

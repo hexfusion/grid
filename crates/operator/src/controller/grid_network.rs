@@ -196,6 +196,9 @@ pub struct OperatorCtx {
     /// How this site learns its members.
     membership: crate::cli::Membership,
 
+    /// The grid-wide settings this site states to its peers.
+    own_settings: crate::peer_settings::OwnSettings,
+
     /// The last value logged per state, so a pass logs at INFO only what changed.
     pub(crate) logged: ChangeLog,
 
@@ -391,6 +394,7 @@ impl OperatorCtx {
             mode_restart: None,
             site_name: None,
             membership: crate::cli::Membership::Swim,
+            own_settings: crate::peer_settings::OwnSettings::new(crate::cli::Membership::Swim),
             logged: ChangeLog::default(),
             started: Instant::now(),
         }
@@ -529,9 +533,16 @@ impl OperatorCtx {
 
     /// Learn members the way `membership` says.
     #[must_use]
-    pub const fn with_membership(mut self, membership: crate::cli::Membership) -> Self {
+    pub fn with_membership(mut self, membership: crate::cli::Membership) -> Self {
         self.membership = membership;
+        self.own_settings = crate::peer_settings::OwnSettings::new(membership);
         self
+    }
+
+    /// The grid-wide settings this site states to its peers, and compares theirs with.
+    #[must_use]
+    pub fn own_settings(&self) -> crate::peer_settings::OwnSettings {
+        self.own_settings.clone()
     }
 
     /// How this site learns its members.
@@ -1936,6 +1947,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     let grid_id = resolve_grid_id(&network);
+    ctx.own_settings.set_grid_id(stated_grid_id(&network));
     // An expired or unreadable identity, as IdentityValid reports it, degrades the network.
     let identity_failed = network.status.as_ref().is_some_and(|status| {
         held_condition(&status.conditions, crate::enroll::local::IDENTITY_VALID)
@@ -2023,7 +2035,7 @@ const DEGRADED_BY: [(&str, &str); 7] = [
     (crate::gateway_ages::GATEWAY_AGES_REJECTED, "True"),
     (crate::peer_reach::PEER_SIGNALS_REACHABLE, "False"),
     (crate::peer_reach::PEER_CATALOGS_ACCEPTED, "False"),
-    (crate::peer_membership::PEER_MEMBERSHIP, "False"),
+    (crate::peer_settings::PEER_SETTINGS_MATCH, "False"),
     (crate::peer_reach::PEER_POLLS_COMPLETE, "False"),
 ];
 
@@ -5080,6 +5092,15 @@ async fn distribute_overlay_configmap(
 /// site, which joins a grid an admin names rather than one this operator would mint.
 fn holds_for_grid_id(network: &GridNetwork, config: &crate::operator_config::Snapshot) -> bool {
     network.spec.grid_id.is_empty() && !matches!(config.loaded.site(), crate::operator_config::Section::Unset)
+}
+
+/// The grid ID `network` states, `spec.gridId` else the one its status keeps, never one minted
+/// for this pass.
+fn stated_grid_id(network: &GridNetwork) -> Option<&str> {
+    Some(network.spec.grid_id.as_str())
+        .filter(|id| !id.is_empty())
+        .or_else(|| network.status.as_ref().map(|status| status.grid_id.as_str()))
+        .filter(|id| !id.is_empty())
 }
 
 /// The grid ID: `spec.gridId` whenever set, else the one minted earlier, else a new one. Only
@@ -9003,12 +9024,12 @@ mod tests {
 
     #[test]
     fn the_peer_conditions_degrade_the_network_after_its_own_and_never_gate_it() {
-        use crate::{peer_membership::PEER_MEMBERSHIP, peer_reach};
+        use crate::{peer_reach, peer_settings::PEER_SETTINGS_MATCH};
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
         for (type_, reason) in [
             (peer_reach::PEER_SIGNALS_REACHABLE, peer_reach::PEERS_UNREACHABLE),
             (peer_reach::PEER_CATALOGS_ACCEPTED, peer_reach::CATALOGS_REFUSED),
-            (PEER_MEMBERSHIP, crate::peer_membership::PEER_MEMBERSHIP_MISMATCH),
+            (PEER_SETTINGS_MATCH, crate::peer_settings::SETTINGS_MISMATCH),
             (peer_reach::PEER_POLLS_COMPLETE, peer_reach::POLL_ROUND_OVERRUN),
         ] {
             let failing = network_holding(&[(type_, "False", reason)]);

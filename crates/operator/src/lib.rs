@@ -55,9 +55,9 @@ pub(crate) mod metrics_token;
 pub mod operator_config;
 /// The `GridNetwork` condition naming peers whose relayed signal ages are rejected.
 pub mod peer_ages;
-pub mod peer_membership;
 /// The `GridNetwork` condition naming peers whose signals endpoints did not answer.
 pub mod peer_reach;
+pub mod peer_settings;
 mod provider_revision;
 pub mod readiness;
 /// Kubernetes resource builders.

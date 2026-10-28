@@ -253,9 +253,8 @@ impl PeerTransport {
 pub struct Stamp {
     /// Its `Date` header.
     pub date: Option<SystemTime>,
-    /// Its membership mode, absent from a release that sends none or names one this release
-    /// does not know.
-    pub membership: Option<String>,
+    /// The grid-wide settings it states, absent when it sends no settings header.
+    pub settings: Option<crate::peer_settings::Settings>,
     /// Its providers catalog version, absent from a release that sends none.
     pub providers_version: Option<String>,
     /// Its providers contract version, on a providers answer.
@@ -404,13 +403,6 @@ impl Bearer {
     }
 }
 
-/// The membership mode `header` names, only one this release knows: anything else is unknown.
-fn known_membership(header: Option<&str>) -> Option<String> {
-    header
-        .and_then(crate::cli::Membership::parse)
-        .map(|mode| mode.as_str().to_owned())
-}
-
 /// Await `request`, then read a 2xx body from `url` and its `Date` header.
 async fn read_response(
     request: hyper_util::client::legacy::ResponseFuture,
@@ -430,7 +422,7 @@ async fn read_response(
     let header = |name| response.headers().get(name).and_then(|value| value.to_str().ok());
     let stamp = Stamp {
         date: header(http::header::DATE.as_str()).and_then(|text| httpdate::parse_http_date(text).ok()),
-        membership: known_membership(header(crate::signals::MEMBERSHIP_HEADER)),
+        settings: header(crate::peer_settings::SETTINGS_HEADER).map(crate::peer_settings::Settings::parse),
         providers_version: header(crate::site_providers::VERSION_HEADER).map(|version| version.trim().to_owned()),
         providers_contract: header(crate::site_providers::CONTRACT_HEADER).map(str::to_owned),
     };

@@ -108,7 +108,7 @@ It carries this cluster's own conditions. `Accepted`, `ResolvedRefs`, `Enrolled`
 `IdentityValid` gate its roll-up, in that order. `RotationOnSchedule` `False`, a
 `PeerTimeValid` of `False`, or a `GatewayAgesRejected` of `True` sets `Degraded` with
 that condition's reason, and after them, under Local membership, a `False`
-`PeerSignalsReachable`, `PeerCatalogsAccepted`, `PeerMembership` or `PeerPollsComplete`.
+`PeerSignalsReachable`, `PeerCatalogsAccepted`, `PeerSettingsMatch` or `PeerPollsComplete`.
 None of the peer conditions gates `Available`, and a site switched to Swim drops them. Each condition type has one writer, and the controller alone
 writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
 [Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
@@ -286,18 +286,19 @@ placing the records on each cluster in a cluster set. Argo CD or plain GitOps de
 same records just as well. Red Hat Advanced Cluster Management is the product built on
 Open Cluster Management.
 
-A `PeerMembership` condition, under its own field manager
-(`grid-operator-peer-membership`), compares the `X-Grid-Membership` header each
-polled peer answers with against this site's `GRID_MEMBERSHIP_SOURCE`. A peer that sends
-no header is an older release and is judged by nothing. A grid that mixes sources is
-not supported: polling goes on so the direction that works still routes, but a
-Swim site never reads a Local site's catalog, and the condition stays False
-until every site names one source.
+A `PeerSettingsMatch` condition, under its own field manager
+(`grid-operator-peer-settings`), compares the grid-wide settings each polled peer states
+in its `x-grid-settings` header with this site's. The header is an RFC 8941 dictionary,
+for example `membership=Local, grid-id="dagobah"`: `membership` is the site's
+`grid.membership.source`, and `grid-id` its `GridNetwork`'s `spec.gridId`, once set. A
+setting is compared only when both sides state it, and a later setting adds a key. A grid
+that mixes sources or grid IDs is not supported: polling goes on so the direction that
+works still routes, and the condition stays False until every site states the same.
 
 | Status | Reason | When |
 |---|---|---|
-| `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
-| `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
+| `False` | `SettingsMismatch` | A polled peer states a setting otherwise. The message names up to 10 such peers with the settings they state, and what to set alike on every site. |
+| `True` | `PeerSettingsMatch` | Every polled peer states this site's settings. |
 
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
