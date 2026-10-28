@@ -2852,12 +2852,20 @@ fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAdd
         tracing::debug!(%remote, "signals caller presented no certificate");
         return (Caller::Peer(None), None);
     };
-    let fingerprint = operator::signals::leaf_fingerprint(leaf);
-    if identity.own.as_ref().is_some_and(|own| own.is_own(&fingerprint)) {
+    caller_named((leaf, &operator::signals::leaf_fingerprint(leaf)), identity, remote)
+}
+
+/// Who `leaf`, whose digest is `fingerprint`, speaks for, as [`caller_for`] says.
+fn caller_named(
+    (leaf, fingerprint): (&[u8], &str),
+    identity: &SignalsIdentity,
+    remote: SocketAddr,
+) -> (Caller, Option<String>) {
+    if identity.own.as_ref().is_some_and(|own| own.is_own(fingerprint)) {
         return (Caller::Local, None);
     }
     let named = match identity.trust {
-        operator::signals::PeerTrustMode::Pin => identity.peers.resolve_site_by_key(&fingerprint),
+        operator::signals::PeerTrustMode::Pin => identity.peers.resolve_site_by_key(fingerprint),
         operator::signals::PeerTrustMode::Spiffe => site_by_spiffe(leaf, identity),
     };
     let Some((site, labels)) = named else {
@@ -2961,7 +2969,9 @@ async fn serve_signals_connection(
         },
         (_, None) => return,
     };
-    let rescope = Some((Arc::<[u8]>::from(leaf), serving.identity));
+    // The leaf's digest once per connection; each request is named again from it.
+    let fingerprint = operator::signals::leaf_fingerprint(&leaf);
+    let rescope = Some((Arc::<[u8]>::from(leaf), fingerprint, serving.identity));
     Box::pin(serve_http(stream, serving.app, (caller, rescope), remote, shutdown)).await;
     drop(slot);
 }
@@ -2971,8 +2981,9 @@ fn unavailable() -> axum::Router {
     axum::Router::new().fallback(|| std::future::ready(http::StatusCode::SERVICE_UNAVAILABLE))
 }
 
-/// A connection's caller, and the leaf and identity to name it again by on each request.
-type Scope = (Caller, Option<(Arc<[u8]>, SignalsIdentity)>);
+/// A connection's caller, and the leaf, its digest and the identity to name it again by on each
+/// request.
+type Scope = (Caller, Option<(Arc<[u8]>, String, SignalsIdentity)>);
 
 /// Serve HTTP on an authenticated stream with the scope `caller` earned, bounded by every signals timeout.
 ///
@@ -2992,7 +3003,7 @@ async fn serve_http(
         let mut request = request;
         let scoped = rescope.as_ref().map_or_else(
             || caller.clone(),
-            |(leaf, identity)| caller_for(Some(leaf), identity, remote).0,
+            |(leaf, fingerprint, identity)| caller_named((leaf, fingerprint), identity, remote).0,
         );
         request.extensions_mut().insert(scoped);
         app.clone().call(request)
@@ -3653,19 +3664,20 @@ impl PeerPoller {
         (source, local_site): (&operator::signals::PollPeers, &str),
         polled: &[String],
         answered: &BTreeMap<String, usize>,
-        urls: &std::collections::HashMap<String, String>,
+        sites: &[operator::signals::PeerSite],
     ) {
         use operator::peer_reach::{CATALOGS, PeerReach, REACH};
         if self.ctx.membership() != Membership::Local {
             if !self.sites_written {
-                let none = [PeerReach::none(&REACH), PeerReach::none(&CATALOGS)];
-                let sites = Box::pin(write_site_conditions(&self.client, &none, &self.shutdown)).await;
-                let network = Box::pin(withdraw_network_conditions(&self.client, &self.shutdown)).await;
-                self.sites_written = sites && network;
+                let (no_reach, no_catalogs) = (PeerReach::none(&REACH), PeerReach::none(&CATALOGS));
+                let none = [&no_reach, &no_catalogs];
+                let on_sites = Box::pin(write_site_conditions(&self.client, &none, &self.shutdown)).await;
+                let on_network = Box::pin(withdraw_network_conditions(&self.client, &self.shutdown)).await;
+                self.sites_written = on_sites && on_network;
             }
             return;
         }
-        let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, urls);
+        let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, sites);
         Box::pin(self.write_network((&reach, &catalogs), (skipped, polled.len()))).await;
         for (peer, judged) in reach.judged() {
             // An egress-only peer has nothing to poll, so no series an alert on 0 could fire on.
@@ -3678,7 +3690,7 @@ impl PeerPoller {
         let changed = reach != self.reach || catalogs != self.catalogs;
         // Rechecked against the live objects on the catalog schedule, so a lost write heals.
         if changed || !self.sites_written || self.turn.is_multiple_of(CATALOG_ROUNDS) {
-            let judged = [reach.clone(), catalogs.clone()];
+            let judged = [&reach, &catalogs];
             self.sites_written = Box::pin(write_site_conditions(&self.client, &judged, &self.shutdown)).await;
         }
         self.reach = reach;
@@ -3712,7 +3724,7 @@ impl PeerPoller {
         (source, local_site): (&operator::signals::PollPeers, &str),
         polled: &[String],
         answered: &BTreeMap<String, usize>,
-        urls: &std::collections::HashMap<String, String>,
+        sites: &[operator::signals::PeerSite],
     ) -> (operator::peer_reach::PeerReach, operator::peer_reach::PeerReach, usize) {
         use operator::peer_reach::PeerReach;
         let identities = self.ctx.peer_identities();
@@ -3724,10 +3736,10 @@ impl PeerPoller {
         let reach = PeerReach::of(
             answered.keys().map(String::as_str),
             self.unanswered.iter().map(|peer| {
-                let failure = source
-                    .failures
-                    .of(peer)
-                    .map(|why| (why, urls.get(peer).map_or("", String::as_str)));
+                let failure = source.failures.of(peer).map(|why| {
+                    let url = sites.iter().find(|site| site.name == *peer);
+                    (why, url.map_or("", |site| site.url.as_str()))
+                });
                 (peer.as_str(), failure)
             }),
             without_endpoint.iter().map(String::as_str),
@@ -3829,9 +3841,7 @@ impl PeerPoller {
                 None => self.catalog_versions.remove(&site),
             };
         }
-        let urls: std::collections::HashMap<String, String> =
-            sites.iter().map(|site| (site.name.clone(), site.url.clone())).collect();
-        let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        let polled: Vec<String> = sites.iter().map(|site| site.name.clone()).collect();
         self.catalog_versions.retain(|site, _| polled.contains(site));
         self.ctx
             .peer_providers()
@@ -3852,7 +3862,7 @@ impl PeerPoller {
             .filter(|site| !answered.contains_key(*site))
             .cloned()
             .collect();
-        Box::pin(self.report_reach((source, &local_site), &polled, &answered, &urls)).await;
+        Box::pin(self.report_reach((source, &local_site), &polled, &answered, &sites)).await;
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }
@@ -4124,7 +4134,7 @@ where
 /// bounded and cut short by shutdown. `true` when every write landed.
 async fn write_site_conditions(
     client: &Client,
-    judged: &[operator::peer_reach::PeerReach],
+    judged: &[&operator::peer_reach::PeerReach],
     shutdown: &operator::shutdown::Shutdown,
 ) -> bool {
     tokio::select! {
@@ -4141,7 +4151,7 @@ async fn write_site_conditions(
 
 /// List the `GridSite` objects and apply each condition of `judged` that differs; `true` when
 /// every write landed.
-async fn apply_site_conditions(client: &Client, judged: &[operator::peer_reach::PeerReach]) -> bool {
+async fn apply_site_conditions(client: &Client, judged: &[&operator::peer_reach::PeerReach]) -> bool {
     let api: Api<GridSite> = Api::all(client.clone());
     let sites = match Box::pin(api.list(&kube::api::ListParams::default())).await {
         Ok(sites) => sites,
