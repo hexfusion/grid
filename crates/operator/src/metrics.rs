@@ -336,8 +336,13 @@ pub fn set_peer_catalog_cut(peer: &str, cut: bool) {
     PEER_CATALOG_CUT.with_label_values(&[peer]).set(i64::from(cut));
 }
 
-/// Set whether `peer`'s `SignalsReachable` condition is True.
-pub fn set_peer_signals_reachable(peer: &str, reachable: bool) {
+/// Set whether `peer`'s `SignalsReachable` condition is True, or with `None` drop the series
+/// of a peer that has nothing to poll.
+pub fn set_peer_signals_reachable(peer: &str, reachable: Option<bool>) {
+    let Some(reachable) = reachable else {
+        let _absent = PEER_SIGNALS_REACHABLE.remove_label_values(&[peer]);
+        return;
+    };
     note_peer(peer, None);
     PEER_SIGNALS_REACHABLE
         .with_label_values(&[peer])
@@ -1211,7 +1216,7 @@ mod tests {
         record_peer_signal_refused(peer, "skew");
         record_peer_catalog(peer, "replaced");
         set_peer_collection_up(peer, true, std::time::SystemTime::now());
-        set_peer_signals_reachable(peer, true);
+        set_peer_signals_reachable(peer, Some(true));
         set_peer_catalog_refused(peer, false);
         set_peer_catalog_cut(peer, true);
     }
@@ -1229,6 +1234,16 @@ mod tests {
         assert!(!after.contains(gone), "{after}");
         assert_eq!(after.matches(kept).count(), series, "another peer keeps its series");
         forget_peer("forget-kept");
+    }
+
+    #[test]
+    fn an_egress_only_peer_has_no_reachable_series() {
+        let series = "grid_peer_signals_reachable{peer=\"egress-only\"}";
+        set_peer_signals_reachable("egress-only", Some(false));
+        assert!(scrape().contains(series));
+        set_peer_signals_reachable("egress-only", None);
+        assert!(!scrape().contains(series), "nothing to poll, nothing to alert on");
+        forget_peer("egress-only");
     }
 
     #[test]

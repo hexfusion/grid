@@ -3646,7 +3646,9 @@ impl PeerPoller {
         let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, urls);
         Box::pin(self.write_network((&reach, &catalogs), (skipped, polled.len()))).await;
         for (peer, judged) in reach.judged() {
-            operator::metrics::set_peer_signals_reachable(peer, judged.is_clear());
+            // An egress-only peer has nothing to poll, so no series an alert on 0 could fire on.
+            let reachable = (*judged != operator::peer_reach::Judged::EgressOnly).then(|| judged.is_clear());
+            operator::metrics::set_peer_signals_reachable(peer, reachable);
         }
         for (peer, judged) in catalogs.judged() {
             operator::metrics::set_peer_catalog_refused(peer, !judged.is_clear());
