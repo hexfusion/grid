@@ -4845,7 +4845,6 @@ mod tests {
     #[cfg(not(feature = "fips"))]
     fn open_and_gold() -> operator::site_providers::LocalProviders {
         let provider = |id: &str, labels: BTreeMap<String, String>| operator::site_providers::WireProvider {
-            network_id: "net".to_owned(),
             provider_id: id.to_owned(),
             routing_cluster: id.to_owned(),
             models: vec!["m".to_owned()],
@@ -4916,7 +4915,7 @@ mod tests {
             alias: None,
         };
         let (read, _) = poll.fetch_providers(&east).await.expect("east answered");
-        let ids: Vec<&str> = read.iter().map(|p| p.provider_id.as_str()).collect();
+        let ids: Vec<&str> = read.providers.iter().map(|p| p.provider_id.as_str()).collect();
         assert_eq!(
             ids,
             ["open"],
@@ -5098,7 +5097,10 @@ mod tests {
             .await
             .expect("east answered under its server name");
         assert_eq!(
-            read.iter().map(|p| p.provider_id.as_str()).collect::<Vec<_>>(),
+            read.providers
+                .iter()
+                .map(|p| p.provider_id.as_str())
+                .collect::<Vec<_>>(),
             ["open"],
             "the same scoped read, dialled at the address rather than the name"
         );
@@ -5129,7 +5131,11 @@ mod tests {
             .await
             .expect("body");
         let read = operator::site_providers::parse(std::str::from_utf8(&body).expect("utf-8")).expect("parses");
-        assert_eq!(read.len(), 2, "the local gateway is not scoped by access policy");
+        assert_eq!(
+            read.providers.len(),
+            2,
+            "the local gateway is not scoped by access policy"
+        );
     }
 
     /// A renewal rebinds the listener on the new leaf: a peer's open connection keeps

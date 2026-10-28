@@ -926,6 +926,7 @@ accepted in the last rendering. It is written once a catalog is held.
 | `False` | `HopClaimed` | A record names a cluster bound to another site's gateway hop. The message names that site. |
 | `False` | `ClusterClaimed` | A record names a cluster another peer holds by declaration: the cluster is bound to that peer's gateway hop, or carries that peer's name. The message names the holder. |
 | `False` | `ClusterContested` | A record names a cluster another peer also names, and nothing declares whose it is, so no peer routes it until the names differ. The message names the other peers. |
+| `False` | `GridIdMismatch` | The peer's catalog states another grid ID, or none, so none of it is admitted. Set `spec.gridId` alike on every site. |
 
 A peer that leaves the Local peer set loses both conditions on the next round, and an
 operator that starts under Swim removes them once. Either way the peer's `Degraded`

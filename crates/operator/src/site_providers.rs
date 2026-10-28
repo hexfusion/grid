@@ -50,13 +50,11 @@ pub const MAX_MODELS_PER_RECORD: usize = 64;
 
 /// One provider record as a peer reads it.
 ///
-/// Carries its network and no site: a reader keeps only its own network's records
-/// and stamps the site from who it polled, so a peer cannot speak for another site.
+/// Carries no site and no network: a reader stamps the site from who it polled, so a peer
+/// cannot speak for another site, and the grid from the body's `gridId`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WireProvider {
-    /// Grid network the provider belongs to.
-    pub network_id: String,
     /// Provider identity within the serving site.
     pub provider_id: String,
     /// Routing cluster identity a candidate names.
@@ -85,7 +83,6 @@ pub struct WireProvider {
 impl From<crdt::ProviderState> for WireProvider {
     fn from(state: crdt::ProviderState) -> Self {
         Self {
-            network_id: state.network_id,
             provider_id: state.provider_id,
             routing_cluster: state.routing_cluster,
             models: state.models,
@@ -100,9 +97,10 @@ impl From<crdt::ProviderState> for WireProvider {
 }
 
 impl WireProvider {
-    /// The provider state `site` serves, `None` for a record no candidate can use.
+    /// The provider state `site` serves in this site's `network`, `None` for a record no
+    /// candidate can use.
     #[must_use]
-    pub fn into_state(self, site: &str) -> Option<crdt::ProviderState> {
+    pub fn into_state(self, site: &str, network: &str) -> Option<crdt::ProviderState> {
         // Both names travel as header values at the gateway, so a bad one is dropped here
         // rather than failing the whole serving document there.
         let header_safe = |name: &str| !name.is_empty() && http::HeaderValue::from_str(name).is_ok();
@@ -114,7 +112,7 @@ impl WireProvider {
             return None;
         }
         Some(crdt::ProviderState {
-            network_id: self.network_id,
+            network_id: network.to_owned(),
             site_id: site.to_owned(),
             provider_id: self.provider_id,
             routing_cluster: self.routing_cluster,
@@ -133,9 +131,25 @@ impl WireProvider {
     }
 }
 
+/// Reason a peer's catalog is refused for naming another grid, or none.
+pub const GRID_ID_MISMATCH: &str = "GridIdMismatch";
+
+/// One peer's catalog: the grid it states and its records.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PeerCatalog {
+    /// The body's `gridId`, `None` when it states none.
+    pub grid_id: Option<String>,
+    /// The records.
+    pub providers: Vec<WireProvider>,
+}
+
 /// The body a site serves.
 #[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Body<Providers> {
+    /// The grid the serving site belongs to, its `GridNetwork`'s `spec.gridId`.
+    #[serde(default)]
+    grid_id: Option<String>,
     /// Provider records.
     providers: Providers,
     /// Whether records were left out to keep the body within its bounds.
@@ -143,9 +157,9 @@ struct Body<Providers> {
     truncated: bool,
 }
 
-/// The records in a peer's body, `None` when it is too large, malformed, or lists too many.
+/// A peer's catalog from its body, `None` when it is too large, malformed, or lists too many.
 #[must_use]
-pub fn parse(body: &str) -> Option<Vec<WireProvider>> {
+pub fn parse(body: &str) -> Option<PeerCatalog> {
     if body.len() > MAX_BODY_BYTES {
         return None;
     }
@@ -159,8 +173,11 @@ pub fn parse(body: &str) -> Option<Vec<WireProvider>> {
                 );
             }
         })
-        .map(|body| body.providers)
-        .filter(|providers| providers.len() <= MAX_PROVIDERS)
+        .filter(|body| body.providers.len() <= MAX_PROVIDERS)
+        .map(|body| PeerCatalog {
+            grid_id: body.grid_id,
+            providers: body.providers,
+        })
 }
 
 /// The first eight bytes of `bytes`' SHA-256, in hex.
@@ -191,6 +208,8 @@ pub struct LocalProviders(Arc<RwLock<Catalog>>, Arc<RwLock<Option<String>>>);
 /// from them, emptied whenever they change.
 #[derive(Debug, Default)]
 pub struct Catalog {
+    /// The grid this site belongs to, stated once on every body.
+    grid_id: Option<String>,
     /// The records, by network.
     networks: BTreeMap<String, Vec<WireProvider>>,
     /// Each reader's body and its version, by the labels it reads under, `None` for this site.
@@ -223,7 +242,7 @@ impl LocalProviders {
             }
             held.networks.insert(network.to_owned(), providers);
             held.rendered.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
-            serde_json::to_vec(&held.networks).ok()
+            serde_json::to_vec(&(&held.grid_id, &held.networks)).ok()
         };
         let version = serialized.map(|bytes| digest(&bytes));
         *self.1.write().unwrap_or_else(PoisonError::into_inner) = version;
@@ -241,10 +260,19 @@ impl LocalProviders {
             }
             held.rendered.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
             (!held.networks.is_empty())
-                .then(|| serde_json::to_vec(&held.networks).ok())
+                .then(|| serde_json::to_vec(&(&held.grid_id, &held.networks)).ok())
                 .flatten()
         };
         *self.1.write().unwrap_or_else(PoisonError::into_inner) = serialized.map(|bytes| digest(&bytes));
+    }
+
+    /// State `grid_id` on every body from now, `None` while this site has none.
+    pub fn set_grid_id(&self, grid_id: Option<&str>) {
+        let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        if held.grid_id.as_deref() != grid_id {
+            held.grid_id = grid_id.map(str::to_owned);
+            held.rendered.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+        }
     }
 
     /// The version of what `reader` is served: a digest of its rendered body, `None` until
@@ -268,7 +296,7 @@ impl LocalProviders {
         let rendered = if let Some(rendered) = kept.get(&key) {
             rendered.clone()
         } else {
-            let body = render_from(&held.networks, reader)?;
+            let body = render_from((held.grid_id.as_deref(), &held.networks), reader)?;
             let rendered = Rendered {
                 version: digest(body.as_bytes()),
                 body: bytes::Bytes::from(body),
@@ -304,8 +332,14 @@ impl LocalProviders {
 
 /// The JSON body `reader` is served from `held`, within [`MAX_PROVIDERS`] and
 /// [`MAX_BODY_BYTES`], `None` when nothing is published.
-fn render_from(held: &BTreeMap<String, Vec<WireProvider>>, reader: Reader<'_>) -> Option<String> {
-    let mut body = String::from(r#"{"providers":["#);
+fn render_from(
+    (grid_id, held): (Option<&str>, &BTreeMap<String, Vec<WireProvider>>),
+    reader: Reader<'_>,
+) -> Option<String> {
+    let mut body = match grid_id.and_then(|id| serde_json::to_string(id).ok()) {
+        Some(id) => format!(r#"{{"gridId":{id},"providers":["#),
+        None => String::from(r#"{"providers":["#),
+    };
     if held.is_empty() {
         return None;
     }
@@ -353,7 +387,7 @@ pub struct PeerProviders(Arc<PeerCatalogs>);
 #[derive(Debug, Default)]
 struct PeerCatalogs {
     /// Each peer's catalog, in name order since the records a round returns are read in it.
-    held: RwLock<BTreeMap<String, Vec<WireProvider>>>,
+    held: RwLock<BTreeMap<String, PeerCatalog>>,
     /// Marked whenever a catalog arrives, changes or is forgotten.
     changed: tokio::sync::watch::Sender<()>,
     /// When each held peer's catalog first arrived, as an order: what the overlay's ceiling
@@ -426,12 +460,12 @@ struct Shared {
 
 impl PeerProviders {
     /// Replace what `site` serves.
-    pub fn replace(&self, site: &str, providers: Vec<WireProvider>) {
+    pub fn replace(&self, site: &str, catalog: PeerCatalog) {
         let changed = {
             let mut held = self.0.held.write().unwrap_or_else(PoisonError::into_inner);
-            let changed = held.get(site) != Some(&providers);
+            let changed = held.get(site) != Some(&catalog);
             if changed {
-                held.insert(site.to_owned(), providers);
+                held.insert(site.to_owned(), catalog);
             }
             changed
         };
@@ -493,8 +527,8 @@ impl PeerProviders {
 
     /// [`Self::admit`] with no cluster bound to a site.
     #[must_use]
-    pub fn remote_for(&self, network: &str, reserved: &HashSet<String>) -> Vec<crdt::ProviderState> {
-        self.admit(network, reserved, &ClusterSites::new())
+    pub fn remote_for(&self, grid: (&str, Option<&str>), reserved: &HashSet<String>) -> Vec<crdt::ProviderState> {
+        self.admit(grid, reserved, &ClusterSites::new())
     }
 
     /// Admit `network`'s held records for routing, stamped as their peer's whatever the body
@@ -507,21 +541,29 @@ impl PeerProviders {
     /// the overlay past its ceiling is admitted up to its share and what is left of the
     /// remainder, records in id order and models in name order.
     #[must_use]
-    pub fn admit(&self, network: &str, reserved: &HashSet<String>, hops: &ClusterSites) -> Vec<crdt::ProviderState> {
+    pub fn admit(
+        &self,
+        (network, grid_id): (&str, Option<&str>),
+        reserved: &HashSet<String>,
+        hops: &ClusterSites,
+    ) -> Vec<crdt::ProviderState> {
         let held = self.0.held.read().unwrap_or_else(PoisonError::into_inner);
-        let in_network: Vec<(&String, &WireProvider)> = held
-            .iter()
-            .flat_map(|(site, providers)| {
-                providers
-                    .iter()
-                    .filter(|provider| provider.network_id == network)
-                    .map(move |provider| (site, provider))
-            })
-            .collect();
+        let mut verdicts = HashMap::new();
+        let mut in_network: Vec<(&String, &WireProvider)> = Vec::new();
+        for (site, catalog) in held.iter() {
+            match grid_mismatch(catalog.grid_id.as_deref(), grid_id) {
+                Some(message) => drop(verdicts.insert(site.clone(), Verdict::refused(GRID_ID_MISMATCH, message))),
+                None => in_network.extend(catalog.providers.iter().map(|provider| (site, provider))),
+            }
+        }
         let shared = self.share_ceiling(&in_network);
         let claims = claimants(in_network.iter().copied(), reserved, hops);
-        let mut verdicts = HashMap::new();
-        let (kept, short) = routed(&in_network, &shared, (reserved, hops, &claims), &mut verdicts);
+        let (kept, short) = routed(
+            (network, &in_network),
+            &shared,
+            (reserved, hops, &claims),
+            &mut verdicts,
+        );
         for site in held.keys() {
             crate::metrics::set_peer_catalog_cut(site, short.contains_key(site.as_str()));
         }
@@ -684,7 +726,7 @@ impl<'shared> Budgets<'shared> {
 /// peer is then cut to what it may contribute, records in id order. Returns what routes and,
 /// by peer, how many candidates of how many were left out.
 fn routed<'shared>(
-    records: &[(&String, &WireProvider)],
+    (network, records): (&str, &[(&String, &WireProvider)]),
     shared: &'shared Shared,
     (reserved, hops, claims): (&HashSet<String>, &ClusterSites, &Claims<'_>),
     verdicts: &mut HashMap<String, Verdict>,
@@ -706,10 +748,22 @@ fn routed<'shared>(
     let mut kept = Vec::new();
     for (site, provider) in routable {
         if let Some(record) = budgets.cut(site, (*provider).clone()) {
-            kept.extend(record.into_state(site.as_str()));
+            kept.extend(record.into_state(site.as_str(), network));
         }
     }
     (kept, budgets.short())
+}
+
+/// Why a catalog stating `theirs` is refused at a site in `ours`, `None` when they are one grid.
+fn grid_mismatch(theirs: Option<&str>, ours: Option<&str>) -> Option<String> {
+    match (theirs, ours) {
+        (Some(theirs), Some(ours)) if theirs == ours => None,
+        (_, None) => Some("this site has no grid ID yet, so no catalog is admitted: set spec.gridId".to_owned()),
+        (None, Some(ours)) => Some(format!("states no grid ID, and this site is in grid {ours}")),
+        (Some(theirs), Some(ours)) => Some(format!(
+            "states grid {theirs}, and this site is in grid {ours}: set spec.gridId alike on every site"
+        )),
+    }
 }
 
 /// `sites` as a message names them, in order.
@@ -911,9 +965,19 @@ mod tests {
         );
     }
 
+    /// The grid every test site is in.
+    const GRID: &str = "grid";
+
+    /// `providers` as a peer in [`GRID`] serves them.
+    fn in_grid(providers: Vec<WireProvider>) -> PeerCatalog {
+        PeerCatalog {
+            grid_id: Some(GRID.to_owned()),
+            providers,
+        }
+    }
+
     fn wire(id: &str, labels: &[(&str, &str)]) -> WireProvider {
         WireProvider {
-            network_id: "net".to_owned(),
             provider_id: id.to_owned(),
             routing_cluster: format!("{id}-cluster"),
             models: vec!["m".to_owned()],
@@ -990,7 +1054,9 @@ mod tests {
     }
 
     fn served(local: &LocalProviders, reader: Reader<'_>) -> Vec<WireProvider> {
-        parse(&local.render(reader).unwrap_or_else(|| std::process::abort())).unwrap_or_else(|| std::process::abort())
+        parse(&local.render(reader).unwrap_or_else(|| std::process::abort()))
+            .unwrap_or_else(|| std::process::abort())
+            .providers
     }
 
     #[test]
@@ -1034,20 +1100,36 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_keeps_its_own_network_and_names_the_polled_peer_whatever_the_body_claims() {
-        let body = r#"{"providers":[{"networkId":"other","providerId":"p","routingCluster":"c","capacityWeight":1,
-            "phase":"Available","revision":1,"siteId":"victim","writerId":"victim"}]}"#;
+    fn a_reader_keeps_only_its_own_grid_and_names_the_polled_peer_whatever_the_body_claims() {
+        let body = r#"{"gridId":"grid","providers":[{"networkId":"other","providerId":"p","routingCluster":"c",
+            "capacityWeight":1,"phase":"Available","revision":1,"siteId":"victim","writerId":"victim"}]}"#;
         let peers = PeerProviders::default();
         peers.replace("east", parse(body).unwrap_or_default());
-        assert!(
-            peers.remote_for("net", &HashSet::new()).is_empty(),
-            "another network's record is not this one's"
-        );
-        let states = peers.remote_for("other", &HashSet::new());
+        let states = peers.remote_for(("net", Some(GRID)), &HashSet::new());
         assert_eq!(states.len(), 1, "unknown fields are ignored, not fatal");
         assert!(
-            states.iter().all(|s| s.site_id == "east" && s.writer_id == "east"),
-            "the site comes from the poll, never the body: {states:?}"
+            states
+                .iter()
+                .all(|s| s.site_id == "east" && s.writer_id == "east" && s.network_id == "net"),
+            "the site comes from the poll and the network from this site, never the body: {states:?}"
+        );
+        assert!(
+            peers.remote_for(("net", Some("hoth")), &HashSet::new()).is_empty(),
+            "another grid's catalog is not this one's"
+        );
+        assert_eq!(
+            peers.verdicts().get("east").map(Verdict::reason),
+            Some(GRID_ID_MISMATCH),
+            "and it is refused by name, not dropped in silence"
+        );
+        peers.replace("east", parse(r#"{"providers":[]}"#).unwrap_or_default());
+        assert!(peers.remote_for(("net", Some(GRID)), &HashSet::new()).is_empty());
+        assert!(
+            peers
+                .verdicts()
+                .get("east")
+                .is_some_and(|verdict| verdict.message().contains("states no grid ID")),
+            "a body stating no grid is refused too"
         );
     }
 
@@ -1061,7 +1143,7 @@ mod tests {
         unprintable.routing_cluster = "c\u{1}".to_owned();
         let kept = [zero, unnamed, unprintable, wire("c", &[])]
             .into_iter()
-            .filter_map(|provider| provider.into_state("east"))
+            .filter_map(|provider| provider.into_state("east", "net"))
             .count();
         assert_eq!(
             kept, 1,
@@ -1072,6 +1154,7 @@ mod tests {
     #[test]
     fn an_oversized_or_overfull_body_is_refused() {
         let overfull = Body {
+            grid_id: None,
             providers: (0..=MAX_PROVIDERS)
                 .map(|i| wire(&i.to_string(), &[]))
                 .collect::<Vec<_>>(),
@@ -1105,23 +1188,33 @@ mod tests {
     }
 
     #[test]
+    fn the_body_states_the_grid_id_once_and_no_record_names_a_network() {
+        let local = LocalProviders::default();
+        local.replace("net", vec![wire("a", &[])]);
+        let unstated = local.render(Reader::Local).unwrap_or_default();
+        assert!(unstated.starts_with(r#"{"providers":["#), "no grid ID yet: {unstated}");
+        local.set_grid_id(Some(GRID));
+        let body = local.render(Reader::Local).unwrap_or_default();
+        assert!(body.starts_with(r#"{"gridId":"grid","providers":["#), "{body}");
+        assert!(!body.contains("networkId"), "{body}");
+        assert_eq!(parse(&body).and_then(|catalog| catalog.grid_id).as_deref(), Some(GRID));
+    }
+
+    #[test]
     fn a_truncated_catalog_keeps_a_share_of_every_network() {
         let local = LocalProviders::default();
         let records = |network: &str, count: usize| -> Vec<WireProvider> {
-            (0..count)
-                .map(|n| {
-                    let mut record = wire(&format!("{network}-{n:04}"), &[]);
-                    network.clone_into(&mut record.network_id);
-                    record
-                })
-                .collect()
+            (0..count).map(|n| wire(&format!("{network}-{n:04}"), &[])).collect()
         };
         local.replace("alpha", records("alpha", MAX_PROVIDERS));
         local.replace("beta", records("beta", 3));
         let served = served(&local, Reader::Local);
         assert_eq!(served.len(), MAX_PROVIDERS, "cut at the record bound");
         assert_eq!(
-            served.iter().filter(|record| record.network_id == "beta").count(),
+            served
+                .iter()
+                .filter(|record| record.provider_id.starts_with("beta-"))
+                .count(),
             3,
             "the small network is not crowded out by the large one"
         );
@@ -1149,7 +1242,7 @@ mod tests {
             body.len()
         );
         assert!(body.ends_with(r#"],"truncated":true}"#), "a capped body says so");
-        let kept = parse(&body).unwrap_or_default();
+        let kept = parse(&body).unwrap_or_default().providers;
         assert!(!kept.is_empty(), "a capped body still serves the first records");
         assert_eq!(
             kept.first().map(|p| p.provider_id.as_str()),
@@ -1165,11 +1258,11 @@ mod tests {
         "local-vllm".clone_into(&mut taken.routing_cluster);
         let mut contested = wire("c", &[]);
         "shared".clone_into(&mut contested.routing_cluster);
-        peers.replace("east", vec![wire("a", &[]), taken, contested.clone()]);
-        peers.replace("west", vec![wire("b", &[]), contested]);
+        peers.replace("east", in_grid(vec![wire("a", &[]), taken, contested.clone()]));
+        peers.replace("west", in_grid(vec![wire("b", &[]), contested]));
         let reserved = HashSet::from(["local-vllm".to_owned()]);
         let kept: Vec<(String, String)> = peers
-            .remote_for("net", &reserved)
+            .remote_for(("net", Some(GRID)), &reserved)
             .into_iter()
             .map(|state| (state.site_id, state.routing_cluster))
             .collect();
@@ -1193,7 +1286,7 @@ mod tests {
 
     fn routes(peers: &PeerProviders, hops: &ClusterSites) -> Vec<(String, String)> {
         peers
-            .admit("net", &HashSet::new(), hops)
+            .admit(("net", Some(GRID)), &HashSet::new(), hops)
             .into_iter()
             .map(|state| (state.site_id, state.routing_cluster))
             .collect()
@@ -1203,9 +1296,9 @@ mod tests {
     fn a_record_naming_too_many_models_is_refused() {
         let mut crowded = wire("x", &[]);
         crowded.models = (0..=MAX_MODELS_PER_RECORD).map(|n| format!("m{n}")).collect();
-        assert!(crowded.clone().into_state("east").is_none());
+        assert!(crowded.clone().into_state("east", "net").is_none());
         crowded.models.truncate(MAX_MODELS_PER_RECORD);
-        assert!(crowded.into_state("east").is_some(), "the cap itself is allowed");
+        assert!(crowded.into_state("east", "net").is_some(), "the cap itself is allowed");
     }
 
     fn catalog(prefix: &str, records: usize, models: usize) -> Vec<WireProvider> {
@@ -1220,7 +1313,7 @@ mod tests {
 
     /// What each site routes, as admitted.
     fn admitted(peers: &PeerProviders) -> Vec<crdt::ProviderState> {
-        peers.admit("net", &HashSet::new(), &ClusterSites::new())
+        peers.admit(("net", Some(GRID)), &HashSet::new(), &ClusterSites::new())
     }
 
     /// The candidates each site routes, by site.
@@ -1235,9 +1328,9 @@ mod tests {
     /// East and west each past a third of the ceiling, east first; north within its share.
     fn east_west_north() -> PeerProviders {
         let peers = PeerProviders::default();
-        peers.replace("east", catalog("e", 9, MAX_MODELS_PER_RECORD));
-        peers.replace("west", catalog("w", 10, MAX_MODELS_PER_RECORD));
-        peers.replace("north", catalog("n", 1, 1));
+        peers.replace("east", in_grid(catalog("e", 9, MAX_MODELS_PER_RECORD)));
+        peers.replace("west", in_grid(catalog("w", 10, MAX_MODELS_PER_RECORD)));
+        peers.replace("north", in_grid(catalog("n", 1, 1)));
         peers
     }
 
@@ -1297,9 +1390,9 @@ mod tests {
     fn a_thousand_model_peer_stays_partly_routable_when_declared_peers_arrive() {
         let peers = PeerProviders::default();
         peers.declare(3);
-        peers.replace("big", catalog("b", 20, 50));
-        peers.replace("east", catalog("e", 5, 60));
-        peers.replace("west", catalog("w", 5, 60));
+        peers.replace("big", in_grid(catalog("b", 20, 50)));
+        peers.replace("east", in_grid(catalog("e", 5, 60)));
+        peers.replace("west", in_grid(catalog("w", 5, 60)));
         assert_eq!(
             routed_candidates(&peers),
             BTreeMap::from([
@@ -1327,13 +1420,13 @@ mod tests {
     fn a_record_with_no_models_is_one_candidate_and_is_dropped_whole() {
         let peers = PeerProviders::default();
         peers.declare(2);
-        peers.replace("bare", catalog("b", 600, 0));
+        peers.replace("bare", in_grid(catalog("b", 600, 0)));
         assert_eq!(
             routes(&peers, &ClusterSites::new()).len(),
             600,
             "alone, the remainder covers it"
         );
-        peers.replace("other", catalog("o", 8, MAX_MODELS_PER_RECORD));
+        peers.replace("other", in_grid(catalog("o", 8, MAX_MODELS_PER_RECORD)));
         let bare: Vec<crdt::ProviderState> = admitted(&peers)
             .into_iter()
             .filter(|record| record.site_id == "bare")
@@ -1357,13 +1450,13 @@ mod tests {
     fn a_greedy_first_peer_cannot_take_every_declared_peers_share() {
         let peers = PeerProviders::default();
         peers.declare(3);
-        peers.replace("greedy", catalog("g", 16, MAX_MODELS_PER_RECORD));
+        peers.replace("greedy", in_grid(catalog("g", 16, MAX_MODELS_PER_RECORD)));
         assert_eq!(
             routes(&peers, &ClusterSites::new()).len(),
             16,
             "alone, the whole remainder is its to take"
         );
-        peers.replace("north", catalog("n", 1, 1));
+        peers.replace("north", in_grid(catalog("n", 1, 1)));
         assert_eq!(
             routed_candidates(&peers),
             BTreeMap::from([("greedy".to_owned(), 1023), ("north".to_owned(), 1)]),
@@ -1376,7 +1469,7 @@ mod tests {
             "{:?}",
             peers.verdicts()["greedy"]
         );
-        peers.replace("greedy", catalog("g", 5, MAX_MODELS_PER_RECORD));
+        peers.replace("greedy", in_grid(catalog("g", 5, MAX_MODELS_PER_RECORD)));
         assert_eq!(
             routes(&peers, &ClusterSites::new()).len(),
             6,
@@ -1390,12 +1483,12 @@ mod tests {
         let peers = PeerProviders::default();
         let mut taken = wire("t", &[]);
         "local-vllm".clone_into(&mut taken.routing_cluster);
-        peers.replace("east", vec![taken]);
+        peers.replace("east", in_grid(vec![taken]));
         let reserved = HashSet::from(["local-vllm".to_owned()]);
-        drop(peers.remote_for("net", &reserved));
+        drop(peers.remote_for(("net", Some(GRID)), &reserved));
         assert_eq!(peers.verdicts()["east"].reason(), "OwnCluster");
-        peers.replace("east", vec![wire("a", &[])]);
-        drop(peers.remote_for("net", &reserved));
+        peers.replace("east", in_grid(vec![wire("a", &[])]));
+        drop(peers.remote_for(("net", Some(GRID)), &reserved));
         assert!(peers.verdicts().is_empty(), "a clean admission clears the last verdict");
     }
 
@@ -1403,7 +1496,7 @@ mod tests {
     fn many_honest_peers_are_all_kept() {
         let peers = PeerProviders::default();
         for n in 0..100 {
-            peers.replace(&format!("site-{n}"), catalog(&format!("s{n}-"), 1, 10));
+            peers.replace(&format!("site-{n}"), in_grid(catalog(&format!("s{n}-"), 1, 10)));
         }
         assert_eq!(
             routes(&peers, &ClusterSites::new()).len(),
@@ -1418,12 +1511,12 @@ mod tests {
         let peers = PeerProviders::default();
         let mut contested = wire("c", &[]);
         "shared".clone_into(&mut contested.routing_cluster);
-        peers.replace("west", vec![contested.clone()]);
+        peers.replace("west", in_grid(vec![contested.clone()]));
         assert_eq!(
             routes(&peers, &ClusterSites::new()),
             [("west".to_owned(), "shared".to_owned())]
         );
-        peers.replace("east", vec![contested]);
+        peers.replace("east", in_grid(vec![contested]));
         assert_eq!(
             routes(&peers, &ClusterSites::new()),
             [],
@@ -1451,8 +1544,8 @@ mod tests {
         let peers = PeerProviders::default();
         let mut wests = wire("w", &[]);
         "west".clone_into(&mut wests.routing_cluster);
-        peers.replace("east", vec![wests.clone()]);
-        peers.replace("west", vec![wests]);
+        peers.replace("east", in_grid(vec![wests.clone()]));
+        peers.replace("west", in_grid(vec![wests]));
         assert_eq!(
             routes(&peers, &ClusterSites::new()),
             [("west".to_owned(), "west".to_owned())],
@@ -1480,8 +1573,8 @@ mod tests {
         let peers = PeerProviders::default();
         let mut hop = wire("h", &[]);
         "hop-east".clone_into(&mut hop.routing_cluster);
-        peers.replace("west", vec![hop.clone()]);
-        peers.replace("east", vec![hop]);
+        peers.replace("west", in_grid(vec![hop.clone()]));
+        peers.replace("east", in_grid(vec![hop]));
         let hops = ClusterSites::from([("hop-east".to_owned(), "east".to_owned())]);
         assert_eq!(
             routes(&peers, &hops),
@@ -1505,12 +1598,12 @@ mod tests {
         let mut changes = Box::pin(peers.changes());
         let mut next = || futures::FutureExt::now_or_never(futures::StreamExt::next(&mut changes)).flatten();
         assert_eq!(next(), None, "nothing held, nothing signalled");
-        peers.replace("east", vec![wire("a", &[])]);
+        peers.replace("east", in_grid(vec![wire("a", &[])]));
         assert_eq!(next(), Some(()), "a first catalog");
-        peers.replace("east", vec![wire("a", &[])]);
+        peers.replace("east", in_grid(vec![wire("a", &[])]));
         assert_eq!(next(), None, "the same catalog read again");
-        peers.replace("east", vec![wire("b", &[])]);
-        peers.replace("west", vec![wire("c", &[])]);
+        peers.replace("east", in_grid(vec![wire("b", &[])]));
+        peers.replace("west", in_grid(vec![wire("c", &[])]));
         assert_eq!(next(), Some(()), "two changes, one wake");
         assert_eq!(next(), None);
         peers.retain_sites(|site| site == "east" || site == "west");
@@ -1522,9 +1615,9 @@ mod tests {
     #[test]
     fn peer_providers_are_stamped_for_the_reader_and_forgotten_with_their_peer() {
         let peers = PeerProviders::default();
-        peers.replace("east", vec![wire("a", &[])]);
-        peers.replace("west", vec![wire("b", &[])]);
-        let remote = peers.remote_for("net", &HashSet::new());
+        peers.replace("east", in_grid(vec![wire("a", &[])]));
+        peers.replace("west", in_grid(vec![wire("b", &[])]));
+        let remote = peers.remote_for(("net", Some(GRID)), &HashSet::new());
         assert_eq!(
             remote
                 .iter()
@@ -1536,7 +1629,7 @@ mod tests {
         peers.retain_sites(|site| site != "east");
         assert_eq!(
             peers
-                .remote_for("net", &HashSet::new())
+                .remote_for(("net", Some(GRID)), &HashSet::new())
                 .iter()
                 .map(|provider| provider.site_id.as_str())
                 .collect::<Vec<_>>(),

@@ -45,6 +45,28 @@ Peers are dialled directly. The signals and providers path reads no
 TLS through untouched, and an egress proxy that terminates TLS breaks the
 mutual TLS the path depends on.
 
+## Providers catalog
+
+Under Local membership each site serves its own providers on `GET /v1/site/providers`,
+on the same listener and scoped by the caller's certificate like its signals. A peer
+reads only the providers whose access policy its labels satisfy. The body is contract 1:
+
+```json
+{"gridId":"dagobah","providers":[{"providerId":"pool-a","routingCluster":"pool-a",
+  "models":["m"],"tools":[],"backendKind":"local","capacityWeight":2,"phase":"Available",
+  "matchLabels":{},"revision":3}],"truncated":false}
+```
+
+| Part | Contract |
+|---|---|
+| `gridId` | The serving site's `GridNetwork` `spec.gridId`, once for the body. A reader admits a catalog only from its own grid, and a body stating another grid ID, or none, reads `CatalogAccepted` `False` `GridIdMismatch` on that peer's `GridSite`. |
+| `providers` | At most 256 records. A record names no site and no network: the reader stamps the site it polled and its own network, so a peer cannot speak for another site. |
+| `models` | At most 64 per record. A record naming more is refused, alone. |
+| Body size | At most 256 KiB. A larger body is refused whole. A site cutting its own catalog to fit says `"truncated":true`, and keeps a share of every network. |
+| `x-grid-providers-contract` | `1` on every providers answer. An answer without it is read as `1`, and another major is refused. |
+| `x-grid-providers-version` | A digest of exactly the body the reader is served, on every signals and providers answer, so a reader rereads only when its own view changed. |
+| `x-grid-settings` | The serving site's grid-wide settings, on every answer, as described for `PeerSettingsMatch`. |
+
 ## Gateway ingest feedback
 
 The local gateway reports completed ingests with an empty-body

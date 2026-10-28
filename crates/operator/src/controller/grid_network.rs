@@ -1778,6 +1778,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Published before any hold or render, so peers can read this site while it waits for
     // theirs, and two sites restarting together do not wait out the grace on each other.
+    ctx.local_providers.set_grid_id(stated_grid_id(&network));
     ctx.local_providers.replace(
         name,
         local_wire_providers(name, &providers, &tool_providers, &ctx.served_models),
@@ -1907,8 +1908,11 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     }
 
     let remote_crdt_providers: Vec<crdt::ProviderState> = if reads_polled_catalogs(ctx.membership()) {
-        ctx.peer_providers()
-            .admit(name, &reserved_clusters(&network, &providers), &hop_sites(&network))
+        ctx.peer_providers().admit(
+            (name, stated_grid_id(&network)),
+            &reserved_clusters(&network, &providers),
+            &hop_sites(&network),
+        )
     } else {
         ctx.swim()
             .map(|swim| collect_remote_crdt_providers(swim, name))

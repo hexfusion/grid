@@ -1884,7 +1884,7 @@ impl PollPeers {
     pub async fn fetch_providers(
         &self,
         site: &PeerSite,
-    ) -> Option<(Vec<crate::site_providers::WireProvider>, Option<String>)> {
+    ) -> Option<(crate::site_providers::PeerCatalog, Option<String>)> {
         let url = with_path(&site.url, crate::site_providers::PROVIDERS_PATH)?;
         let transport = self
             .peer_transport(&site.name, &site.pins, site.alias())
@@ -1911,7 +1911,7 @@ impl PollPeers {
 }
 
 /// `peer`'s providers from `body`, `None` for an unsupported contract or a body the reader refuses.
-fn read_catalog(peer: &str, body: &str, contract: Option<&str>) -> Option<Vec<crate::site_providers::WireProvider>> {
+fn read_catalog(peer: &str, body: &str, contract: Option<&str>) -> Option<crate::site_providers::PeerCatalog> {
     if !crate::site_providers::reads_contract(contract) {
         tracing::warn!(
             peer,
