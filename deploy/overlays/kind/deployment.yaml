@@ -67,6 +67,8 @@ spec:
               value: "app.kubernetes.io/name=grid-operator,app.kubernetes.io/instance=grid-operator"
             - name: GRID_LEADER_SWIM_SERVICES
               value: "grid-operator-swim"
+            - name: GRID_MEMBERSHIP_SOURCE
+              value: "Swim"
             - name: GRID_SWIM_BIND_ADDR
               value: "0.0.0.0:7946"
             - name: GRID_SWIM_ADVERTISE_ADDR

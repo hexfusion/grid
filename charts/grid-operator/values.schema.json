@@ -54,6 +54,17 @@
             "spiffe"
           ]
         },
+        "membership": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "description": "Where this site learns its members: Swim, or Local, where this site's configuration lists its peers as GridSites polled at their derived signals endpoints.",
+              "type": "string",
+              "enum": ["Swim", "Local"]
+            }
+          }
+        },
         "signals": {
           "description": "Signal transport, gossip or poll. Empty keeps the GridNetwork default.",
           "type": "string",
@@ -550,6 +561,20 @@
               "type": "string"
             }
           }
+        },
+        "maxHandshakesPerSource": {
+          "description": "Concurrent handshakes one source address may hold. Empty keeps the operator default.",
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 65535 },
+            { "type": "string", "maxLength": 0 }
+          ]
+        },
+        "peerEndpointPort": {
+          "description": "Port each peer serves signals on, under Local membership, at its gateway endpoint's host. Empty dials the gateway's own port under <site>-signals.grid.internal.",
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 65535 },
+            { "type": "string", "maxLength": 0 }
+          ]
         },
         "peerIntervalSeconds": {
           "description": "Seconds between peer signal polls, 1 to 99999. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator default.",

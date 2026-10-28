@@ -69,3 +69,23 @@ tests:
             resources: ["deployments"]
             resourceNames: ["provider-gateway"]
             verbs: ["get", "patch"]
+
+  - it: grants no SWIM Service read under Local membership, which renders none
+    set:
+      grid.membership.source: Local
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            resourceNames: ["provider-gateway", "grid-operator-swim", "grid-operator-signals"]
+            verbs: ["get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            resourceNames: ["provider-gateway", "grid-operator-signals"]
+            verbs: ["get"]
+
