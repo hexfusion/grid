@@ -340,6 +340,12 @@ async fn main() {
     let writer_site_name = ctx.site_name().map(str::to_owned);
     // Every mode scrapes for readiness; only Poll mode publishes what it scrapes.
     let writer_scrape_interval = config.signals.scrape_interval();
+    // The poller writes status too, so it stops with the other writers, before the lease goes.
+    let poller = (
+        signals_enabled.then(|| config.signals.clone()),
+        swim_rx.clone(),
+        shutdown.clone(),
+    );
     let writer_group = async move {
         tokio::try_join!(
             run_network_controller(writer_client.clone(), Arc::clone(&writer_ctx), writer_swim),
@@ -347,6 +353,13 @@ async fn main() {
             run_provider_controller(writer_client.clone(), writer_site_name),
             run_agent_tool_provider_controller(writer_client.clone()),
             run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
+            run_peer_poller(
+                poller.0,
+                Arc::clone(&writer_ctx),
+                poller.1,
+                writer_client.clone(),
+                poller.2
+            ),
             run_model_discovery(writer_ctx, writer_client),
         )
         .map(|_joined| ())
@@ -397,14 +410,7 @@ async fn main() {
                     max_per_peer: config.signals.max_per_peer,
                     max_per_source: config.signals.max_per_source,
                 }),
-                swim_rx.clone(),
-                shutdown.clone(),
-            ),
-            run_peer_poller(
-                signals_enabled.then(|| config.signals.clone()),
-                Arc::clone(&ctx),
                 swim_rx,
-                client.clone(),
                 shutdown.clone(),
             ),
         )
