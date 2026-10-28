@@ -414,6 +414,8 @@ pub enum Verdict {
     },
     /// Accepted, holding or crowding what another peer names: the detail.
     Noted(String),
+    /// Accepted in part, cut past its share of the overlay's ceiling: the detail.
+    Cut(String),
 }
 
 impl Verdict {
@@ -425,7 +427,7 @@ impl Verdict {
     /// Whether the catalog was accepted.
     #[must_use]
     pub const fn accepted(&self) -> bool {
-        matches!(self, Self::Noted(_))
+        matches!(self, Self::Noted(_) | Self::Cut(_))
     }
 
     /// The condition reason: the cause when refused, else the condition's type.
@@ -433,7 +435,7 @@ impl Verdict {
     pub const fn reason(&self) -> &'static str {
         match self {
             Self::Refused { reason, .. } => reason,
-            Self::Noted(_) => crate::peer_reach::CATALOG_ACCEPTED,
+            Self::Noted(_) | Self::Cut(_) => crate::peer_reach::CATALOG_ACCEPTED,
         }
     }
 
@@ -441,7 +443,7 @@ impl Verdict {
     #[must_use]
     pub fn message(&self) -> &str {
         match self {
-            Self::Refused { message, .. } | Self::Noted(message) => message,
+            Self::Refused { message, .. } | Self::Noted(message) | Self::Cut(message) => message,
         }
     }
 }
@@ -568,7 +570,10 @@ impl PeerProviders {
             crate::metrics::set_peer_catalog_cut(site, short.contains_key(site.as_str()));
         }
         for (site, note) in notes(&shared, &short, &claims) {
-            verdicts.entry(site).or_insert(Verdict::Noted(note));
+            let cut = short.contains_key(site.as_str());
+            verdicts
+                .entry(site)
+                .or_insert(if cut { Verdict::Cut(note) } else { Verdict::Noted(note) });
         }
         drop(held);
         *self.0.verdicts.lock().unwrap_or_else(PoisonError::into_inner) = verdicts;

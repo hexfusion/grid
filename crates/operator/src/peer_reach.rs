@@ -148,6 +148,8 @@ pub enum Judged {
     Clear,
     /// In the clear, holding or crowding what another peer names: the detail.
     Noted(String),
+    /// In the clear in part, cut past its share of the overlay's ceiling: the detail.
+    Cut(String),
     /// Not in the clear: the cause as a reason, and the detail.
     Failing(&'static str, String),
     /// Declares no signals endpoint, so it is not polled; counted neither way.
@@ -162,7 +164,7 @@ impl Judged {
     /// Whether the peer is in the clear, with or without a note.
     #[must_use]
     pub const fn is_clear(&self) -> bool {
-        matches!(self, Self::Clear | Self::Noted(_))
+        matches!(self, Self::Clear | Self::Noted(_) | Self::Cut(_))
     }
 }
 
@@ -248,7 +250,7 @@ impl PeerReach {
             let recent = misses.of(peer) < MISSES_BEFORE_UNREACHABLE;
             let excused = match judged {
                 Judged::Failing(..) | Judged::Awaiting => recent,
-                Judged::Clear | Judged::Noted(_) | Judged::EgressOnly | Judged::Skipped => false,
+                Judged::Clear | Judged::Noted(_) | Judged::Cut(_) | Judged::EgressOnly | Judged::Skipped => false,
             };
             if excused && before == Some(&Judged::Clear) {
                 *judged = Judged::Clear;
@@ -283,6 +285,7 @@ impl PeerReach {
                 let judged = match verdicts.get(peer) {
                     None => Judged::Clear,
                     Some(Verdict::Noted(note)) => Judged::Noted(note.clone()),
+                    Some(Verdict::Cut(note)) => Judged::Cut(note.clone()),
                     Some(Verdict::Refused { reason, message }) => Judged::Failing(reason, message.clone()),
                 };
                 (peer.to_owned(), judged)
@@ -309,18 +312,19 @@ impl PeerReach {
     /// The `GridNetwork` condition to write over `current`, `None` when it already says this.
     #[must_use]
     pub fn condition(&self, current: &[Condition], now_rfc3339: &str, generation: Option<i64>) -> Option<Condition> {
-        let failing = self
-            .peers
-            .values()
-            .filter(|judged| matches!(judged, Judged::Failing(..)))
-            .count();
-        let checked = self
-            .peers
-            .values()
-            .filter(|judged| !matches!(judged, Judged::Awaiting | Judged::EgressOnly | Judged::Skipped))
-            .count();
-        let (status, reason, message) = if failing == 0 {
+        let count = |counted: fn(&Judged) -> bool| self.peers.values().filter(|judged| counted(judged)).count();
+        let failing = count(|judged| matches!(judged, Judged::Failing(..)));
+        let checked = count(|judged| !matches!(judged, Judged::Awaiting | Judged::EgressOnly | Judged::Skipped));
+        let cut = count(|judged| matches!(judged, Judged::Cut(_)));
+        let (status, reason, message) = if failing == 0 && cut == 0 {
             ("True", self.kind.type_, self.kind.clear.to_owned())
+        } else if failing == 0 {
+            // Accepted, so True, but the count says the overlay is short of what peers serve.
+            (
+                "True",
+                self.kind.type_,
+                format!("{}, {cut} of {checked} cut past its share", self.kind.clear),
+            )
         } else {
             (
                 "False",
@@ -340,7 +344,9 @@ impl PeerReach {
     fn site_condition(&self, site: &str) -> Option<(&'static str, &'static str, String)> {
         Some(match self.peers.get(site)? {
             Judged::Clear => ("True", self.kind.site_type, self.kind.site_clear.to_owned()),
-            Judged::Noted(note) => ("True", self.kind.site_type, format!("{}; {note}", self.kind.site_clear)),
+            Judged::Noted(note) | Judged::Cut(note) => {
+                ("True", self.kind.site_type, format!("{}; {note}", self.kind.site_clear))
+            },
             Judged::Failing(reason, message) => ("False", *reason, message.clone()),
             Judged::EgressOnly => ("False", EGRESS_ONLY, NO_ENDPOINT.to_owned()),
             Judged::Awaiting | Judged::Skipped => (
@@ -845,6 +851,32 @@ mod tests {
             north.message, CATALOGS.site_clear,
             "a peer in nobody's way says only that"
         );
+    }
+
+    #[test]
+    fn a_catalog_cut_past_its_share_is_accepted_and_counted() {
+        let cut = HashMap::from([(
+            "east".to_owned(),
+            Verdict::Cut("takes 4 candidates over its share".to_owned()),
+        )]);
+        let partial = PeerReach::catalogs(["east", "west"], &cut);
+        let written = condition(&partial);
+        assert_eq!(
+            (
+                written.status.as_str(),
+                written.reason.as_str(),
+                written.message.as_str()
+            ),
+            (
+                "True",
+                PEER_CATALOGS_ACCEPTED,
+                "every peer catalog read is accepted, 1 of 2 cut past its share"
+            ),
+            "a cut is accepted and counted, never plain True"
+        );
+        let east = applied(&partial, &site("east", Vec::new())).unwrap_or_else(|| std::process::abort());
+        assert_eq!((east.status.as_str(), east.reason.as_str()), ("True", CATALOG_ACCEPTED));
+        assert!(east.message.contains("over its share"), "{}", east.message);
     }
 
     #[test]

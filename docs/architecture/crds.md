@@ -239,7 +239,7 @@ or part of it, was refused, out of the peers whose catalog is held.
 | Status | Reason | When |
 |---|---|---|
 | `False` | `CatalogsRefused` | A peer's catalog was refused. The message counts them, for example `1 of 5 peers' catalogs refused`. |
-| `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
+| `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. A catalog admitted in part, cut past its share of the overlay's ceiling, is accepted and counted in the message, for example `1 of 5 cut past its share`, and raises nothing. |
 
 `PeerPollsComplete` (`grid-operator-peer-polls`) says whether each round had time to poll
 every peer. A peer the round had no time for keeps its last `SignalsReachable` verdict, so
