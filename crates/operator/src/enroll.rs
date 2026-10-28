@@ -154,7 +154,7 @@ impl Backoff {
 
 /// `wait` plus up to a tenth of itself, so independent sites that failed
 /// together do not come back in step and herd on the enrollment service.
-pub(crate) fn jittered(wait: Duration) -> Duration {
+pub fn jittered(wait: Duration) -> Duration {
     let spread = u64::from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

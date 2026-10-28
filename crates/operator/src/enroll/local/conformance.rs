@@ -529,7 +529,10 @@ async fn invariant_5_the_own_grid_site_carries_only_the_peer_rollup_and_the_netw
         let site: GridSite = serde_json::from_value(api.get(SITE_PATH).expect("own site stored")).expect("a GridSite");
         Box::pin(crate::controller::grid_site::reconcile(
             Arc::new(site),
-            Arc::new(client.clone()),
+            Arc::new(crate::controller::grid_site::SiteContext {
+                client: Arc::new(client.clone()),
+                membership: crate::cli::Membership::default(),
+            }),
         ))
         .await
         .expect("the GridSite controller reconciles the own site");

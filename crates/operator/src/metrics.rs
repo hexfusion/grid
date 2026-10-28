@@ -21,6 +21,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SITE_IDENTITY_EXPIRY.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SWIM_UNAVAILABLE.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SITE_IDENTITY_RENEWALS.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROBE_DURATION.clone()))
@@ -73,11 +75,22 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SIGNALS_SHED.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_CONNECTION_CAP.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SIGNALS_RELAY_TRUNCATED.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MODEL_DISCOVERY_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r
+});
+
+/// The signals listener's connection cap.
+static SIGNALS_CONNECTION_CAP: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_signals_connection_cap",
+        "Concurrent signals connections the listener admits, sized for the declared members",
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// Signals connections shed at accept, by the limit that shed them.
@@ -159,6 +172,15 @@ pub fn record_relay_truncated(store: &str, rendered: &crate::signals::Rendered) 
             .inc_by(u64::try_from(rendered.lines_cut).unwrap_or(u64::MAX));
     }
 }
+
+/// One while SWIM is configured but not running, zero otherwise.
+static SWIM_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_swim_unavailable",
+        "Whether SWIM is configured on this site but not running",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
 
 /// The site identity's `notAfter`, Unix seconds; zero when the identity cannot be read.
 static SITE_IDENTITY_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -674,7 +696,7 @@ pub(crate) fn record_swim_pending_drop() {
     SWIM_PENDING_DROPS.inc();
 }
 
-/// Count a signals connection shed by `limit`, `total` or `source`.
+/// Count a signals connection shed by `limit`: `total`, `handshake` or `source`.
 pub fn record_signals_shed(limit: &str) {
     SIGNALS_SHED.with_label_values(&[limit]).inc();
 }
@@ -688,6 +710,16 @@ pub fn set_operator_config_ignored_sections(count: usize) {
 #[cfg(test)]
 pub(crate) fn operator_config_ignored_sections() -> i64 {
     OPERATOR_CONFIG_IGNORED.get()
+}
+
+/// Record the signals listener's connection cap, sized for the declared members.
+pub fn set_signals_connection_cap(cap: usize) {
+    SIGNALS_CONNECTION_CAP.set(i64::try_from(cap).unwrap_or(i64::MAX));
+}
+
+/// Record whether SWIM is configured but not running.
+pub fn set_swim_unavailable(unavailable: bool) {
+    SWIM_UNAVAILABLE.set(i64::from(unavailable));
 }
 
 /// Set when the site identity expires, Unix seconds.
