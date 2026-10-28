@@ -1741,6 +1741,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
+    // Before any step that can fail, so a failing listener never keeps an old True.
+    let served = ctx.signals_listener.as_ref().map(|report| report.borrow().clone());
+    let listener = crate::signals_listener::Listener::of(served.as_ref(), ctx.signal_mode);
+    Box::pin(apply_signals_listener_condition(client, &network, listener.as_ref())).await;
     if holds_for_grid_id(&network, &ctx.operator_config.current()) {
         tracing::info!(name, "spec.gridId is not set; the grid runtime waits until it is");
         Box::pin(apply_rollup(client, &network)).await;
@@ -2008,9 +2012,6 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
-    let served = ctx.signals_listener.as_ref().map(|report| report.borrow().clone());
-    let listener = crate::signals_listener::Listener::of(served.as_ref(), ctx.signal_mode);
-    Box::pin(apply_signals_listener_condition(client, &network, listener.as_ref())).await;
     Box::pin(apply_rollup(client, &network)).await;
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
