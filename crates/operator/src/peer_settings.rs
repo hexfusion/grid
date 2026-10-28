@@ -187,32 +187,22 @@ impl PeerSettings {
     /// `observedGeneration`: the poller reads no `GridNetwork` spec.
     #[must_use]
     pub fn condition(&self, current: &[Condition], ours: &Settings, now_rfc3339: &str) -> Option<Condition> {
-        let held = current.iter().find(|held| held.type_ == PEER_SETTINGS_MATCH);
         let (status, reason) = if self.mismatched.is_empty() {
             ("True", PEER_SETTINGS_MATCH)
         } else {
             ("False", SETTINGS_MISMATCH)
         };
-        let message = self.message(ours);
-        if held.is_some_and(|held| {
-            held.status == status
-                && held.reason == reason
-                && held.message == message
-                && held.observed_generation.is_none()
-        }) {
-            return None;
-        }
-        let last_transition_time = held
-            .filter(|held| held.status == status)
-            .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
-        Some(Condition {
-            type_: PEER_SETTINGS_MATCH.to_owned(),
-            status: status.to_owned(),
-            reason: reason.to_owned(),
-            message,
-            last_transition_time,
-            observed_generation: None,
-        })
+        let stamp = crate::rollup::Stamp {
+            generation: None,
+            now: now_rfc3339,
+        };
+        let condition = crate::rollup::condition(
+            current,
+            PEER_SETTINGS_MATCH,
+            (status, reason, self.message(ours)),
+            stamp,
+        );
+        crate::rollup::differs(current, std::slice::from_ref(&condition)).then_some(condition)
     }
 
     /// Up to [`MAX_NAMED_PEERS`] mismatched peers with the settings each states, then a count.

@@ -390,26 +390,12 @@ fn stamp(
     now_rfc3339: &str,
     generation: Option<i64>,
 ) -> Option<Condition> {
-    let held = current.iter().find(|held| held.type_ == type_);
-    if held.is_some_and(|held| {
-        held.status == status
-            && held.reason == reason
-            && held.message == message
-            && held.observed_generation == generation
-    }) {
-        return None;
-    }
-    let last_transition_time = held
-        .filter(|held| held.status == status)
-        .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
-    Some(Condition {
-        type_: type_.to_owned(),
-        status: status.to_owned(),
-        reason: reason.to_owned(),
-        message,
-        last_transition_time,
-        observed_generation: generation,
-    })
+    let stamp = crate::rollup::Stamp {
+        generation,
+        now: now_rfc3339,
+    };
+    let condition = crate::rollup::condition(current, type_, (status, reason, message), stamp);
+    crate::rollup::differs(current, std::slice::from_ref(&condition)).then_some(condition)
 }
 
 /// The status patch carrying `network`'s condition for `reach`, with the name to
