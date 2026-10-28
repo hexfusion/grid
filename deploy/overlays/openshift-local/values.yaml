@@ -1,0 +1,28 @@
+# OpenShift platform installation with membership supplied by ACM/OCM or GitOps.
+# Site names, identities and GridSite records are delivered separately.
+grid:
+  membership:
+    source: Local
+  signals: poll
+  peerTrust: spiffe
+  swimKeySecretName: ""
+swim:
+  service:
+    enabled: false
+signals:
+  enabled: true
+  service:
+    type: ClusterIP
+  # Site-specific passthrough Routes are supplied with the membership records.
+  route:
+    enabled: false
+  maxHandshakesPerSource: 32
+operatorConfig:
+  create: false
+metrics:
+  tls:
+    source: serviceCA
+networkPolicy:
+  enabled: false
+serviceMonitor:
+  enabled: true

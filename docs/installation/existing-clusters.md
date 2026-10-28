@@ -34,6 +34,35 @@ mTLS trust, RBAC, and NetworkPolicy when both roles share a cluster.
 
 See `examples/helm/existing-clusters/combined-site/` for site-specific Helm values.
 
+## OpenShift with managed membership
+
+`deploy/overlays/openshift-local` is generated from the existing operator chart
+for clusters whose site identities and GridSites are supplied separately. It
+selects Local membership, HTTPS polling, SPIFFE trust, OpenShift service-CA
+metrics TLS, and a selector-free signals Service managed by the elected leader.
+It includes the config-watch and leader-election permissions. It does not
+create a SWIM listener, SWIM Service, site identity, or network policy.
+
+Set the operator image and namespace in `params.env`; supply the site-only
+`grid-operator-config` ConfigMap, GridNetwork, identities, local GridSite, peer
+records, and reachable signals endpoint through your deployment system. On
+OpenShift a site-specific passthrough Route can send `<site>-signals.grid.internal`
+to the signals Service. Ensure the identity certificate covers that DNS name.
+
+```console
+kubectl kustomize deploy/overlays/openshift-local
+```
+
+Use the same membership mode across the grid. For a platform-managed existing
+installation, the platform integration must coordinate resource ownership and
+remove old SWIM environment variables. Applying these generated manifests with
+server-side apply alone does not remove fields owned by another controller.
+The signals Service must have no selector after migration. Preserve the
+existing CA and verify externally supplied identities before runtime cutover.
+
+Regenerate this overlay with `scripts/generate-deployment-operator.sh` and
+check it with the same script's `--check` option.
+
 ## Inventory
 
 Copy `examples/helm/existing-clusters/inventory.example.yaml` to a local, gitignored `inventory.yaml`
