@@ -1385,3 +1385,46 @@ fn the_peer_catalog_keys_clusters_by_the_site_the_record_names() {
         ])
     );
 }
+
+#[test]
+fn a_disabled_provider_is_never_derived_named_or_published() {
+    let mut off = provider("a1b2c3d4", "http://pool.models.svc:8000", None);
+    off.spec.traffic_policy = Some(crate::crd::inference_provider::TrafficPolicy {
+        drain: false,
+        disable: true,
+    });
+    let providers = vec![off];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("a1b2c3d4", "site-a")];
+    let named = vec!["a1b2c3d4".to_owned()];
+    let published = knobs(LocalProviders::Published, RemoteServing::None);
+    for declarations in [
+        decl_allowing(&providers, &sites, &named),
+        unnamed(&providers, &sites, published, None),
+    ] {
+        let resolution = resolve(&candidates, &[], &declarations);
+        assert!(resolution.is_empty(), "a disabled provider supplies no upstream");
+        assert_eq!(reasons(&resolution), [Refusal::Disabled]);
+    }
+}
+
+#[test]
+fn disabled_and_unavailable_carriers_report_unavailable() {
+    let mut off = provider("prov-a", "https://off.example.invalid", None);
+    off.spec.traffic_policy = Some(crate::crd::inference_provider::TrafficPolicy {
+        drain: false,
+        disable: true,
+    });
+    let mut down = provider("prov-a", "https://down.example.invalid", None);
+    down.status = Some(serde_json::from_value(serde_json::json!({ "phase": "Unavailable" })).expect("status"));
+    let providers = vec![off, down];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("prov-a", "site-a")];
+    let resolution = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
+    assert!(resolution.is_empty());
+    assert_eq!(
+        reasons(&resolution),
+        [Refusal::Unavailable],
+        "Disabled only when every carrier is disabled"
+    );
+}

@@ -1145,6 +1145,8 @@ type ModelInfo struct {
 
 // TrafficPolicy Optional administrative traffic policy.
 type TrafficPolicy struct {
+	// Withdraw the provider: no routing candidates, no derived upstream, and advertised to peers as unavailable.
+	Disable bool `json:"disable,omitempty"`
 	// Stop new sessions while preserving existing affinity sessions.
 	Drain bool `json:"drain,omitempty"`
 }
@@ -1224,7 +1226,7 @@ type InferenceProviderStatus struct {
 	Phase ProviderPhase `json:"phase,omitempty"`
 	// Machine-readable reason for the current phase when not Available.
 	// Set when the provider cannot reach Available due to a configuration, credential, or metrics/health-check collection error. None when the provider is Available, Pending, or the reason is unknown.
-	// Stable reason values: - UnsupportedAuthStrategy, CredentialSecretRefInvalid, CredentialSecretMissing, CredentialSecretKeyMissing, CredentialSecretValueInvalid - MetricsTlsSecretMissing, MetricsTlsKeyMissing, MetricsTlsMaterialInvalid, MetricsTlsIdentityMismatch - HealthCheckTlsSecretMissing, HealthCheckTlsKeyMissing, HealthCheckTlsMaterialInvalid, HealthCheckTlsIdentityMismatch - HealthCheckAuthCredentialUnavailable, HealthCheckAuthValueInvalid
+	// Stable reason values: - UnsupportedAuthStrategy, CredentialSecretRefInvalid, CredentialSecretMissing, CredentialSecretKeyMissing, CredentialSecretValueInvalid - MetricsTlsSecretMissing, MetricsTlsKeyMissing, MetricsTlsMaterialInvalid, MetricsTlsIdentityMismatch - HealthCheckTlsSecretMissing, HealthCheckTlsKeyMissing, HealthCheckTlsMaterialInvalid, HealthCheckTlsIdentityMismatch - HealthCheckAuthCredentialUnavailable, HealthCheckAuthValueInvalid - Disabled, with phase Pending, while spec.trafficPolicy.disable is set
 	Reason *string `json:"reason,omitempty"`
 	// Models the discovery loop last observed this provider serving.
 	// Present for a successful held set. Cleared when the set is unknown, expired, or discovery is disabled, though clearing may lag after expiry. Readers must require servedModelsExpiresAt to be in the future. An empty set means the backend serves no models. Bounded by the discovery caps (256 models, 256-byte names); order carries no meaning.

@@ -1116,6 +1116,12 @@ probe anonymously. Redirects are not followed; a 3xx response degrades health.
 
 **Phases**: Pending → Available → Degraded → Unavailable
 
+`spec.trafficPolicy.drain` stops new sessions and keeps existing ones.
+`spec.trafficPolicy.disable` withdraws the provider: no routing candidate, no
+derived upstream, and advertised to peers as `Unavailable`. Its status reads
+`Pending` with reason `Disabled`. See
+[Administrative provider draining](provider-draining.md#disabling-a-provider).
+
 **Readiness**: `status.conditions` carries a `Ready` condition, written by the
 operator's signals loop from each scrape of the provider's metrics, in every
 signal mode. Readiness is

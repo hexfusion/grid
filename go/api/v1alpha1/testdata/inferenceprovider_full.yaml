@@ -78,6 +78,7 @@ spec:
     perMillionOutputTokens: 0.60
   trafficPolicy:
     drain: true
+    disable: true
 status:
   phase: Degraded
   observedGeneration: 7

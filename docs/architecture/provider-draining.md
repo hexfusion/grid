@@ -14,6 +14,26 @@ health and metrics. It does not blindly promote the provider. The stable
 candidate ID, selection group, and rank are preserved while only effective
 admission changes affect the semantic overlay revision.
 
+## Disabling a provider
+
+`spec.trafficPolicy.disable: true` withdraws a provider outright, where drain
+keeps existing sessions. A disabled provider offers no routing candidate,
+derives no upstream for a generated consumer gateway, and is advertised to
+peers as `Unavailable` with no models, so a peer that held its record drops it.
+Its signals are not published to peers or the gateway. The provider controller
+does not probe it, but the readiness pass still scrapes its metrics so its
+`Ready` condition stays current. Its status reads phase `Pending` with reason
+`Disabled`. Derivation names it `provider disabled` when a candidate still
+names its identity. Clearing it re-evaluates the provider from the start.
+
+```yaml
+spec:
+  trafficPolicy:
+    disable: true
+```
+
+## Administrative operations
+
 Provider membership for administrative operations is explicit through
 `spec.providerGateway`. It is not inferred from endpoint strings. A gateway-wide
 operation selects every provider with the requested reference, prints the

@@ -691,8 +691,8 @@ func wellKnownTypeName(n schemaNode) (string, bool) {
 			return "ToolInfo", true
 		}
 
-	// TrafficPolicy: {drain}.
-	case eqKeys(keys, "drain"):
+	// TrafficPolicy: {disable?, drain}.
+	case eqKeys(keys, "disable", "drain") || eqKeys(keys, "drain"):
 		return "TrafficPolicy", true
 
 	// HealthCheckConfig: {endpoint?, interval?, path?, timeout?, tls?}

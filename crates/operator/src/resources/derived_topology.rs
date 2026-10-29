@@ -16,7 +16,7 @@ use crate::{
         inference_provider::InferenceProvider,
     },
     operator_config::{LocalProviders, RemoteServing, Serving},
-    resources::routing_overlay::{CANDIDATE_KIND, RoutingCandidate, is_explicitly_unavailable, routing_identity},
+    resources::routing_overlay::{CANDIDATE_KIND, RoutingCandidate, is_disabled, is_withdrawn, routing_identity},
 };
 
 /// Clusters each member site's catalog offers, by site.
@@ -66,6 +66,8 @@ pub(crate) enum Refusal {
     ServerNameInvalid,
     /// A remote hop's server name is not the site's own `{site}.grid.internal`.
     ServerNameNotSite,
+    /// Every provider carrying the identity is disabled.
+    Disabled,
     /// Remote `Members` serving outside Local membership, where no catalog is authenticated.
     MembersNeedLocal,
     /// More than one `GridSite` of the network keys to the candidate's site.
@@ -93,6 +95,7 @@ impl Refusal {
             Self::ServerNameNeeded => "server name needed",
             Self::ServerNameInvalid => "server name invalid",
             Self::ServerNameNotSite => "server name is not the site's",
+            Self::Disabled => "provider disabled",
             Self::MembersNeedLocal => "remote Members needs Local membership",
             Self::SiteKeyAmbiguous => "site key is ambiguous",
             Self::MemberHopNotMutual => "member hop is not mutual TLS",
@@ -235,7 +238,7 @@ fn local_providers<'decl>(declarations: &Declarations<'decl>) -> BTreeMap<&'decl
         };
         if !admits_local(identity, declarations)
             || provider.spec.grid_network_ref != declarations.network_name
-            || is_explicitly_unavailable(provider)
+            || is_withdrawn(provider)
         {
             continue;
         }
@@ -329,12 +332,12 @@ fn local_refusal(cluster: &str, declarations: &Declarations<'_>) -> Refusal {
             routing_identity(provider) == Some(cluster) && provider.spec.grid_network_ref == declarations.network_name
         })
         .collect();
-    let available = carriers
-        .iter()
-        .filter(|provider| !is_explicitly_unavailable(provider))
-        .count();
+    let enabled = carriers.iter().filter(|provider| !is_disabled(provider)).count();
+    let available = carriers.iter().filter(|provider| !is_withdrawn(provider)).count();
     if carriers.is_empty() {
         Refusal::NoProvider
+    } else if enabled == 0 {
+        Refusal::Disabled
     } else if available == 0 {
         Refusal::Unavailable
     } else {

@@ -382,6 +382,9 @@ fn no_matching_sites_reason(has_no_matches: bool) -> Option<String> {
     has_no_matches.then(|| "NoMatchingSites".to_owned())
 }
 
+/// Status reason while `spec.trafficPolicy.disable` withdraws the provider.
+const DISABLED_REASON: &str = "Disabled";
+
 /// Derive the initial provider phase from the current selector matches.
 pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
     if matching.is_empty() {
@@ -714,6 +717,16 @@ async fn resolve_phase_and_sites(
     local_site: Option<&str>,
 ) -> Result<(ProviderPhase, Vec<String>, Option<String>, Refs), OperatorError> {
     let name = provider.metadata.name.as_deref().unwrap_or("?");
+
+    // Withdrawn on purpose, so nothing is probed.
+    if crate::resources::routing_overlay::is_disabled(provider) {
+        return Ok((
+            ProviderPhase::Pending,
+            Vec::new(),
+            Some(DISABLED_REASON.to_owned()),
+            Refs::NotChecked,
+        ));
+    }
 
     // Static validation: config errors map immediately to Unavailable.
     if let Some(config_error) = validate_provider_config(provider) {
@@ -1458,6 +1471,22 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[tokio::test]
+    async fn a_disabled_provider_reads_pending_disabled_and_is_not_probed() {
+        let client = mock_kube_client_for_health_tls("net-1", HashMap::new());
+        let mut provider = provider_with_shared_health_tls("net-1", "missing-ca", "https://127.0.0.1:1");
+        provider.spec.traffic_policy = Some(crate::crd::inference_provider::TrafficPolicy {
+            drain: false,
+            disable: true,
+        });
+        let (phase, matching, reason, _refs) = resolve_phase_and_sites(&provider, &client, None)
+            .await
+            .expect("no API call or probe is made");
+        assert_eq!(phase, ProviderPhase::Pending);
+        assert!(matching.is_empty());
+        assert_eq!(reason.as_deref(), Some("Disabled"));
     }
 
     #[tokio::test]

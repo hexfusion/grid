@@ -785,7 +785,7 @@ pub(crate) fn build_grid_state_with_metrics(
 ) -> scoring::GridState {
     let mut state = scoring::GridState::new();
     for provider in providers {
-        if provider.spec.grid_network_ref != network_name || is_explicitly_unavailable(provider) {
+        if provider.spec.grid_network_ref != network_name || is_withdrawn(provider) {
             continue;
         }
         if let Some(config) = provider_to_backend_config(provider) {
@@ -1145,7 +1145,7 @@ fn build_admission_map(
 ) -> HashMap<String, AdmissionState> {
     let mut map = HashMap::new();
     for provider in providers {
-        if provider.spec.grid_network_ref != network_name || is_explicitly_unavailable(provider) {
+        if provider.spec.grid_network_ref != network_name || is_withdrawn(provider) {
             continue;
         }
         if let Some(key) = routing_identity(provider) {
@@ -1723,10 +1723,10 @@ fn should_include_provider_for_consumer(
 
 /// Collect [`RoutingCandidate`]s from providers belonging to `network_name`.
 ///
-/// Providers explicitly marked [`ProviderPhase::Unavailable`] in their status
-/// are excluded.  Providers in any other phase (`Pending`, `Available`,
-/// `Degraded`, or absent status) are included.  See [`is_explicitly_unavailable`]
-/// for the rationale.
+/// Providers explicitly marked [`ProviderPhase::Unavailable`] in their status,
+/// or disabled, are excluded.  Providers in any other phase (`Pending`,
+/// `Available`, `Degraded`, or absent status) are included.  See
+/// [`is_explicitly_unavailable`] for the rationale.
 ///
 /// Provider access policy enforcement: Each provider's `spec.accessPolicy` is
 /// evaluated against the `consumer_site_labels`. Providers with non-empty access
@@ -1755,7 +1755,7 @@ fn collect_candidates(
         if provider.spec.grid_network_ref != network_name {
             continue;
         }
-        if is_explicitly_unavailable(provider) {
+        if is_withdrawn(provider) {
             continue;
         }
 
@@ -1985,6 +1985,20 @@ pub(crate) fn is_explicitly_unavailable(provider: &InferenceProvider) -> bool {
         .is_some_and(|s| s.phase == ProviderPhase::Unavailable)
 }
 
+/// Whether an admin withdrew the provider through `spec.trafficPolicy.disable`.
+pub(crate) fn is_disabled(provider: &InferenceProvider) -> bool {
+    provider
+        .spec
+        .traffic_policy
+        .as_ref()
+        .is_some_and(|policy| policy.disable)
+}
+
+/// Whether the provider offers nothing: disabled, or explicitly `Unavailable`.
+pub(crate) fn is_withdrawn(provider: &InferenceProvider) -> bool {
+    is_disabled(provider) || is_explicitly_unavailable(provider)
+}
+
 /// Build [`RoutingCandidate`]s for a local [`AgentToolProvider`].
 ///
 /// One candidate per `(tool, site)` pair with `kind = "mcp_tool"`.
@@ -2060,8 +2074,8 @@ fn resolve_tool_provider_sites<'prov>(
 /// Absent status uses `true` as the conservative default so that
 /// providers are visible before OP-02 has populated their status.
 ///
-/// `Unavailable` providers never reach this function; they are excluded
-/// by [`is_explicitly_unavailable`] before candidates are generated.
+/// `Unavailable` and disabled providers never reach this function; they are
+/// excluded by [`is_withdrawn`] before candidates are generated.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 pub(crate) fn is_candidate_fresh(provider: &InferenceProvider) -> bool {
@@ -4039,6 +4053,36 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         assert!(overlay.candidates.is_empty(), "Unavailable provider must be excluded");
+    }
+
+    #[test]
+    fn disabled_provider_offers_no_candidate_whatever_its_phase() {
+        let network = test_network("net");
+        let mut provider = test_provider_with_phase("prov", "net", &["model-1"], "Available");
+        provider.spec.traffic_policy = Some(crate::crd::inference_provider::TrafficPolicy {
+            drain: false,
+            disable: true,
+        });
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            overlay.candidates.is_empty(),
+            "a disabled provider must not be a candidate"
+        );
+        assert!(
+            overlay.excluded.is_empty(),
+            "nor an excluded one the render still reads"
+        );
     }
 
     #[test]

@@ -936,6 +936,12 @@ spec:
                   description: Optional administrative traffic policy.
                   nullable: true
                   properties:
+                    disable:
+                      default: false
+                      description: |-
+                        Withdraw the provider: no routing candidates, no derived upstream, and
+                        advertised to peers as unavailable.
+                      type: boolean
                     drain:
                       default: false
                       description: Stop new sessions while preserving existing affinity sessions.
@@ -1046,6 +1052,7 @@ spec:
                     - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
                       `HealthCheckTlsIdentityMismatch`
                     - `HealthCheckAuthCredentialUnavailable`, `HealthCheckAuthValueInvalid`
+                    - `Disabled`, with phase `Pending`, while `spec.trafficPolicy.disable` is set
                   nullable: true
                   type: string
                 servedModels:

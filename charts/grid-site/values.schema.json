@@ -310,7 +310,7 @@
               "gatewayRef": { "type": "string", "description": "Deprecated alias for providerGateway; accepted through 0.3.x." },
               "metricsConfig": { "type": "object", "additionalProperties": true, "properties": { "endpoint": { "type": "string" }, "metricsEndpoint": { "type": "string", "description": "Deprecated alias for endpoint; accepted through 0.3.x." } } },
               "auth": { "type": "object", "additionalProperties": true, "properties": { "credentialsManagedExternally": { "type": "boolean" }, "manual": { "type": "boolean", "description": "Deprecated alias for credentialsManagedExternally; accepted through 0.3.x." } } },
-              "trafficPolicy": { "type": "object", "additionalProperties": false, "properties": { "drain": { "type": "boolean", "default": false } } },
+              "trafficPolicy": { "type": "object", "additionalProperties": false, "properties": { "drain": { "type": "boolean", "default": false }, "disable": { "type": "boolean", "default": false } } },
               "capacityWeight": { "type": "integer", "minimum": 1, "maximum": 1000 },
               "model": { "type": "string", "minLength": 1, "description": "Model name. Defaults to the key." }
             }
@@ -338,7 +338,7 @@
           "trafficPolicy": {
             "type": "object",
             "additionalProperties": false,
-            "properties": { "drain": { "type": "boolean", "default": false } }
+            "properties": { "drain": { "type": "boolean", "default": false }, "disable": { "type": "boolean", "default": false } }
           },
           "capacityWeight": { "type": "integer", "minimum": 1, "maximum": 1000 }
         }

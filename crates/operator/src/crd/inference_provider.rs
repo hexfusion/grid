@@ -178,6 +178,11 @@ pub struct TrafficPolicy {
     /// Stop new sessions while preserving existing affinity sessions.
     #[serde(default)]
     pub drain: bool,
+
+    /// Withdraw the provider: no routing candidates, no derived upstream, and
+    /// advertised to peers as unavailable.
+    #[serde(default)]
+    pub disable: bool,
 }
 
 /// Prometheus metrics scraping configuration for an `InferenceProvider`.
@@ -715,6 +720,7 @@ pub struct InferenceProviderStatus {
     /// - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
     ///   `HealthCheckTlsIdentityMismatch`
     /// - `HealthCheckAuthCredentialUnavailable`, `HealthCheckAuthValueInvalid`
+    /// - `Disabled`, with phase `Pending`, while `spec.trafficPolicy.disable` is set
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

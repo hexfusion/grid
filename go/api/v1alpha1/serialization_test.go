@@ -380,6 +380,9 @@ func TestInferenceProviderFullRoundTrip(t *testing.T) {
 	if ip.Spec.TrafficPolicy == nil || !ip.Spec.TrafficPolicy.Drain {
 		t.Errorf("TrafficPolicy.Drain not true")
 	}
+	if ip.Spec.TrafficPolicy == nil || !ip.Spec.TrafficPolicy.Disable {
+		t.Errorf("TrafficPolicy.Disable not true")
+	}
 	if ip.Spec.Cost == nil || ip.Spec.Cost.PerMillionInputTokens != 0.15 {
 		t.Errorf("Cost not preserved")
 	}

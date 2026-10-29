@@ -681,6 +681,7 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     }
     Box::pin(scrape_providers(ctx, client, &providers, network_name)).await;
     let mut collected = resolve_readiness(ctx, client, &providers, network_name);
+    withhold_disabled(&mut collected, &providers);
     if polling && !ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(publisher) = publisher {
             let Some((epoch, sequence)) = publication_order(ctx, client, publisher).await? else {
@@ -782,6 +783,21 @@ fn resolve_readiness(
     }
     write_ready_conditions(client.clone(), writes);
     collected
+}
+
+/// Drop the signals of identities only disabled providers carry; readiness still tracks them.
+fn withhold_disabled(collected: &mut HashMap<String, Vec<signals::Observation>>, providers: &[InferenceProvider]) {
+    let carried = |disabled: bool| -> std::collections::HashSet<&str> {
+        providers
+            .iter()
+            .filter(|provider| routing_overlay::is_disabled(provider) == disabled)
+            .filter_map(routing_overlay::routing_identity)
+            .collect()
+    };
+    let enabled = carried(false);
+    for identity in carried(true).difference(&enabled) {
+        collected.remove(*identity);
+    }
 }
 
 /// Keep one entry per routing identity: the stricter verdict wins, so one provider
@@ -5699,15 +5715,21 @@ pub(crate) fn provider_state_from_kube(
 ) -> Option<crdt::ProviderState> {
     let provider_id = provider.metadata.name.as_deref()?;
     let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
+    let disabled = routing_overlay::is_disabled(provider);
     let models = match served_model_store.select_for(provider) {
         // FIXME: we are currently only wiring static config, even if we support discovery.
-        Some(inventory) if inventory.is_static() => inventory.models().to_vec(),
+        Some(inventory) if inventory.is_static() && !disabled => inventory.models().to_vec(),
         _ => Vec::new(),
     };
-    let phase = crdt_phase_from_provider(
-        provider.status.as_ref(),
-        provider.metadata.generation.unwrap_or_default(),
-    );
+    // Published as Unavailable, not omitted, so peers drop the record they hold.
+    let phase = if disabled {
+        crdt::ProviderPhase::Unavailable
+    } else {
+        crdt_phase_from_provider(
+            provider.status.as_ref(),
+            provider.metadata.generation.unwrap_or_default(),
+        )
+    };
     let revision = provider_revision(&provider.metadata);
     let capacity_weight = effective_capacity_weight(provider);
     Some(crdt::ProviderState {
@@ -8828,6 +8850,58 @@ mod tests {
             state.phase,
             crdt::ProviderPhase::Degraded,
             "Degraded must propagate to CRDT phase"
+        );
+    }
+
+    #[test]
+    fn a_disabled_provider_is_advertised_unavailable_with_no_models() {
+        let mut p = make_provider("prov-a", "net", "local", 3);
+        p.spec.traffic_policy = Some(crate::crd::inference_provider::TrafficPolicy {
+            drain: false,
+            disable: true,
+        });
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new());
+        assert!(
+            matches!(&state, Some(state) if state.phase == crdt::ProviderPhase::Unavailable && state.models.is_empty()),
+            "advertised Unavailable with no models, so peers drop what they hold: {state:?}"
+        );
+        let served = local_wire_providers("net", &[p], &[], &served_models::ServedModelStore::new());
+        let candidates: Vec<_> = served
+            .into_iter()
+            .filter_map(|wire| wire.into_state("site-a"))
+            .flat_map(|record| routing_overlay::remote_crdt_provider_to_candidates(&record, &[], "grid"))
+            .collect();
+        assert!(candidates.is_empty(), "a peer reading the catalog renders no candidate");
+    }
+
+    #[test]
+    fn signals_of_an_identity_only_disabled_providers_carry_are_withheld() {
+        let disable = |mut provider: InferenceProvider| {
+            provider.spec.traffic_policy = Some(crate::crd::inference_provider::TrafficPolicy {
+                drain: false,
+                disable: true,
+            });
+            provider
+        };
+        let mut twin = disable(make_provider("prov-twin-off", "net", "local", 1));
+        twin.spec.cluster_name = Some("prov-twin".to_owned());
+        let providers = [
+            disable(make_provider("prov-off", "net", "local", 1)),
+            make_provider("prov-on", "net", "local", 1),
+            make_provider("prov-twin", "net", "local", 1),
+            twin,
+        ];
+        let mut collected: HashMap<String, Vec<signals::Observation>> = ["prov-off", "prov-on", "prov-twin"]
+            .into_iter()
+            .map(|identity| (identity.to_owned(), Vec::new()))
+            .collect();
+        withhold_disabled(&mut collected, &providers);
+        let mut kept: Vec<&str> = collected.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            ["prov-on", "prov-twin"],
+            "an identity an enabled provider still carries keeps its signals"
         );
     }
 
