@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[path = "namespace_sites.rs"]
+mod namespace_sites;
+
 /// Build an `InferenceProvider` with the given endpoint and optional `spec.tls`.
 fn provider(name: &str, endpoint: &str, tls: Option<serde_json::Value>) -> InferenceProvider {
     let mut spec = serde_json::json!({
