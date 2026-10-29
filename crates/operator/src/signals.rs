@@ -1310,26 +1310,22 @@ fn classify(error: &MetricsScrapeError) -> RequestOutcome {
 /// is worth retrying and the other will fail identically until a certificate is
 /// replaced. The chain is walked rather than the message matched, because an
 /// error string is not an interface.
-#[expect(clippy::wildcard_enum_match_arm, reason = "std::io::ErrorKind is non_exhaustive")]
 fn classify_transport(error: &(dyn std::error::Error + 'static)) -> RequestOutcome {
-    let mut current = Some(error);
-    while let Some(err) = current {
-        if tls_backend::is_tls_error(err) {
-            return RequestOutcome::Tls;
-        }
-        if let Some(io) = err.downcast_ref::<std::io::Error>() {
-            return match io.kind() {
-                std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::HostUnreachable
-                | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::ConnectionReset => RequestOutcome::Refused,
-                std::io::ErrorKind::TimedOut => RequestOutcome::Timeout,
-                _ => RequestOutcome::Transport,
-            };
-        }
-        current = err.source();
+    let (tls, io_kind) = tls_backend::transport_error_details(error);
+    if tls {
+        return RequestOutcome::Tls;
     }
-    RequestOutcome::Transport
+
+    match io_kind {
+        Some(
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::ConnectionReset,
+        ) => RequestOutcome::Refused,
+        Some(std::io::ErrorKind::TimedOut) => RequestOutcome::Timeout,
+        Some(_) | None => RequestOutcome::Transport,
+    }
 }
 
 /// Delay before attempt `attempt`, counting the first retry as zero.
@@ -1613,10 +1609,6 @@ impl PollPeers {
     /// Returns the body, or nothing if every attempt failed. The outcome is
     /// recorded either way, because a peer that is never reachable has to be
     /// distinguishable from one that has nothing to say.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one poll: guard, transport, attempts and what it records"
-    )]
     async fn poll_one(
         &self,
         target: &Target<'_>,
@@ -1765,10 +1757,6 @@ impl PollPeers {
     }
 
     /// Attempt until one succeeds, the budget from `started` runs out, or retrying is pointless.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one retry loop with its budget, backoff and stand-down"
-    )]
     async fn attempt_until(
         &self,
         peer: &str,
@@ -1844,10 +1832,6 @@ impl PollPeers {
 
     /// Hand each site's observations to `publish` as its poll completes, with how
     /// many of its rows were dropped for an implausible age.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one round: targets, budgets, then each answer as it lands"
-    )]
     pub async fn collect_each<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
     where
         Publish: FnMut(String, Vec<Observation>, usize, crate::metrics_scraper::Stamp),
@@ -2277,10 +2261,6 @@ fn render_contract_block(
 }
 
 /// Render whole provider batches, retaining metadata through metric selection.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one atomic provider render keeps filtering, row counts, and the line budget together"
-)]
 fn render_batches(
     samples: &[Observation],
     collect: &[String],
@@ -2388,10 +2368,6 @@ const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 /// the sample from its own clock reading and this age, so no wall time of this
 /// site's is stored. A missing `Date` or stamp leaves the row aged from its
 /// collection here, never from the peer's absolute clock.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one age conversion keeps invalidations and payload freshness together"
-)]
 fn reexpress_peer_ages(
     observations: Vec<Observation>,
     date: Option<SystemTime>,
@@ -2590,7 +2566,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one table of accepted and refused samples")]
     fn a_hub_refuses_peer_names_providers_and_values_outside_the_contract() {
         let cases = [
             (
@@ -2863,7 +2838,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "a peer that answers late, served inline")]
     async fn a_slow_peer_that_missed_a_round_still_answers_inside_its_short_budget() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         crate::init_process_crypto();
@@ -3057,7 +3031,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one table of ages either side of each bound")]
     fn reexpress_peer_ages_keeps_plausible_ages_and_drops_the_rest() {
         let date_ms = 5_000_000_000_000;
         let stamped = |stamp: Option<i64>| Observation {
@@ -3531,10 +3504,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exercise HTTP projection, relay and guarded consumption together"
-    )]
     async fn a_default_peer_poll_projects_custom_metrics_without_losing_revision() {
         crate::init_process_crypto();
         let body = format!(
@@ -3575,10 +3544,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "invalidation, replay rejection and recovery share one receiver"
-    )]
     fn relay_invalidation_fences_old_data_and_allows_later_learning() {
         let old = revision_text();
         let new = old
@@ -3744,7 +3709,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "one polled row rendered at three wall readings")]
     async fn a_wall_step_between_poll_and_render_leaves_relayed_ages_alone() {
         let peers = relayed_through_a_poll(30_000).await;
         let later = Instant::now() + Duration::from_secs(5);
@@ -3848,10 +3812,9 @@ mod tests {
         assert!(!client.is_retryable() && server.is_retryable());
     }
 
+    /// Peer polling separates retryable refusal from a non-retryable trust failure.
     #[test]
     fn a_refused_connection_is_told_apart_from_a_trust_failure() {
-        // Both arrive as transport errors and call for opposite responses, so
-        // the chain is walked rather than the message matched.
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(classify_transport(&refused), RequestOutcome::Refused);
 
@@ -3859,7 +3822,12 @@ mod tests {
         let tls_err = rustls::Error::DecryptError;
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
-        assert_eq!(classify_transport(&tls_err), RequestOutcome::Tls);
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, tls_err);
+        assert_eq!(
+            classify_transport(&wrapped),
+            RequestOutcome::Tls,
+            "the wrapped TLS failure should remain distinguishable from transport I/O"
+        );
     }
 
     /// Peer TLS material from a throwaway CA, for the config cache tests.
@@ -4260,7 +4228,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one scene, read both ways")]
     fn a_refusal_stops_traffic_in_both_directions() {
         let identities = PeerIdentities::new();
         identities.set(BTreeMap::from([
