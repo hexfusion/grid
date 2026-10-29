@@ -607,7 +607,7 @@ impl DeclaredSignals {
 #[derive(Clone, Debug, Default)]
 pub struct PeerIdentities {
     /// Site name to what is held for it.
-    inner: Arc<RwLock<BTreeMap<String, PeerRecord>>>,
+    inner: Arc<RwLock<Arc<BTreeMap<String, PeerRecord>>>>,
     /// Whether the peers have been read from the `GridSite` objects at least once.
     loaded: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -622,9 +622,22 @@ impl PeerIdentities {
     /// Replace what is known about every peer.
     pub fn set(&self, identities: BTreeMap<String, PeerRecord>) {
         if let Ok(mut guard) = self.inner.write() {
-            *guard = identities;
+            *guard = Arc::new(identities);
         }
         self.loaded.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Freeze peer records for one poll round, so later edits cannot stamp its results with
+    /// a generation whose endpoint it did not read.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        let Ok(held) = self.inner.read() else {
+            return Self::default();
+        };
+        Self {
+            inner: Arc::new(RwLock::new(Arc::clone(&held))),
+            loaded: Arc::new(std::sync::atomic::AtomicBool::new(self.loaded())),
+        }
     }
 
     /// Whether the peers have been read at least once, so an empty registry means none.
@@ -2470,6 +2483,51 @@ fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_poll_snapshot_keeps_the_endpoint_and_generation_read_before_a_peer_edit() {
+        let record = |endpoint: &str, generation| PeerRecord {
+            generation: Some(generation),
+            pins: vec!["aa".to_owned()],
+            signals: Some(DeclaredSignals {
+                endpoint: SignalsEndpoint::parse(endpoint).expect("endpoint"),
+                server_name: None,
+            }),
+            ..PeerRecord::default()
+        };
+        let identities = PeerIdentities::new();
+        identities.set(BTreeMap::from([("east".to_owned(), record("10.0.0.1:9443", 2))]));
+        let round = identities.snapshot();
+        let endpoints = round.declared_endpoints();
+        identities.set(BTreeMap::from([("east".to_owned(), record("10.0.0.2:9443", 3))]));
+        assert!(round.loaded(), "the round retains the initial registry's loaded state");
+        assert_eq!(round.declared_endpoints(), endpoints, "the endpoint polled stays fixed");
+        assert_eq!(
+            round.generations().get("east"),
+            Some(&2),
+            "its verdict observes generation 2"
+        );
+        assert_ne!(
+            identities.declared_endpoints(),
+            endpoints,
+            "live readers see the new endpoint"
+        );
+        assert_eq!(
+            identities.generations().get("east"),
+            Some(&3),
+            "the next round sees generation 3"
+        );
+        identities.set(BTreeMap::new());
+        assert!(
+            identities.refuses("east"),
+            "live request authorization sees the removal immediately"
+        );
+        assert_eq!(
+            round.generations().get("east"),
+            Some(&2),
+            "the completed round keeps its evidence"
+        );
+    }
 
     #[test]
     fn a_restarted_site_catches_up_once_every_peer_is_held_or_long_silent() {

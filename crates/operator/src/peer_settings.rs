@@ -300,7 +300,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "three peers stating three ways, then all matching")]
     fn a_peer_stating_a_setting_otherwise_is_a_mismatch_until_it_matches() {
         let held = after(
             &PeerSettings::default(),

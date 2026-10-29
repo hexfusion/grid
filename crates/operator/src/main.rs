@@ -3679,7 +3679,7 @@ impl PeerPoller {
     /// changed. Under Swim, remove what a Local run left on the `GridSite` objects, once.
     async fn report_reach(
         &mut self,
-        (source, local_site): (&operator::signals::PollPeers, &str),
+        (source, local_site, identities): (&operator::signals::PollPeers, &str, &operator::signals::PeerIdentities),
         polled: &[String],
         answered: &BTreeMap<String, usize>,
         sites: &[operator::signals::PeerSite],
@@ -3695,7 +3695,7 @@ impl PeerPoller {
             }
             return;
         }
-        let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, sites);
+        let (reach, catalogs, skipped) = self.judge((source, local_site, identities), polled, answered, sites);
         Box::pin(self.write_network((&reach, &catalogs), (skipped, polled.len()))).await;
         for (peer, judged) in reach.judged() {
             // An egress-only peer has nothing to poll, so no series an alert on 0 could fire on.
@@ -3739,13 +3739,12 @@ impl PeerPoller {
     /// time to poll.
     fn judge(
         &self,
-        (source, local_site): (&operator::signals::PollPeers, &str),
+        (source, local_site, identities): (&operator::signals::PollPeers, &str, &operator::signals::PeerIdentities),
         polled: &[String],
         answered: &BTreeMap<String, usize>,
         sites: &[operator::signals::PeerSite],
     ) -> (operator::peer_reach::PeerReach, operator::peer_reach::PeerReach, usize) {
         use operator::peer_reach::PeerReach;
-        let identities = self.ctx.peer_identities();
         let without_endpoint: Vec<String> = identities
             .without_endpoint(local_site)
             .into_iter()
@@ -3763,7 +3762,7 @@ impl PeerPoller {
             without_endpoint.iter().map(String::as_str),
         );
         let skipped = reach.skipped();
-        let generations = self.ctx.peer_identities().generations();
+        let generations = identities.generations();
         let reach = reach.held_over(&self.reach, &self.misses).read_at(generations.clone());
         let held = self.ctx.peer_providers();
         let catalogs = PeerReach::catalogs(
@@ -3793,7 +3792,7 @@ impl PeerPoller {
             tracing::debug!("peer polling waits for this site's name");
             return;
         };
-        let identities = self.ctx.peer_identities();
+        let identities = self.ctx.peer_identities().snapshot();
         let targets = Targeting {
             identities: &identities,
             trust: source.trust,
@@ -3880,7 +3879,7 @@ impl PeerPoller {
             .filter(|site| !answered.contains_key(*site))
             .cloned()
             .collect();
-        Box::pin(self.report_reach((source, &local_site), &polled, &answered, &sites)).await;
+        Box::pin(self.report_reach((source, &local_site, &identities), &polled, &answered, &sites)).await;
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }
@@ -5369,10 +5368,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "floor, growth, no shrink and ceiling on one admission"
-    )]
     fn the_connection_cap_grows_with_the_declared_members_up_to_its_ceiling() {
         let members = operator::signals::PeerIdentities::new();
         let admission = Admission::new(4, 8, members.clone());
