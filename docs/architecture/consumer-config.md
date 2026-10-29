@@ -276,6 +276,44 @@ praxisConfig:
         name: serving-gateway-ca
 ```
 
+### Site serving
+
+A site can derive without a name list. Provider names are per site, as on
+RHOAI where they derive from a UID, so the knobs live in the operator config's
+top-level `serving` section, private to the site, not on the GridNetwork. It
+sits apart from `site`, so setting it never makes the site enroll itself. They widen
+`fromProviders` and never narrow it. The defaults derive exactly what
+`fromProviders` names.
+
+```yaml
+serving:
+  localProviders: Published   # Named (default) or Published
+  remote: Members             # None (default) or Members
+```
+
+An edit applies at once: the operator reconciles every GridNetwork when the
+config changes. A refused document, such as `remote: members`, falls back to
+the defaults, and the `praxisConfigStatus` message says `operator config
+refused`.
+
+`localProviders: Published` also derives every `InferenceProvider` of the
+network on this cluster. Two providers claiming one routing identity still
+refuse with `ambiguous identity`.
+
+`remote: Members` also derives a hop for a remote candidate a member site's
+own catalog offers. Under Local membership, the operator reads each catalog
+from the peer over mutual TLS and stamps its records with that peer's site.
+A candidate a local provider's `siteSelector` places at a remote site is not
+in that site's catalog, so it keeps the name gate. The hop takes the existing
+remote checks, the site's `GridSite` probed at its current generation, and
+adds three refusals:
+
+| Reason | Cause |
+|---|---|
+| `remote Members needs Local membership` | The operator runs SWIM membership, where no catalog is read from a verified peer |
+| `site key is ambiguous` | More than one `GridSite` of the network keys to the candidate's site |
+| `member hop is not mutual TLS` | The site's egress is plaintext, so the hop does not verify the peer |
+
 ## Operational diagnostics
 
 After enabling `praxisConfig.generate: true` for a gateway, the `GridNetwork`
@@ -477,8 +515,9 @@ that all provider `clusterName` values are non-empty.
 
 A route candidate references a cluster with no `praxisConfig.clusterEndpoints[]`
 entry that could not be derived, so the operator withdrew it from this gateway.
-The message names the cluster and the reason. Add an endpoint entry for it, or
-allowlist its provider in `deriveTopology.fromProviders`.
+The message names the cluster and the reason. Add an endpoint entry for it,
+allowlist its provider in `deriveTopology.fromProviders`, or widen the
+operator config's `serving`.
 
 **Phase is `Error` / reason `MissingClusterEndpoint`**
 

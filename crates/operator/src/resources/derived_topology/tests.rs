@@ -69,6 +69,8 @@ fn decl<'decl>(
         from_providers: &ALLOWED,
         transport: None,
         signal: SignalMode::Gossip,
+        serving: Serving::default(),
+        peer_catalog: None,
     }
 }
 
@@ -465,6 +467,8 @@ fn decl_allowing<'decl>(
         from_providers: allowed,
         transport: None,
         signal: SignalMode::Gossip,
+        serving: Serving::default(),
+        peer_catalog: None,
     }
 }
 
@@ -1090,5 +1094,294 @@ fn a_remote_hop_naming_another_sites_server_name_derives_nothing() {
     assert_eq!(
         resolution.refused.first().map(|refused| refused.reason),
         Some(Refusal::ServerNameNotSite)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Site serving
+// ---------------------------------------------------------------------------
+
+/// Knobs set to `local` and `remote`.
+const fn knobs(local_providers: LocalProviders, remote: RemoteServing) -> Serving {
+    Serving {
+        local_providers,
+        remote,
+    }
+}
+
+/// Declarations naming nothing, with the given knobs and catalog, at `site-a`.
+fn unnamed<'decl>(
+    providers: &'decl [InferenceProvider],
+    sites: &'decl [GridSite],
+    serving: Serving,
+    peer_catalog: Option<&'decl PeerCatalog<'decl>>,
+) -> Declarations<'decl> {
+    Declarations {
+        serving,
+        peer_catalog,
+        ..decl_allowing(providers, sites, &[])
+    }
+}
+
+/// A catalog in which `site` offers `clusters`.
+fn catalog<'name>(site: &'name str, clusters: &[&'name str]) -> PeerCatalog<'name> {
+    PeerCatalog::from([(site, clusters.iter().copied().collect())])
+}
+
+/// `site-a` and a probed, mutual-TLS `site-b`.
+fn member_sites_ab() -> Vec<GridSite> {
+    vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(mutual_egress(
+                "site-b.grid.example.invalid:8443",
+                "site-b.grid.internal",
+            )),
+        ),
+    ]
+}
+
+/// The refusal reasons `resolution` carries.
+fn reasons(resolution: &Resolution) -> Vec<Refusal> {
+    resolution.refused.iter().map(|refused| refused.reason).collect()
+}
+
+#[test]
+fn the_serving_defaults_are_named_and_none() {
+    assert_eq!(
+        Serving::default(),
+        knobs(LocalProviders::Named, RemoteServing::None),
+        "the defaults keep derivation to what fromProviders names"
+    );
+}
+
+#[test]
+fn published_admits_an_unnamed_local_provider() {
+    let providers = vec![provider("a1b2c3d4", "http://pool.models.svc:8000", None)];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("a1b2c3d4", "site-a")];
+    let published = knobs(LocalProviders::Published, RemoteServing::None);
+    let resolution = resolve(&candidates, &[], &unnamed(&providers, &sites, published, None));
+    let got = resolution.get("a1b2c3d4").expect("a published provider derives");
+    assert_eq!(got.origin, Origin::DerivedLocal);
+    assert_eq!(got.endpoint.address, "pool.models.svc:8000");
+}
+
+#[test]
+fn named_does_not_admit_an_unnamed_local_provider() {
+    let providers = vec![provider("a1b2c3d4", "http://pool.models.svc:8000", None)];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("a1b2c3d4", "site-a")];
+    let resolution = resolve(&candidates, &[], &unnamed(&providers, &sites, Serving::default(), None));
+    assert!(resolution.is_empty(), "Named derives only what fromProviders names");
+    assert_eq!(reasons(&resolution), [Refusal::NotAllowlisted]);
+}
+
+#[test]
+fn published_never_picks_between_two_providers_claiming_one_identity() {
+    let mut twin = provider("zzz-shadow", "http://attacker.models.svc:8000", None);
+    twin.spec.cluster_name = Some("a1b2c3d4".to_owned());
+    let providers = vec![provider("a1b2c3d4", "http://pool.models.svc:8000", None), twin];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("a1b2c3d4", "site-a")];
+    let published = knobs(LocalProviders::Published, RemoteServing::None);
+    let resolution = resolve(&candidates, &[], &unnamed(&providers, &sites, published, None));
+    assert!(
+        resolution.is_empty(),
+        "an ambiguous identity refuses under Published too"
+    );
+    assert_eq!(reasons(&resolution), [Refusal::Ambiguous]);
+}
+
+#[test]
+fn published_does_not_admit_a_remote_candidate() {
+    let sites = member_sites_ab();
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let published = knobs(LocalProviders::Published, RemoteServing::None);
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, published, None));
+    assert_eq!(
+        reasons(&resolution),
+        [Refusal::NotAllowlisted],
+        "Published reaches local providers only"
+    );
+}
+
+#[test]
+fn members_admits_a_catalog_candidate_at_a_probed_member_site() {
+    let sites = member_sites_ab();
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let members = knobs(LocalProviders::Named, RemoteServing::Members);
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, members, Some(&offered)));
+    let got = resolution
+        .get("e5f6a7b8")
+        .expect("a member site's catalog candidate derives");
+    assert_eq!(got.origin, Origin::DerivedRemote);
+    assert_eq!(got.endpoint.address, "site-b.grid.example.invalid:8443");
+    assert_eq!(
+        got.endpoint.transport.as_ref().map(|transport| transport.mode.clone()),
+        Some(TransportMode::MutualTls)
+    );
+}
+
+#[test]
+fn members_refuses_a_remote_candidate_no_catalog_offered() {
+    let sites = member_sites_ab();
+    let elsewhere = PeerCatalog::from([
+        ("site-b", BTreeSet::from(["e5f6a7b8"])),
+        ("site-c", BTreeSet::from(["prov-local"])),
+    ]);
+    let candidates = vec![candidate("prov-local", "site-b")];
+    let members = knobs(LocalProviders::Named, RemoteServing::Members);
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, members, Some(&elsewhere)));
+    assert!(
+        resolution.is_empty(),
+        "a local selector placing a candidate at a peer is not that peer's catalog"
+    );
+    assert_eq!(reasons(&resolution), [Refusal::NotAllowlisted]);
+}
+
+#[test]
+fn members_without_local_membership_is_refused_by_name() {
+    let sites = member_sites_ab();
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let members = knobs(LocalProviders::Named, RemoteServing::Members);
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, members, None));
+    assert!(resolution.is_empty());
+    assert_eq!(reasons(&resolution), [Refusal::MembersNeedLocal]);
+    assert_eq!(
+        Refusal::MembersNeedLocal.as_str(),
+        "remote Members needs Local membership"
+    );
+}
+
+#[test]
+fn members_refuses_a_site_two_grid_sites_key_to() {
+    let egress = mutual_egress("site-b.grid.example.invalid:8443", "site-b.grid.internal");
+    let sites = vec![
+        site("site-a", None),
+        site("site-b", Some(egress.clone())),
+        discovered_site("net-site-b-7f3a", "site-b", &egress),
+    ];
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let members = knobs(LocalProviders::Named, RemoteServing::Members);
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, members, Some(&offered)));
+    assert!(resolution.is_empty(), "first match must not pick the hop");
+    assert_eq!(reasons(&resolution), [Refusal::SiteKeyAmbiguous]);
+}
+
+#[test]
+fn members_refuses_a_site_not_probed_at_its_generation_or_not_active() {
+    let egress = mutual_egress("site-b.grid.example.invalid:8443", "site-b.grid.internal");
+    let changed: GridSite = serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": "site-b", "generation": 2 },
+        "spec": { "gridNetworkRef": "net", "egress": egress },
+        "status": { "phase": "Active", "capabilities": {}, "message": "", "observedGeneration": 1, "reason": "" }
+    }))
+    .expect("site probed at an older generation");
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let members = knobs(LocalProviders::Named, RemoteServing::Members);
+    for (member, want) in [
+        (changed, Refusal::SiteNotProbed),
+        (
+            site_in_phase("site-b", Some(egress), "Connecting"),
+            Refusal::SiteNotActive,
+        ),
+    ] {
+        let sites = vec![site("site-a", None), member];
+        let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, members, Some(&offered)));
+        assert!(
+            resolution.is_empty(),
+            "{want:?}: an unprobed address is not a member hop"
+        );
+        assert_eq!(reasons(&resolution), [want]);
+    }
+}
+
+#[test]
+fn members_refuses_a_plaintext_hop() {
+    let sites = vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(serde_json::json!({ "address": "site-b:8080", "tls": { "mode": "Plaintext" } })),
+        ),
+    ];
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let members = knobs(LocalProviders::Named, RemoteServing::Members);
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, members, Some(&offered)));
+    assert!(resolution.is_empty(), "plaintext reaches an unverified peer");
+    assert_eq!(reasons(&resolution), [Refusal::MemberHopNotMutual]);
+}
+
+#[test]
+fn the_default_knobs_ignore_a_catalog() {
+    let sites = member_sites_ab();
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let resolution = resolve(
+        &candidates,
+        &[],
+        &unnamed(&[], &sites, Serving::default(), Some(&offered)),
+    );
+    assert_eq!(
+        reasons(&resolution),
+        [Refusal::NotAllowlisted],
+        "None keeps remote candidates behind the name gate"
+    );
+}
+
+#[test]
+fn a_named_remote_candidate_keeps_its_hop_under_members() {
+    let sites = vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(serde_json::json!({ "address": "site-b:8080", "tls": { "mode": "Plaintext" } })),
+        ),
+    ];
+    let allowed = vec!["prov-b".to_owned()];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let declarations = Declarations {
+        serving: knobs(LocalProviders::Named, RemoteServing::Members),
+        ..decl_allowing(&[], &sites, &allowed)
+    };
+    let resolution = resolve(&candidates, &[], &declarations);
+    assert!(
+        resolution.contains_key("prov-b"),
+        "a name keeps today's checks; the Members guards apply to unnamed candidates"
+    );
+}
+
+#[test]
+fn the_peer_catalog_keys_clusters_by_the_site_the_record_names() {
+    let record = |site: &str, cluster: &str| crdt::ProviderState {
+        network_id: "net".to_owned(),
+        site_id: site.to_owned(),
+        provider_id: cluster.to_owned(),
+        routing_cluster: cluster.to_owned(),
+        models: vec!["model-x".to_owned()],
+        tools: Vec::new(),
+        backend_kind: "local".to_owned(),
+        capacity_weight: 1,
+        phase: crdt::ProviderPhase::Available,
+        metrics: crdt::ProviderMetricsSnapshot::default(),
+        access_policy: crdt::ProviderAccessPolicy::default(),
+        revision: 1,
+        writer_id: site.to_owned(),
+    };
+    let records = [record("site-b", "x"), record("site-b", "y"), record("site-c", "x")];
+    assert_eq!(
+        peer_catalog(&records),
+        PeerCatalog::from([
+            ("site-b", BTreeSet::from(["x", "y"])),
+            ("site-c", BTreeSet::from(["x"]))
+        ])
     );
 }
