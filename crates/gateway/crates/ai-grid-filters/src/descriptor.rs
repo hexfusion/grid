@@ -10,11 +10,13 @@ use std::{
     sync::Arc,
 };
 
-use praxis_core::connectivity::Upstream;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN};
+use crate::{
+    dial::Dialed,
+    metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN},
+};
 
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
@@ -92,6 +94,10 @@ impl AdmissionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfig {
+    /// Unix-millisecond deadline for a discovered model; absent for static candidates.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+
     /// Whether it takes new requests, as the operator resolved it. Absent means it does.
     #[serde(default)]
     pub admission: AdmissionState,
@@ -146,6 +152,9 @@ fn default_fresh() -> bool {
     reason = "each flag is an independent fact the operator or the snapshot resolves"
 )]
 pub struct RouteCandidate {
+    /// Unix-millisecond deadline for a discovered model; absent for static candidates.
+    pub expires_at_ms: Option<u64>,
+
     /// Grid-operator admission state.
     pub admission_state: AdmissionState,
 
@@ -205,8 +214,19 @@ pub struct RouteCandidate {
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
 
-    /// Remote site's gateway, dialed directly instead of a `load_balancer` cluster.
-    pub upstream: Option<Upstream>,
+    /// The upstream the gateway built for this cluster from the serving config, sent to
+    /// directly instead of a `load_balancer` cluster.
+    pub dial: Option<Arc<Dialed>>,
+}
+
+impl RouteCandidate {
+    /// Whether this candidate is past its deadline after applying the mesh clock-skew margin.
+    pub(crate) fn expired_at(&self, now_ms: i64) -> bool {
+        self.expires_at_ms.is_some_and(|deadline| {
+            i128::from(now_ms).saturating_add(i128::from(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS))
+                >= i128::from(deadline)
+        })
+    }
 }
 
 /// Build a deterministic stable ID from candidate identity fields.
@@ -275,6 +295,7 @@ fn validate_candidates_with_empty(
             Arc::from,
         );
         candidates.push(RouteCandidate {
+            expires_at_ms: cand.expires_at_ms,
             admission_state: cand.admission,
             capacity: None,
             rho: None,
@@ -292,7 +313,7 @@ fn validate_candidates_with_empty(
             selection_tier: None,
             site: Arc::from(cand.site.as_str()),
             stable_id,
-            upstream: None,
+            dial: None,
         });
     }
 
@@ -379,7 +400,7 @@ pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
 ///
 /// Site names go into stored-state ids and request paths, so a `.`, `/`, quote
 /// or backslash in one would break them.
-fn validate_site(field: &str, value: &str) -> Result<(), FilterError> {
+pub(crate) fn validate_site(field: &str, value: &str) -> Result<(), FilterError> {
     let bytes = value.as_bytes();
     let edge = |byte: Option<&u8>| byte.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
     let label = (1..=63).contains(&bytes.len())
@@ -429,6 +450,7 @@ mod tests {
     fn candidate(kind_str: &str, name: &str, site: &str, cluster: &str) -> CandidateConfig {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();
         CandidateConfig {
+            expires_at_ms: None,
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
@@ -459,6 +481,20 @@ mod tests {
         c.fresh = false;
         let candidates = validate_candidates(vec![c]).unwrap();
         assert!(!candidates[0].fresh);
+    }
+
+    #[test]
+    fn serving_expiry_is_parsed_and_applies_the_mesh_clock_skew_margin() {
+        let config: CandidateConfig = serde_yaml::from_str(
+            "admission: new_and_existing\ncluster: c\nexpires_at_ms: 100000\nfresh: true\nkind: inference_model\nname: m\npublishes_load: true\nsite: s\nstable_id: null\n",
+        )
+        .unwrap();
+        let candidates = validate_candidates(vec![config]).unwrap();
+        let parsed = candidates.first().unwrap();
+
+        assert_eq!(parsed.expires_at_ms, Some(100_000));
+        assert!(!parsed.expired_at(69_999));
+        assert!(parsed.expired_at(70_000));
     }
 
     #[test]

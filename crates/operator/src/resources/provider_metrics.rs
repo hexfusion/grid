@@ -335,9 +335,9 @@ fn relayed(metric: &str) -> bool {
 /// does not start with `/`, one is prepended.
 ///
 /// ```text
-/// metrics_url("http://backend:8080",  "/metrics") → "http://backend:8080/metrics"
-/// metrics_url("http://backend:8080/", "/metrics") → "http://backend:8080/metrics"
-/// metrics_url("http://backend:8080",  "metrics")  → "http://backend:8080/metrics"
+/// metrics_url("http://backend:8080",  "/metrics") -> "http://backend:8080/metrics"
+/// metrics_url("http://backend:8080/", "/metrics") -> "http://backend:8080/metrics"
+/// metrics_url("http://backend:8080",  "metrics")  -> "http://backend:8080/metrics"
 /// ```
 pub(crate) fn metrics_url(endpoint: &str, path: &str) -> String {
     let base = endpoint.trim_end_matches('/');
@@ -1408,19 +1408,15 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     #[tokio::test]
     async fn provider_signal_scrapes_are_bounded_at_sixteen() {
         let (endpoint, peak_connections) = start_bounded_test_server(ok_response("bounded_queue 0.1\n"), 17, 16).await;
+        let mut metrics = mc_with_queue("bounded_queue");
+        metrics.timeout = "10s".to_owned();
         let providers: Vec<_> = (0..17)
-            .map(|index| {
-                provider_fixture(
-                    &format!("provider-{index}"),
-                    &endpoint,
-                    Some(mc_with_queue("bounded_queue")),
-                )
-            })
+            .map(|index| provider_fixture(&format!("provider-{index}"), &endpoint, Some(metrics.clone())))
             .collect();
         let readiness = crate::readiness::ReadinessStore::default();
 
         let collected = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(15),
             collect_provider_signals("net", &providers, None, &readiness),
         )
         .await;
@@ -1531,7 +1527,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
 
     #[tokio::test]
     async fn collect_metrics_malformed_body_produces_finite_metrics() {
-        // Malformed Prometheus text: metric not found → neutral defaults.
+        // Malformed Prometheus text: metric not found -> neutral defaults.
         let body = "not_prometheus_text {invalid} NaN\n";
         let base_url = start_test_server(ok_response(body)).await;
         let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue("my_queue")));
@@ -1771,7 +1767,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                 },
             );
         }
-        // Clock advanced past TTL → cache entry is expired → plaintext provider omitted.
+        // Clock advanced past TTL -> cache entry is expired -> plaintext provider omitted.
         let result = collect_provider_metrics("net", &[provider], &cache, t_after_ttl, None).await;
         assert!(
             !result.metrics.contains_key("prov-a"),

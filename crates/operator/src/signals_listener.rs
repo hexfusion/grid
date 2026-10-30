@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use crate::crd::{
     grid_network::{GridNetwork, SignalMode},
-    inference_provider::Condition,
+    inference_provider::{Condition, ConditionStatus},
 };
 
 /// The condition's type.
@@ -92,13 +92,13 @@ impl Listener {
     }
 
     /// The status and reason the condition carries.
-    const fn verdict(&self) -> (&'static str, &'static str) {
+    const fn verdict(&self) -> (ConditionStatus, &'static str) {
         match self {
-            Self::Serving => ("True", SIGNALS_LISTENER_SERVING),
-            Self::Absent => ("False", SIGNALS_LISTENER_ABSENT),
-            Self::Starting => ("False", SIGNALS_LISTENER_STARTING),
-            Self::TlsUnavailable => ("False", SIGNALS_LISTENER_TLS_UNAVAILABLE),
-            Self::BindFailed(_) => ("False", SIGNALS_LISTENER_BIND_FAILED),
+            Self::Serving => (ConditionStatus::True, SIGNALS_LISTENER_SERVING),
+            Self::Absent => (ConditionStatus::False, SIGNALS_LISTENER_ABSENT),
+            Self::Starting => (ConditionStatus::False, SIGNALS_LISTENER_STARTING),
+            Self::TlsUnavailable => (ConditionStatus::False, SIGNALS_LISTENER_TLS_UNAVAILABLE),
+            Self::BindFailed(_) => (ConditionStatus::False, SIGNALS_LISTENER_BIND_FAILED),
         }
     }
 
@@ -146,7 +146,7 @@ pub fn condition(network: &GridNetwork, listener: &Listener, now_rfc3339: &str) 
         .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
     Some(Condition {
         type_: SIGNALS_LISTENER.to_owned(),
-        status: state.to_owned(),
+        status: state,
         reason: reason.to_owned(),
         message,
         last_transition_time,
@@ -212,8 +212,8 @@ mod tests {
         }
         let absent = condition(&network(), &Listener::Absent, "t").expect("written");
         assert_eq!(
-            (absent.status.as_str(), absent.reason.as_str()),
-            ("False", SIGNALS_LISTENER_ABSENT)
+            (absent.status, absent.reason.as_str()),
+            (ConditionStatus::False, SIGNALS_LISTENER_ABSENT)
         );
         assert!(absent.message.contains("gossip"), "{}", absent.message);
     }
@@ -223,8 +223,8 @@ mod tests {
         let serving = Listener::of(Some(&Served::Serving), SignalMode::Poll).expect("declared");
         let serving = condition(&network(), &serving, "t").expect("written");
         assert_eq!(
-            (serving.status.as_str(), serving.reason.as_str()),
-            ("True", SIGNALS_LISTENER_SERVING)
+            (serving.status, serving.reason.as_str()),
+            (ConditionStatus::True, SIGNALS_LISTENER_SERVING)
         );
         for (served, reason, detail) in [
             (Served::Starting, SIGNALS_LISTENER_STARTING, "not bound"),
@@ -238,8 +238,8 @@ mod tests {
             let listener = Listener::of(Some(&served), SignalMode::Poll).expect("declared");
             let written = condition(&network(), &listener, "t").expect("written");
             assert_eq!(
-                (written.status.as_str(), written.reason.as_str()),
-                ("False", reason),
+                (written.status, written.reason.as_str()),
+                (ConditionStatus::False, reason),
                 "{served:?}"
             );
             assert!(written.message.contains(detail), "{served:?}: {}", written.message);

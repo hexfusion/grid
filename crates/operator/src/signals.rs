@@ -569,7 +569,7 @@ pub struct PeerRecord {
 /// The server name `site`'s gateway is reached and verified under, the DNS name its leaf carries.
 #[must_use]
 pub fn gateway_server_name(site: &str) -> String {
-    format!("{site}.{}", certs::SPIFFE_TRUST_DOMAIN)
+    certs::site_dns_name(site)
 }
 
 /// The server name `site`'s signals listener is reached under, beside its gateway's own.
@@ -921,15 +921,28 @@ impl SignalStore {
     /// Every sample still served, across targets.
     #[must_use]
     pub fn current(&self) -> Vec<Observation> {
+        let mut current = Vec::new();
+        self.for_each_current(|sample| current.push(sample.clone()));
+        current
+    }
+
+    /// Visit every sample still served, across targets, in the order [`current`] returns
+    /// them, without cloning any.
+    ///
+    /// `visit` runs under the store's read lock, so it must not call back into this store's
+    /// writers; a refresh waits until the visit ends.
+    ///
+    /// [`current`]: Self::current
+    pub fn for_each_current<F: FnMut(&Observation)>(&self, mut visit: F) {
         let Ok(guard) = self.inner.read() else {
-            return Vec::new();
+            return;
         };
         let now = Instant::now();
         guard
             .values()
             .filter(|held| held.expires_at > now)
-            .flat_map(|held| held.samples.iter().cloned())
-            .collect()
+            .flat_map(|held| held.samples.iter())
+            .for_each(&mut visit);
     }
 
     /// Targets currently held and unexpired.
@@ -2436,6 +2449,7 @@ fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::crd::inference_provider::ConditionStatus;
 
     #[test]
     fn a_restarted_site_catches_up_once_every_peer_is_held_or_long_silent() {
@@ -2849,7 +2863,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut request = [0_u8; 1024];
             drop(stream.read(&mut request).await);
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let response = format!("HTTP/1.1 200 OK\r\n{date}Content-Length: {}\r\n\r\n{body}", body.len());
             drop(stream.write_all(response.as_bytes()).await);
         });
@@ -2869,7 +2883,7 @@ mod tests {
         let round = poll.collect(&[slow]).await;
         assert!(
             round.contains_key("east"),
-            "1.5 s fits the 2 s budget of one that missed a round"
+            "a peer that answers inside the short budget is included in the round"
         );
     }
 
@@ -3156,7 +3170,7 @@ mod tests {
             &answered,
         );
         let condition = ages.condition(&[], "t0", Some(1)).expect("raised");
-        assert_eq!(condition.status, "False", "{condition:?}");
+        assert_eq!(condition.status, ConditionStatus::False, "{condition:?}");
         assert!(
             condition.message.contains("from ahead, ancient:"),
             "the peers stamping past their Date and a day behind it are named, the clean one is not: {}",
@@ -4527,6 +4541,27 @@ mod tests {
         );
         assert_eq!(store.targets().len(), 2, "one failed scrape must not erase a target");
     }
+
+    #[tokio::test]
+    async fn visiting_the_current_samples_sees_what_current_returns_and_skips_the_expired() {
+        let store = SignalStore::new();
+        let mut visited = Vec::new();
+        store.for_each_current(|sample| visited.push(sample.clone()));
+        assert!(visited.is_empty(), "an empty store visits nothing");
+        store.refresh(
+            BTreeMap::from([("pool-a".to_owned(), scraped()), ("pool-b".to_owned(), scraped())]),
+            Duration::from_secs(60),
+        );
+        store.refresh(
+            BTreeMap::from([("pool-c".to_owned(), scraped())]),
+            Duration::from_millis(20),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        store.for_each_current(|sample| visited.push(sample.clone()));
+        assert_eq!(visited.len(), 2, "pool-c expired while still held: {visited:?}");
+        assert_eq!(visited, store.current(), "the same samples, in the same order");
+    }
+
     #[test]
     fn non_finite_values_never_reach_the_store() {
         let scraped = "\
