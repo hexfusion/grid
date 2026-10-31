@@ -217,7 +217,7 @@ behavior, see the [AGN Routing Guide](../routing.md).
 | `admissionPolicy.mode` | `instantaneous`, `stabilized` | `instantaneous`; stabilized behavior requires repeated pressure/recovery observations. |
 | `admissionPolicy.missingMetrics` | `existingOnly`, `excluded` | `existingOnly` when admission policy is configured. Applies when an active scoring strategy and provider signal are configured but the signal is missing or expired; it does not activate metrics observation. |
 | `admissionPolicy.pressure` | Six fields: `enterThreshold`, `exitThreshold`, `failureThreshold`, `successThreshold`, `minimumStateDuration`, `recoveryHoldDown` | When `pressure` is omitted, defaults are `0.85`, `0.70`, `2`, `3`, `10s`, and `30s`, respectively. When supplied, all six fields are required. Exit must be lower than enter; durations must be positive whole seconds (for example, `10s`). |
-| `metricsRefreshInterval` | Seconds or milliseconds, at least one second | `300s`; TLS-protected metrics cap the effective interval at `60s`. Controls metric refresh/re-ranking, not request-time selection. |
+| `metricsRefreshInterval` | Seconds or milliseconds, at least one second | `120s`; TLS-protected metrics cap the effective interval at `60s`. Controls metric refresh/re-ranking, not request-time selection. |
 
 `geographyFirst` and `scoreFirst` are the only current routing-policy values.
 Explicit grouping fields such as `selectionPolicy.grouping.localityScope` are
@@ -511,7 +511,7 @@ ignores redundant joins.
 
 | Change | Effect |
 |---|---|
-| Seed added to `spec.seeds` | Announced to the SWIM runtime on the next reconcile (~300 s default); SWIM join initiated |
+| Seed added to `spec.seeds` | Announced to the SWIM runtime on the next reconcile (~120 s default); SWIM join initiated |
 | Seed removed from `spec.seeds` | No active disconnect; SWIM failure detection ages out the peer naturally |
 | `spec.seeds` unchanged | Re-announced on every reconcile; idempotent, no side effects |
 

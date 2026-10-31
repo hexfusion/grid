@@ -778,7 +778,7 @@ pub struct GridNetworkSpec {
     /// This controls the `GridNetwork` reconcile cadence for provider metrics;
     /// it does not change request-path routing or the overlay watch latency.
     /// Use a duration of at least one second, such as `"10s"` or `"1500ms"`.
-    /// The default cadence is 300 seconds. TLS-protected provider metrics cap
+    /// The default cadence is 120 seconds. TLS-protected provider metrics cap
     /// the cadence at 60 seconds for bounded certificate-rotation detection.
     #[schemars(regex(pattern = "^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]

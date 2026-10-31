@@ -1832,8 +1832,8 @@ async fn collect_gossip_peer_pins(
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Requeue interval after a successful reconciliation.
-const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
+/// Safety requeue after a successful reconciliation; changes arrive through the watches.
+const REQUEUE_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Shorter requeue interval when any provider in the network has
 /// `metricsConfig.tls` configured.  Without a cluster-wide Secret watch,
@@ -2988,7 +2988,7 @@ async fn announce_crd_seeds(
     );
     if let Err(e) = swim.announce_seeds(seeds.clone()) {
         // Channel-full or closed: log and continue. Seeds will be re-queued on
-        // the next reconcile cycle (REQUEUE_INTERVAL = 300 s by default).
+        // the next reconcile cycle (REQUEUE_INTERVAL = 120 s by default).
         tracing::warn!(network = name, error = %e, "failed to queue CRD seeds for SWIM announcement; will retry on next reconcile");
         return;
     }
@@ -14529,7 +14529,7 @@ mod tests {
         assert_eq!(
             requeue_interval_for_network(&base_network(), &providers).ok(),
             Some(REQUEUE_INTERVAL),
-            "networks with no TLS providers should use 300s"
+            "networks with no TLS providers should use the safety requeue"
         );
     }
 
