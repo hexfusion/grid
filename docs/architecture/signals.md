@@ -86,9 +86,23 @@ serializes publication within the same request budget.
 `unauthorized` when a non-local caller submits feedback, and `write_failure`
 for other Kubernetes write errors or unverified storage responses. Labels never
 include reporter identities, request metadata, or error strings.
+`grid_gateway_feedback_heartbeats_total` counts clean reports acknowledged
+without a status write.
 
-A `204` response echoes `x-grid-ingest-epoch` and `x-grid-ingest-sequence` only
-after the report and resulting condition have been persisted together. A
+A gateway reports after every poll, so a clean process with an unchanged counter
+sends a strictly newer clean report about once a second. The operator
+acknowledges such a report from memory and leaves the status untouched: the
+record keeps its sequence and receipt time until the counter moves, the flag
+changes, the condition changes, or five minutes pass since the record was last
+written, at which point the next clean report re-stamps it. The acknowledged
+sequence is tracked in memory so a replay below it is still refused. Without this
+every acknowledgment would be a `GridNetwork` status write, and every write a
+full reconcile.
+
+A `204` response echoes `x-grid-ingest-epoch` and `x-grid-ingest-sequence` once
+the durable record holds that process's counter and flag and the resulting
+condition. For a heartbeat the record already held them, so the echoed sequence
+is acknowledged in memory and the record keeps its last written one. A
 counter increase establishes rejection even when the flag claims clean. A
 strictly newer clean report with the same cumulative counter clears only that
 process's evidence. Exact duplicates are idempotent and do not renew freshness;

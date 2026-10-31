@@ -130,6 +130,7 @@ already did. Both fire above four fifths of a cap for five minutes:
 | `grid_mcp_probe_total` | counter | `outcome` | Total AgentToolProvider MCP tools/list probe attempts. |
 | `grid_mcp_probe_duration_seconds` | histogram | | AgentToolProvider MCP tools/list probe duration. |
 | `grid_gateway_feedback_events_total` | counter | `event` | Gateway status feedback events the operator could not apply as sent: `conflict`, `conflict_exhausted`, `overflow`, `unauthorized`, `write_failure`. |
+| `grid_gateway_feedback_heartbeats_total` | counter | | Clean gateway reports acknowledged without a `GridNetwork` status write. |
 
 ## Operator: identity and gossip
 

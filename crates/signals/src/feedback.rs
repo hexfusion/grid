@@ -11,9 +11,9 @@ pub const REPORT_HEADERS: [&str; 6] = [
     "x-grid-ingest-skew",
     "x-grid-ingest-rejected",
 ];
-/// Process epoch acknowledged after durable storage.
+/// Process epoch whose skew and flag the durable record holds.
 pub const ACK_EPOCH: &str = "x-grid-ingest-epoch";
-/// Sequence acknowledged after durable storage.
+/// Sequence acknowledged; the record carries it only when the acknowledgment wrote.
 pub const ACK_SEQUENCE: &str = "x-grid-ingest-sequence";
 
 /// One completed observation, with cumulative evidence retained until acknowledged.

@@ -45,6 +45,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(GATEWAY_FEEDBACK_EVENTS.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(GATEWAY_FEEDBACK_HEARTBEATS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROVIDER_SCRAPES.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROVIDER_LAST_SCRAPE_SUCCESS.clone()))
@@ -482,6 +484,20 @@ impl GatewayFeedbackEvent {
 /// Count a bounded gateway status feedback event.
 pub(crate) fn record_gateway_feedback(event: GatewayFeedbackEvent) {
     GATEWAY_FEEDBACK_EVENTS.with_label_values(&[event.as_str()]).inc();
+}
+
+/// Clean gateway reports acknowledged from memory without a status write.
+static GATEWAY_FEEDBACK_HEARTBEATS: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "grid_gateway_feedback_heartbeats_total",
+        "Clean gateway reports acknowledged without a GridNetwork status write",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Count one acknowledged heartbeat.
+pub(crate) fn record_gateway_feedback_heartbeat() {
+    GATEWAY_FEEDBACK_HEARTBEATS.inc();
 }
 
 /// What a bounded relay render left out, by store and by what was cut.

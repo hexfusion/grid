@@ -1604,7 +1604,8 @@ pub struct GatewayAgeReport {
     pub rejected: bool,
     /// Original wire flag, retained to verify exact duplicates.
     pub reported_rejected: bool,
-    /// Receipt time for inspection; freshness uses the operator's monotonic clock.
+    /// Time of the last durable change to this record, re-stamped at most every five
+    /// minutes while the process reports clean; freshness uses the operator's monotonic clock.
     #[schemars(extend("format" = "date-time"))]
     pub received_at: String,
 }

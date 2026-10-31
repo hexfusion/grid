@@ -2514,7 +2514,9 @@ spec:
                         pattern: ^[0-9a-f]{32}$
                         type: string
                       receivedAt:
-                        description: Receipt time for inspection; freshness uses the operator's monotonic clock.
+                        description: |-
+                          Time of the last durable change to this record, re-stamped at most every five
+                          minutes while the process reports clean; freshness uses the operator's monotonic clock.
                         format: date-time
                         type: string
                       rejected:

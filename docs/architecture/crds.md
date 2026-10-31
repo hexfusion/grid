@@ -373,7 +373,12 @@ capacity was exceeded. Conditions never change network phase or routing.
 
 `gatewayAgeReports[]` retains at most 128 records keyed by random process epoch:
 replica label, sequence, cumulative skew count, original report flag, effective
-rejection state, and receipt timestamp. Live freshness uses a five-minute
+rejection state, and receipt timestamp. The receipt timestamp is the last durable
+change to the record; a clean process with an unchanged counter is acknowledged
+without a write and re-stamped at most every five minutes. Under reporter
+overflow the oldest clean record by that timestamp is evicted. A live clean
+process can therefore briefly outrank one that retired within the last five
+minutes, and its next report re-admits it. Live freshness uses a five-minute
 monotonic receipt window. Expiration is evaluated when another report arrives;
 if reporting stops entirely, the last condition remains until a report arrives.
 After an operator restart, persisted rejected epochs have unknown freshness

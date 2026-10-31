@@ -22,7 +22,7 @@ use crate::{
         grid_network::{GatewayAgeReport, GridNetwork},
         inference_provider::{Condition, ConditionStatus},
     },
-    metrics::{GatewayFeedbackEvent, record_gateway_feedback},
+    metrics::{GatewayFeedbackEvent, record_gateway_feedback, record_gateway_feedback_heartbeat},
     shutdown::Shutdown,
 };
 
@@ -45,7 +45,7 @@ pub struct GatewayFeedback {
     /// Serializes the CAS flow and receipt commit under the request budget.
     publication: Arc<tokio::sync::Semaphore>,
     /// Updated only after durable acceptance; empty after operator restart.
-    receipts: Arc<Mutex<BTreeMap<String, Instant>>>,
+    receipts: Arc<Mutex<BTreeMap<String, Receipt>>>,
     /// Cancels publication when the operator terminates.
     shutdown: Shutdown,
 }
@@ -92,12 +92,20 @@ impl GatewayFeedback {
             match attempt(&api, &report, &receipts).await {
                 Ok((update, instant)) => {
                     let mut accepted_receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
-                    if update.fresh {
-                        accepted_receipts.insert(report.epoch.clone(), instant);
+                    match update.outcome {
+                        Outcome::Changed => {
+                            accepted_receipts.insert(report.epoch.clone(), Receipt::new(instant, report.sequence));
+                        },
+                        Outcome::Heartbeat => {
+                            if let Some(receipt) = accepted_receipts.get_mut(&report.epoch) {
+                                receipt.sequence = report.sequence;
+                            }
+                        },
+                        Outcome::Duplicate | Outcome::Refused => {},
                     }
                     accepted_receipts.retain(|epoch, _| update.evidence.reports.iter().any(|row| &row.epoch == epoch));
                     drop(accepted_receipts);
-                    return acknowledgment(&report, update.overflow);
+                    return acknowledgment(&report, update.outcome);
                 },
                 Err(StatusCode::CONFLICT) => {},
                 Err(status) => return status.into_response(),
@@ -112,7 +120,7 @@ impl GatewayFeedback {
 async fn attempt(
     api: &Api<GridNetwork>,
     report: &IngestReport,
-    receipts: &BTreeMap<String, Instant>,
+    receipts: &BTreeMap<String, Receipt>,
 ) -> Result<(Update, Instant), StatusCode> {
     let network = Box::pin(read_network(api)).await?;
     let now = time::OffsetDateTime::now_utc()
@@ -120,19 +128,19 @@ async fn attempt(
         .map_err(|_format| StatusCode::SERVICE_UNAVAILABLE)?;
     let instant = Instant::now();
     let update = fold(&network, report, &now, receipts, instant).map_err(|()| StatusCode::BAD_REQUEST)?;
+    let Some(patch) = &update.patch else {
+        record_gateway_feedback_heartbeat();
+        return Ok((update, instant));
+    };
     let name = network
         .metadata
         .name
         .as_deref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let applied = Box::pin(api.patch_status(
-        name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&update.patch),
-    ))
-    .await
-    .map_err(|error| write_error(&error))?;
-    if !durable(&applied, &update) {
+    let applied = Box::pin(api.patch_status(name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(patch)))
+        .await
+        .map_err(|error| write_error(&error))?;
+    if !durable(&applied, &update.evidence) {
         record_gateway_feedback(GatewayFeedbackEvent::WriteFailure);
         tracing::warn!("gateway feedback response did not contain the intended evidence");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -141,8 +149,8 @@ async fn attempt(
 }
 
 /// Echo exact report identity only after storage and capacity acceptance.
-fn acknowledgment(report: &IngestReport, overflow: bool) -> Response {
-    if overflow {
+fn acknowledgment(report: &IngestReport, outcome: Outcome) -> Response {
+    if outcome == Outcome::Refused {
         record_gateway_feedback(GatewayFeedbackEvent::Overflow);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -216,14 +224,46 @@ fn parse(headers: &HeaderMap) -> Option<IngestReport> {
 
 /// Atomic desired status, with freshness committed only after publication.
 struct Update {
-    /// SSA document including the read resourceVersion.
-    patch: serde_json::Value,
+    /// SSA document including the read resourceVersion; absent when nothing durable changed.
+    patch: Option<serde_json::Value>,
     /// Structured desired evidence for verifying the storage response.
     evidence: Evidence,
-    /// Whether this is a strictly newer accepted observation.
-    fresh: bool,
-    /// Capacity refusal, whose uncertainty is still published.
-    overflow: bool,
+    /// How the report relates to the retained evidence.
+    outcome: Outcome,
+}
+
+/// What an accepted report did to its epoch's retained row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Outcome {
+    /// New epoch, new evidence, or a clean row re-stamped past the receipt floor.
+    Changed,
+    /// Strictly newer clean report for a clean row; acknowledged without re-stamping.
+    Heartbeat,
+    /// Exact replay of the accepted head; nothing renews.
+    Duplicate,
+    /// Reporter capacity refused a new identity; the uncertainty is still published.
+    Refused,
+}
+
+/// Process-local acceptance state for one epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Receipt {
+    /// Monotonic time of the last durable change to the row.
+    accepted: Instant,
+    /// Highest acknowledged sequence, heartbeats included.
+    sequence: i64,
+}
+
+impl Receipt {
+    /// A receipt whose row was just written at `accepted`.
+    const fn new(accepted: Instant, sequence: i64) -> Self {
+        Self { accepted, sequence }
+    }
+
+    /// Whether the row's last write is inside the freshness window at `instant`.
+    fn fresh_at(&self, instant: Instant) -> bool {
+        instant.saturating_duration_since(self.accepted) < FRESHNESS
+    }
 }
 
 /// Separately owned durable evidence and its diagnostic condition.
@@ -239,7 +279,7 @@ struct Evidence {
 /// Monotonic receipt context; missing receipt knowledge remains stale after restart.
 struct Freshness<'receipt> {
     /// Live accepted receipts.
-    receipts: &'receipt BTreeMap<String, Instant>,
+    receipts: &'receipt BTreeMap<String, Receipt>,
     /// Shared reading for this operation.
     instant: Instant,
     /// Only a strictly newer observation renews its epoch.
@@ -253,7 +293,7 @@ impl Freshness<'_> {
             || self
                 .receipts
                 .get(&row.epoch)
-                .is_some_and(|received| self.instant.saturating_duration_since(*received) < FRESHNESS)
+                .is_some_and(|receipt| receipt.fresh_at(self.instant))
     }
 }
 
@@ -262,65 +302,97 @@ fn fold(
     network: &GridNetwork,
     report: &IngestReport,
     now: &str,
-    receipts: &BTreeMap<String, Instant>,
+    receipts: &BTreeMap<String, Receipt>,
     instant: Instant,
 ) -> Result<Update, ()> {
     let status = network.status.as_ref();
     let mut reports = status.map_or_else(Vec::new, |status| status.gateway_age_reports.clone());
-    let (fresh, overflow) = observe(&mut reports, report, now)?;
-    let uncertain = overflow || status.is_some_and(|status| status.gateway_age_report_overflow);
+    let outcome = observe(&mut reports, report, now, receipts.get(&report.epoch), instant)?;
+    let uncertain = outcome == Outcome::Refused || status.is_some_and(|status| status.gateway_age_report_overflow);
     reports.sort_by(|left, right| left.epoch.cmp(&right.epoch));
     let freshness = Freshness {
         receipts,
         instant,
-        epoch: fresh.then_some(report.epoch.as_str()),
+        epoch: (outcome == Outcome::Changed).then_some(report.epoch.as_str()),
     };
     let condition = condition(network, &reports, uncertain, now, &freshness);
-    let patch = serde_json::json!({
+    let evidence = Evidence {
+        reports,
+        uncertain,
+        condition,
+    };
+    // A heartbeat still writes when expiry or overflow moved the condition.
+    let write = outcome != Outcome::Heartbeat || !durable(network, &evidence);
+    Ok(Update {
+        patch: write.then(|| patch(network, &evidence)),
+        evidence,
+        outcome,
+    })
+}
+
+/// SSA document for `evidence` against the read resourceVersion.
+fn patch(network: &GridNetwork, evidence: &Evidence) -> serde_json::Value {
+    serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
         "metadata": { "name": network.metadata.name, "resourceVersion": network.metadata.resource_version },
-        "status": { "gatewayAgeReports": reports, "gatewayAgeReportOverflow": uncertain, "conditions": [condition] }
-    });
-    Ok(Update {
-        patch,
-        evidence: Evidence {
-            reports,
-            uncertain,
-            condition,
-        },
-        fresh,
-        overflow,
+        "status": {
+            "gatewayAgeReports": evidence.reports,
+            "gatewayAgeReportOverflow": evidence.uncertain,
+            "conditions": [evidence.condition],
+        }
     })
 }
 
 /// Admit a new identity only by reclaiming clean bookkeeping.
-fn observe(reports: &mut Vec<GatewayAgeReport>, report: &IngestReport, now: &str) -> Result<(bool, bool), ()> {
+fn observe(
+    reports: &mut Vec<GatewayAgeReport>,
+    report: &IngestReport,
+    now: &str,
+    receipt: Option<&Receipt>,
+    instant: Instant,
+) -> Result<Outcome, ()> {
     if let Some(held) = reports.iter_mut().find(|held| held.epoch == report.epoch) {
-        return replace(held, report, now).map(|fresh| (fresh, false));
+        return replace(held, report, now, receipt, instant);
     }
     if reports.len() >= MAX_REPORTERS {
         reports.sort_by(|left, right| (&left.received_at, &left.epoch).cmp(&(&right.received_at, &right.epoch)));
         let Some(position) = reports.iter().position(|held| !held.rejected) else {
-            return Ok((false, true));
+            return Ok(Outcome::Refused);
         };
         reports.remove(position);
     }
     reports.push(row(report, report.rejected || report.skew > 0, now));
-    Ok((true, false))
+    Ok(Outcome::Changed)
 }
 
 /// Reject replay or changed duplicates; counter rises override a clean claim.
-fn replace(held: &mut GatewayAgeReport, report: &IngestReport, now: &str) -> Result<bool, ()> {
-    if held.replica != report.replica || report.sequence < held.sequence || report.skew < held.skew {
+///
+/// The acknowledged head is the durable sequence or the receipt's, whichever is higher, so a
+/// heartbeat that was never written still refuses replay below it.
+fn replace(
+    held: &mut GatewayAgeReport,
+    report: &IngestReport,
+    now: &str,
+    receipt: Option<&Receipt>,
+    instant: Instant,
+) -> Result<Outcome, ()> {
+    let acknowledged = receipt
+        .map_or(held.sequence, |receipt| receipt.sequence)
+        .max(held.sequence);
+    if held.replica != report.replica || report.sequence < acknowledged || report.skew < held.skew {
         return Err(());
     }
-    if report.sequence == held.sequence {
+    if report.sequence == acknowledged {
         return (report.skew == held.skew && report.rejected == held.reported_rejected)
-            .then_some(false)
+            .then_some(Outcome::Duplicate)
             .ok_or(());
     }
+    let clean = !report.rejected && !held.rejected && report.skew == held.skew;
+    if clean && receipt.is_some_and(|receipt| receipt.fresh_at(instant)) {
+        return Ok(Outcome::Heartbeat);
+    }
     *held = row(report, report.rejected || report.skew > held.skew, now);
-    Ok(true)
+    Ok(Outcome::Changed)
 }
 
 /// Preserve transition time while updating diagnostic detail and observed generation.
@@ -368,15 +440,15 @@ fn condition(
 }
 
 /// Acknowledgment requires the response to contain the intended durable evidence.
-fn durable(network: &GridNetwork, update: &Update) -> bool {
+fn durable(network: &GridNetwork, evidence: &Evidence) -> bool {
     network.status.as_ref().is_some_and(|status| {
-        status.gateway_age_reports == update.evidence.reports
-            && status.gateway_age_report_overflow == update.evidence.uncertain
+        status.gateway_age_reports == evidence.reports
+            && status.gateway_age_report_overflow == evidence.uncertain
             && status
                 .conditions
                 .iter()
                 .find(|condition| condition.type_ == GATEWAY_AGES_REJECTED)
-                == Some(&update.evidence.condition)
+                == Some(&evidence.condition)
     })
 }
 
@@ -409,7 +481,7 @@ mod tests {
         let first = report("a", 1, 1, true);
         let update = fold(&network, &first, "t0", &BTreeMap::new(), instant).expect("bad");
         apply(&mut network, &update);
-        let receipts = BTreeMap::from([(first.epoch, instant)]);
+        let receipts = BTreeMap::from([(first.epoch, Receipt::new(instant, 1))]);
         let other = fold(&network, &report("b", 1, 0, false), "t1", &receipts, instant).expect("other");
         assert_eq!(
             standing(&other),
@@ -441,7 +513,11 @@ mod tests {
         );
         apply(&mut network, &update);
         let duplicate = fold(&network, &report, "t1", &BTreeMap::new(), instant).expect("exact duplicate");
-        assert!(!duplicate.fresh, "an exact replay must not renew the receipt");
+        assert_eq!(
+            duplicate.outcome,
+            Outcome::Duplicate,
+            "an exact replay must not renew the receipt"
+        );
         assert_eq!(
             standing(&duplicate),
             "Unknown",
@@ -487,7 +563,7 @@ mod tests {
         let overflow =
             fold(&network, &report("f", 1, 1, true), "t1", &BTreeMap::new(), instant).expect("overflow flag");
         assert!(
-            overflow.overflow && overflow.evidence.reports.len() == MAX_REPORTERS,
+            overflow.outcome == Outcome::Refused && overflow.evidence.reports.len() == MAX_REPORTERS,
             "overflow retains all bounded unresolved evidence"
         );
         assert_eq!(
@@ -519,7 +595,7 @@ mod tests {
         let instant = Instant::now();
         let first = fold(&network, &report, "t0", &BTreeMap::new(), instant).expect("bad");
         apply(&mut network, &first);
-        let receipts = BTreeMap::from([(report.epoch.clone(), instant)]);
+        let receipts = BTreeMap::from([(report.epoch.clone(), Receipt::new(instant, 2))]);
         let expired = instant.checked_add(FRESHNESS).expect("bounded instant");
         let stale = fold(&network, &report, "t1", &receipts, expired).expect("duplicate");
         assert_eq!(standing(&stale), "Unknown", "receipt expiry cannot prove recovery");
@@ -538,6 +614,91 @@ mod tests {
             .is_err(),
             "a stale lower sequence must not replace retained evidence"
         );
+    }
+
+    #[test]
+    fn clean_heartbeat_keeps_the_row_until_the_receipt_floor_or_a_condition_change() {
+        let mut network = network();
+        let instant = Instant::now();
+        let first = fold(&network, &report("a", 1, 0, false), "t0", &BTreeMap::new(), instant).expect("clean");
+        assert_eq!(first.outcome, Outcome::Changed, "a new epoch is always written");
+        apply(&mut network, &first);
+        let receipts = BTreeMap::from([(first.evidence.reports[0].epoch.clone(), Receipt::new(instant, 1))]);
+        let heartbeat = fold(&network, &report("a", 2, 0, false), "t1", &receipts, instant).expect("heartbeat");
+        assert_eq!(
+            heartbeat.outcome,
+            Outcome::Heartbeat,
+            "a newer clean report for a clean row"
+        );
+        assert!(
+            heartbeat.patch.is_none(),
+            "nothing durable changed, so nothing is written"
+        );
+        assert_eq!(
+            heartbeat.evidence.reports[0].sequence, 1,
+            "the row keeps its durable sequence and receipt time"
+        );
+        let replay = fold(&network, &report("a", 1, 0, false), "t2", &receipts, instant);
+        assert!(
+            replay.is_ok(),
+            "the durable head is still accepted as an exact duplicate"
+        );
+        let acknowledged = BTreeMap::from([(first.evidence.reports[0].epoch.clone(), Receipt::new(instant, 2))]);
+        assert!(
+            fold(&network, &report("a", 1, 0, false), "t2", &acknowledged, instant).is_err(),
+            "a replay below the acknowledged heartbeat is refused"
+        );
+        let expired = instant.checked_add(FRESHNESS).expect("bounded instant");
+        let restamped = fold(&network, &report("a", 3, 0, false), "t3", &acknowledged, expired).expect("re-stamp");
+        assert_eq!(
+            restamped.outcome,
+            Outcome::Changed,
+            "past the receipt floor the clean row is written again"
+        );
+        assert!(restamped.patch.is_some(), "the re-stamp is written");
+        assert_eq!(
+            restamped.evidence.reports[0].sequence, 3,
+            "the re-stamp carries the new head"
+        );
+        let counted = fold(&network, &report("a", 3, 1, false), "t3", &acknowledged, instant).expect("skew");
+        assert_eq!(counted.outcome, Outcome::Changed, "a counter rise is never a heartbeat");
+        assert!(counted.patch.is_some(), "a counter rise is written");
+        assert!(
+            counted.evidence.reports[0].rejected,
+            "a counter rise is rejection evidence"
+        );
+    }
+
+    #[test]
+    fn heartbeat_still_writes_when_another_epoch_goes_stale() {
+        let mut network = network();
+        let instant = Instant::now();
+        let bad = report("b", 1, 1, true);
+        let rejected = fold(&network, &bad, "t0", &BTreeMap::new(), instant).expect("bad");
+        apply(&mut network, &rejected);
+        let clean = report("a", 1, 0, false);
+        let receipts = BTreeMap::from([(bad.epoch.clone(), Receipt::new(instant, 1))]);
+        let admitted = fold(&network, &clean, "t1", &receipts, instant).expect("clean");
+        assert_eq!(standing(&admitted), "True", "the fresh rejection stands");
+        apply(&mut network, &admitted);
+        let expired = instant.checked_add(FRESHNESS).expect("bounded instant");
+        let both = BTreeMap::from([
+            (bad.epoch, Receipt::new(instant, 1)),
+            (clean.epoch, Receipt::new(expired, 1)),
+        ]);
+        let unchanged = fold(&network, &report("a", 2, 0, false), "t2", &both, instant).expect("heartbeat");
+        assert_eq!(unchanged.outcome, Outcome::Heartbeat);
+        assert!(
+            unchanged.patch.is_none(),
+            "the condition is unchanged, so the heartbeat is silent"
+        );
+        let flipped = fold(&network, &report("a", 2, 0, false), "t3", &both, expired).expect("heartbeat");
+        assert_eq!(flipped.outcome, Outcome::Heartbeat, "the clean row itself is unchanged");
+        assert!(
+            flipped.patch.is_some(),
+            "the rejected epoch went stale, so the condition must be written"
+        );
+        assert_eq!(standing(&flipped), "Unknown", "expiry never proves recovery");
     }
 
     #[test]
@@ -619,6 +780,78 @@ mod tests {
             patches.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "bad and clean reports each require one durable write"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeats_are_acknowledged_without_a_status_write() {
+        let (client, stored, patches) = mock_api(StorageMode::Normal);
+        let (_trigger, shutdown) = crate::shutdown::Trigger::new();
+        let feedback = GatewayFeedback::new(client, shutdown);
+        let heartbeats = heartbeat_count();
+        assert_eq!(
+            feedback
+                .respond(true, request(&report("a", 1, 0, false), ""))
+                .await
+                .status(),
+            StatusCode::NO_CONTENT,
+            "the first clean report is written and acknowledged"
+        );
+        for sequence in 2..=4 {
+            let response = feedback
+                .respond(true, request(&report("a", sequence, 0, false), ""))
+                .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "a clean heartbeat is acknowledged"
+            );
+            assert_eq!(
+                response.headers().get(ACK_SEQUENCE).expect("sequence"),
+                sequence.to_string().as_str(),
+                "the acknowledgment names the heartbeat's own sequence"
+            );
+        }
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "heartbeats never write status"
+        );
+        assert_eq!(
+            heartbeat_count(),
+            heartbeats.saturating_add(3),
+            "each skipped write is counted"
+        );
+        assert_eq!(
+            stored.lock().expect("stored")["status"]["gatewayAgeReports"][0]["sequence"],
+            1,
+            "the durable row keeps the written sequence"
+        );
+        assert_eq!(
+            feedback.receipts.lock().expect("receipts")[&"a".repeat(32)].sequence,
+            4,
+            "the receipt tracks the acknowledged head"
+        );
+        assert_eq!(
+            feedback
+                .respond(true, request(&report("a", 3, 0, false), ""))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "a replay below the acknowledged head is refused"
+        );
+        assert_eq!(
+            feedback
+                .respond(true, request(&report("a", 5, 1, true), ""))
+                .await
+                .status(),
+            StatusCode::NO_CONTENT,
+            "new evidence is written and acknowledged"
+        );
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the counter rise is the second write"
         );
     }
 
@@ -911,6 +1144,14 @@ mod tests {
             .map_or(0, |value| value.parse().expect("integer counter"))
     }
 
+    /// Current exported heartbeat count.
+    fn heartbeat_count() -> u64 {
+        let text = String::from_utf8(crate::metrics::encode_metrics()).expect("metrics text");
+        text.lines()
+            .find_map(|line| line.strip_prefix("grid_gateway_feedback_heartbeats_total "))
+            .map_or(0, |value| value.parse().expect("integer counter"))
+    }
+
     /// Named network with a CAS version.
     fn network() -> GridNetwork {
         serde_json::from_value(serde_json::json!({"apiVersion":"grid.praxis.fast/v1alpha1","kind":"GridNetwork","metadata":{"name":"grid","resourceVersion":"1"},"spec":{"seeds":[],"gridId":"grid"}})).expect("network")
@@ -929,12 +1170,13 @@ mod tests {
 
     /// Durable application from the atomic patch.
     fn apply(network: &mut GridNetwork, update: &Update) {
-        network.status = Some(serde_json::from_value(update.patch["status"].clone()).expect("status"));
+        let patch = update.patch.as_ref().expect("patch");
+        network.status = Some(serde_json::from_value(patch["status"].clone()).expect("status"));
     }
 
     /// Aggregate condition standing.
     fn standing(update: &Update) -> &str {
-        update.patch["status"]["conditions"][0]["status"]
+        update.patch.as_ref().expect("patch")["status"]["conditions"][0]["status"]
             .as_str()
             .expect("standing")
     }
